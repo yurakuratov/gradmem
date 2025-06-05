@@ -123,7 +123,7 @@ class KVDataset(Dataset):
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
-        input_seq = sample['sequence']
+        input_seq = sample['input_sequence']
         target_seq = sample['target']
 
         return {
