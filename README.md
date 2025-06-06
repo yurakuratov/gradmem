@@ -2,6 +2,30 @@
 
 This repository contains small experiments around "test time" gradient updates for key--value retrieval tasks. The main goal is to train compact GPT style models (both vanilla and models with an adaptive memory) to recover values that appear in the context.
 
+
+## Intro
+Large-context transformers pay a **quadratic cost** every time they reread long prompts.
+
+Our goal is to compress those prompts into a **small, writable parameter block `[mem]`** that we update with a few gradient steps at test time, then drop the original text entirely.
+
+### How it works
+
+| Phase | What happens | Compute cost |
+|-------|--------------|--------------|
+| **Write (inner loop, *K* steps)** | Show the context, compute an LM loss **L<sub>inner</sub>**, update **`[mem]` only** | O(*K*·|`[mem]` + |context|) |
+| **Read (outer loop)** | Discard the context; answer the query with the **updated `[mem]`** and compute **L<sub>outer</sub>** | O(`[mem]` + |query|) |
+
+*Back-propagating L<sub>outer</sub> meta-trains both the Transformer weights θ and the **initial memory `[mem]_0`**, so the model learns how to “write quickly.”*
+
+### Gradient-flow modes
+
+| Flag | What gradients reach `[mem]_0`? | Extra VRAM cost | Typical use-case |
+|------|---------------------------------|-----------------|------------------|
+| `none` (“Frozen”) | **None** (detach) | None | Baseline sanity check |
+| `first` (“1st-order”) | Straight-through, no Hessian term | None | Fast runs, XX% of full accuracy |
+| `second` (“2nd-order”) | Full MAML (keeps full graph through the *K* inner steps) | **≈ K × activation-memory** (parameters are shared; what multiplies is the *activations* for each inner forward/backward) | Highest accuracy when GPU RAM is sufficient |
+
+
 ## Prerequisites
 
 * Python 3.11
