@@ -64,7 +64,7 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
     kv_pairs_dict = dict(zip(keys, values))
     kv_pairs = [f'!{k}:{v}!' for k, v in kv_pairs_dict.items()]
 
-    # distribute fact by segments
+    # distribute facts by segments
     segments_ids = list(range(n_segments))
     segments_ids_with_kv_pairs = random.choices(segments_ids, k=len(kv_pairs))
     # create a mapping from segment_id to list of fact indices
