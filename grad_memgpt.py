@@ -156,9 +156,9 @@ class GradMemGPT(PreTrainedModel):
             mem_batch = mem_batch.requires_grad_(True)
 
         opt_state = {}                       # moments for stateless Adam
-        grad_norm_stats = {'mean': torch.tensor(0.0, device=device),
-                           'max': torch.tensor(-1.0, device=device),
-                           'min': torch.tensor(1e06, device=device)}
+        inner_loop_stats = {'inner_grad_norm_mean': torch.tensor(0.0, device=device),
+                            'inner_grad_norm_max': torch.tensor(-1.0, device=device),
+                            'inner_grad_norm_min': torch.tensor(1e06, device=device)}
         # ---------------------------------------------------------------- #
         # 1.  INNER loop on context. WRITE context to mem.
         # ---------------------------------------------------------------- #
@@ -192,9 +192,9 @@ class GradMemGPT(PreTrainedModel):
 
                     # track inner grad norm (todo: move to _opt_step?, currently we compute g_norm twice)
                     g_norm = g.reshape(B, -1).norm(dim=1).detach()
-                    grad_norm_stats['mean'] += g_norm.mean()
-                    grad_norm_stats['max'] = max(grad_norm_stats['max'], g_norm.max())
-                    grad_norm_stats['min'] = min(grad_norm_stats['min'], g_norm.min())
+                    inner_loop_stats['inner_grad_norm_mean'] += g_norm.mean()
+                    inner_loop_stats['inner_grad_norm_max'] = max(inner_loop_stats['inner_grad_norm_max'], g_norm.max())
+                    inner_loop_stats['inner_grad_norm_min'] = min(inner_loop_stats['inner_grad_norm_min'], g_norm.min())
 
                     if self.use_adam:
                         mem_batch = self._adam_step(mem_batch, g, opt_state, inner_step + 1, self.lr)
@@ -208,10 +208,15 @@ class GradMemGPT(PreTrainedModel):
                         pass  # do nothing, keep gradients flow
 
         if self.K:
-            grad_norm_stats['mean'] = grad_norm_stats['mean'] / self.K
+            inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
+            inner_loop_stats['inner_loss'] = inner_loss
+        # mem_batch: [B,M,d]
+        mem_norm = mem_batch.norm(dim=[1, 2]).detach()  # B
+        inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
+        inner_loop_stats['mem_norm_max'] = mem_norm.max()
 
         # ---------------------------------------------------------------- #
-        # 2.  READ phase – compute outer loss on query, read from mem
+        # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
         # ---------------------------------------------------------------- #
         qry_emb = self.model.get_input_embeddings()(query_input_ids)        # [B,Q,d]
         x_qry = torch.cat([mem_batch, qry_emb], dim=1)                      # [B,M+Q,d]
@@ -221,7 +226,7 @@ class GradMemGPT(PreTrainedModel):
         logits_q = self.model(inputs_embeds=x_qry).logits                   # [B,M+Q,V]
         logits_q = logits_q[:, self.n_mem_tokens+self.n_ctrl_tokens:, :]    # [B,Q,V]
 
-        output = {'predictions': logits_q, 'inner_loss': inner_loss, 'inner_grad_stats': grad_norm_stats}
+        output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:
             output['mem'] = mem_batch
 

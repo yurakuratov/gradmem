@@ -63,7 +63,7 @@ def collate_fn(batch, tokenizer):
 
 def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
-    logits, inner_loss, inner_grad_stats = predictions
+    logits, inner_loop_stats = predictions
     logits = logits[..., :-1, :]
     labels = labels[..., 1:]
     preds = np.argmax(logits, axis=-1)
@@ -102,10 +102,12 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     return {
         "token_accuracy": float(accuracy),
         "exact_match": float(exact_match),
-        "inner_loss": float(inner_loss.mean()),
-        "inner_grad_norm": float(inner_grad_stats['mean'].mean()),
-        "inner_grad_norm_max": float(inner_grad_stats['max'].max()),
-        "inner_grad_norm_min": float(inner_grad_stats['min'].min()),
+        "inner_loss": float(inner_loop_stats['inner_loss'].mean()),
+        "inner_grad_norm": float(inner_loop_stats['inner_grad_norm_mean'].mean()),
+        "inner_grad_norm_max": float(inner_loop_stats['inner_grad_norm_max'].max()),
+        "inner_grad_norm_min": float(inner_loop_stats['inner_grad_norm_min'].min()),
+        "mem_norm_mean": float(inner_loop_stats['mem_norm_mean'].mean()),
+        "mem_norm_max": float(inner_loop_stats['mem_norm_max'].max()),
     }
 
 
