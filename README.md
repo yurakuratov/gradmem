@@ -10,10 +10,10 @@ Our goal is to compress those prompts into a **small, writable parameter block `
 
 ### How it works
 
-| Phase | What happens | Compute cost |
-|-------|--------------|--------------|
-| **Write (inner loop, *K* steps)** | Show the context, compute an LM loss **L<sub>inner</sub>**, update **`[mem]` only** | O(*K*·|`[mem]` + |context|) |
-| **Read (outer loop)** | Discard the context; answer the query with the **updated `[mem]`** and compute **L<sub>outer</sub>** | O(`[mem]` + |query|) |
+| Phase | What happens | N_iters | Input size |
+|-------|--------------|--------------|------------|
+| **Write (inner loop, *K* steps)** | Show the context, compute an LM loss **L<sub>inner</sub>**, update **`[mem]` only** | *K* | `[mem]` + `context` |
+| **Read (outer loop)** | Discard the context; answer the query with the **updated `[mem]`** and compute **L<sub>outer</sub>** | 1 |  `query` |
 
 *Back-propagating L<sub>outer</sub> meta-trains both the Transformer weights θ and the **initial memory `[mem]_0`**, so the model learns how to “write quickly.”*
 
