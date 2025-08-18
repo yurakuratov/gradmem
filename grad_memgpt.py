@@ -20,8 +20,8 @@ class GradMemGPT(PreTrainedModel):
             self.mem.grad = mem_batch.grad.sum(0)
         second: second-order update. Full MAML. Outer grads include second-order term via a differentiable inner step.
 
-        inner loop: [write_ctrl][mem][context]
-        outer loop: [read_ctrl][mem][query][target]
+        inner loop: [write_st][mem][write_end][context]
+        outer loop: [read_st][mem][read_end][query][target]
 
         mem is updated in inner loop, write_ctrl/read_ctrl/model_params/init_mem are trained by outer loop
         """
@@ -37,11 +37,14 @@ class GradMemGPT(PreTrainedModel):
         self.inner_clip_norm = inner_clip_norm
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.config, 'n_embd', self.config.hidden_size)
+        # mem are inner loop params
         self.mem = nn.Parameter(torch.randn(n_mem_tokens, n_embd) * 0.02)
         # read/write control parameters (shape = n_ctrl_tokens × d)
         if n_ctrl_tokens > 0:
-            self.write_ctrl = nn.Parameter(torch.randn(n_ctrl_tokens, n_embd) * 0.02)
-            self.read_ctrl = nn.Parameter(torch.randn(n_ctrl_tokens, n_embd) * 0.02)
+            self.write_st = nn.Parameter(torch.randn(n_ctrl_tokens, n_embd) * 0.02)
+            self.write_end = nn.Parameter(torch.randn(n_ctrl_tokens, n_embd) * 0.02)
+            self.read_st = nn.Parameter(torch.randn(n_ctrl_tokens, n_embd) * 0.02)
+            self.read_end = nn.Parameter(torch.randn(n_ctrl_tokens, n_embd) * 0.02)
         self.tie_weights()
         self.main_input_name = "input_ids"
 
@@ -145,8 +148,10 @@ class GradMemGPT(PreTrainedModel):
 
         # ctrl tokens
         if self.n_ctrl_tokens > 0:
-            write_ctrl_batch = self.write_ctrl.unsqueeze(0).expand(B, -1, -1).requires_grad_(True)
-            read_ctrl_batch = self.read_ctrl.unsqueeze(0).expand(B, -1, -1).requires_grad_(True)
+            write_st_batch = self.write_st.unsqueeze(0).expand(B, -1, -1).requires_grad_(True)
+            write_end_batch = self.write_end.unsqueeze(0).expand(B, -1, -1).requires_grad_(True)
+            read_st_batch = self.read_st.unsqueeze(0).expand(B, -1, -1).requires_grad_(True)
+            read_end_batch = self.read_end.unsqueeze(0).expand(B, -1, -1).requires_grad_(True)
 
         # make a copy of the memory that we'll update K times, manage gradients:
         mem_batch = self.mem.unsqueeze(0).expand(B, -1, -1).clone()  # [B,M,d]
@@ -166,15 +171,16 @@ class GradMemGPT(PreTrainedModel):
             # re‑enable autograd even if outer context is `no_grad`
             with torch.enable_grad():
                 # build ctx embedding once, then reuse it with updated mem
-                ctx_emb = self.model.get_input_embeddings()(context_input_ids)    # [B,S,d]
+                ctx_emb = self.model.get_input_embeddings()(context_input_ids)      # [B,S,d]
                 for inner_step in range(self.K):
-                    x_ctx = torch.cat([mem_batch, ctx_emb], dim=1)                # [B,M+S,d]
-                    # add params that can control write operation to mem in inner loop
                     if self.n_ctrl_tokens > 0:
-                        x_ctx = torch.cat([write_ctrl_batch, x_ctx], dim=1)
+                        # add params that can control write operation to mem in inner loop
+                        x_ctx = torch.cat([write_st_batch, mem_batch, write_end_batch, ctx_emb], dim=1)
+                    else:
+                        x_ctx = torch.cat([mem_batch, ctx_emb], dim=1)              # [B,M+S,d]
 
-                    logits = self.model(inputs_embeds=x_ctx).logits               # [B,M+S,V]
-                    logits = logits[:, self.n_mem_tokens+self.n_ctrl_tokens:, :]  # [B,S,V]
+                    logits = self.model(inputs_embeds=x_ctx).logits                 # [B,M+S,V]
+                    logits = logits[:, self.n_mem_tokens+self.n_ctrl_tokens*2:, :]  # [B,S,V]
                     # shift‑left LM loss, ignore mem tokens + padding
                     lm_labels = context_input_ids.clone()
                     lm_labels[lm_labels == pad_id] = -100
@@ -218,13 +224,14 @@ class GradMemGPT(PreTrainedModel):
         # ---------------------------------------------------------------- #
         # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
         # ---------------------------------------------------------------- #
-        qry_emb = self.model.get_input_embeddings()(query_input_ids)        # [B,Q,d]
-        x_qry = torch.cat([mem_batch, qry_emb], dim=1)                      # [B,M+Q,d]
-        # add params that can control read operation from mem
+        qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
         if self.n_ctrl_tokens > 0:
-            x_qry = torch.cat([read_ctrl_batch, x_qry], dim=1)
-        logits_q = self.model(inputs_embeds=x_qry).logits                   # [B,M+Q,V]
-        logits_q = logits_q[:, self.n_mem_tokens+self.n_ctrl_tokens:, :]    # [B,Q,V]
+            # add params that can control read operation from mem
+            x_qry = torch.cat([read_st_batch, mem_batch, read_end_batch, qry_emb], dim=1)
+        else:
+            x_qry = torch.cat([mem_batch, qry_emb], dim=1)                    # [B,M+Q,d]
+        logits_q = self.model(inputs_embeds=x_qry).logits                     # [B,M+Q,V]
+        logits_q = logits_q[:, self.n_mem_tokens+self.n_ctrl_tokens*2:, :]    # [B,Q,V]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:
