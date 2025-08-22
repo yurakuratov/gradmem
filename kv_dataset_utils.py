@@ -79,8 +79,8 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
         kv_pairs_n_chars = sum([len(kv_pairs[kv_pair_idx]) for kv_pair_idx in segment_ids_to_kv_ids[i]])
         min_n_random_chars = max(min_segment_len - kv_pairs_n_chars, 0)
         max_n_random_chars = max(max_segment_len - kv_pairs_n_chars, 0)
-        random_chars = ''.join(random.choice(ALPHABET) for _ in range(random.randint(min_n_random_chars,
-                                                                                     max_n_random_chars)))
+        random_chars = ''.join(random.choice(KV_ALPHABET) for _ in range(random.randint(min_n_random_chars,
+                                                                                        max_n_random_chars)))
         # insert kv pairs into random places in the segment
         # first, determine all insertion positions
         kv_pairs_idxs = segment_ids_to_kv_ids[i]
@@ -134,7 +134,7 @@ class KVDataset(Dataset):
 
 def create_tokenizer():
     # Create character tokenizer
-    chars = ALPHABET + '!?:|'
+    chars = KV_ALPHABET + '!?:|'
     special = {'[PAD]': 0, '[BOS]': 1, '[EOS]': 2, '[UNK]': 3}
     vocab = {ch: i + len(special) for i, ch in enumerate(chars)}
     vocab.update(special)

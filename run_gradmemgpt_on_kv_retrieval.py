@@ -175,6 +175,9 @@ class ExperimentArgs:
     n_ctrl_tokens: Optional[int] = field(default=0)
     inner_clip_value: Optional[float] = field(default=None)
     inner_clip_norm: Optional[float] = field(default=None)
+    use_mem_proj: Optional[bool] = field(default=False)
+    mem_proj_mode: Optional[str] = field(default="none")
+    use_write_head: Optional[bool] = field(default=False)
 
 
 if __name__ == '__main__':
@@ -234,7 +237,9 @@ if __name__ == '__main__':
     # Create gradmemgpt model
     model = GradMemGPT(config, n_mem_tokens=args.n_mem_tokens, K=args.K, lr=args.inner_lr,
                        use_adam=args.use_adam, grad_mode=args.grad_mode, n_ctrl_tokens=args.n_ctrl_tokens,
-                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm)
+                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
+                       use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
+                       use_write_head=args.use_write_head)
 
     dataset = datasets.load_from_disk(args.data_path)
 
