@@ -12,15 +12,13 @@ import datasets
 import accelerate
 import transformers
 from transformers import (
-    AutoConfig,
+    AutoConfig, AutoTokenizer,
     AutoModelForCausalLM,
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback, TrainerCallback,
     HfArgumentParser
 )
-
-from kv_dataset_utils import create_tokenizer
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -37,6 +35,7 @@ def collate_fn(batch, tokenizer):
     seq = [item['context'] + item['query'] + item['target'] for item in batch]
     input_ids = tokenizer(seq, return_tensors="pt", add_special_tokens=False,
                           padding=True, pad_to_multiple_of=8).input_ids
+    attn_mask = (input_ids != tokenizer.pad_token_id).to(dtype=torch.long)
     # add labels_mask
     # input_seq: 0, target_seq: 1, seq = input_seq + target_seq
     labels_mask = torch.zeros_like(input_ids)
@@ -48,6 +47,7 @@ def collate_fn(batch, tokenizer):
     labels = input_ids * labels_mask + (1 - labels_mask) * -100
     return {
         'input_ids': input_ids,
+        'attention_mask': attn_mask,
         'labels': labels,
     }
 
@@ -129,7 +129,10 @@ class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
     data_path: str = field(
-        default='/home/jovyan/kuratov/data/test_time_gd/data/N2-K4V4-S4(32-64)_1M',
+        default='./data/N2-K4V4-S4(32-64)_1M',
+    )
+    tokenizer_path: str = field(
+        default='./tokenizers/kv_alphabet_62/',
     )
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
@@ -172,7 +175,7 @@ if __name__ == '__main__':
         json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
 
     # create tokenizer
-    tokenizer = create_tokenizer()
+    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
 
     # create model config
     if args.base_model == 'gpt2':
@@ -198,13 +201,16 @@ if __name__ == '__main__':
         raise ValueError(f'Unsupported base model: {args.base_model}')
 
     config.torch_dtype = "float32"  # weights in float32, at training precision is controlled by accelerate
-    config.vocab_size = 128
+    config.vocab_size = tokenizer.vocab_size
     config.pad_token_id = tokenizer.convert_tokens_to_ids('[PAD]')
     config.bos_token_id = tokenizer.convert_tokens_to_ids('[BOS]')
     config.eos_token_id = tokenizer.convert_tokens_to_ids('[EOS]')
 
     # create model
     model = AutoModelForCausalLM.from_config(config)
+
+    logger.info(f'model config: {model.config}')
+    logger.info(f'model: {model}')
 
     dataset = datasets.load_from_disk(args.data_path)
 
