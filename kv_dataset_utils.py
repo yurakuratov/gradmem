@@ -7,7 +7,7 @@ from torch.utils.data import Dataset
 from tokenizers import Tokenizer, Regex
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Split
-
+from tokenizers.decoders import BPEDecoder
 from transformers import PreTrainedTokenizerFast
 
 # Define alphabets for character generation
@@ -191,6 +191,8 @@ def create_tokenizer(vocab_size: int = 62):
 
     tokenizer = Tokenizer(WordLevel(vocab, unk_token='[UNK]'))
     tokenizer.pre_tokenizer = Split(Regex(r'.'), behavior="isolated", invert=True)
+    # to remove spaces between tokens
+    tokenizer.decoder = BPEDecoder(' ')
 
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=tokenizer,
                                         pad_token='[PAD]', eos_token='[EOS]',

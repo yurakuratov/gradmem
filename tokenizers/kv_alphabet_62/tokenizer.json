@@ -50,7 +50,10 @@
     "invert": true
   },
   "post_processor": null,
-  "decoder": null,
+  "decoder": {
+    "type": "BPEDecoder",
+    "suffix": " "
+  },
   "model": {
     "type": "WordLevel",
     "vocab": {
