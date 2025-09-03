@@ -90,12 +90,12 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
                                          inputs['context_input_ids'][:5], inputs['query_input_ids'][:5]):
         mask = (label != -100)
         pred = pred[mask]
-        inp_c[inp_c == -100] = 0
-        inp_q[inp_q == -100] = 0
-        label[label == -100] = 0
-        print('i:', tokenizer.decode(np.concatenate([inp_c, inp_q]), skip_special_tokens=True).replace(' ', ''))
-        print('p:', tokenizer.decode(pred, skip_special_tokens=True).replace(' ', ''))
-        print('t:', tokenizer.decode(label, skip_special_tokens=True).replace(' ', ''))
+        inp_c[inp_c == -100] = tokenizer.pad_token_id
+        inp_q[inp_q == -100] = tokenizer.pad_token_id
+        label[label == -100] = tokenizer.pad_token_id
+        print('i:', tokenizer.decode(np.concatenate([inp_c, inp_q]), skip_special_tokens=True).strip())
+        print('p:', tokenizer.decode(pred, skip_special_tokens=True).strip())
+        print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
         print('-' * 50)
 
     return {
@@ -232,9 +232,10 @@ if __name__ == '__main__':
 
     config.torch_dtype = "float32"  # weights in float32, at training precision is controlled by accelerate
     config.vocab_size = tokenizer.vocab_size
-    config.pad_token_id = tokenizer.convert_tokens_to_ids('[PAD]')
-    config.bos_token_id = tokenizer.convert_tokens_to_ids('[BOS]')
-    config.eos_token_id = tokenizer.convert_tokens_to_ids('[EOS]')
+    config.pad_token_id = tokenizer.pad_token_id
+    config.bos_token_id = tokenizer.bos_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    config.use_cache = False
 
     # Create gradmemgpt model
     model = GradMemGPT(config, n_mem_tokens=args.n_mem_tokens, K=args.K, lr=args.inner_lr,

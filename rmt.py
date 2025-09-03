@@ -11,9 +11,10 @@ class RMT2Segm(PreTrainedModel):
 
     def __init__(self, config, n_mem_tokens=8, n_ctrl_tokens=0, use_mem_proj=False, mem_proj_mode="none"):
         """
-        mem_proj_mode: "none" | "proj"
+        mem_proj_mode: "none" | "proj" | "proj_rw"
         none: no linear projection of mem
         proj: shared nn.Linear, is used only in write operation (todo: check if it is better to use at read as well)
+        proj_rw: one nn.Linear in read operation, one in write operation
 
         1st segment: [write_st][mem][write_end][context][write_st][mem]
         2nd segment: [read_st][mem][read_end][query][target]
@@ -34,7 +35,7 @@ class RMT2Segm(PreTrainedModel):
         self.mem_proj_mode = mem_proj_mode
 
         # check args
-        assert mem_proj_mode in ["none", "proj"]
+        assert mem_proj_mode in ["none", "proj", "proj_rw"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
 
         # memory parameters (shape = n_mem_tokens × d)
@@ -43,8 +44,14 @@ class RMT2Segm(PreTrainedModel):
         self.mem = nn.Parameter(torch.randn(n_mem_tokens, n_embd) * 0.02)
 
         # optional mem projection linear layer
-        if self.mem_proj_mode != "none":
+        if self.mem_proj_mode == "proj":
             self.mem_proj = nn.Linear(n_embd, n_embd, bias=True)
+        elif self.mem_proj_mode == "proj_rw":
+            self.mem_proj = nn.Linear(n_embd, n_embd, bias=True)
+            self.read_mem_proj = nn.Linear(n_embd, n_embd, bias=True)
+            with torch.no_grad():
+                nn.init.eye_(self.read_mem_proj.weight)
+                self.read_mem_proj.bias.zero_()
 
         # optional read/write control parameters (shape = n_ctrl_tokens × d)
         if n_ctrl_tokens > 0:
@@ -102,7 +109,7 @@ class RMT2Segm(PreTrainedModel):
         ctx_mask = (context_input_ids != pad_id).to(dtype=torch.long)
         mem_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
 
-        mem_inp_write = self.mem_proj(mem_batch) if self.mem_proj_mode == "proj" else mem_batch
+        mem_inp_write = self.mem_proj(mem_batch) if self.mem_proj_mode in ["proj", "proj_rw"] else mem_batch
 
         if self.n_ctrl_tokens > 0:
             # add params that can control write operation to mem in inner loop
@@ -126,10 +133,10 @@ class RMT2Segm(PreTrainedModel):
                           output_hidden_states=True, return_dict=True)
         h = outs.hidden_states[-1]             # [B,M+S+M,d]
         # extract mem tokens states
-        mem_batch = h[:, -self.n_mem_tokens:]  # [B,M,d]
+        mem_out = h[:, -self.n_mem_tokens:]  # [B,M,d]
 
         stats = {}
-        mem_norm = mem_batch.norm(dim=(1, 2)).detach()  # B
+        mem_norm = mem_out.norm(dim=(1, 2)).detach()  # B
         stats['mem_norm_mean'] = mem_norm.mean()
         stats['mem_norm_max'] = mem_norm.max()
 
@@ -144,14 +151,17 @@ class RMT2Segm(PreTrainedModel):
         #     mem_inp = mem_batch
         # elif self.mem_proj_mode == "proj":
         #     mem_inp = self.mem_proj(mem_batch)
-        mem_inp = mem_batch
+        if self.mem_proj_mode == "proj_rw":
+            mem_read_inp = self.read_mem_proj(mem_out)
+        else:
+            mem_read_inp = mem_out
 
         if self.n_ctrl_tokens > 0:
             # add params that can control read operation from mem
-            x_qry = torch.cat([read_st_batch, mem_inp, read_end_batch, qry_emb], dim=1)
+            x_qry = torch.cat([read_st_batch, mem_read_inp, read_end_batch, qry_emb], dim=1)
             qry_attn_mask = torch.cat([ctrl_mask, mem_mask, ctrl_mask, qry_mask], dim=1)
         else:
-            x_qry = torch.cat([mem_inp, qry_emb], dim=1)            # [B,M+Q,d]
+            x_qry = torch.cat([mem_read_inp, qry_emb], dim=1)            # [B,M+Q,d]
             qry_attn_mask = torch.cat([mem_mask, qry_mask], dim=1)
 
         logits_q = self.model(inputs_embeds=x_qry, attention_mask=qry_attn_mask).logits  # [B,M+Q,V]
@@ -159,7 +169,7 @@ class RMT2Segm(PreTrainedModel):
 
         output = {'predictions': logits_q, 'inner_loop_stats': stats}
         if return_mem:
-            output['mem'] = mem_batch
+            output['mem'] = mem_out
 
         if labels is None:
             return output

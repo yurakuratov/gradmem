@@ -88,12 +88,12 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
                                          inputs['context_input_ids'][:5], inputs['query_input_ids'][:5]):
         mask = (label != -100)
         pred = pred[mask]
-        inp_c[inp_c == -100] = 0
-        inp_q[inp_q == -100] = 0
-        label[label == -100] = 0
-        print('i:', tokenizer.decode(np.concatenate([inp_c, inp_q]), skip_special_tokens=True).replace(' ', ''))
-        print('p:', tokenizer.decode(pred, skip_special_tokens=True).replace(' ', ''))
-        print('t:', tokenizer.decode(label, skip_special_tokens=True).replace(' ', ''))
+        inp_c[inp_c == -100] = tokenizer.pad_token_id
+        inp_q[inp_q == -100] = tokenizer.pad_token_id
+        label[label == -100] = tokenizer.pad_token_id
+        print('i:', tokenizer.decode(np.concatenate([inp_c, inp_q]), skip_special_tokens=True).strip())
+        print('p:', tokenizer.decode(pred, skip_special_tokens=True).strip())
+        print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
         print('-' * 50)
 
     return {
@@ -155,6 +155,9 @@ class ExperimentArgs:
     eval_steps: Optional[int] = field(default=100)
     weight_decay: Optional[float] = field(default=0.0)
     learning_rate: Optional[float] = field(default=1e-04)
+    adam_beta1: Optional[float] = field(default=0.9)
+    adam_beta2: Optional[float] = field(default=0.999)
+    adam_epsilon: Optional[float] = field(default=1e-8)
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
     seed: Optional[int] = field(default=142)
@@ -219,9 +222,10 @@ if __name__ == '__main__':
 
     config.torch_dtype = "float32"  # weights in float32, at training precision is controlled by accelerate
     config.vocab_size = tokenizer.vocab_size
-    config.pad_token_id = tokenizer.convert_tokens_to_ids('[PAD]')
-    config.bos_token_id = tokenizer.convert_tokens_to_ids('[BOS]')
-    config.eos_token_id = tokenizer.convert_tokens_to_ids('[EOS]')
+    config.pad_token_id = tokenizer.pad_token_id
+    config.bos_token_id = tokenizer.bos_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    config.use_cache = False
 
     # Create rmt model
     model = RMT2Segm(config, n_mem_tokens=args.n_mem_tokens, n_ctrl_tokens=args.n_ctrl_tokens,
@@ -263,6 +267,9 @@ if __name__ == '__main__':
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        adam_epsilon=args.adam_epsilon,
         lr_scheduler_type=args.lr_scheduler_type,
 
         eval_strategy='steps',
