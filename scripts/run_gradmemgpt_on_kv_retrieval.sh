@@ -28,7 +28,7 @@ TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
 K=2
-INNER_LR=2.5
+INNER_LR=0.04
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 USE_ADAM=false
@@ -73,7 +73,7 @@ for N in "${N_VALUES[@]}"; do
   accelerate launch \
     --main_process_port $((29500+$TBS+$N+1)) \
     --num_processes $NP \
-    --mixed_precision bf16 \
+    --mixed_precision 'no' \
     --config_file accelerate.yaml \
     run_gradmemgpt_on_kv_retrieval.py \
     --exp_path $EXP_PATH \
