@@ -1,17 +1,90 @@
 import torch
 from torch import nn
-from transformers import AutoModelForCausalLM, PreTrainedModel, AutoConfig
+from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
+
+
+def get_backbone(m):
+    # most HF CausalLM classes define base_model_prefix, e.g. "transformer" (GPT-2), "model" (LLaMA)
+    if hasattr(m, "base_model_prefix") and hasattr(m, m.base_model_prefix):
+        return getattr(m, m.base_model_prefix)
+    # robust fallback
+    for attr in ("model", "transformer", "gpt_neox", "backbone", "decoder"):
+        if hasattr(m, attr):
+            return getattr(m, attr)
+    raise AttributeError("Could not locate backbone submodule")
+
+
+class GradMemGPTConfig(PretrainedConfig):
+    """
+    Configuration class for GradMemGPT.
+    """
+    model_type = "grad_memgpt"
+
+    def __init__(self,
+                 pretrained_model=None,
+                 base_config=None,
+                 n_mem_tokens=8,
+                 K=2,
+                 lr=0.01,
+                 use_adam=False,
+                 grad_mode="second",
+                 n_ctrl_tokens=0,
+                 inner_clip_value=None,
+                 inner_clip_norm=None,
+                 use_mem_proj=False,
+                 mem_proj_mode="none",
+                 use_write_head=False,
+                 **kwargs):
+        """
+        Args:
+            pretrained_model: str, name of pretrained model to load (e.g., 'gpt2')
+            base_config: dict or PretrainedConfig, config for base model when creating from scratch
+            n_mem_tokens: int, number of memory tokens
+            K: int, number of inner loop steps
+            lr: float, inner loop learning rate, it is a effective learning rate per sample
+            use_adam: bool, whether to use Adam optimizer in inner loop
+            grad_mode: str, gradient mode ("none", "first", "second")
+            n_ctrl_tokens: int, number of control tokens
+            inner_clip_value: float, gradient clipping value
+            inner_clip_norm: float, gradient clipping norm
+            use_mem_proj: bool, whether to use memory projection
+            mem_proj_mode: str, memory projection mode ("none", "proj", "per_sample")
+            use_write_head: bool, whether to use write head
+        """
+        super().__init__(**kwargs)
+
+        if pretrained_model is not None:
+            self.pretrained_model = pretrained_model
+            self.base_config = None
+        else:
+            self.pretrained_model = None
+            self.base_config = base_config
+
+        # GradMemGPT specific parameters
+        self.n_mem_tokens = n_mem_tokens
+        self.K = K
+        self.lr = lr
+        self.use_adam = use_adam
+        self.grad_mode = grad_mode
+        self.n_ctrl_tokens = n_ctrl_tokens
+        self.inner_clip_value = inner_clip_value
+        self.inner_clip_norm = inner_clip_norm
+        self.use_mem_proj = use_mem_proj
+        self.mem_proj_mode = mem_proj_mode
+        self.use_write_head = use_write_head
+
+        # Validate mem_proj_mode settings
+        assert mem_proj_mode in ["none", "proj", "per_sample"]
+        assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
 
 
 class GradMemGPT(PreTrainedModel):
     """
     Transformer-decoder backbone + writable prefix memory (n_mem_tokens x d).
     """
-    config_class = AutoConfig
+    config_class = GradMemGPTConfig
 
-    def __init__(self, config, n_mem_tokens=8, K=3, lr=2e-02, use_adam=True, grad_mode="none", n_ctrl_tokens=0,
-                 inner_clip_value=None, inner_clip_norm=None, use_mem_proj=False, mem_proj_mode="none",
-                 use_write_head=False):
+    def __init__(self, config):
         """
         grad_mode: "none" | "first" | "second"
         none: stop grad in inner update. Outer optimizer ignores mem pathway.
@@ -46,29 +119,35 @@ class GradMemGPT(PreTrainedModel):
         mem is updated in inner loop, write_ctrl/read_ctrl/model_params/init_mem are trained by outer loop
         """
         super().__init__(config)
-        self.model = AutoModelForCausalLM.from_config(config)
-        self.n_mem_tokens = n_mem_tokens
-        self.n_ctrl_tokens = n_ctrl_tokens
-        self.K = K
-        self.lr = lr
-        self.use_adam = use_adam
-        self.grad_mode = grad_mode
-        self.inner_clip_value = inner_clip_value
-        self.inner_clip_norm = inner_clip_norm
-        self.use_mem_proj = use_mem_proj  # defaults to mem_proj_mode == "proj"
-        if mem_proj_mode is None:
-            mem_proj_mode = "proj" if use_mem_proj else "none"
-        self.mem_proj_mode = mem_proj_mode
-        self.use_write_head = use_write_head
 
-        # check args
-        assert mem_proj_mode in ["none", "proj", "per_sample"]
-        assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
+        if config.pretrained_model is not None and config.base_config is not None:
+            raise ValueError("Only one of pretrained_model or base_config should be provided")
+        if config.pretrained_model is None and config.base_config is None:
+            raise ValueError("Either pretrained_model or base_config must be provided to instantiate GradMemGPT")
+
+        # initialize base model, attention is eager to support backward pass over backward pass
+        if config.pretrained_model is not None:
+            self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model, attn_implementation='eager')
+        else:
+            self.model = AutoModelForCausalLM.from_config(config.base_config, attn_implementation='eager')
+
+        # store GradMemGPT parameters
+        self.n_mem_tokens = config.n_mem_tokens
+        self.n_ctrl_tokens = config.n_ctrl_tokens
+        self.K = config.K
+        self.lr = config.lr
+        self.use_adam = config.use_adam
+        self.grad_mode = config.grad_mode
+        self.inner_clip_value = config.inner_clip_value
+        self.inner_clip_norm = config.inner_clip_norm
+        self.use_mem_proj = config.use_mem_proj
+        self.mem_proj_mode = config.mem_proj_mode
+        self.use_write_head = config.use_write_head
 
         # memory parameters (shape = n_mem_tokens × d)
-        n_embd = getattr(self.config, 'n_embd', self.config.hidden_size)
+        n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
         # self.mem are inner loop per-sample params, intial states of mem (self.mem) are meta-learned
-        self.mem = nn.Parameter(torch.randn(n_mem_tokens, n_embd) * 0.02)
+        self.mem = nn.Parameter(torch.randn(self.n_mem_tokens, n_embd) * 0.02)
 
         # optional mem projection linear layer
         if self.mem_proj_mode != "none":
@@ -81,12 +160,12 @@ class GradMemGPT(PreTrainedModel):
             self.mem_proj = None
 
         # optional read/write control parameters (shape = n_ctrl_tokens × d)
-        if n_ctrl_tokens > 0:
+        if self.n_ctrl_tokens > 0:
             # write ctrl tokens can be trained only by outer loop and only if grads flow through inner loop ("second")
-            self.write_st = nn.Parameter(torch.randn(n_ctrl_tokens, n_embd) * 0.02)
-            self.write_end = nn.Parameter(torch.randn(n_ctrl_tokens, n_embd) * 0.02)
-            self.read_st = nn.Parameter(torch.randn(n_ctrl_tokens, n_embd) * 0.02)
-            self.read_end = nn.Parameter(torch.randn(n_ctrl_tokens, n_embd) * 0.02)
+            self.write_st = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
+            self.write_end = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
+            self.read_st = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
+            self.read_end = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
 
         if self.use_write_head:
             V = self.model.config.vocab_size
@@ -101,6 +180,18 @@ class GradMemGPT(PreTrainedModel):
 
         self.tie_weights()
         self.main_input_name = "input_ids"
+        self.model.config.use_cache = False
+        if self.model.config.pad_token_id is None:
+            self.model.config.pad_token_id = self.model.config.eos_token_id
+
+        # TODO: CHECK
+        # # turn on gradient checkpointing to save gpu ram
+        # if hasattr(self.model, "gradient_checkpointing_enable"):
+        #     try:
+        #         self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        #     except TypeError:
+        #         # fallback for older HF versions
+        #         self.model.gradient_checkpointing_enable()
 
     def floating_point_ops(self, inputs):
         # dummy method to satisfy base class and it's invocation by trainer:
@@ -249,6 +340,10 @@ class GradMemGPT(PreTrainedModel):
                 # shift‑left LM loss, ignore mem tokens + padding
                 lm_labels = context_input_ids.clone()
                 lm_labels[lm_labels == pad_id] = -100
+                # loss mask
+                mask = (lm_labels[:, 1:] != -100)
+                # n real tokens per sample
+                seq_len = mask.sum(dim=1).clamp_min(1)
                 for inner_step in range(self.K):
                     if self.mem_proj_mode == 'none':
                         mem_inp = mem_batch
@@ -263,12 +358,16 @@ class GradMemGPT(PreTrainedModel):
                     else:
                         x_ctx = torch.cat([mem_inp, ctx_emb], dim=1)                    # [B,M+S,d]
 
-                    outs = self.model(inputs_embeds=x_ctx, output_hidden_states=self.use_write_head, return_dict=True)
                     if self.use_write_head:
-                        h = outs.hidden_states[-1]                                      # [B,M+S,V]
+                        # we do not need to compute read memory head logits here, we need only last hidden state
+                        # to get write head logits
+                        outs = get_backbone(self.model)(inputs_embeds=x_ctx, return_dict=True)
+                        h = outs.last_hidden_state                                      # [B,M+S,V]
                         h = h[:, self.n_mem_tokens+self.n_ctrl_tokens*2:, :]            # [B,S,V]
                         logits = self.write_head(h)
+                        del h
                     else:
+                        outs = self.model(inputs_embeds=x_ctx, return_dict=True)
                         logits = outs.logits                                            # [B,M+S,V]
                         logits = logits[:, self.n_mem_tokens+self.n_ctrl_tokens*2:, :]  # [B,S,V]
 
@@ -276,7 +375,13 @@ class GradMemGPT(PreTrainedModel):
                         logits[:, :-1].reshape(-1, logits.size(-1)),
                         lm_labels[:, 1:].reshape(-1),
                         ignore_index=-100,
-                    )
+                        reduction='none',
+                    ).view(B, -1)
+                    # per_sample losses, make per-sample inner loss invariant to batch size B:
+                    # g_i = d inner_loss / d mem_i = d inner_loss_i / d mem_i
+                    inner_loss = (inner_loss * mask).sum(1) / seq_len
+                    inner_loss = inner_loss.sum()
+                    del outs, logits
 
                     # get inner loop gradients
                     create_graph = (self.grad_mode == "second")
@@ -320,11 +425,14 @@ class GradMemGPT(PreTrainedModel):
 
         if self.K:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
-            inner_loop_stats['inner_loss'] = inner_loss.detach()
+            # log average inner loss
+            inner_loop_stats['inner_loss'] = inner_loss.detach() / B
         # mem_batch: [B,M,d]
         mem_norm = mem_batch.norm(dim=(1, 2)).detach()  # B
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
         inner_loop_stats['mem_norm_max'] = mem_norm.max()
+
+        del ctx_emb, lm_labels
 
         # ---------------------------------------------------------------- #
         # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
