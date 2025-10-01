@@ -298,6 +298,9 @@ class GradMemGPT(PreTrainedModel):
         device = context_input_ids.device
         B = context_input_ids.size(0)
 
+        # actual model inputs starts after mem tokens and ctrl tokens
+        mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
+
         # ctrl tokens
         if self.n_ctrl_tokens > 0:
             write_st_batch = self.write_st.unsqueeze(0).expand(B, -1, -1)
@@ -337,11 +340,11 @@ class GradMemGPT(PreTrainedModel):
             with torch.enable_grad():
                 # build ctx embedding once, then reuse it with updated mem
                 ctx_emb = self.model.get_input_embeddings()(context_input_ids)      # [B,S,d]
-                # shift‑left LM loss, ignore mem tokens + padding
+                # lm labels: reconstructing the context, last mem/ctrl token predicts the first token of the context
                 lm_labels = context_input_ids.clone()
                 lm_labels[lm_labels == pad_id] = -100
                 # loss mask
-                mask = (lm_labels[:, 1:] != -100)
+                mask = (lm_labels != -100)
                 # n real tokens per sample
                 seq_len = mask.sum(dim=1).clamp_min(1)
                 for inner_step in range(self.K):
@@ -356,24 +359,24 @@ class GradMemGPT(PreTrainedModel):
                         # add params that can control write operation to mem in inner loop
                         x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch, ctx_emb], dim=1)
                     else:
-                        x_ctx = torch.cat([mem_inp, ctx_emb], dim=1)                    # [B,M+S,d]
+                        x_ctx = torch.cat([mem_inp, ctx_emb], dim=1)    # [B,M+S,d]
 
                     if self.use_write_head:
                         # we do not need to compute read memory head logits here, we need only last hidden state
                         # to get write head logits
                         outs = get_backbone(self.model)(inputs_embeds=x_ctx, return_dict=True)
-                        h = outs.last_hidden_state                                      # [B,M+S,V]
-                        h = h[:, self.n_mem_tokens+self.n_ctrl_tokens*2:, :]            # [B,S,V]
+                        h = outs.last_hidden_state                     # [B,M+S,V]
+                        h = h[:, mem_offset-1:, :]                     # [B,S,V]
                         logits = self.write_head(h)
                         del h
                     else:
                         outs = self.model(inputs_embeds=x_ctx, return_dict=True)
-                        logits = outs.logits                                            # [B,M+S,V]
-                        logits = logits[:, self.n_mem_tokens+self.n_ctrl_tokens*2:, :]  # [B,S,V]
+                        logits = outs.logits                           # [B,M+S,V]
+                        logits = logits[:, mem_offset-1:, :]           # [B,S,V]
 
                     inner_loss = nn.functional.cross_entropy(
                         logits[:, :-1].reshape(-1, logits.size(-1)),
-                        lm_labels[:, 1:].reshape(-1),
+                        lm_labels.reshape(-1),
                         ignore_index=-100,
                         reduction='none',
                     ).view(B, -1)
@@ -453,7 +456,7 @@ class GradMemGPT(PreTrainedModel):
             x_qry = torch.cat([mem_inp, qry_emb], dim=1)                      # [B,M+Q,d]
 
         logits_q = self.model(inputs_embeds=x_qry).logits                     # [B,M+Q,V]
-        logits_q = logits_q[:, self.n_mem_tokens+self.n_ctrl_tokens*2:, :]    # [B,Q,V]
+        logits_q = logits_q[:, mem_offset:, :]    # [B,Q,V]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:
@@ -465,7 +468,7 @@ class GradMemGPT(PreTrainedModel):
         if labels is None:
             return output
 
-        # lm loss
+        # lm loss, todo: we never compute loss from the last mem/ctrl token, it's ok until we have prefix/query in x_qry
         loss = nn.functional.cross_entropy(
             logits_q[:, :-1].reshape(-1, logits_q.size(-1)),
             labels[:, 1:].reshape(-1),
