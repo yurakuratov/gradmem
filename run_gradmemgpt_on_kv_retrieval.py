@@ -189,6 +189,7 @@ class ExperimentArgs:
     # GradMemGPT parameters
     n_mem_tokens: Optional[int] = field(default=8)
     K: Optional[int] = field(default=3)
+    last_K_second_order: Optional[int] = field(default=None)
     inner_lr: Optional[float] = field(default=0.01)
     use_adam: Optional[bool] = field(default=True)
     grad_mode: Optional[str] = field(default="none")
@@ -198,7 +199,7 @@ class ExperimentArgs:
     use_mem_proj: Optional[bool] = field(default=False)
     mem_proj_mode: Optional[str] = field(default="none")
     use_write_head: Optional[bool] = field(default=False)
-
+    use_gradient_checkpointing: Optional[bool] = field(default=False)
 
 if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
@@ -264,11 +265,13 @@ if __name__ == '__main__':
 
     gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
+                                      last_K_second_order=args.last_K_second_order,
                                       lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
                                       n_ctrl_tokens=args.n_ctrl_tokens,
                                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
                                       use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
-                                      use_write_head=args.use_write_head)
+                                      use_write_head=args.use_write_head,
+                                      use_gradient_checkpointing=args.use_gradient_checkpointing)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
@@ -313,6 +316,7 @@ if __name__ == '__main__':
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
+        gradient_checkpointing=args.use_gradient_checkpointing,
 
         eval_strategy='steps',
         save_strategy='steps',

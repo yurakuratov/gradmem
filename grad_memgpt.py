@@ -28,12 +28,14 @@ class GradMemGPTConfig(PretrainedConfig):
                  lr=0.01,
                  use_adam=False,
                  grad_mode="second",
+                 last_K_second_order=None,
                  n_ctrl_tokens=0,
                  inner_clip_value=None,
                  inner_clip_norm=None,
                  use_mem_proj=False,
                  mem_proj_mode="none",
                  use_write_head=False,
+                 use_gradient_checkpointing=False,
                  **kwargs):
         """
         Args:
@@ -44,12 +46,14 @@ class GradMemGPTConfig(PretrainedConfig):
             lr: float, inner loop learning rate, it is a effective learning rate per sample
             use_adam: bool, whether to use Adam optimizer in inner loop
             grad_mode: str, gradient mode ("none", "first", "second")
+            last_K_second_order: int, use second order update for last K inner gradient steps only
             n_ctrl_tokens: int, number of control tokens
             inner_clip_value: float, gradient clipping value
             inner_clip_norm: float, gradient clipping norm
             use_mem_proj: bool, whether to use memory projection
             mem_proj_mode: str, memory projection mode ("none", "proj", "per_sample")
             use_write_head: bool, whether to use write head
+            use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
         """
         super().__init__(**kwargs)
 
@@ -72,6 +76,9 @@ class GradMemGPTConfig(PretrainedConfig):
         self.use_mem_proj = use_mem_proj
         self.mem_proj_mode = mem_proj_mode
         self.use_write_head = use_write_head
+        self.last_K_second_order = K if last_K_second_order is None and grad_mode == "second" else 0
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -135,6 +142,7 @@ class GradMemGPT(PreTrainedModel):
         self.n_mem_tokens = config.n_mem_tokens
         self.n_ctrl_tokens = config.n_ctrl_tokens
         self.K = config.K
+        self.last_K_second_order = config.last_K_second_order
         self.lr = config.lr
         self.use_adam = config.use_adam
         self.grad_mode = config.grad_mode
@@ -184,14 +192,11 @@ class GradMemGPT(PreTrainedModel):
         if self.model.config.pad_token_id is None:
             self.model.config.pad_token_id = self.model.config.eos_token_id
 
-        # TODO: CHECK
-        # # turn on gradient checkpointing to save gpu ram
-        # if hasattr(self.model, "gradient_checkpointing_enable"):
-        #     try:
-        #         self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        #     except TypeError:
-        #         # fallback for older HF versions
-        #         self.model.gradient_checkpointing_enable()
+        # turn on gradient checkpointing to save gpu ram
+        # currently, gradient checkpointing is not used in inner loop, so it wont save GPU RAM at forward pass.
+        # but it's still saves some GPU RAM for training in outer loop
+        if getattr(config, "use_gradient_checkpointing", False):
+            self.gradient_checkpointing_enable()
 
     def floating_point_ops(self, inputs):
         # dummy method to satisfy base class and it's invocation by trainer:
@@ -200,6 +205,15 @@ class GradMemGPT(PreTrainedModel):
 
     def tie_weights(self):
         self.model.tie_weights()
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        # force {"use_reentrant": False}
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+            try:
+                self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+            except TypeError:
+                # fallback for older HF versions
+                self.model.gradient_checkpointing_enable()
 
     def _adam_step(self, p, g, state, step_idx, lr, beta1=0.9, beta2=0.999, eps=1e-8, clip_value=10.0):
         """
@@ -347,7 +361,7 @@ class GradMemGPT(PreTrainedModel):
                 mask = (lm_labels != -100)
                 # n real tokens per sample
                 seq_len = mask.sum(dim=1).clamp_min(1)
-                for inner_step in range(self.K):
+                for k in range(self.K):
                     if self.mem_proj_mode == 'none':
                         mem_inp = mem_batch
                     elif self.mem_proj_mode == 'proj':
@@ -386,8 +400,9 @@ class GradMemGPT(PreTrainedModel):
                     inner_loss = inner_loss.sum()
                     del outs, logits
 
+                    is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
+                    create_graph = is_second_order_step
                     # get inner loop gradients
-                    create_graph = (self.grad_mode == "second")
                     if self.mem_proj_mode == 'per_sample':
                         g_mem, g_W, g_b = torch.autograd.grad(inner_loss, [mem_batch, W_batch, b_batch],
                                                               create_graph=create_graph)
@@ -401,13 +416,10 @@ class GradMemGPT(PreTrainedModel):
                     inner_loop_stats['inner_grad_norm_min'] = min(inner_loop_stats['inner_grad_norm_min'], g_norm.min())
 
                     if self.use_adam:
-                        mem_batch = self._adam_step(mem_batch, g_mem, opt_state.setdefault('mem', {}),
-                                                    inner_step + 1, self.lr)
+                        mem_batch = self._adam_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), k + 1, self.lr)
                         if self.mem_proj_mode == 'per_sample':
-                            W_batch = self._adam_step(W_batch, g_W, opt_state.setdefault('W', {}),
-                                                      inner_step + 1, self.lr)
-                            b_batch = self._adam_step(b_batch, g_b, opt_state.setdefault('b', {}),
-                                                      inner_step + 1, self.lr)
+                            W_batch = self._adam_step(W_batch, g_W, opt_state.setdefault('W', {}), k + 1, self.lr)
+                            b_batch = self._adam_step(b_batch, g_b, opt_state.setdefault('b', {}), k + 1, self.lr)
                             raise NotImplementedError("Adam is not tested, be careful!")
                     else:
                         mem_batch = self._sgd_step(mem_batch, g_mem,
