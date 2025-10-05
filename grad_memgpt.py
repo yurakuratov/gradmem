@@ -76,9 +76,11 @@ class GradMemGPTConfig(PretrainedConfig):
         self.use_mem_proj = use_mem_proj
         self.mem_proj_mode = mem_proj_mode
         self.use_write_head = use_write_head
-        self.last_K_second_order = K if last_K_second_order is None and grad_mode == "second" else 0
+        self.last_K_second_order = K if last_K_second_order is None else last_K_second_order
+        if grad_mode != "second":
+            self.last_K_second_order = 0
+        self.last_K_second_order = max(0, min(self.last_K_second_order, K))
         self.use_gradient_checkpointing = use_gradient_checkpointing
-
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
