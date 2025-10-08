@@ -2,6 +2,9 @@ import torch
 from torch import nn
 from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
 
+from accelerate.logging import get_logger
+logger = get_logger('')
+
 
 def get_backbone(m):
     # most HF CausalLM classes define base_model_prefix, e.g. "transformer" (GPT-2), "model" (LLaMA)
@@ -36,6 +39,7 @@ class GradRMTConfig(PretrainedConfig):
                  use_mem_proj=False,
                  mem_proj_mode="none",
                  use_write_head=False,
+                 use_mem_attn=False,
                  segment_size=None,
                  use_gradient_checkpointing=False,
                  **kwargs):
@@ -56,6 +60,8 @@ class GradRMTConfig(PretrainedConfig):
             use_mem_proj: bool, whether to use memory projection
             mem_proj_mode: str, memory projection mode ("none", "proj", "per_sample")
             use_write_head: bool, whether to use write head
+            use_mem_attn: bool, whether to use memory cross-attention
+            segment_size: int, size of segments for splitting the context
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
         """
         super().__init__(**kwargs)
@@ -86,11 +92,62 @@ class GradRMTConfig(PretrainedConfig):
 
         # Recurrency parameters
         self.segment_size = segment_size
+        self.use_mem_attn = use_mem_attn
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
         assert self.momentum_mode != "none" or self.inner_optim == "sgd", "Adam and Muon work with momentum only"
+
+
+class MemoryAttention(torch.nn.Module):
+    """
+    Transformer block with cross-attention.
+    """
+    def __init__(self, memory_dim, hidden_dim=None, num_heads=4, embd_std=0.02):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = memory_dim * 4
+
+        self.attention = nn.MultiheadAttention(memory_dim, num_heads, batch_first=True)
+        self.q_norm = nn.RMSNorm(memory_dim)
+        self.kv_norm = nn.RMSNorm(memory_dim)
+        # optional FFN (pre-LN)
+        self.ff_norm = nn.RMSNorm(memory_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(memory_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, memory_dim),
+        )
+
+        self._init_weights(embd_std)
+
+    def _init_weights(self, embd_std):
+        for n, p in self.named_parameters():
+            if "weight" in n:
+                if "attention" in n:
+                    nn.init.normal_(p, mean=0.0, std=embd_std)
+                elif "norm" in n:
+                    nn.init.ones_(p)
+                else:
+                    nn.init.xavier_uniform_(p)
+            elif "bias" in n:
+                nn.init.zeros_(p)
+
+    def forward(self, m_prev, m_new):
+        """
+        Combines memory from neighboring segments weighted by the previous memory.
+        """
+        kv = torch.cat([m_prev, m_new], dim=1)
+        q  = self.q_norm(m_prev)
+        kv = self.kv_norm(kv)
+
+        attn_out, _ = self.attention(query=q, key=kv, value=kv, need_weights=False)
+        x = m_prev + attn_out
+        x = x + self.ff(self.ff_norm(x))
+        eps = 1e-6
+        scale = (m_prev.norm(dim=-1, keepdim=True) + eps) / (x.norm(dim=-1, keepdim=True) + eps)
+        return x * scale
 
 
 class GradRMT(PreTrainedModel):
@@ -161,6 +218,7 @@ class GradRMT(PreTrainedModel):
         self.mem_proj_mode = config.mem_proj_mode
         self.use_write_head = config.use_write_head
         self.segment_size = config.segment_size
+        self.use_mem_attn = config.use_mem_attn
 
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
@@ -195,6 +253,9 @@ class GradRMT(PreTrainedModel):
                 head_params = self.model.get_input_embeddings().weight
             with torch.no_grad():
                 self.write_head.weight.copy_(head_params.detach())
+
+        if self.use_mem_attn:
+            self.mem_attn = MemoryAttention(memory_dim=n_embd)
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -249,7 +310,7 @@ class GradRMT(PreTrainedModel):
             g = torch.clamp(g, min=-clip_value, max=clip_value)
 
         # ---- 2. update moments (stay outside autograd graph) ------------- #
-        with torch.no_grad():
+        with torch.enable_grad():
             m_new = beta1 * m + (1 - beta1) * g
             v_new = beta2 * v + (1 - beta2) * (g * g)
 
@@ -576,10 +637,18 @@ class GradRMT(PreTrainedModel):
 
                 out = self._inner_loop(**inner_loop_kwargs)
                 if self.mem_proj_mode == 'per_sample':
-                    mem_batch, W_batch, b_batch, opt_state, segment_stats = out
+                    new_mem, W_batch, b_batch, opt_state, segment_stats = out
                 else:
-                    mem_batch, opt_state, segment_stats = out
-                
+                    new_mem, opt_state, segment_stats = out
+
+                if self.use_mem_attn and i > 0:
+                    # enable grad so that output keeps gradients
+                    with torch.enable_grad():
+                        mem_batch = self.mem_attn(mem_batch, new_mem)
+                else:
+                    mem_batch = new_mem
+                del new_mem
+
                 for k, v in segment_stats.items():
                     inner_loop_stats[f'{k}_{i}'] = v
 

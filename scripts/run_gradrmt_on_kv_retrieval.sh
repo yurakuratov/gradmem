@@ -26,7 +26,7 @@ V=62
 # DATA_NAME="N0-S1(4-4)_1M"
 # DATA_NAME="N10-K2V2-S4(32-64)_1M"
 # DATA_NAME="N16-K1V1-vocab512_1M"
-DATA_NAME="N4-K2V2-V${V}_1M"
+DATA_NAME="N8-K2V2-V${V}_1M"
 SEGMENT_SIZE=14
 DATA_PATH="./data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
@@ -45,6 +45,7 @@ MOMENTUM_MODE="second"
 USE_MEM_PROJ=true
 MEM_PROJ_MODE="proj"
 USE_WRITE_HEAD=true
+USE_MEM_ATTN=true
 
 RUN_NAME=gradmem_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
@@ -105,6 +106,7 @@ for N in "${N_VALUES[@]}"; do
     $( [ "$USE_MEM_PROJ" = true ] && echo "--use_mem_proj" ) \
     $( [ "$USE_MEM_PROJ" = true ] && echo "--mem_proj_mode $MEM_PROJ_MODE" ) \
     $( [ "$USE_WRITE_HEAD" = true ] && echo "--use_write_head" ) \
+    $( [ "$USE_MEM_ATTN" = true ] && echo "--use_mem_attn" ) \
     --max_steps 200000 \
     --eval_steps 500 \
     --logging_steps 500 \
