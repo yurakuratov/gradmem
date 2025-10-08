@@ -201,6 +201,7 @@ class ExperimentArgs:
     mem_proj_mode: Optional[str] = field(default="none")
     use_write_head: Optional[bool] = field(default=False)
     use_mem_attn: Optional[bool] = field(default=False)
+    use_retrieval: Optional[bool] = field(default=False)
     segment_size: int = field(default=None)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
 
@@ -276,7 +277,7 @@ if __name__ == '__main__':
                                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
                                       use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                       use_write_head=args.use_write_head, segment_size=args.segment_size,
-                                      use_mem_attn=args.use_mem_attn,
+                                      use_mem_attn=args.use_mem_attn, use_retrieval=args.use_retrieval,
                                       use_gradient_checkpointing=args.use_gradient_checkpointing)
 
     # Create gradmemgpt model

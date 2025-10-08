@@ -45,9 +45,10 @@ MOMENTUM_MODE="second"
 USE_MEM_PROJ=true
 MEM_PROJ_MODE="proj"
 USE_WRITE_HEAD=true
-USE_MEM_ATTN=true
+USE_MEM_ATTN=false
+USE_RETRIEVAL=false
 
-RUN_NAME=gradmem_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
+RUN_NAME=gradrmt_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
 fi
@@ -66,6 +67,12 @@ if [ "$USE_MEM_PROJ" = true ]; then
 fi
 if [ "$USE_WRITE_HEAD" = true ]; then
   RUN_NAME=${RUN_NAME}_whead
+fi
+if [ "$USE_MEM_ATTN" = true ]; then
+  RUN_NAME=${RUN_NAME}_mem_attn
+fi
+if [ "$USE_RETRIEVAL" = true ]; then
+  RUN_NAME=${RUN_NAME}_retrieve
 fi
 
 RUN_NAME=${RUN_NAME}_${INNER_OPTIM}_grad_${GRAD_MODE}_m_${MOMENTUM_MODE}_bs_${TBS}_lr_${LR}
@@ -107,6 +114,7 @@ for N in "${N_VALUES[@]}"; do
     $( [ "$USE_MEM_PROJ" = true ] && echo "--mem_proj_mode $MEM_PROJ_MODE" ) \
     $( [ "$USE_WRITE_HEAD" = true ] && echo "--use_write_head" ) \
     $( [ "$USE_MEM_ATTN" = true ] && echo "--use_mem_attn" ) \
+    $( [ "$USE_RETRIEVAL" = true ] && echo "--use_retrieval" ) \
     --max_steps 200000 \
     --eval_steps 500 \
     --logging_steps 500 \

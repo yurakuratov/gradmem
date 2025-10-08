@@ -40,6 +40,7 @@ class GradRMTConfig(PretrainedConfig):
                  mem_proj_mode="none",
                  use_write_head=False,
                  use_mem_attn=False,
+                 use_retrieval=False,
                  segment_size=None,
                  use_gradient_checkpointing=False,
                  **kwargs):
@@ -93,6 +94,7 @@ class GradRMTConfig(PretrainedConfig):
         # Recurrency parameters
         self.segment_size = segment_size
         self.use_mem_attn = use_mem_attn
+        self.use_retrieval = use_retrieval
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -219,6 +221,7 @@ class GradRMT(PreTrainedModel):
         self.use_write_head = config.use_write_head
         self.segment_size = config.segment_size
         self.use_mem_attn = config.use_mem_attn
+        self.use_retrieval = config.use_retrieval
 
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
@@ -555,18 +558,14 @@ class GradRMT(PreTrainedModel):
         out = out + (opt_state, inner_loop_stats)
         return out
     
-    def _read_memory(self, query_input_ids, mem_batch, W_batch=None, b_batch=None):
+    def _read_memory(self, query_input_ids, mem_batch, W_batch=None, b_batch=None, mem_list=None):
         # ---------------------------------------------------------------- #
         # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
         # ---------------------------------------------------------------- #
         B = query_input_ids.size(0)
 
         qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
-        mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
-
-        if self.n_ctrl_tokens > 0:
-            read_st_batch = self.read_st.unsqueeze(0).expand(B, -1, -1)
-            read_end_batch = self.read_end.unsqueeze(0).expand(B, -1, -1)
+        mem_offset = mem_batch.size(1) + self.n_ctrl_tokens * 2
 
         if self.mem_proj_mode == "none":
             mem_inp = mem_batch
@@ -577,6 +576,8 @@ class GradRMT(PreTrainedModel):
 
         if self.n_ctrl_tokens > 0:
             # add params that can control read operation from mem
+            read_st_batch = self.read_st.unsqueeze(0).expand(B, -1, -1)
+            read_end_batch = self.read_end.unsqueeze(0).expand(B, -1, -1)
             x_qry = torch.cat([read_st_batch, mem_inp, read_end_batch, qry_emb], dim=1)
         else:
             x_qry = torch.cat([mem_inp, qry_emb], dim=1)                      # [B,M+Q,d]
@@ -623,6 +624,8 @@ class GradRMT(PreTrainedModel):
 
         opt_state = {}
         inner_loop_stats = {}
+        if self.use_retrieval:
+            mem_list = []
 
         for i, segment_input_ids in enumerate(context_segments):
             if self.K and segment_input_ids.ne(pad_id).any():
@@ -649,16 +652,24 @@ class GradRMT(PreTrainedModel):
                     mem_batch = new_mem
                 del new_mem
 
+                if self.use_retrieval:
+                    mem_list.append(mem_batch)
+
                 for k, v in segment_stats.items():
                     inner_loop_stats[f'{k}_{i}'] = v
 
         read_kwargs = {
             'query_input_ids': query_input_ids,
-            'mem_batch': mem_batch,
         }
+        if self.use_retrieval:
+            read_kwargs['mem_batch'] = torch.cat(mem_list, dim=1)
+        else:
+            read_kwargs['mem_batch'] = mem_batch
+        
         if self.mem_proj_mode == 'per_sample':
             read_kwargs['W_batch'] = W_batch
-            read_kwargs['b_batch']
+            read_kwargs['b_batch'] = b_batch
+
         logits_q = self._read_memory(**read_kwargs)
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
