@@ -201,6 +201,7 @@ class ExperimentArgs:
     use_write_head: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
 
+
 if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
     args = parser.parse_args_into_dataclasses()[0]
@@ -331,7 +332,7 @@ if __name__ == '__main__':
         remove_unused_columns=False,
         include_num_input_tokens_seen=False,  # input_ids is a dict, so HF Trainer cant get number of tokens
         include_for_metrics=['inputs'],
-        save_total_limit=3,
+        save_total_limit=1,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         seed=args.seed,
@@ -356,3 +357,4 @@ if __name__ == '__main__':
     metrics = trainer.evaluate(dataset['valid'])
     logger.info(f'{metrics}')
     trainer.save_metrics(split='all', metrics=metrics)
+    trainer.state.save_to_json(output_dir / 'trainer_state.json')
