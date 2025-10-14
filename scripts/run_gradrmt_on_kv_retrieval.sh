@@ -4,8 +4,9 @@ export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUBLAS_WORKSPACE_CONFIG=:4096:2
 export CUDA_LAUNCH_BLOCKING=1
-export CUDA_VISIBLE_DEVICES=1
-NP=${NP:-1}  # Default to 1 process if not set
+export CUDA_VISIBLE_DEVICES=6
+# NP=${NP:-1}  # Default to 1 process if not set
+NP=1
 
 # Define arguments for the script
 LR=1e-04
@@ -26,21 +27,25 @@ V=62
 # DATA_NAME="N0-S1(4-4)_1M"
 # DATA_NAME="N10-K2V2-S4(32-64)_1M"
 # DATA_NAME="N16-K1V1-vocab512_1M"
-DATA_NAME="N8-K2V2-V${V}_1M"
-SEGMENT_SIZE=14
+PAIR_LEN=7
+N_PAIRS=16
+N_SEGMENTS=2
+SEGMENT_SIZE=$(($PAIR_LEN * $N_PAIRS / $N_SEGMENTS))
+DATA_NAME="N${N_PAIRS}-K2V2-V${V}_1M"
 DATA_PATH="./data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
 # GradMemGPT specific parameters
 N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
-K=3
-INNER_LR=0.04
+K=5
+INNER_LR=0.2
+LEARN_LR=false
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 INNER_OPTIM="sgd"
 GRAD_MODE="second"
-MOMENTUM_MODE="second"
+MOMENTUM_MODE="none"
 
 USE_MEM_PROJ=true
 MEM_PROJ_MODE="proj"
@@ -48,11 +53,14 @@ USE_WRITE_HEAD=true
 USE_MEM_ATTN=false
 USE_RETRIEVAL=false
 
-RUN_NAME=gradrmt_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
+RUN_NAME=gradrmt_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}_s${N_SEGMENTS}
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
 fi
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
+if [ "$LEARN_LR" = true ]; then
+  RUN_NAME=${RUN_NAME}learn
+fi
 if [ "$INNER_CLIP_VALUE" != "None" ]; then
   RUN_NAME=${RUN_NAME}_icv${INNER_CLIP_VALUE}
 fi
@@ -115,6 +123,7 @@ for N in "${N_VALUES[@]}"; do
     $( [ "$USE_WRITE_HEAD" = true ] && echo "--use_write_head" ) \
     $( [ "$USE_MEM_ATTN" = true ] && echo "--use_mem_attn" ) \
     $( [ "$USE_RETRIEVAL" = true ] && echo "--use_retrieval" ) \
+    $( [ "$LEARN_LR" = true ] && echo "--learn_lr" ) \
     --max_steps 200000 \
     --eval_steps 500 \
     --logging_steps 500 \

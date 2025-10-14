@@ -29,6 +29,7 @@ class GradRMTConfig(PretrainedConfig):
                  n_mem_tokens=8,
                  K=2,
                  lr=0.01,
+                 learn_lr=False,
                  inner_optim="sgd",
                  grad_mode="second",
                  momentum_mode="none",
@@ -51,6 +52,7 @@ class GradRMTConfig(PretrainedConfig):
             n_mem_tokens: int, number of memory tokens
             K: int, number of inner loop steps
             lr: float, inner loop learning rate, it is an effective learning rate per sample
+            learn_lr: bool, whether to set lr as trainable parameter
             inner_optim: str, inner optimizer ("sgd", "adam", "muon")
             grad_mode: str, gradient mode ("none", "first", "second")
             momentum_mode: str, momentum mode ("none", "first", "second")
@@ -78,6 +80,7 @@ class GradRMTConfig(PretrainedConfig):
         self.n_mem_tokens = n_mem_tokens
         self.K = K
         self.lr = lr
+        self.learn_lr = learn_lr
         # self.use_adam = use_adam
         self.inner_optim = inner_optim
         self.grad_mode = grad_mode
@@ -211,6 +214,7 @@ class GradRMT(PreTrainedModel):
         self.K = config.K
         self.last_K_second_order = config.last_K_second_order
         self.lr = config.lr
+        self.learn_lr = config.learn_lr
         self.inner_optim = config.inner_optim
         self.grad_mode = config.grad_mode
         self.momentum_mode = config.momentum_mode
@@ -259,6 +263,9 @@ class GradRMT(PreTrainedModel):
 
         if self.use_mem_attn:
             self.mem_attn = MemoryAttention(memory_dim=n_embd)
+
+        if self.learn_lr:
+            self.log_lr = nn.Parameter(torch.log(torch.tensor(self.lr)))
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -512,24 +519,29 @@ class GradRMT(PreTrainedModel):
                 inner_loop_stats['inner_grad_norm_max'] = max(inner_loop_stats['inner_grad_norm_max'], g_norm.max())
                 inner_loop_stats['inner_grad_norm_min'] = min(inner_loop_stats['inner_grad_norm_min'], g_norm.min())
 
+                if self.learn_lr:
+                    lr = torch.exp(self.log_lr)
+                else:
+                    lr = self.lr
+
                 if self.inner_optim == 'sgd':
-                    mem_batch = self._sgd_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), self.lr,
+                    mem_batch = self._sgd_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), lr,
                                                 clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
                     if self.mem_proj_mode == 'per_sample':
-                        W_batch = self._sgd_step(W_batch, g_W, opt_state.setdefault('W', {}), self.lr,
+                        W_batch = self._sgd_step(W_batch, g_W, opt_state.setdefault('W', {}), lr,
                                                     clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
-                        b_batch = self._sgd_step(b_batch, g_b, opt_state.setdefault('b', {}), self.lr,
+                        b_batch = self._sgd_step(b_batch, g_b, opt_state.setdefault('b', {}), lr,
                                                     clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
                 elif self.inner_optim == 'adam':
-                    mem_batch = self._adam_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), k + 1, self.lr)
+                    mem_batch = self._adam_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), k + 1, lr)
                     if self.mem_proj_mode == 'per_sample':
-                        W_batch = self._adam_step(W_batch, g_W, opt_state.setdefault('W', {}), k + 1, self.lr)
-                        b_batch = self._adam_step(b_batch, g_b, opt_state.setdefault('b', {}), k + 1, self.lr)
+                        W_batch = self._adam_step(W_batch, g_W, opt_state.setdefault('W', {}), k + 1, lr)
+                        b_batch = self._adam_step(b_batch, g_b, opt_state.setdefault('b', {}), k + 1, lr)
                 elif self.inner_optim == 'muon':
-                    mem_batch = self._muon_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), k + 1, self.lr)
+                    mem_batch = self._muon_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), k + 1, lr)
                     if self.mem_proj_mode == 'per_sample':
-                        W_batch = self._muon_step(W_batch, g_W, opt_state.setdefault('W', {}), k + 1, self.lr)
-                        b_batch = self._muon_step(b_batch, g_b, opt_state.setdefault('b', {}), k + 1, self.lr)
+                        W_batch = self._muon_step(W_batch, g_W, opt_state.setdefault('W', {}), k + 1, lr)
+                        b_batch = self._muon_step(b_batch, g_b, opt_state.setdefault('b', {}), k + 1, lr)
                 else:
                     raise NotImplementedError("Unknown optimizer")
 
@@ -657,6 +669,8 @@ class GradRMT(PreTrainedModel):
 
                 for k, v in segment_stats.items():
                     inner_loop_stats[f'{k}_{i}'] = v
+        if self.learn_lr:
+            inner_loop_stats['learned_lr'] = torch.exp(self.log_lr)
 
         read_kwargs = {
             'query_input_ids': query_input_ids,

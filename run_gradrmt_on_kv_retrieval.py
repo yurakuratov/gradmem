@@ -190,6 +190,7 @@ class ExperimentArgs:
     K: Optional[int] = field(default=3)
     last_K_second_order: Optional[int] = field(default=None)
     inner_lr: Optional[float] = field(default=0.01)
+    learn_lr: Optional[bool] = field(default=False)
     # use_adam: Optional[bool] = field(default=True)
     inner_optim: Optional[str] = field(default="sgd")
     grad_mode: Optional[str] = field(default="none")
@@ -271,7 +272,7 @@ if __name__ == '__main__':
     gradmem_config = GradRMTConfig(pretrained_model=args.pretrained_model, base_config=config,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
                                       last_K_second_order=args.last_K_second_order,
-                                      lr=args.inner_lr, inner_optim=args.inner_optim,
+                                      lr=args.inner_lr, learn_lr=args.learn_lr, inner_optim=args.inner_optim,
                                       grad_mode=args.grad_mode, momentum_mode=args.momentum_mode,
                                       n_ctrl_tokens=args.n_ctrl_tokens,
                                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
@@ -339,7 +340,7 @@ if __name__ == '__main__':
         remove_unused_columns=False,
         include_num_input_tokens_seen=False,  # input_ids is a dict, so HF Trainer cant get number of tokens
         include_for_metrics=['inputs'],
-        save_total_limit=3,
+        save_total_limit=1,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         seed=args.seed,
@@ -364,3 +365,4 @@ if __name__ == '__main__':
     metrics = trainer.evaluate(dataset['valid'])
     logger.info(f'{metrics}')
     trainer.save_metrics(split='all', metrics=metrics)
+    trainer.state.save_to_json(output_dir / 'trainer_state.json')
