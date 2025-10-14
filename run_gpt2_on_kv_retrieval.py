@@ -15,12 +15,13 @@ import transformers
 from transformers import (
     AutoConfig, AutoTokenizer,
     AutoModelForCausalLM,
-    Trainer,
+    Trainer, TrainerState,
     TrainingArguments,
     EarlyStoppingCallback, TrainerCallback,
     HfArgumentParser
 )
 
+from transformers.trainer_utils import get_last_checkpoint
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -177,6 +178,12 @@ class ExperimentArgs:
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
     max_position_embeddings: Optional[int] = field(default=None)
+    attn_implementation: Optional[str] = field(default=None)
+
+    # allow writing to existing folder & resume
+    overwrite_output_dir: Optional[bool] = field(default=False)
+    # skip training; evaluate best checkpoint
+    do_eval_only: Optional[bool] = field(default=False)
 
 
 if __name__ == '__main__':
@@ -195,19 +202,33 @@ if __name__ == '__main__':
 
     assert not (args.pretrained_model is not None and args.base_model is not None), "only one of these args must be set"
 
-    if accel.is_main_process:
+    output_dir = Path(args.exp_path)
+    if output_dir.exists() and not args.overwrite_output_dir and not args.do_eval_only:
+        raise RuntimeError(f"Output directory already exists: {output_dir}. "
+                           f"Pass --overwrite_output_dir to resume/continue here, or choose a new --exp_path.")
+
+    if accel.is_main_process and not args.do_eval_only:
         config = {
             'cli_args': dict(vars(args)),
         }
         logger.info('saving experiment configuration..')
-        Path(args.exp_path).mkdir(parents=True)
+        Path(args.exp_path).mkdir(parents=True, exist_ok=True)
         json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
+
+    if accel.mixed_precision == 'bf16':
+        dtype = torch.bfloat16
+    elif accel.mixed_precision == 'fp16':
+        dtype = torch.float16
+    else:
+        dtype = torch.float32
+        args.attn_implementation = None
 
     if args.pretrained_model is not None:
         tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
-        model = AutoModelForCausalLM.from_pretrained(args.pretrained_model)
+        model = AutoModelForCausalLM.from_pretrained(args.pretrained_model, torch_dtype=dtype,
+                                                     attn_implementation=args.attn_implementation)
     else:
         # create tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
@@ -249,21 +270,25 @@ if __name__ == '__main__':
             config.intermediate_size = config.expand * config.hidden_size
             config.d_inner = config.expand * config.hidden_size
             config.time_step_rank = math.ceil(config.hidden_size / 16)
+            args.attn_implementation = None
         else:
             raise ValueError(f'Unsupported base model: {args.base_model}')
 
-        config.torch_dtype = "float32"  # weights in float32, at training precision is controlled by accelerate
+        config.torch_dtype = dtype  # weights in float32, at training precision is controlled by accelerate
         config.vocab_size = tokenizer.vocab_size
         config.pad_token_id = tokenizer.pad_token_id
         config.bos_token_id = tokenizer.bos_token_id
         config.eos_token_id = tokenizer.eos_token_id
         # create model
-        model = AutoModelForCausalLM.from_config(config)
+        model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype,
+                                                 attn_implementation=args.attn_implementation)
 
     model.config.use_cache = False
 
     logger.info(f'model config: {model.config}')
     logger.info(f'model: {model}')
+    logger.info(f'model.dtype: {model.dtype}')
+    logger.info(f'attn_implementation: {args.attn_implementation}')
 
     dataset = datasets.load_from_disk(args.data_path)
 
@@ -278,8 +303,6 @@ if __name__ == '__main__':
     def compute_metrics(eval_pred):
         return compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer)
 
-    output_dir = Path(args.exp_path)
-
     if args.total_batch_size is None:
         args.total_batch_size = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
     else:
@@ -290,6 +313,7 @@ if __name__ == '__main__':
     training_args = TrainingArguments(
         output_dir=output_dir,
         logging_dir=output_dir,
+        overwrite_output_dir=args.overwrite_output_dir,
 
         max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_batch_size,
@@ -316,7 +340,7 @@ if __name__ == '__main__':
         remove_unused_columns=False,
         include_num_input_tokens_seen=True,
         include_for_metrics=['inputs'],
-        save_total_limit=3,
+        save_total_limit=1,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         seed=args.seed,
@@ -335,9 +359,28 @@ if __name__ == '__main__':
                    StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
                    ],
     )
-    # Train the model
-    trainer.train()
-    logger.info('training done. running final evaluation...')
+
+    last_ckpt = get_last_checkpoint(output_dir)
+
+    if args.do_eval_only:
+        # load best checkpoint and run eval
+        try:
+            state_path = Path(last_ckpt) / "trainer_state.json"
+            trainer.state = TrainerState.load_from_json(state_path)
+            trainer._load_best_model()
+            logger.info(f'Successfully loaded best model from {trainer.state.best_model_checkpoint}')
+        except Exception as e:
+            logger.error(f"Failed to load best model from {output_dir}: {e}")
+            exit(1)
+    else:
+        if last_ckpt:
+            logger.info(f'Resuming training from last checkpoint: {last_ckpt}')
+        # run training
+        trainer.train(resume_from_checkpoint=last_ckpt)
+        logger.info('training done. running final evaluation...')
+    # run final evaluation
     metrics = trainer.evaluate(dataset['valid'])
     logger.info(f'{metrics}')
     trainer.save_metrics(split='all', metrics=metrics)
+    if not args.do_eval_only:
+        trainer.state.save_to_json(output_dir / 'trainer_state.json')

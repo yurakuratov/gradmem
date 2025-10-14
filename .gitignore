@@ -174,5 +174,5 @@ cython_debug/
 .pypirc
 
 # data
-./data/
-./runs/
+data/
+runs/

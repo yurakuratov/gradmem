@@ -326,7 +326,7 @@ if __name__ == '__main__':
         remove_unused_columns=False,
         include_num_input_tokens_seen=True,
         include_for_metrics=['inputs'],
-        save_total_limit=3,
+        save_total_limit=1,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
         seed=args.seed,
@@ -378,3 +378,4 @@ if __name__ == '__main__':
 
     logger.info(f'{metrics}')
     trainer.save_metrics(split='all', metrics=metrics)
+    trainer.state.save_to_json(output_dir / 'trainer_state.json')
