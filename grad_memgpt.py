@@ -326,6 +326,7 @@ class GradMemGPT(PreTrainedModel):
 
         # make a copy of the memory that we'll update K times, manage gradients:
         mem_batch = self.mem.unsqueeze(0).expand(B, -1, -1).clone()  # [B,M,d]
+        mem_batch_initial = mem_batch.clone()
 
         # per-sample params for mem_proj:
         if self.mem_proj_mode == "per_sample":
@@ -448,6 +449,12 @@ class GradMemGPT(PreTrainedModel):
         mem_norm = mem_batch.norm(dim=(1, 2)).detach()  # B
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
         inner_loop_stats['mem_norm_max'] = mem_norm.max()
+        inner_loop_stats['mem_norm_min'] = mem_norm.min()
+        # log how mem has changed from initial state to state after inner loop
+        detla_mem_norm = (mem_batch - mem_batch_initial).detach().norm(dim=(1, 2))
+        inner_loop_stats['delta_mem_norm_mean'] = detla_mem_norm.mean()
+        inner_loop_stats['delta_mem_norm_max'] = detla_mem_norm.max()
+        inner_loop_stats['delta_mem_norm_min'] = detla_mem_norm.min()
 
         del ctx_emb, lm_labels
 
