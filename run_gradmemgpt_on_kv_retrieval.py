@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import datasets
 
 import accelerate
+from safetensors.torch import load_file
 import transformers
 from transformers import (
     AutoConfig, AutoTokenizer,
@@ -124,6 +125,10 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         "inner_grad_norm_min": float(inner_loop_stats['inner_grad_norm_min'].min()),
         "mem_norm_mean": float(inner_loop_stats['mem_norm_mean'].mean()),
         "mem_norm_max": float(inner_loop_stats['mem_norm_max'].max()),
+        "mem_norm_min": float(inner_loop_stats['mem_norm_min'].min()),
+        "delta_mem_norm_mean": float(inner_loop_stats['delta_mem_norm_mean'].mean()),
+        "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
+        "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
     }
 
 
@@ -183,6 +188,7 @@ class ExperimentArgs:
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
+    init_checkpoint: Optional[str] = field(default=None)
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
@@ -276,6 +282,14 @@ if __name__ == '__main__':
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
+
+    if args.init_checkpoint is not None:
+        missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
+        if len(missing_k) != 0:
+            logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
+        if len(unexpected_k) != 0:
+            logger.info(f'{unexpected_k} were found in checkpoint, but model is not expecting them!')
+
     if accel.mixed_precision == 'bf16':
         model.to(torch.bfloat16)
 

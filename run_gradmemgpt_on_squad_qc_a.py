@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import datasets
 
 import accelerate
+from safetensors.torch import load_file
 import transformers
 from transformers import (
     AutoConfig, AutoTokenizer,
@@ -129,6 +130,10 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         "inner_grad_norm_min": float(inner_loop_stats['inner_grad_norm_min'].min()),
         "mem_norm_mean": float(inner_loop_stats['mem_norm_mean'].mean()),
         "mem_norm_max": float(inner_loop_stats['mem_norm_max'].max()),
+        "mem_norm_min": float(inner_loop_stats['mem_norm_min'].min()),
+        "delta_mem_norm_mean": float(inner_loop_stats['delta_mem_norm_mean'].mean()),
+        "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
+        "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
     }
 
 
@@ -188,6 +193,8 @@ class ExperimentArgs:
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
+    init_base_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize base model'})
+    init_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize gradmemgpt model'})
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
@@ -281,6 +288,21 @@ if __name__ == '__main__':
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
+
+    model_to_init_from_ckpt = None
+    if args.init_checkpoint is not None:
+        model_to_init_from_ckpt = model
+        init_ckpt_path = args.init_checkpoint
+    elif args.init_base_checkpoint is not None:
+        model_to_init_from_ckpt = model.model
+        init_ckpt_path = args.init_base_checkpoint
+    if model_to_init_from_ckpt is not None:
+        missing_k, unexpected_k = model_to_init_from_ckpt.load_state_dict(load_file(init_ckpt_path), strict=False)
+        if len(missing_k) != 0:
+            logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
+        if len(unexpected_k) != 0:
+            logger.info(f'{unexpected_k} were found in checkpoint, but model_to_init_from_ckpt is not expecting them!')
+
     if accel.mixed_precision == 'bf16':
         model.to(torch.bfloat16)
 
