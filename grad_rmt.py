@@ -450,6 +450,7 @@ class GradRMT(PreTrainedModel):
         if self.momentum_mode != "second":
             opt_state = {}
 
+        mem_batch_initial = mem_batch.clone()
         inner_loop_stats = {'inner_grad_norm_mean': torch.tensor(0.0, device=device),
                             'inner_grad_norm_max': torch.tensor(-1.0, device=device),
                             'inner_grad_norm_min': torch.tensor(1e06, device=device)}
@@ -561,6 +562,12 @@ class GradRMT(PreTrainedModel):
         mem_norm = mem_batch.norm(dim=(1, 2)).detach()  # B
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
         inner_loop_stats['mem_norm_max'] = mem_norm.max()
+        inner_loop_stats['mem_norm_min'] = mem_norm.min()
+        # log how mem has changed from initial state to state after inner loop
+        detla_mem_norm = (mem_batch - mem_batch_initial).detach().norm(dim=(1, 2))
+        inner_loop_stats['delta_mem_norm_mean'] = detla_mem_norm.mean()
+        inner_loop_stats['delta_mem_norm_max'] = detla_mem_norm.max()
+        inner_loop_stats['delta_mem_norm_min'] = detla_mem_norm.min()
 
         del ctx_emb, lm_labels
         
@@ -616,6 +623,7 @@ class GradRMT(PreTrainedModel):
 
         # make a copy of the memory that we'll update K times, manage gradients:
         mem_batch = self.mem.unsqueeze(0).expand(B, -1, -1).clone()  # [B,M,d]
+        mem_batch_initial = mem_batch.clone()
 
         # per-sample params for mem_proj:
         if self.mem_proj_mode == "per_sample":
@@ -638,7 +646,7 @@ class GradRMT(PreTrainedModel):
         inner_loop_stats = {}
         if self.use_retrieval:
             mem_list = []
-
+        
         for i, segment_input_ids in enumerate(context_segments):
             if self.K and segment_input_ids.ne(pad_id).any():
                 inner_loop_kwargs = {
@@ -669,8 +677,14 @@ class GradRMT(PreTrainedModel):
 
                 for k, v in segment_stats.items():
                     inner_loop_stats[f'{k}_{i}'] = v
+        
+        detla_mem_norm = (mem_batch - mem_batch_initial).detach().norm(dim=(1, 2))
+        inner_loop_stats['total_delta_mem_norm_mean'] = detla_mem_norm.mean()
+        inner_loop_stats['total_delta_mem_norm_max'] = detla_mem_norm.max()
+        inner_loop_stats['total_delta_mem_norm_min'] = detla_mem_norm.min()
         if self.learn_lr:
             inner_loop_stats['learned_lr'] = torch.exp(self.log_lr)
+        
 
         read_kwargs = {
             'query_input_ids': query_input_ids,

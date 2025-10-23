@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 import datasets
 
 import accelerate
+from safetensors.torch import load_file
 import transformers
 from transformers import (
     AutoConfig, AutoTokenizer,
@@ -118,10 +119,14 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     metrics = {
         "token_accuracy": float(accuracy),
         "exact_match": float(exact_match),
+        "total_delta_mem_norm_mean": float(inner_loop_stats['total_delta_mem_norm_mean'].mean()),
+        "total_delta_mem_norm_max": float(inner_loop_stats['total_delta_mem_norm_max'].max()),
+        "total_delta_mem_norm_min": float(inner_loop_stats['total_delta_mem_norm_min'].min()),
     }
 
     for k, v in inner_loop_stats.items():
-        metrics[k] = v.max() if 'max' in k else (v.min() if 'min' in k else v.mean())
+        if 'total' not in k:
+            metrics[k] = v.max() if 'max' in k else (v.min() if 'min' in k else v.mean())
     
     return metrics
 
@@ -182,6 +187,7 @@ class ExperimentArgs:
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
+    init_checkpoint: Optional[str] = field(default=None)
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
@@ -227,7 +233,7 @@ if __name__ == '__main__':
             'cli_args': dict(vars(args)),
         }
         logger.info(f'saving experiment configuration to {args.exp_path}')
-        Path(args.exp_path).mkdir(parents=True, exist_ok=True)
+        Path(args.exp_path).mkdir(parents=True, exist_ok=False)  # don't overwrite past runs
         json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
 
     if args.pretrained_model is None:
@@ -283,6 +289,14 @@ if __name__ == '__main__':
 
     # Create gradmemgpt model
     model = GradRMT(gradmem_config)
+
+    if args.init_checkpoint is not None:
+        missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
+        if len(missing_k) != 0:
+            logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
+        if len(unexpected_k) != 0:
+            logger.info(f'{unexpected_k} were found in checkpoint, but model is not expecting them!')
+
     if accel.mixed_precision == 'bf16':
         model.to(torch.bfloat16)
 
