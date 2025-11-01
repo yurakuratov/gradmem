@@ -43,6 +43,7 @@ class GradRMTConfig(PretrainedConfig):
                  use_mem_attn=False,
                  use_retrieval=False,
                  segment_size=None,
+                 prune_grad_keep_topk=None,
                  use_gradient_checkpointing=False,
                  **kwargs):
         """
@@ -65,6 +66,7 @@ class GradRMTConfig(PretrainedConfig):
             use_write_head: bool, whether to use write head
             use_mem_attn: bool, whether to use memory cross-attention
             segment_size: int, size of segments for splitting the context
+            prune_grad_keep_topk: float, share of gradients to keep before inner step
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
         """
         super().__init__(**kwargs)
@@ -98,6 +100,7 @@ class GradRMTConfig(PretrainedConfig):
         self.segment_size = segment_size
         self.use_mem_attn = use_mem_attn
         self.use_retrieval = use_retrieval
+        self.prune_grad_keep_topk = prune_grad_keep_topk
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -226,6 +229,7 @@ class GradRMT(PreTrainedModel):
         self.segment_size = config.segment_size
         self.use_mem_attn = config.use_mem_attn
         self.use_retrieval = config.use_retrieval
+        self.prune_grad_keep_topk = config.prune_grad_keep_topk
 
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
@@ -432,7 +436,7 @@ class GradRMT(PreTrainedModel):
             return mem
         return torch.baddbmm(b.unsqueeze(1), mem, W.transpose(1, 2))
 
-    def _inner_loop(self, context_input_ids, mem_batch, opt_state=None, W_batch=None, b_batch=None):
+    def _inner_loop(self, context_input_ids, mem_batch, opt_state=None, W_batch=None, b_batch=None, return_mem_per_step=False):
         # ---------------------------------------------------------------- #
         # 1.  INNER loop on context. WRITE context to mem.
         # ---------------------------------------------------------------- #
@@ -454,6 +458,8 @@ class GradRMT(PreTrainedModel):
         inner_loop_stats = {'inner_grad_norm_mean': torch.tensor(0.0, device=device),
                             'inner_grad_norm_max': torch.tensor(-1.0, device=device),
                             'inner_grad_norm_min': torch.tensor(1e06, device=device)}
+        if return_mem_per_step:
+            mem_step_list_ = []
 
         # re‑enable autograd even if outer context is `no_grad`
         with torch.enable_grad():
@@ -514,6 +520,12 @@ class GradRMT(PreTrainedModel):
                 else:
                     g_mem = torch.autograd.grad(inner_loss, mem_batch, create_graph=create_graph)[0]
 
+                if self.prune_grad_keep_topk is not None:
+                    g_mem = g_mem * (g_mem >= torch.quantile(g_mem, 1.0 - self.prune_grad_keep_topk))
+                    if self.mem_proj_mode == 'per_sample':
+                        g_W = g_W * (g_W >= torch.quantile(g_W, 1.0 - self.prune_grad_keep_topk))
+                        g_b = g_b * (g_b >= torch.quantile(g_b, 1.0 - self.prune_grad_keep_topk))
+
                 # track inner grad norm (todo: move to _opt_step?, currently we compute g_norm twice)
                 g_norm = g_mem.reshape(B, -1).norm(dim=1).detach()
                 inner_loop_stats['inner_grad_norm_mean'] += g_norm.mean()
@@ -554,6 +566,9 @@ class GradRMT(PreTrainedModel):
                 elif self.grad_mode in ['first', 'second']:
                     pass  # do nothing, keep gradients flow
 
+                if return_mem_per_step:
+                    mem_step_list_.append(mem_batch.detach().cpu())
+
         if self.K:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
             # log average inner loss
@@ -575,9 +590,11 @@ class GradRMT(PreTrainedModel):
         if self.mem_proj_mode == 'per_sample':
             out = out + (W_batch, b_batch)
         out = out + (opt_state, inner_loop_stats)
+        if return_mem_per_step:
+            out = out + (mem_step_list_,)
         return out
     
-    def _read_memory(self, query_input_ids, mem_batch, W_batch=None, b_batch=None, mem_list=None):
+    def _read_memory(self, query_input_ids, mem_batch, W_batch=None, b_batch=None):
         # ---------------------------------------------------------------- #
         # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
         # ---------------------------------------------------------------- #
@@ -658,7 +675,15 @@ class GradRMT(PreTrainedModel):
                     inner_loop_kwargs['W_batch'] = W_batch
                     inner_loop_kwargs['b_batch'] = b_batch
 
-                out = self._inner_loop(**inner_loop_kwargs)
+                # Flash Attention does not support higher-order derivatives
+                # so, during training, we fall back to eager on inner loop
+                if self.training:
+                    ctx = nn.attention.sdpa_kernel(nn.attention.SDPBackend.MATH)
+                else:
+                    ctx = nn.attention.sdpa_kernel(nn.attention.SDPBackend.FLASH_ATTENTION)
+                with ctx:
+                    out = self._inner_loop(**inner_loop_kwargs)
+
                 if self.mem_proj_mode == 'per_sample':
                     new_mem, W_batch, b_batch, opt_state, segment_stats = out
                 else:
@@ -685,7 +710,6 @@ class GradRMT(PreTrainedModel):
         if self.learn_lr:
             inner_loop_stats['learned_lr'] = torch.exp(self.log_lr)
         
-
         read_kwargs = {
             'query_input_ids': query_input_ids,
         }
@@ -698,7 +722,8 @@ class GradRMT(PreTrainedModel):
             read_kwargs['W_batch'] = W_batch
             read_kwargs['b_batch'] = b_batch
 
-        logits_q = self._read_memory(**read_kwargs)
+        with nn.attention.sdpa_kernel(nn.attention.SDPBackend.FLASH_ATTENTION):
+            logits_q = self._read_memory(**read_kwargs)
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:

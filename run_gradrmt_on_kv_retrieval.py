@@ -210,6 +210,7 @@ class ExperimentArgs:
     use_mem_attn: Optional[bool] = field(default=False)
     use_retrieval: Optional[bool] = field(default=False)
     segment_size: int = field(default=None)
+    prune_grad_keep_topk: Optional[float] = field(default=None)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
 
 if __name__ == '__main__':
@@ -276,21 +277,23 @@ if __name__ == '__main__':
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
     gradmem_config = GradRMTConfig(pretrained_model=args.pretrained_model, base_config=config,
-                                      n_mem_tokens=args.n_mem_tokens, K=args.K,
-                                      last_K_second_order=args.last_K_second_order,
-                                      lr=args.inner_lr, learn_lr=args.learn_lr, inner_optim=args.inner_optim,
-                                      grad_mode=args.grad_mode, momentum_mode=args.momentum_mode,
-                                      n_ctrl_tokens=args.n_ctrl_tokens,
-                                      inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
-                                      use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
-                                      use_write_head=args.use_write_head, segment_size=args.segment_size,
-                                      use_mem_attn=args.use_mem_attn, use_retrieval=args.use_retrieval,
-                                      use_gradient_checkpointing=args.use_gradient_checkpointing)
+                                   n_mem_tokens=args.n_mem_tokens, K=args.K,
+                                   last_K_second_order=args.last_K_second_order,
+                                   lr=args.inner_lr, learn_lr=args.learn_lr, inner_optim=args.inner_optim,
+                                   grad_mode=args.grad_mode, momentum_mode=args.momentum_mode,
+                                   n_ctrl_tokens=args.n_ctrl_tokens,
+                                   inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
+                                   use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
+                                   use_write_head=args.use_write_head, segment_size=args.segment_size,
+                                   use_mem_attn=args.use_mem_attn, use_retrieval=args.use_retrieval,
+                                   prune_grad_keep_topk=args.prune_grad_keep_topk,
+                                   use_gradient_checkpointing=args.use_gradient_checkpointing)
 
     # Create gradmemgpt model
     model = GradRMT(gradmem_config)
 
     if args.init_checkpoint is not None:
+        logger.info(f'Loading model checkpoint from {args.init_checkpoint}')
         missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
         if len(missing_k) != 0:
             logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
