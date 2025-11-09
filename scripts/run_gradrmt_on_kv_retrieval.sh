@@ -4,7 +4,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUBLAS_WORKSPACE_CONFIG=:4096:2
 export CUDA_LAUNCH_BLOCKING=1
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=0
 # NP=${NP:-1}  # Default to 1 process if not set
 NP=1
 
@@ -28,8 +28,8 @@ V=62
 # DATA_NAME="N10-K2V2-S4(32-64)_1M"
 # DATA_NAME="N16-K1V1-vocab512_1M"
 PAIR_LEN=7
-N_PAIRS=16
-N_SEGMENTS=2
+N_PAIRS=32
+N_SEGMENTS=4
 SEGMENT_SIZE=$(($PAIR_LEN * $N_PAIRS / $N_SEGMENTS))
 DATA_NAME="N${N_PAIRS}-K2V2-V${V}_1M"
 DATA_PATH="./data/${DATA_NAME}"
@@ -38,20 +38,22 @@ TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 # GradMemGPT specific parameters
 N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
-K=5
-INNER_LR=0.2
+K=1
+INNER_LR=0.04
 LEARN_LR=false
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 INNER_OPTIM="sgd"
 GRAD_MODE="second"
 MOMENTUM_MODE="none"
+PRUNE_GRAD_KEEP_TOPK=None
 
 USE_MEM_PROJ=true
 MEM_PROJ_MODE="proj"
 USE_WRITE_HEAD=true
 USE_MEM_ATTN=false
 USE_RETRIEVAL=false
+USE_MEM_NORM=false
 
 RUN_NAME=gradrmt_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}_s${N_SEGMENTS}
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
@@ -66,6 +68,9 @@ if [ "$INNER_CLIP_VALUE" != "None" ]; then
 fi
 if [ "$INNER_CLIP_NORM" != "None" ]; then
   RUN_NAME=${RUN_NAME}_icn${INNER_CLIP_NORM}
+fi
+if [ "$PRUNE_GRAD_KEEP_TOPK" != "None" ]; then
+  RUN_NAME=${RUN_NAME}_prune${PRUNE_GRAD_KEEP_TOPK}
 fi
 if [ "$USE_MEM_PROJ" = true ]; then
   RUN_NAME=${RUN_NAME}_mem_proj
@@ -82,18 +87,32 @@ fi
 if [ "$USE_RETRIEVAL" = true ]; then
   RUN_NAME=${RUN_NAME}_retrieve
 fi
+if [ "$USE_MEM_NORM" = true ]; then
+  RUN_NAME=${RUN_NAME}_mem_norm
+fi
 
 RUN_NAME=${RUN_NAME}_${INNER_OPTIM}_grad_${GRAD_MODE}_m_${MOMENTUM_MODE}_bs_${TBS}_lr_${LR}
 
+# init checkpoint settings
+# SOURCE_N_PAIRS=32
+# SOURCE_DATA_NAME="N${SOURCE_N_PAIRS}-K2V2-V${V}_1M"
+# INIT_CHECKPOINT=""
+
+
 # Run ID
+# RUN_NAME=${RUN_NAME}_from_N32_s4
+
 N_VALUES=(1 2)
 for N in "${N_VALUES[@]}"; do
   # Path to save experiment results
-  EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
+
+  # INIT_CHECKPOINT_T="./runs/N32-K2V2-V62_1M/gradrmt_llama_L4H4D128_mem8_s4_K1_ilr1.0_mem_proj_whead_sgd_grad_second_m_none_bs_64_lr_1e-04/run_${N}/*/model.safetensors"
+  # INIT_CHECKPOINT=$(compgen -G $INIT_CHECKPOINT_T | head -n1)
+  EXP_PATH="/cephfs/home/mkairov/gd_runs/${DATA_NAME}/${RUN_NAME}/run_$N"
 
   # Execute the script using accelerate for parallel processing
   accelerate launch \
-    --main_process_port $((29500+$TBS+$N+1)) \
+    --main_process_port $((29500+$TBS+$N+3)) \
     --num_processes $NP \
     --mixed_precision 'no' \
     --config_file accelerate.yaml \
@@ -118,11 +137,13 @@ for N in "${N_VALUES[@]}"; do
     --segment_size $SEGMENT_SIZE \
     $( [ "$INNER_CLIP_VALUE" != "None" ] && echo "--inner_clip_value $INNER_CLIP_VALUE" ) \
     $( [ "$INNER_CLIP_NORM" != "None" ] && echo "--inner_clip_norm $INNER_CLIP_NORM" ) \
+    $( [ "$PRUNE_GRAD_KEEP_TOPK" != "None" ] && echo "--prune_grad_keep_topk $PRUNE_GRAD_KEEP_TOPK" ) \
     $( [ "$USE_MEM_PROJ" = true ] && echo "--use_mem_proj" ) \
     $( [ "$USE_MEM_PROJ" = true ] && echo "--mem_proj_mode $MEM_PROJ_MODE" ) \
     $( [ "$USE_WRITE_HEAD" = true ] && echo "--use_write_head" ) \
     $( [ "$USE_MEM_ATTN" = true ] && echo "--use_mem_attn" ) \
     $( [ "$USE_RETRIEVAL" = true ] && echo "--use_retrieval" ) \
+    $( [ "$USE_MEM_NORM" = true ] && echo "--normalize_memory" ) \
     $( [ "$LEARN_LR" = true ] && echo "--learn_lr" ) \
     --max_steps 200000 \
     --eval_steps 500 \
@@ -130,6 +151,7 @@ for N in "${N_VALUES[@]}"; do
     --warmup_steps 10000 \
     --early_stopping_patience 500 \
     --seed $((142+$N))
+    #  --init_checkpoint $INIT_CHECKPOINT
 done
 
 echo "Done"

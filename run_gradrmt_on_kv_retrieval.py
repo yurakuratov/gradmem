@@ -211,6 +211,7 @@ class ExperimentArgs:
     use_retrieval: Optional[bool] = field(default=False)
     segment_size: int = field(default=None)
     prune_grad_keep_topk: Optional[float] = field(default=None)
+    normalize_memory: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
 
 if __name__ == '__main__':
@@ -234,7 +235,7 @@ if __name__ == '__main__':
             'cli_args': dict(vars(args)),
         }
         logger.info(f'saving experiment configuration to {args.exp_path}')
-        Path(args.exp_path).mkdir(parents=True, exist_ok=False)  # don't overwrite past runs
+        Path(args.exp_path).mkdir(parents=True, exist_ok=True)  # don't overwrite past runs
         json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
 
     if args.pretrained_model is None:
@@ -286,7 +287,7 @@ if __name__ == '__main__':
                                    use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                    use_write_head=args.use_write_head, segment_size=args.segment_size,
                                    use_mem_attn=args.use_mem_attn, use_retrieval=args.use_retrieval,
-                                   prune_grad_keep_topk=args.prune_grad_keep_topk,
+                                   prune_grad_keep_topk=args.prune_grad_keep_topk, normalize_memory=args.normalize_memory,
                                    use_gradient_checkpointing=args.use_gradient_checkpointing)
 
     # Create gradmemgpt model

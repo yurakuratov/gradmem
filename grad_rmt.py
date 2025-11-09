@@ -44,6 +44,7 @@ class GradRMTConfig(PretrainedConfig):
                  use_retrieval=False,
                  segment_size=None,
                  prune_grad_keep_topk=None,
+                 normalize_memory=False,
                  use_gradient_checkpointing=False,
                  **kwargs):
         """
@@ -67,6 +68,7 @@ class GradRMTConfig(PretrainedConfig):
             use_mem_attn: bool, whether to use memory cross-attention
             segment_size: int, size of segments for splitting the context
             prune_grad_keep_topk: float, share of gradients to keep before inner step
+            normalize_memory: bool, apply layernorm to memory tokens after gradient update
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
         """
         super().__init__(**kwargs)
@@ -101,6 +103,7 @@ class GradRMTConfig(PretrainedConfig):
         self.use_mem_attn = use_mem_attn
         self.use_retrieval = use_retrieval
         self.prune_grad_keep_topk = prune_grad_keep_topk
+        self.normalize_memory = normalize_memory
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -230,6 +233,7 @@ class GradRMT(PreTrainedModel):
         self.use_mem_attn = config.use_mem_attn
         self.use_retrieval = config.use_retrieval
         self.prune_grad_keep_topk = config.prune_grad_keep_topk
+        self.normalize_memory = config.normalize_memory
 
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
@@ -270,6 +274,12 @@ class GradRMT(PreTrainedModel):
 
         if self.learn_lr:
             self.log_lr = nn.Parameter(torch.log(torch.tensor(self.lr)))
+
+        if self.normalize_memory:
+            self.mem_norm = nn.LayerNorm((self.n_mem_tokens, n_embd))
+            embd_std = self.model.get_output_embeddings().weight.detach().std()
+            # self.mem_norm.weight.fill_(embd_std)
+            nn.init.constant_(self.mem_norm.weight, float(embd_std))
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -521,10 +531,10 @@ class GradRMT(PreTrainedModel):
                     g_mem = torch.autograd.grad(inner_loss, mem_batch, create_graph=create_graph)[0]
 
                 if self.prune_grad_keep_topk is not None:
-                    g_mem = g_mem * (g_mem >= torch.quantile(g_mem, 1.0 - self.prune_grad_keep_topk))
+                    g_mem = g_mem * (g_mem >= torch.quantile(torch.abs(g_mem), 1.0 - self.prune_grad_keep_topk))
                     if self.mem_proj_mode == 'per_sample':
-                        g_W = g_W * (g_W >= torch.quantile(g_W, 1.0 - self.prune_grad_keep_topk))
-                        g_b = g_b * (g_b >= torch.quantile(g_b, 1.0 - self.prune_grad_keep_topk))
+                        g_W = g_W * (g_W >= torch.quantile(torch.abs(g_W), 1.0 - self.prune_grad_keep_topk))
+                        g_b = g_b * (g_b >= torch.quantile(torch.abs(g_b), 1.0 - self.prune_grad_keep_topk))
 
                 # track inner grad norm (todo: move to _opt_step?, currently we compute g_norm twice)
                 g_norm = g_mem.reshape(B, -1).norm(dim=1).detach()
@@ -557,6 +567,9 @@ class GradRMT(PreTrainedModel):
                         b_batch = self._muon_step(b_batch, g_b, opt_state.setdefault('b', {}), k + 1, lr)
                 else:
                     raise NotImplementedError("Unknown optimizer")
+
+                if self.normalize_memory:
+                    mem_batch = self.mem_norm(mem_batch)
 
                 if self.grad_mode in ['none']:
                     mem_batch = mem_batch.detach().requires_grad_(True)
@@ -709,6 +722,8 @@ class GradRMT(PreTrainedModel):
         inner_loop_stats['total_delta_mem_norm_min'] = detla_mem_norm.min()
         if self.learn_lr:
             inner_loop_stats['learned_lr'] = torch.exp(self.log_lr)
+        if self.normalize_memory:
+            inner_loop_stats['outer_norm_gamma_mean'] = self.mem_norm.weight.data.mean()
         
         read_kwargs = {
             'query_input_ids': query_input_ids,
