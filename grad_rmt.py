@@ -1,9 +1,18 @@
 import torch
 from torch import nn
-from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
-
+import torch.nn.functional as F
+from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig, AttentionInterface
+from jvp_attention import JVPAttn
 from accelerate.logging import get_logger
 logger = get_logger('')
+
+def jvp_flash(module, query_states, key_states, value_states, *_, **__):
+    return JVPAttn.fwd(
+        query_states, key_states, value_states, causal=True,
+        dropout_p=0.0, sm_scale=query_states.size(-1)**-0.5
+    ), None
+
+AttentionInterface.register("jvp_flash", jvp_flash)
 
 
 def get_backbone(m):
@@ -210,9 +219,9 @@ class GradRMT(PreTrainedModel):
 
         # initialize base model, attention is eager to support backward pass over backward pass
         if config.pretrained_model is not None:
-            self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model, attn_implementation='eager')
+            self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model, attn_implementation='jvp_flash')
         else:
-            self.model = AutoModelForCausalLM.from_config(config.base_config, attn_implementation='eager')
+            self.model = AutoModelForCausalLM.from_config(config.base_config, attn_implementation='jvp_flash')
 
         # store GradMemGPT parameters
         self.n_mem_tokens = config.n_mem_tokens
@@ -482,6 +491,14 @@ class GradRMT(PreTrainedModel):
             mask = (lm_labels != -100)
             # n real tokens per sample
             seq_len = mask.sum(dim=1).clamp_min(1)
+            # we use a custom flash attention module during training
+            # to pass second-order derivatives which only works with
+            # sequence lengths divisible by 32
+            # if self.training:
+            pad_list = [0, -(ctx_emb.size(1) + self.n_mem_tokens + 2 * self.n_ctrl_tokens) % 32, 0, 0]
+            mask = F.pad(mask, pad_list, "constant", 0)
+            ctx_emb = F.pad(ctx_emb, [0, 0] + pad_list, "constant", 0)
+
             for k in range(self.K):
                 if self.mem_proj_mode == 'none':
                     mem_inp = mem_batch
@@ -631,8 +648,11 @@ class GradRMT(PreTrainedModel):
         else:
             x_qry = torch.cat([mem_inp, qry_emb], dim=1)                      # [B,M+Q,d]
 
+        # pad to multiple of 32 for compatibility with JVP Flash Attention
+        pad_list = [0, 0, 0, -x_qry.size(1) % 32]
+        x_qry = F.pad(x_qry, pad_list, "constant", 0)
         logits_q = self.model(inputs_embeds=x_qry).logits                     # [B,M+Q,V]
-        logits_q = logits_q[:, mem_offset:, :]    # [B,Q,V]
+        logits_q = logits_q[:, mem_offset:mem_offset+qry_emb.size(1), :]      # [B,Q,V]
 
         return logits_q
 
@@ -677,6 +697,13 @@ class GradRMT(PreTrainedModel):
         if self.use_retrieval:
             mem_list = []
         
+        if self.training:
+            # efficient attention with second-order derivatives
+            self.model.set_attn_implementation('jvp_flash')
+        else:
+            # native Transformers implementation for inference
+            self.model.set_attn_implementation('flash_attention_2')
+        
         for i, segment_input_ids in enumerate(context_segments):
             if self.K and segment_input_ids.ne(pad_id).any():
                 inner_loop_kwargs = {
@@ -688,14 +715,7 @@ class GradRMT(PreTrainedModel):
                     inner_loop_kwargs['W_batch'] = W_batch
                     inner_loop_kwargs['b_batch'] = b_batch
 
-                # Flash Attention does not support higher-order derivatives
-                # so, during training, we fall back to eager on inner loop
-                if self.training:
-                    ctx = nn.attention.sdpa_kernel(nn.attention.SDPBackend.MATH)
-                else:
-                    ctx = nn.attention.sdpa_kernel(nn.attention.SDPBackend.FLASH_ATTENTION)
-                with ctx:
-                    out = self._inner_loop(**inner_loop_kwargs)
+                out = self._inner_loop(**inner_loop_kwargs)
 
                 if self.mem_proj_mode == 'per_sample':
                     new_mem, W_batch, b_batch, opt_state, segment_stats = out
@@ -737,8 +757,8 @@ class GradRMT(PreTrainedModel):
             read_kwargs['W_batch'] = W_batch
             read_kwargs['b_batch'] = b_batch
 
-        with nn.attention.sdpa_kernel(nn.attention.SDPBackend.FLASH_ATTENTION):
-            logits_q = self._read_memory(**read_kwargs)
+        self.model.set_attn_implementation('flash_attention_2')
+        logits_q = self._read_memory(**read_kwargs)
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:
