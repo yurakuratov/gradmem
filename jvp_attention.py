@@ -1009,10 +1009,10 @@ def _attn_fwd(
 
     # Epilogue
     empty_mask = l_i == 0.0
-    # if empty_mask.sum() > 0:
-    l_i = tl.where(
-        empty_mask, 1.0, l_i
-    )  # NOTE: This happens if the entire block is masked out.
+    if empty_mask.sum() > 0:
+        l_i = tl.where(
+            empty_mask, 1.0, l_i
+        )  # NOTE: This happens if the entire block is masked out.
 
     m_i = m_i + tl.where(
         # NOTE: This is needed to compute the logsumexp for the backward pass.
@@ -1358,10 +1358,10 @@ def _attn_fwd_tma(
 
     # Epilogue
     empty_mask = l_i == 0.0
-    # if empty_mask.sum() > 0:
-    l_i = tl.where(
-        empty_mask, 1.0, l_i
-    )  # NOTE: This happens if the entire block is masked out.
+    if empty_mask.sum() > 0:
+        l_i = tl.where(
+            empty_mask, 1.0, l_i
+        )  # NOTE: This happens if the entire block is masked out.
 
     m_i = m_i + tl.where(
         # NOTE: This is needed to compute the logsumexp for the backward pass.

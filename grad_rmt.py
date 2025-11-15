@@ -6,11 +6,8 @@ from jvp_attention import JVPAttn
 from accelerate.logging import get_logger
 logger = get_logger('')
 
-def jvp_flash(module, query_states, key_states, value_states, *_, **__):
-    return JVPAttn.fwd(
-        query_states, key_states, value_states, causal=True,
-        dropout_p=0.0, sm_scale=query_states.size(-1)**-0.5
-    ), None
+def jvp_flash(*args, **kwargs):
+    return JVPAttn.fwd(*args, **kwargs), None
 
 AttentionInterface.register("jvp_flash", jvp_flash)
 
@@ -217,7 +214,7 @@ class GradRMT(PreTrainedModel):
         if config.pretrained_model is None and config.base_config is None:
             raise ValueError("Either pretrained_model or base_config must be provided to instantiate GradRMT")
 
-        # initialize base model, attention is eager to support backward pass over backward pass
+        # initialize base model, use custom flash attention to enable second-order gradients
         if config.pretrained_model is not None:
             self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model, attn_implementation='jvp_flash')
         else:
@@ -494,7 +491,6 @@ class GradRMT(PreTrainedModel):
             # we use a custom flash attention module during training
             # to pass second-order derivatives which only works with
             # sequence lengths divisible by 32
-            # if self.training:
             pad_list = [0, -(ctx_emb.size(1) + self.n_mem_tokens + 2 * self.n_ctrl_tokens) % 32, 0, 0]
             mask = F.pad(mask, pad_list, "constant", 0)
             ctx_emb = F.pad(ctx_emb, [0, 0] + pad_list, "constant", 0)
@@ -697,13 +693,6 @@ class GradRMT(PreTrainedModel):
         if self.use_retrieval:
             mem_list = []
         
-        if self.training:
-            # efficient attention with second-order derivatives
-            self.model.set_attn_implementation('jvp_flash')
-        else:
-            # native Transformers implementation for inference
-            self.model.set_attn_implementation('flash_attention_2')
-        
         for i, segment_input_ids in enumerate(context_segments):
             if self.K and segment_input_ids.ne(pad_id).any():
                 inner_loop_kwargs = {
@@ -757,7 +746,6 @@ class GradRMT(PreTrainedModel):
             read_kwargs['W_batch'] = W_batch
             read_kwargs['b_batch'] = b_batch
 
-        self.model.set_attn_implementation('flash_attention_2')
         logits_q = self._read_memory(**read_kwargs)
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
