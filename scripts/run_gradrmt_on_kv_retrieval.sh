@@ -4,7 +4,7 @@ export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUBLAS_WORKSPACE_CONFIG=:4096:2
 export CUDA_LAUNCH_BLOCKING=1
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=2
 # NP=${NP:-1}  # Default to 1 process if not set
 NP=1
 
@@ -38,6 +38,7 @@ TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 # GradMemGPT specific parameters
 N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
+N_HASH_TOKENS=2
 K=1
 INNER_LR=0.04
 LEARN_LR=false
@@ -58,6 +59,9 @@ USE_MEM_NORM=false
 RUN_NAME=gradrmt_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}_s${N_SEGMENTS}
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
+fi
+if [ "$N_HASH_TOKENS" -gt 0 ]; then
+  RUN_NAME=${RUN_NAME}_h${N_HASH_TOKENS}
 fi
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
 if [ "$LEARN_LR" = true ]; then
@@ -93,15 +97,6 @@ fi
 
 RUN_NAME=${RUN_NAME}_${INNER_OPTIM}_grad_${GRAD_MODE}_m_${MOMENTUM_MODE}_bs_${TBS}_lr_${LR}
 
-# init checkpoint settings
-# SOURCE_N_PAIRS=32
-# SOURCE_DATA_NAME="N${SOURCE_N_PAIRS}-K2V2-V${V}_1M"
-# INIT_CHECKPOINT=""
-
-
-# Run ID
-# RUN_NAME=${RUN_NAME}_from_N32_s4
-
 N_VALUES=(1 2)
 for N in "${N_VALUES[@]}"; do
   # Path to save experiment results
@@ -112,7 +107,7 @@ for N in "${N_VALUES[@]}"; do
 
   # Execute the script using accelerate for parallel processing
   accelerate launch \
-    --main_process_port $((29500+$TBS+$N+3)) \
+    --main_process_port $((29500+$TBS+$N)) \
     --num_processes $NP \
     --mixed_precision 'no' \
     --config_file accelerate.yaml \
@@ -129,6 +124,8 @@ for N in "${N_VALUES[@]}"; do
     --n_embd $D \
     --base_model $BASE_MODEL \
     --n_mem_tokens $N_MEM_TOKENS \
+    --n_ctrl_tokens $N_CTRL_TOKENS \
+    --n_hash_tokens $N_HASH_TOKENS \
     --K $K \
     --inner_lr $INNER_LR \
     --inner_optim $INNER_OPTIM \
@@ -150,7 +147,8 @@ for N in "${N_VALUES[@]}"; do
     --logging_steps 500 \
     --warmup_steps 10000 \
     --early_stopping_patience 500 \
-    --seed $((142+$N))
+    --seed $((142+$N)) \
+    --attn_implementation "eager"
     #  --init_checkpoint $INIT_CHECKPOINT
 done
 

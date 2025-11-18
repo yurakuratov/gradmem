@@ -202,6 +202,7 @@ class ExperimentArgs:
     grad_mode: Optional[str] = field(default="none")
     momentum_mode: Optional[str] = field(default="none")
     n_ctrl_tokens: Optional[int] = field(default=0)
+    n_hash_tokens: Optional[int] = field(default=0)
     inner_clip_value: Optional[float] = field(default=None)
     inner_clip_norm: Optional[float] = field(default=None)
     use_mem_proj: Optional[bool] = field(default=False)
@@ -278,12 +279,12 @@ if __name__ == '__main__':
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    gradmem_config = GradRMTConfig(pretrained_model=args.pretrained_model, base_config=config,
+    gradrmt_config = GradRMTConfig(pretrained_model=args.pretrained_model, base_config=config,
                                    n_mem_tokens=args.n_mem_tokens, K=args.K,
                                    last_K_second_order=args.last_K_second_order,
                                    lr=args.inner_lr, learn_lr=args.learn_lr, inner_optim=args.inner_optim,
                                    grad_mode=args.grad_mode, momentum_mode=args.momentum_mode,
-                                   n_ctrl_tokens=args.n_ctrl_tokens,
+                                   n_ctrl_tokens=args.n_ctrl_tokens, n_hash_tokens=args.n_hash_tokens,
                                    inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
                                    use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                    use_write_head=args.use_write_head, segment_size=args.segment_size,
@@ -293,7 +294,7 @@ if __name__ == '__main__':
                                    attn_implementation=args.attn_implementation)
 
     # Create gradmemgpt model
-    model = GradRMT(gradmem_config)
+    model = GradRMT(gradrmt_config)
 
     if args.init_checkpoint is not None:
         logger.info(f'Loading model checkpoint from {args.init_checkpoint}')

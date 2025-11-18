@@ -1,16 +1,55 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig, AttentionInterface
+from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig, AttentionInterface, AttentionMaskInterface
+from transformers.masking_utils import sdpa_mask
+from transformers.integrations.sdpa_attention import repeat_kv
 from jvp_attention import JVPAttn
+from typing import Optional
+
 from accelerate.logging import get_logger
 logger = get_logger('')
 
-def jvp_flash(*args, **kwargs):
-    return JVPAttn.fwd(*args, **kwargs), None
+def jvp_flash(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    is_causal: Optional[bool] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, None]:
+
+    if hasattr(module, "num_key_value_groups"):
+        key = repeat_kv(key, module.num_key_value_groups)
+        value = repeat_kv(value, module.num_key_value_groups)
+
+    if attention_mask is not None and attention_mask.ndim == 4:
+        attention_mask = attention_mask[:, :, :, : key.shape[-2]]
+        if attention_mask.size(1) < query.size(1):
+            attention_mask = attention_mask.expand(-1, query.size(1), -1, -1)
+    
+    if is_causal is None:
+        is_causal = query.shape[2] > 1 and attention_mask is None and getattr(module, "is_causal", True)
+
+    attn_output = JVPAttn.fwd(
+        query, key, value,
+        attn_mask=attention_mask,
+        dropout_p=dropout,
+        causal=is_causal,
+        sm_scale=scaling,
+    )
+
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    return attn_output, None
+
+def jvp_flash_mask(*args, **kwargs):
+    return sdpa_mask(*args, **kwargs)
 
 AttentionInterface.register("jvp_flash", jvp_flash)
-
+AttentionMaskInterface.register("jvp_flash", jvp_flash_mask)
 
 def get_backbone(m):
     # most HF CausalLM classes define base_model_prefix, e.g. "transformer" (GPT-2), "model" (LLaMA)
@@ -40,6 +79,7 @@ class GradRMTConfig(PretrainedConfig):
                  grad_mode="second",
                  momentum_mode="none",
                  last_K_second_order=None,
+                 n_hash_tokens=0,
                  n_ctrl_tokens=0,
                  inner_clip_value=None,
                  inner_clip_norm=None,
@@ -67,6 +107,7 @@ class GradRMTConfig(PretrainedConfig):
             momentum_mode: str, momentum mode ("none", "first", "second")
             last_K_second_order: int, use second order update for last K inner gradient steps only
             n_ctrl_tokens: int, number of control tokens
+            n_hash_tokens: int, number of tokens sampled as random prefixes for each segment
             inner_clip_value: float, gradient clipping value
             inner_clip_norm: float, gradient clipping norm
             use_mem_proj: bool, whether to use memory projection
@@ -98,6 +139,7 @@ class GradRMTConfig(PretrainedConfig):
         self.grad_mode = grad_mode
         self.momentum_mode = momentum_mode
         self.n_ctrl_tokens = n_ctrl_tokens
+        self.n_hash_tokens = n_hash_tokens
         self.inner_clip_value = inner_clip_value
         self.inner_clip_norm = inner_clip_norm
         self.use_mem_proj = use_mem_proj
@@ -227,6 +269,7 @@ class GradRMT(PreTrainedModel):
         # store GradMemGPT parameters
         self.n_mem_tokens = config.n_mem_tokens
         self.n_ctrl_tokens = config.n_ctrl_tokens
+        self.n_hash_tokens = config.n_hash_tokens
         self.K = config.K
         self.last_K_second_order = config.last_K_second_order
         self.lr = config.lr
@@ -267,6 +310,13 @@ class GradRMT(PreTrainedModel):
             self.write_end = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
             self.read_st = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
             self.read_end = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
+
+        # optional "hash" for each segment
+        if self.n_hash_tokens > 0:
+            # hash start/end tokens are trained by outer loop, hashes are sampled randomly from the embedding matrix
+            self.hash_st = nn.Parameter(torch.randn(1, n_embd) * 0.02)
+            self.hash_end = nn.Parameter(torch.randn(1, n_embd) * 0.02)
+            self.hash_set = set()  # used to check if hash was used previously in forward
 
         if self.use_write_head:
             V = self.model.config.vocab_size
@@ -465,11 +515,24 @@ class GradRMT(PreTrainedModel):
         B = context_input_ids.size(0)
 
         # actual model inputs starts after mem tokens and ctrl tokens
-        mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
+        mem_offset = self.n_mem_tokens + 2 * self.n_ctrl_tokens + self.n_hash_tokens + (2 if self.n_hash_tokens > 0 else 0)
 
         if self.n_ctrl_tokens > 0:
             write_st_batch = self.write_st.unsqueeze(0).expand(B, -1, -1)
             write_end_batch = self.write_end.unsqueeze(0).expand(B, -1, -1)
+
+        if self.n_hash_tokens > 0:
+            hash_st_batch = self.hash_st.unsqueeze(0).expand(B, -1, -1)
+            hash_end_batch = self.hash_end.unsqueeze(0).expand(B, -1, -1)
+
+            emb_weight = self.model.get_input_embeddings().weight
+            hash_key = None
+            while hash_key is None or hash_key in self.hash_set:
+                hash_tokens_idx = torch.randint(0, emb_weight.shape[0], (self.n_hash_tokens,))
+                hash_key = hash_tokens_idx.detach().cpu().numpy().tobytes()
+            
+            self.hash_set.add(hash_key)
+            hash_seq_batch = emb_weight[hash_tokens_idx].unsqueeze(0).expand(B, -1, -1)
 
         if self.momentum_mode != "second":
             opt_state = {}
@@ -494,9 +557,10 @@ class GradRMT(PreTrainedModel):
             seq_len = mask.sum(dim=1).clamp_min(1)
             
             # pad to multiple of 32 for compatibility with JVP Flash Attention
-            if self.attn_implementation == 'jvp':
-                pad_list = [0, -(ctx_emb.size(1) + self.n_mem_tokens + 2 * self.n_ctrl_tokens) % 32, 0, 0]
+            if self.attn_implementation == 'jvp_flash':
+                pad_list = [0, -(ctx_emb.size(1) + mem_offset) % 32, 0, 0]
                 mask = F.pad(mask, pad_list, "constant", 0)
+                lm_labels = F.pad(lm_labels, pad_list, "constant", 0)
                 ctx_emb = F.pad(ctx_emb, [0, 0] + pad_list, "constant", 0)
 
             for k in range(self.K):
@@ -509,9 +573,12 @@ class GradRMT(PreTrainedModel):
 
                 if self.n_ctrl_tokens > 0:
                     # add params that can control write operation to mem in inner loop
-                    x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch, ctx_emb], dim=1)
-                else:
-                    x_ctx = torch.cat([mem_inp, ctx_emb], dim=1)    # [B,M+S,d]
+                    mem_inp = torch.cat([write_st_batch, mem_inp, write_end_batch], dim=1)
+                
+                if self.n_hash_tokens > 0:
+                    mem_inp = torch.cat([mem_inp, hash_st_batch, hash_seq_batch, hash_end_batch], dim=1)
+                    
+                x_ctx = torch.cat([mem_inp, ctx_emb], dim=1)    # [B,M+S,d]
 
                 if self.use_write_head:
                     # we do not need to compute read memory head logits here, we need only last hidden state
@@ -649,7 +716,7 @@ class GradRMT(PreTrainedModel):
             x_qry = torch.cat([mem_inp, qry_emb], dim=1)                      # [B,M+Q,d]
 
         # pad to multiple of 32 for compatibility with JVP Flash Attention
-        if self.attn_implementation == 'jvp':
+        if self.attn_implementation == 'jvp_flash':
             pad_list = [0, 0, 0, -x_qry.size(1) % 32]
             x_qry = F.pad(x_qry, pad_list, "constant", 0)
             
@@ -696,8 +763,12 @@ class GradRMT(PreTrainedModel):
 
         opt_state = {}
         inner_loop_stats = {}
+
+        # reset existing lists
         if self.use_retrieval:
             mem_list = []
+        if self.n_hash_tokens > 0:
+            self.hash_set = set()
         
         for i, segment_input_ids in enumerate(context_segments):
             if self.K and segment_input_ids.ne(pad_id).any():
