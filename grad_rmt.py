@@ -52,6 +52,7 @@ class GradRMTConfig(PretrainedConfig):
                  prune_grad_keep_topk=None,
                  normalize_memory=False,
                  use_gradient_checkpointing=False,
+                 attn_implementation='eager',
                  **kwargs):
         """
         Args:
@@ -76,6 +77,7 @@ class GradRMTConfig(PretrainedConfig):
             prune_grad_keep_topk: float, share of gradients to keep before inner step
             normalize_memory: bool, apply layernorm to memory tokens after gradient update
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
+            attn_implementation: str, type of attention to use (sdpa incompatible with double backward)
         """
         super().__init__(**kwargs)
 
@@ -103,6 +105,7 @@ class GradRMTConfig(PretrainedConfig):
         self.use_write_head = use_write_head
         self.last_K_second_order = K if last_K_second_order is None and grad_mode == "second" else 0
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.attn_implementation = attn_implementation
 
         # Recurrency parameters
         self.segment_size = segment_size
@@ -216,9 +219,10 @@ class GradRMT(PreTrainedModel):
 
         # initialize base model, use custom flash attention to enable second-order gradients
         if config.pretrained_model is not None:
-            self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model, attn_implementation='jvp_flash')
+            self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model, attn_implementation=config.attn_implementation)
         else:
-            self.model = AutoModelForCausalLM.from_config(config.base_config, attn_implementation='jvp_flash')
+            self.model = AutoModelForCausalLM.from_config(config.base_config, attn_implementation=config.attn_implementation)
+        self.attn_implementation = config.attn_implementation
 
         # store GradMemGPT parameters
         self.n_mem_tokens = config.n_mem_tokens
@@ -488,12 +492,12 @@ class GradRMT(PreTrainedModel):
             mask = (lm_labels != -100)
             # n real tokens per sample
             seq_len = mask.sum(dim=1).clamp_min(1)
-            # we use a custom flash attention module during training
-            # to pass second-order derivatives which only works with
-            # sequence lengths divisible by 32
-            pad_list = [0, -(ctx_emb.size(1) + self.n_mem_tokens + 2 * self.n_ctrl_tokens) % 32, 0, 0]
-            mask = F.pad(mask, pad_list, "constant", 0)
-            ctx_emb = F.pad(ctx_emb, [0, 0] + pad_list, "constant", 0)
+            
+            # pad to multiple of 32 for compatibility with JVP Flash Attention
+            if self.attn_implementation == 'jvp':
+                pad_list = [0, -(ctx_emb.size(1) + self.n_mem_tokens + 2 * self.n_ctrl_tokens) % 32, 0, 0]
+                mask = F.pad(mask, pad_list, "constant", 0)
+                ctx_emb = F.pad(ctx_emb, [0, 0] + pad_list, "constant", 0)
 
             for k in range(self.K):
                 if self.mem_proj_mode == 'none':
@@ -544,10 +548,10 @@ class GradRMT(PreTrainedModel):
                     g_mem = torch.autograd.grad(inner_loss, mem_batch, create_graph=create_graph)[0]
 
                 if self.prune_grad_keep_topk is not None:
-                    g_mem = g_mem * (g_mem >= torch.quantile(torch.abs(g_mem), 1.0 - self.prune_grad_keep_topk))
+                    g_mem = g_mem * (torch.abs(g_mem) >= torch.quantile(torch.abs(g_mem), 1.0 - self.prune_grad_keep_topk))
                     if self.mem_proj_mode == 'per_sample':
-                        g_W = g_W * (g_W >= torch.quantile(torch.abs(g_W), 1.0 - self.prune_grad_keep_topk))
-                        g_b = g_b * (g_b >= torch.quantile(torch.abs(g_b), 1.0 - self.prune_grad_keep_topk))
+                        g_W = g_W * (torch.abs(g_W) >= torch.quantile(torch.abs(g_W), 1.0 - self.prune_grad_keep_topk))
+                        g_b = g_b * (torch.abs(g_b) >= torch.quantile(torch.abs(g_b), 1.0 - self.prune_grad_keep_topk))
 
                 # track inner grad norm (todo: move to _opt_step?, currently we compute g_norm twice)
                 g_norm = g_mem.reshape(B, -1).norm(dim=1).detach()
@@ -645,8 +649,10 @@ class GradRMT(PreTrainedModel):
             x_qry = torch.cat([mem_inp, qry_emb], dim=1)                      # [B,M+Q,d]
 
         # pad to multiple of 32 for compatibility with JVP Flash Attention
-        pad_list = [0, 0, 0, -x_qry.size(1) % 32]
-        x_qry = F.pad(x_qry, pad_list, "constant", 0)
+        if self.attn_implementation == 'jvp':
+            pad_list = [0, 0, 0, -x_qry.size(1) % 32]
+            x_qry = F.pad(x_qry, pad_list, "constant", 0)
+            
         logits_q = self.model(inputs_embeds=x_qry).logits                     # [B,M+Q,V]
         logits_q = logits_q[:, mem_offset:mem_offset+qry_emb.size(1), :]      # [B,Q,V]
 

@@ -213,6 +213,7 @@ class ExperimentArgs:
     prune_grad_keep_topk: Optional[float] = field(default=None)
     normalize_memory: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
+    attn_implementation: Optional[str] = field(default="eager")
 
 if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
@@ -288,7 +289,8 @@ if __name__ == '__main__':
                                    use_write_head=args.use_write_head, segment_size=args.segment_size,
                                    use_mem_attn=args.use_mem_attn, use_retrieval=args.use_retrieval,
                                    prune_grad_keep_topk=args.prune_grad_keep_topk, normalize_memory=args.normalize_memory,
-                                   use_gradient_checkpointing=args.use_gradient_checkpointing)
+                                   use_gradient_checkpointing=args.use_gradient_checkpointing,
+                                   attn_implementation=args.attn_implementation)
 
     # Create gradmemgpt model
     model = GradRMT(gradmem_config)
