@@ -1,4 +1,4 @@
-name: /home/jovyan/kuratov/envs/py311_pt2.6_cu12.4
+name: py311_pt2.6_cu12.4
 channels:
   - nvidia/label/cuda-12.4.1
   - conda-forge
@@ -94,6 +94,9 @@ dependencies:
   - tk=8.6.13=noxft_h4845f30_101
   - wheel=0.45.1=pyhd8ed1ab_1
   - pip:
+      - torch==2.6.0
+      - torchaudio==2.6.0
+      - torchvision==0.21.0
       - accelerate==1.5.2
       - aiohappyeyeballs==2.6.1
       - aiohttp==3.11.14
@@ -132,7 +135,6 @@ dependencies:
       - fastapi-cli==0.0.7
       - fastrlock==0.8.3
       - filelock==3.18.0
-      - flash-attn==2.7.4.post1
       - fonttools==4.56.0
       - frozenlist==1.5.0
       - fsspec==2024.12.0
@@ -260,9 +262,6 @@ dependencies:
       - sympy==1.13.1
       - tiktoken==0.9.0
       - tokenizers==0.21.1
-      - torch==2.6.0
-      - torchaudio==2.6.0
-      - torchvision==0.21.0
       - tornado==6.4.2
       - tqdm==4.67.1
       - traitlets==5.14.3
@@ -285,4 +284,3 @@ dependencies:
       - xxhash==3.5.0
       - yarl==1.18.3
       - zipp==3.21.0
-prefix: /home/jovyan/kuratov/envs/py311_pt2.6_cu12.4
