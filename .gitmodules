@@ -1,0 +1,4 @@
+[submodule "associative-recurrent-memory-transformer"]
+	path = associative-recurrent-memory-transformer
+	url = https://github.com/RodkinIvan/associative-recurrent-memory-transformer.git
+	branch = deep_mem
