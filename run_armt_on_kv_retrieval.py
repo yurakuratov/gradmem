@@ -292,6 +292,7 @@ class ExperimentArgs:
     base_model: Optional[str] = field(default='gpt2')
     pretrained_model: Optional[str] = field(default=None)
     init_checkpoint: Optional[str] = field(default=None)
+    model_cpt: Optional[str] = field(default=None)  # Path to ARMT model checkpoint directory
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
@@ -371,36 +372,130 @@ if __name__ == '__main__':
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    # Determine base_model_name or base_model_config for ARMT
-    base_model_name = args.pretrained_model
-    base_model_config = config if args.pretrained_model is None else None
-    
-    # Create ARMT config
-    armt_config = ThinkingARMTConfig(
-        base_model_name=base_model_name,
-        base_model_config=base_model_config,
-        num_mem_tokens=args.num_mem_tokens,
-        d_mem=args.d_mem,
-        segment_size=args.segment_size,
-        segment_alignment=args.segment_alignment,
-        layers_attr=args.layers_attr,
-        wrap_pos=args.wrap_pos,
-        correction=args.correction,
-        n_heads=args.n_heads,
-        use_denom=args.use_denom,
-        reading_depth_multiplier=args.reading_depth_multiplier,
-        writing_depth_multiplier=args.writing_depth_multiplier,
-    )
-    
-    # Set vocab and tokenizer settings
-    if base_model_config is not None:
-        armt_config.vocab_size = base_model_config.vocab_size
-        armt_config.pad_token_id = base_model_config.pad_token_id
-        armt_config.bos_token_id = getattr(base_model_config, 'bos_token_id', None)
-        armt_config.eos_token_id = getattr(base_model_config, 'eos_token_id', None)
+    # Load ARMT model from checkpoint or create new one
+    if args.model_cpt is not None and args.model_cpt != 'None':
+        # Find the latest checkpoint directory if args.model_cpt is a directory with checkpoint-* subdirectories
+        checkpoint_dir = args.model_cpt
+        if os.path.isdir(args.model_cpt):
+            # Look for checkpoint-* directories
+            import re
+            checkpoint_dirs = []
+            files = os.listdir(args.model_cpt)
+            logger.info(f'Found {len(files)} files in {args.model_cpt}: {files}')
+            for item in files:
+                item_path = os.path.join(args.model_cpt, item)
+                if os.path.isdir(item_path) and item.startswith('checkpoint-'):
+                    # Extract step number from checkpoint-$STEPS
+                    match = re.match(r'checkpoint-(\d+)', item)
+                    if match:
+                        step_num = int(match.group(1))
+                        checkpoint_dirs.append((step_num, item_path))
+            
+            if checkpoint_dirs:
+                # Sort by step number and get the latest (highest step number)
+                checkpoint_dirs.sort(key=lambda x: x[0], reverse=True)
+                latest_step, checkpoint_dir = checkpoint_dirs[0]
+                logger.info(f'Found {len(checkpoint_dirs)} checkpoint(s), loading from latest: checkpoint-{latest_step}')
+            else:
+                # No checkpoint-* directories found, use the directory directly
+                checkpoint_dir = args.model_cpt
+                logger.info(f'No checkpoint-* directories found in {args.model_cpt}, using directory directly')
+        
+        # Load ARMT model from checkpoint directory
+        logger.info(f'Loading ARMT model from checkpoint: {checkpoint_dir}')
+        try:
+            # Try loading as a saved model directory (from_pretrained)
+            model = ThinkingARMTForCausalLM.from_pretrained(checkpoint_dir)
+            logger.info(f'Successfully loaded ARMT model from {checkpoint_dir}')
+        except Exception as e:
+            logger.warning(f'Failed to load as pretrained model: {e}')
+            logger.info('Trying to load from state dict files...')
+            # Need to create model first, so determine config
+            base_model_name = args.pretrained_model
+            base_model_config = config if args.pretrained_model is None else None
+            
+            # Create ARMT config
+            armt_config = ThinkingARMTConfig(
+                base_model_name=base_model_name,
+                base_model_config=base_model_config,
+                num_mem_tokens=args.num_mem_tokens,
+                d_mem=args.d_mem,
+                segment_size=args.segment_size,
+                segment_alignment=args.segment_alignment,
+                layers_attr=args.layers_attr,
+                wrap_pos=args.wrap_pos,
+                correction=args.correction,
+                n_heads=args.n_heads,
+                use_denom=args.use_denom,
+                reading_depth_multiplier=args.reading_depth_multiplier,
+                writing_depth_multiplier=args.writing_depth_multiplier,
+            )
+            
+            # Set vocab and tokenizer settings
+            if base_model_config is not None:
+                armt_config.vocab_size = base_model_config.vocab_size
+                armt_config.pad_token_id = base_model_config.pad_token_id
+                armt_config.bos_token_id = getattr(base_model_config, 'bos_token_id', None)
+                armt_config.eos_token_id = getattr(base_model_config, 'eos_token_id', None)
+            
+            model = ThinkingARMTForCausalLM(armt_config)
+            # Try different checkpoint file locations
+            checkpoint_paths = [
+                os.path.join(checkpoint_dir, "model_best", "model.safetensors"),
+                os.path.join(checkpoint_dir, "model_best", "pytorch_model.bin"),
+                os.path.join(checkpoint_dir, "model.safetensors"),
+                os.path.join(checkpoint_dir, "pytorch_model.bin"),
+                checkpoint_dir,  # Direct path to checkpoint file
+            ]
+            loaded = False
+            for cpt_path in checkpoint_paths:
+                if os.path.exists(cpt_path):
+                    logger.info(f'Loading from: {cpt_path}')
+                    if cpt_path.endswith('.safetensors'):
+                        state_dict = load_file(cpt_path)
+                    else:
+                        state_dict = torch.load(cpt_path, map_location='cpu')
+                        if isinstance(state_dict, dict) and 'model_state_dict' in state_dict:
+                            state_dict = state_dict['model_state_dict']
+                    missing_k, unexpected_k = model.load_state_dict(state_dict, strict=False)
+                    if len(missing_k) != 0:
+                        logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
+                    if len(unexpected_k) != 0:
+                        logger.info(f'{unexpected_k} were found in checkpoint, but model is not expecting them!')
+                    loaded = True
+                    break
+            if not loaded:
+                raise FileNotFoundError(f'Could not find checkpoint file in {checkpoint_dir}. Tried: {checkpoint_paths}')
+    else:
+        # Create new ARMT model
+        base_model_name = args.pretrained_model
+        base_model_config = config if args.pretrained_model is None else None
+        
+        # Create ARMT config
+        armt_config = ThinkingARMTConfig(
+            base_model_name=base_model_name,
+            base_model_config=base_model_config,
+            num_mem_tokens=args.num_mem_tokens,
+            d_mem=args.d_mem,
+            segment_size=args.segment_size,
+            segment_alignment=args.segment_alignment,
+            layers_attr=args.layers_attr,
+            wrap_pos=args.wrap_pos,
+            correction=args.correction,
+            n_heads=args.n_heads,
+            use_denom=args.use_denom,
+            reading_depth_multiplier=args.reading_depth_multiplier,
+            writing_depth_multiplier=args.writing_depth_multiplier,
+        )
+        
+        # Set vocab and tokenizer settings
+        if base_model_config is not None:
+            armt_config.vocab_size = base_model_config.vocab_size
+            armt_config.pad_token_id = base_model_config.pad_token_id
+            armt_config.bos_token_id = getattr(base_model_config, 'bos_token_id', None)
+            armt_config.eos_token_id = getattr(base_model_config, 'eos_token_id', None)
 
-    # Create ARMT model
-    model = ThinkingARMTForCausalLM(armt_config)
+        model = ThinkingARMTForCausalLM(armt_config)
 
     if args.init_checkpoint is not None:
         missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
@@ -498,7 +593,7 @@ if __name__ == '__main__':
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
+                   StopOnMetricValue(metric_name='exact_match', value=0.99, higher_is_better=True),
                    ],
     )
     # Train the model
