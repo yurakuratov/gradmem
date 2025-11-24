@@ -548,6 +548,11 @@ if __name__ == '__main__':
         args_total_bs = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
         assert args.total_batch_size == args_total_bs
 
+    # Get wandb run name from environment variable if set
+    wandb_run_name = os.environ.get('WANDB_NAME', None)
+    if wandb_run_name:
+        logger.info(f'Using WANDB_NAME from environment: {wandb_run_name}')
+
     # Training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
@@ -571,6 +576,7 @@ if __name__ == '__main__':
         eval_steps=args.eval_steps,
         logging_steps=args.logging_steps,
         report_to='wandb',
+        run_name=wandb_run_name,  # Use WANDB_NAME environment variable if set
         metric_for_best_model=args.metric_for_best_model,
         load_best_model_at_end=True,
         eval_on_start=True,
