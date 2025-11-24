@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export WANDB_PROJECT=kv_retrieval
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
@@ -26,17 +26,17 @@ V=62
 
 TBS=256
 
-NUMS_PAIRS=(1 2 4 8 16 32 64)
-NUMS_PAIRS_PER_SEGMENT=(1 1 1 1 1 1 1)
-BSS=(256 256 256 256 256 128 64)
-ITERSS=(10000 10000 10000 10000 10000 10000 10000)
-NS=(1)
+NUMS_PAIRS=(1 2 4 8 16 32 64 128)
+NUMS_PAIRS_PER_SEGMENT=(4 4 4 4 4 4 4 4)
+BSS=(256 256 256 256 256 128 64 64)
+ITERSS=(10000 10000 10000 10000 10000 10000 10000 10000)
+NS=(2)
 
 for N in "${NS[@]}"; do
 
 MODEL_CPT=None
 
-for (( i=6; i<${#NUMS_PAIRS[@]}; i++ ))
+for (( i=0; i<${#NUMS_PAIRS[@]}; i++ ))
 do
 
 NUM_PAIRS=${NUMS_PAIRS[i]}
@@ -71,7 +71,7 @@ RUN_NAME=armt_thinking_${BASE_MODEL}_L${L}H${H}D${D}_mem${NUM_MEM_TOKENS}_dmem${
     MODEL_CPT="./runs/N${NUMS_PAIRS[i-1]}-K2V2-V${V}/armt_thinking_${BASE_MODEL}_L${L}H${H}D${D}_mem${NUM_MEM_TOKENS}_dmem${D_MEM}_seg${PAST_SEGMENT_SIZE}_wdm${WRITING_DEPTH_MULTIPLIER}_rdm${READING_DEPTH_MULTIPLIER}/run_$N"
   fi
   # Execute the script using accelerate for parallel processing
-  export WANDB_NAME=${RUN_NAME}_run_$N
+  export WANDB_NAME=armt_w${WRITING_DEPTH_MULTIPLIER}_r${READING_DEPTH_MULTIPLIER}_cur_N${NUM_PAIRS}_pps${NUM_PAIRS_PER_SEGMENT}
   accelerate launch \
     --main_process_port $((29500+$TBS+$N+200)) \
     --num_processes $NP \
@@ -86,7 +86,7 @@ RUN_NAME=armt_thinking_${BASE_MODEL}_L${L}H${H}D${D}_mem${NUM_MEM_TOKENS}_dmem${
     --tokenizer_path $TOKENIZER_PATH \
     --learning_rate $LR \
     $( [ -n "$ADAM_BETA2" ] && echo "--adam_beta2 $ADAM_BETA2" ) \
-    --weight_decay 0.1 \
+    --weight_decay 5.0 \
     --n_layer $L \
     --n_head $H \
     --n_embd $D \
