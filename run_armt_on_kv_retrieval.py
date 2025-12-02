@@ -466,6 +466,9 @@ if __name__ == '__main__':
                     break
             if not loaded:
                 raise FileNotFoundError(f'Could not find checkpoint file in {checkpoint_dir}. Tried: {checkpoint_paths}')
+        model.segment_size = args.segment_size
+        for layer in model.get_layers():
+            layer.segment_size = args.segment_size
     else:
         # Create new ARMT model
         base_model_name = args.pretrained_model
@@ -480,10 +483,6 @@ if __name__ == '__main__':
             segment_size=args.segment_size,
             segment_alignment=args.segment_alignment,
             layers_attr=args.layers_attr,
-            wrap_pos=args.wrap_pos,
-            correction=args.correction,
-            n_heads=args.n_heads,
-            use_denom=args.use_denom,
             reading_depth_multiplier=args.reading_depth_multiplier,
             writing_depth_multiplier=args.writing_depth_multiplier,
         )
