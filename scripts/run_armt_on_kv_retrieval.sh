@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 export WANDB_PROJECT=kv_retrieval
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
@@ -54,11 +54,13 @@ SEGMENT_SIZE=$((7*$NUM_PAIRS_PER_SEGMENT))
 SEGMENT_ALIGNMENT="left"
 LAYERS_ATTR="model.layers"
 
-READING_DEPTH_MULTIPLIER=4
-WRITING_DEPTH_MULTIPLIER=4
+READING_DEPTH_MULTIPLIER=1
+WRITING_DEPTH_MULTIPLIER=1
+REPEAT_READ_SEGMENTS=4
+REPEAT_WRITE_SEGMENTS=4
 
 
-RUN_NAME=armt_thinking_${BASE_MODEL}_L${L}H${H}D${D}_mem${NUM_MEM_TOKENS}_dmem${D_MEM}_seg${SEGMENT_SIZE}_wdm${WRITING_DEPTH_MULTIPLIER}_rdm${READING_DEPTH_MULTIPLIER}
+RUN_NAME=armt_thinking_${BASE_MODEL}_L${L}H${H}D${D}_mem${NUM_MEM_TOKENS}_dmem${D_MEM}_seg${SEGMENT_SIZE}_wdm${WRITING_DEPTH_MULTIPLIER}_rdm${READING_DEPTH_MULTIPLIER}_repW${REPEAT_WRITE_SEGMENTS}_repR${REPEAT_READ_SEGMENTS}
 
 
 # Run ID
@@ -69,10 +71,10 @@ RUN_NAME=armt_thinking_${BASE_MODEL}_L${L}H${H}D${D}_mem${NUM_MEM_TOKENS}_dmem${
     MODEL_CPT=None
   else
     PAST_SEGMENT_SIZE=$((7*NUMS_PAIRS_PER_SEGMENT[i-1]))
-    MODEL_CPT="./runs/N${NUMS_PAIRS[i-1]}-K2V2-V${V}/armt_thinking_${BASE_MODEL}_L${L}H${H}D${D}_mem${NUM_MEM_TOKENS}_dmem${D_MEM}_seg${PAST_SEGMENT_SIZE}_wdm${WRITING_DEPTH_MULTIPLIER}_rdm${READING_DEPTH_MULTIPLIER}/run_$N"
+    MODEL_CPT="./runs/N${NUMS_PAIRS[i-1]}-K2V2-V${V}/armt_thinking_${BASE_MODEL}_L${L}H${H}D${D}_mem${NUM_MEM_TOKENS}_dmem${D_MEM}_seg${PAST_SEGMENT_SIZE}_wdm${WRITING_DEPTH_MULTIPLIER}_rdm${READING_DEPTH_MULTIPLIER}_repW${REPEAT_WRITE_SEGMENTS}_repR${REPEAT_READ_SEGMENTS}/run_$N"
   fi
   # Execute the script using accelerate for parallel processing
-  export WANDB_NAME=armt_w${WRITING_DEPTH_MULTIPLIER}_r${READING_DEPTH_MULTIPLIER}_cur_N${NUM_PAIRS}_pps${NUM_PAIRS_PER_SEGMENT}
+  export WANDB_NAME=armt_w${WRITING_DEPTH_MULTIPLIER}_r${READING_DEPTH_MULTIPLIER}_repW${REPEAT_WRITE_SEGMENTS}_repR${REPEAT_READ_SEGMENTS}_cur_N${NUM_PAIRS}_pps${NUM_PAIRS_PER_SEGMENT}
   accelerate launch \
     --main_process_port $((29500+$TBS+$N+200)) \
     --num_processes $NP \
@@ -106,8 +108,9 @@ RUN_NAME=armt_thinking_${BASE_MODEL}_L${L}H${H}D${D}_mem${NUM_MEM_TOKENS}_dmem${
     --warmup_steps 1000 \
     --early_stopping_patience 500 \
     --seed $((142+$N+$i)) \
-    --model_cpt $MODEL_CPT
-
+    --model_cpt $MODEL_CPT \
+    --repeat_read_segments $REPEAT_READ_SEGMENTS \
+    --repeat_write_segments $REPEAT_WRITE_SEGMENTS
 done
 done
 

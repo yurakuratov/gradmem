@@ -308,6 +308,8 @@ class ExperimentArgs:
     use_denom: Optional[bool] = field(default=True)
     reading_depth_multiplier: Optional[int] = field(default=1)
     writing_depth_multiplier: Optional[int] = field(default=1)
+    repeat_read_segments: Optional[int] = field(default=1)
+    repeat_write_segments: Optional[int] = field(default=1)
 
 
 if __name__ == '__main__':
@@ -429,6 +431,8 @@ if __name__ == '__main__':
                 use_denom=args.use_denom,
                 reading_depth_multiplier=args.reading_depth_multiplier,
                 writing_depth_multiplier=args.writing_depth_multiplier,
+                repeat_read_segments=args.repeat_read_segments,
+                repeat_write_segments=args.repeat_write_segments,
             )
             
             # Set vocab and tokenizer settings
@@ -485,6 +489,8 @@ if __name__ == '__main__':
             layers_attr=args.layers_attr,
             reading_depth_multiplier=args.reading_depth_multiplier,
             writing_depth_multiplier=args.writing_depth_multiplier,
+            repeat_read_segments=args.repeat_read_segments,
+            repeat_write_segments=args.repeat_write_segments,
         )
         
         # Set vocab and tokenizer settings
