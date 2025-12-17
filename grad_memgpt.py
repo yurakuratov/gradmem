@@ -374,7 +374,7 @@ class GradMemGPT(PreTrainedModel):
                 if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
                     pad_list = [0, -(ctx_emb.size(1) + mem_offset) % 32, 0, 0]
                     mask = F.pad(mask, pad_list, "constant", 0)
-                    lm_labels = F.pad(lm_labels, pad_list, "constant", 0)
+                    lm_labels = F.pad(lm_labels, pad_list, "constant", -100)
                     ctx_emb = F.pad(ctx_emb, [0, 0] + pad_list, "constant", 0)
 
                 for k in range(self.K):
