@@ -19,7 +19,7 @@ class SDPA_FullManualBwd(torch.autograd.Function):
         scores = (q @ k.transpose(-2, -1)) * scale
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
-                attn_mask = torch.where(attn_mask, 0.0, float('-inf'))
+                attn_mask = torch.where(attn_mask, 0.0, float('-inf')).to(q.dtype)
             scores = scores + attn_mask
         if is_causal:
             S, L = scores.size(-2), scores.size(-1)
