@@ -207,6 +207,7 @@ class ExperimentArgs:
     use_reconstruction_loss: Optional[bool] = field(default=False)
     reconstruction_loss_weight: Optional[float] = field(default=1.0)
     use_write_head: Optional[bool] = field(default=False)
+    use_mem_residual: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default='eager')
 
 
@@ -278,7 +279,8 @@ if __name__ == '__main__':
                                 use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                 use_reconstruction_loss=args.use_reconstruction_loss,
                                 reconstruction_loss_weight=args.reconstruction_loss_weight,
-                                use_write_head=args.use_write_head, attn_implementation=args.attn_implementation)
+                                use_write_head=args.use_write_head, use_mem_residual=args.use_mem_residual,
+                                attn_implementation=args.attn_implementation)
 
     # Create rmt model
     model = RMT2Segm(rmt_config)
