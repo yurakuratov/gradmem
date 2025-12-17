@@ -2998,6 +2998,8 @@ class JVPAttnBwd(torch.autograd.Function):
         if attn_mask is not None and attn_mask.dim() == 4:
             if attn_mask.dtype == torch.bool:
                 attn_mask = torch.where(attn_mask, 0.0, float('-inf')).to(q.dtype)
+            else:
+                attn_mask = attn_mask.to(q.dtype)
             scores = scores + attn_mask
         if is_causal:
             S, L = scores.size(-2), scores.size(-1)
