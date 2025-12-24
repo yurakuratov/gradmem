@@ -3,22 +3,14 @@
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
 LR=3e-04
-# ADAM_BETA2=0.98
 TBS=256
 PER_DEVICE_BATCH_SIZE=64
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 MAX_STEPS=200000
 WARMUP_STEPS=10000
 
-# MAX_POSITION_EMBEDDINGS=1024
-# MODEL_NAME=mamba-130m-hf
-# PRETRAINED_MODEL=state-spaces/mamba-130m-hf
 MODEL_NAME=gpt2
 PRETRAINED_MODEL=gpt2
-
-# Dataset parameters
-# DATA_NAME="babilong_qa1_0k"
-# DATA_PATH="./data/${DATA_NAME}"
 
 RUN_NAME="${MODEL_NAME}"
 

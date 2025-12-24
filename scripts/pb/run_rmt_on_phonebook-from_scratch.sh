@@ -21,10 +21,10 @@ USE_MEM_PROJ=true
 MEM_PROJ_MODE="proj"
 USE_WRITE_HEAD=true
 
-N_MEM_TOKENS=8
+N_MEM_TOKENS=32
 
-for N_PAIRS in 2 4 8; do
-  for LR in 1e-03 3e-04; do
+for N_PAIRS in 2 4 8 16 32 64; do
+  for LR in 1e-03; do
     RUN_NAME=rmt2segm_${MODEL_NAME}_mem${N_MEM_TOKENS}
     if [ "$N_CTRL_TOKENS" -gt 0 ]; then
       RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
