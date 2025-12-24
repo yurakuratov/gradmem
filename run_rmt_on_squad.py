@@ -2,7 +2,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import math
 
 import torch
 import numpy as np
@@ -11,16 +10,17 @@ from dataclasses import dataclass, field
 import datasets
 
 import accelerate
+from safetensors.torch import load_file
 import transformers
 from transformers import (
     AutoConfig, AutoTokenizer,
-    AutoModelForCausalLM,
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback, TrainerCallback,
     HfArgumentParser
 )
 
+from rmt import RMT2Segm, RMT2SegmConfig
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -33,20 +33,23 @@ logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
 def collate_fn(batch, tokenizer):
-    seq = [item['context'] + item['query'] + item['target'] for item in batch]
-    seq_encoded = tokenizer(seq, return_tensors="pt", add_special_tokens=True,
-                            padding=True, pad_to_multiple_of=8, return_offsets_mapping=True)
-    input_ids = seq_encoded['input_ids']
-    offsets_mapping = seq_encoded['offset_mapping']
+    context = [item['context'].strip() for item in batch]
+    query = [item['query'] + item['target'] for item in batch]
 
-    attn_mask = (input_ids != tokenizer.pad_token_id).to(dtype=torch.long)
+    context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
+                                  padding=True, pad_to_multiple_of=8).input_ids
+    query_encoded = tokenizer(query, return_tensors="pt", add_special_tokens=True,
+                              padding=True, pad_to_multiple_of=8, return_offsets_mapping=True)
+    query_input_ids = query_encoded['input_ids']
+    offsets_mapping = query_encoded['offset_mapping']
+
     # add labels_mask
     # input_seq: 0, target_seq: 1, seq = input_seq + target_seq
-    labels_mask = torch.zeros_like(input_ids)
+    labels_mask = torch.zeros_like(query_input_ids)
     for i, item in enumerate(batch):
-        input_seq_len = len(item['context']) + len(item['query'])
+        query_seq_len = len(item['query'])
         target_seq_len = len(item['target'])
-        target_st, target_end = input_seq_len, input_seq_len + target_seq_len
+        target_st, target_end = query_seq_len, query_seq_len + target_seq_len
 
         # find target tokens
         # since target is closer to the end, search from the end
@@ -60,32 +63,35 @@ def collate_fn(batch, tokenizer):
             elif in_target:
                 break
 
-    labels = input_ids * labels_mask + (1 - labels_mask) * -100
+    labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
     return {
-        'input_ids': input_ids,
-        'attention_mask': attn_mask,
+        'input_ids': {
+            'context_input_ids': context_input_ids,
+            'query_input_ids': query_input_ids,
+        },
         'labels': labels,
     }
 
 
-def preprocess_logits_for_metrics(logits, labels):
+def preprocess_logits_for_metrics(eval_pred, labels):
+    logits, inner_loop_stats = eval_pred
     # saves gpu RAM, as HF Trainer accumulates all eval logits on GPU
-    return logits.argmax(dim=-1)
+    return (logits.argmax(dim=-1), inner_loop_stats)
 
 
 def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
-
-    # shift for lm loss
-    predictions = predictions[..., :-1]
+    preds, inner_loop_stats = predictions
+    preds = preds[..., :-1]
     labels = labels[..., 1:]
 
     # Create a mask for tokens that are not padding (-100) and ignored tokens (like ! and |)
     mask = (labels != -100)
     for t_id in ignore_token_ids:
         mask &= (labels != t_id)
+
     # Calculate token-level accuracy only on content tokens
-    masked_predictions = predictions[mask]
+    masked_predictions = preds[mask]
     masked_labels = labels[mask]
 
     accuracy = (masked_predictions == masked_labels).mean()
@@ -94,24 +100,43 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     # predictions.shape = (batch_size, seq_len)
     exact_match = np.mean([
         np.all(pred[mask[i]] == lab[mask[i]])
-        for i, (pred, lab) in enumerate(zip(predictions, labels))
+        for i, (pred, lab) in enumerate(zip(preds, labels))
         if np.any(mask[i])  # Skip samples that are all masked
     ])
 
-    for pred, label, inp in zip(predictions[:5], labels[:5], inputs[:5]):
+    for pred, label, inp_c, inp_q in zip(preds[:5], labels[:5],
+                                         inputs['context_input_ids'][:5], inputs['query_input_ids'][:5]):
         mask = (label != -100)
         pred = pred[mask]
-        inp[inp == -100] = tokenizer.pad_token_id
+        inp_c[inp_c == -100] = tokenizer.pad_token_id
+        inp_q[inp_q == -100] = tokenizer.pad_token_id
         label[label == -100] = tokenizer.pad_token_id
-        print('i:', tokenizer.decode(inp, skip_special_tokens=True).strip())
+        print('i:', tokenizer.decode(np.concatenate([inp_c, inp_q]), skip_special_tokens=True).strip())
         print('p:', tokenizer.decode(pred, skip_special_tokens=True).strip())
         print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
         print('-' * 50)
 
-    return {
+    metrics = {
         "token_accuracy": float(accuracy),
         "exact_match": float(exact_match),
+        "mem_norm_mean": float(inner_loop_stats['mem_norm_mean'].mean()),
+        "mem_norm_max": float(inner_loop_stats['mem_norm_max'].max()),
+        "mem_norm_min": float(inner_loop_stats['mem_norm_min'].min()),
     }
+    if 'step_delta_mem_norm_mean' in inner_loop_stats:
+        metrics.update({
+            "step_delta_mem_norm_mean": float(inner_loop_stats['step_delta_mem_norm_mean'].mean()),
+            "step_delta_mem_norm_max": float(inner_loop_stats['step_delta_mem_norm_max'].max()),
+            "step_delta_mem_norm_min": float(inner_loop_stats['step_delta_mem_norm_min'].min()),
+            "delta_mem_norm_mean": float(inner_loop_stats['delta_mem_norm_mean'].mean()),
+            "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
+            "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
+        })
+    if 'rec_loss' in inner_loop_stats:
+        metrics['rec_loss'] = float(inner_loop_stats['rec_loss'].mean())
+    if 'target_loss' in inner_loop_stats:
+        metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
+    return metrics
 
 
 class StopOnMetricValue(TrainerCallback):
@@ -151,7 +176,9 @@ class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
     dataset_name: str = field(default='squad')
-    tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62')
+    tokenizer_path: str = field(
+        default='./tokenizers/kv_alphabet_62/',
+    )
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -168,11 +195,23 @@ class ExperimentArgs:
     early_stopping_patience: Optional[int] = field(default=50)
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
+    tokenizer: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
+    init_base_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize base model'})
+    init_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize gradmemgpt model'})
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
-    max_position_embeddings: Optional[int] = field(default=None)
+    # RMT parameters
+    n_mem_tokens: Optional[int] = field(default=8)
+    K: Optional[int] = field(default=1)
+    n_ctrl_tokens: Optional[int] = field(default=0)
+    use_mem_proj: Optional[bool] = field(default=False)
+    mem_proj_mode: Optional[str] = field(default="none")
+    use_reconstruction_loss: Optional[bool] = field(default=False)
+    reconstruction_loss_weight: Optional[float] = field(default=1.0)
+    use_write_head: Optional[bool] = field(default=False)
+    attn_implementation: Optional[str] = field(default='eager')
 
 
 if __name__ == '__main__':
@@ -195,32 +234,25 @@ if __name__ == '__main__':
         config = {
             'cli_args': dict(vars(args)),
         }
-        logger.info('saving experiment configuration..')
+        logger.info(f'saving experiment configuration to {args.exp_path}')
         Path(args.exp_path).mkdir(parents=True)
         json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
 
-    if args.pretrained_model is not None:
-        tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-        model = AutoModelForCausalLM.from_pretrained(args.pretrained_model)
-    else:
+    if args.pretrained_model is None:
         # create tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-        # create model config
+        # create base model config
         if args.base_model == 'gpt2':
             config = AutoConfig.from_pretrained('gpt2')
             config.n_layer = args.n_layer
             config.n_head = args.n_head
             config.n_embd = args.n_embd
-            if args.max_position_embeddings is not None:
-                config.n_positions = args.max_position_embeddings
         elif args.base_model == 'pythia':
             config = AutoConfig.from_pretrained('EleutherAI/pythia-160m')
             config.num_hidden_layers = args.n_layer
             config.num_attention_heads = args.n_head
             config.hidden_size = args.n_embd
             config.intermediate_size = config.hidden_size * 4
-            if args.max_position_embeddings is not None:
-                config.max_position_embeddings = args.max_position_embeddings
         elif args.base_model == 'llama':
             config = AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B')
             config.num_hidden_layers = args.n_layer
@@ -229,20 +261,6 @@ if __name__ == '__main__':
             config.hidden_size = args.n_embd
             config.head_dim = config.hidden_size // config.num_attention_heads
             config.intermediate_size = config.hidden_size * 4
-            if args.max_position_embeddings is not None:
-                config.rope_scaling = None
-                config.rope_theta = 10000.0
-                config.max_position_embeddings = args.max_position_embeddings
-        elif args.base_model == 'mamba':
-            config = AutoConfig.from_pretrained('state-spaces/mamba-130m-hf')
-            config.num_hidden_layers = args.n_layer
-            config.n_layer = args.n_layer
-            config.hidden_size = args.n_embd
-            config.d_model = args.n_embd
-            config.expand = 4
-            config.intermediate_size = config.expand * config.hidden_size
-            config.d_inner = config.expand * config.hidden_size
-            config.time_step_rank = math.ceil(config.hidden_size / 16)
         else:
             raise ValueError(f'Unsupported base model: {args.base_model}')
 
@@ -251,17 +269,42 @@ if __name__ == '__main__':
         config.pad_token_id = tokenizer.pad_token_id
         config.bos_token_id = tokenizer.bos_token_id
         config.eos_token_id = tokenizer.eos_token_id
-        # create model
-        model = AutoModelForCausalLM.from_config(config)
+        config.use_cache = False
+    else:
+        config = None
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
+            print(f'using pretrained model tokenizer: {args.pretrained_model}')
+        except:
+            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+            print(f'using base model tokenizer: {args.tokenizer}')
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    model.config.use_cache = False
-    if model.config.pad_token_id is None:
-        model.config.pad_token_id = tokenizer.pad_token_id
+    rmt_config = RMT2SegmConfig(pretrained_model=args.pretrained_model, base_config=config,
+                                n_mem_tokens=args.n_mem_tokens, K=args.K,
+                                n_ctrl_tokens=args.n_ctrl_tokens,
+                                use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
+                                use_reconstruction_loss=args.use_reconstruction_loss,
+                                reconstruction_loss_weight=args.reconstruction_loss_weight,
+                                use_write_head=args.use_write_head, attn_implementation=args.attn_implementation)
+
+    # Create rmt model
+    model = RMT2Segm(rmt_config)
+
+    if args.init_checkpoint is not None:
+        missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
+        if len(missing_k) != 0:
+            logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
+        if len(unexpected_k) != 0:
+            logger.info(f'{unexpected_k} were found in checkpoint, but model is not expecting them!')
+
+    if accel.mixed_precision == 'bf16':
+        model.to(torch.bfloat16)
 
     logger.info(f'model config: {model.config}')
     logger.info(f'model: {model}')
+    logger.info(f'model.dtype: {model.dtype}')
 
     raw_dataset = datasets.load_dataset(args.dataset_name)
     if args.dataset_name == 'squad':
@@ -279,7 +322,7 @@ if __name__ == '__main__':
     # Let's not count ! and | in the accuracy calculation
     ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in []]
 
-    # Define custom compute metrics function with ignore tokens
+    # Define custom compute metrics function with ignored tokens
     def compute_metrics(eval_pred):
         return compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer)
 
@@ -295,6 +338,7 @@ if __name__ == '__main__':
     training_args = TrainingArguments(
         output_dir=output_dir,
         logging_dir=output_dir,
+
         max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_batch_size,
         per_device_eval_batch_size=args.per_device_batch_size,
@@ -318,7 +362,7 @@ if __name__ == '__main__':
         eval_on_start=True,
         greater_is_better=True,
         remove_unused_columns=False,
-        include_num_input_tokens_seen=True,
+        include_num_input_tokens_seen=False,  # input_ids is a dict, so HF Trainer cant get number of tokens
         include_for_metrics=['inputs'],
         save_total_limit=1,
         dataloader_num_workers=4,
@@ -343,33 +387,6 @@ if __name__ == '__main__':
     trainer.train()
     logger.info('training done. running final evaluation...')
     metrics = trainer.evaluate(dataset['valid'])
-
-    # TODO: use built-in trainer predict method, to parallelize generation on gpus, need to switch to seq2seq trainer..
-    # this code works, but takes about 30min to run on single A100 :(
-    # logger.info('final evaluation done. running generation to get final F-1, EM metrics...')
-    # model.config.use_cache = True
-    # predictions = []
-    # targets = []
-    # from tqdm.auto import tqdm
-    # for sample in tqdm(raw_dataset['validation'].select(range(1000))):
-    #     sample = preprocess_valid_fn(sample)
-    #     input_seq = sample['context'] + sample['query']
-    #     input_seq_encoded = tokenizer(input_seq, return_tensors='pt', add_special_tokens=True)
-    #     for k in input_seq_encoded:
-    #         input_seq_encoded[k] = input_seq_encoded[k].to(model.device)
-    #     with torch.no_grad():
-    #         output = model.generate(**input_seq_encoded, do_sample=False, max_new_tokens=10,
-    #                                 pad_token_id=tokenizer.pad_token_id)
-    #     predictions += [tokenizer.decode(output[0], skip_special_tokens=True)]
-    #     targets += [sample['target']]
-
-    # from squad_utils import squad_v1_f1, squad_v1_exact_match
-    # squad_metrics = {
-    #     'valid_squad_f1': squad_v1_f1(y_true=targets, y_predicted=predictions),
-    #     'valid_squad_em': squad_v1_exact_match(y_true=targets, y_predicted=predictions),
-    # }
-    # metrics.update(squad_metrics)
-
     logger.info(f'{metrics}')
     trainer.save_metrics(split='all', metrics=metrics)
     trainer.state.save_to_json(output_dir / 'trainer_state.json')
