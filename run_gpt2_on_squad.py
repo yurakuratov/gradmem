@@ -21,8 +21,6 @@ from transformers import (
     HfArgumentParser
 )
 
-from squad_utils import preprocess_train_fn, preprocess_valid_fn
-
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -152,12 +150,8 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(
-        default='./data/N2-K4V4-S4(32-64)_1M',
-    )
-    tokenizer_path: str = field(
-        default='./tokenizers/kv_alphabet_62/',
-    )
+    dataset_name: str = field(default='squad')
+    tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62')
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -207,8 +201,6 @@ if __name__ == '__main__':
 
     if args.pretrained_model is not None:
         tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
         model = AutoModelForCausalLM.from_pretrained(args.pretrained_model)
     else:
         # create tokenizer
@@ -261,6 +253,8 @@ if __name__ == '__main__':
         config.eos_token_id = tokenizer.eos_token_id
         # create model
         model = AutoModelForCausalLM.from_config(config)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     model.config.use_cache = False
     if model.config.pad_token_id is None:
@@ -269,13 +263,14 @@ if __name__ == '__main__':
     logger.info(f'model config: {model.config}')
     logger.info(f'model: {model}')
 
-    raw_dataset = datasets.load_dataset('squad')
-
-    dataset = datasets.DatasetDict({
-        'train': raw_dataset['train'].map(preprocess_train_fn, remove_columns=raw_dataset['train'].column_names),
-        'valid': raw_dataset['validation'].map(preprocess_train_fn,
-                                               remove_columns=raw_dataset['validation'].column_names)
-        })
+    raw_dataset = datasets.load_dataset(args.dataset_name)
+    if args.dataset_name == 'squad':
+        from squad_utils import preprocess_dataset
+    elif 'phonebook' in args.dataset_name:
+        from phonebook_utils import preprocess_dataset
+    else:
+        raise ValueError(f'Unsupported dataset: {args.dataset_name}')
+    dataset = preprocess_dataset(raw_dataset)
 
     def data_collator(batch):
         return collate_fn(batch, tokenizer)
@@ -300,7 +295,6 @@ if __name__ == '__main__':
     training_args = TrainingArguments(
         output_dir=output_dir,
         logging_dir=output_dir,
-
         max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_batch_size,
         per_device_eval_batch_size=args.per_device_batch_size,

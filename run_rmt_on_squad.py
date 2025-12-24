@@ -21,8 +21,6 @@ from transformers import (
 )
 
 from rmt import RMT2Segm, RMT2SegmConfig
-from squad_utils import preprocess_train_fn, preprocess_valid_fn
-
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -177,9 +175,7 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(
-        default='./data/N2-K4V4-S4(32-64)_1M',
-    )
+    dataset_name: str = field(default='squad')
     tokenizer_path: str = field(
         default='./tokenizers/kv_alphabet_62/',
     )
@@ -282,8 +278,8 @@ if __name__ == '__main__':
         except:
             tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
             print(f'using base model tokenizer: {args.tokenizer}')
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
     rmt_config = RMT2SegmConfig(pretrained_model=args.pretrained_model, base_config=config,
                                 n_mem_tokens=args.n_mem_tokens, K=args.K,
@@ -310,13 +306,14 @@ if __name__ == '__main__':
     logger.info(f'model: {model}')
     logger.info(f'model.dtype: {model.dtype}')
 
-    raw_dataset = datasets.load_dataset('squad')
-
-    dataset = datasets.DatasetDict({
-        'train': raw_dataset['train'].map(preprocess_train_fn, remove_columns=raw_dataset['train'].column_names),
-        'valid': raw_dataset['validation'].map(preprocess_train_fn,
-                                               remove_columns=raw_dataset['validation'].column_names)
-        })
+    raw_dataset = datasets.load_dataset(args.dataset_name)
+    if args.dataset_name == 'squad':
+        from squad_utils import preprocess_dataset
+    elif 'phonebook' in args.dataset_name:
+        from phonebook_utils import preprocess_dataset
+    else:
+        raise ValueError(f'Unsupported dataset: {args.dataset_name}')
+    dataset = preprocess_dataset(raw_dataset)
 
     def data_collator(batch):
         return collate_fn(batch, tokenizer)

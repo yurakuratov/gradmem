@@ -2,6 +2,7 @@ import re
 import string
 from collections import Counter
 from typing import List
+import datasets
 
 # code for metrics is taken from
 # https://github.com/deeppavlov/DeepPavlov/blob/5f9fbed0c7191466bc7621e604b810f66f254c03/deeppavlov/metrics/squad_metrics.py
@@ -89,9 +90,16 @@ def preprocess_train_fn(example):
     return {'context': context, 'query': question, 'target': answer}
 
 
-def preprocess_valid_fn(example):
-    context = example['context'].strip() + ' '
-    question = example['question'].strip() + ' '
-    # keep all answers for final metrics with generate method
-    answers = [text.strip() for text in example['answers']['text']]
-    return {'context': context, 'query': question, 'target': answers}
+# def preprocess_valid_fn(example):
+#     context = example['context'].strip() + ' '
+#     question = example['question'].strip() + ' '
+#     # keep all answers for final metrics with generate method
+#     answers = [text.strip() for text in example['answers']['text']]
+#     return {'context': context, 'query': question, 'target': answers}
+
+def preprocess_dataset(raw_dataset):
+    return datasets.DatasetDict({
+        'train': raw_dataset['train'].map(preprocess_train_fn, remove_columns=raw_dataset['train'].column_names),
+        'valid': raw_dataset['validation'].map(preprocess_train_fn,
+                                               remove_columns=raw_dataset['validation'].column_names)
+        })

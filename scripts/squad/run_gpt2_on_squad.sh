@@ -37,7 +37,6 @@ fi
 RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
 
 DATA_NAME="squad"
-DATA_PATH="./data/${DATA_NAME}"
 
 # Run ID
 N_VALUES=(1)
@@ -57,7 +56,7 @@ for N in "${N_VALUES[@]}"; do
     --per_device_batch_size $PER_DEVICE_BATCH_SIZE \
     --gradient_accumulation_steps $GRAD_ACC_STEPS \
     --total_batch_size $TBS \
-    --data_path $DATA_PATH \
+    --dataset_name $DATA_NAME \
     --learning_rate $LR \
     --pretrained_model $PRETRAINED_MODEL \
     --max_steps 200000 \
