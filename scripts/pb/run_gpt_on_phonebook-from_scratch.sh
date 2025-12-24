@@ -22,8 +22,7 @@ fi
 RUN_NAME=${RUN_NAME}_from_scratch
 
 for N_PAIRS in 4 8 16 32 64; do
-  DATA_NAME="phonebook"
-  DATA_PATH="booydar/${DATA_NAME}_N${N_PAIRS}"
+  DATA_NAME="booydar/phonebook_N${N_PAIRS}"
 
   # Run ID
   N_VALUES=(1)
@@ -37,12 +36,12 @@ for N_PAIRS in 4 8 16 32 64; do
       --num_processes $NP \
       --mixed_precision bf16 \
       --config_file accelerate.yaml \
-      run_gpt2_on_phonebook.py \
+      run_gpt2_on_squad.py \
       --exp_path $EXP_PATH \
       --per_device_batch_size $PER_DEVICE_BATCH_SIZE \
       --gradient_accumulation_steps $GRAD_ACC_STEPS \
       --total_batch_size $TBS \
-      --data_path $DATA_PATH \
+      --dataset_name $DATA_NAME \
       --learning_rate $LR \
       $( [ -n "$ADAM_BETA2" ] && echo "--adam_beta2 $ADAM_BETA2" ) \
       $( [ -n "$MAX_POSITION_EMBEDDINGS" ] && echo "--max_position_embeddings $MAX_POSITION_EMBEDDINGS" ) \
