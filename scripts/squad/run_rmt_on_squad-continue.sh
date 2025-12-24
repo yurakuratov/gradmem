@@ -4,12 +4,11 @@
 NP=${NP:-1}  # Default to 1 process if not set
 LR=1e-04
 TBS=64
-PER_DEVICE_BATCH_SIZE=32
+PER_DEVICE_BATCH_SIZE=16
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 USE_GRAD_CKPT=false
 
 MODEL_NAME=gpt2
-PRETRAINED_MODEL=gpt2
 
 
 # GradMemGPT specific parameters
@@ -34,10 +33,11 @@ fi
 if [ "$USE_WRITE_HEAD" = true ]; then
   RUN_NAME=${RUN_NAME}_whead
 fi
-RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
+RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}_from_gpt2_9k
 
 DATA_NAME="squad"
 DATA_PATH="./data/${DATA_NAME}"
+PRETRAINED_MODEL="/workspace-SR006.nfs2/bulatov/rmt/test-time/test_time_gd/runs/squad/gpt2_mem8_K2_mem_proj_whead_bs_64_lr_1e-04/run_1/checkpoint-9000"
 
 # Run ID
 N_VALUES=(1)
@@ -59,6 +59,7 @@ for N in "${N_VALUES[@]}"; do
     --total_batch_size $TBS \
     --data_path $DATA_PATH \
     --learning_rate $LR \
+    --tokenizer $MODEL_NAME \
     --pretrained_model $PRETRAINED_MODEL \
     --n_mem_tokens $N_MEM_TOKENS \
     --K $K \

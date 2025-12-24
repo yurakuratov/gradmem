@@ -245,6 +245,8 @@ if __name__ == '__main__':
     if args.pretrained_model is None:
         # create tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
         # create base model config
         if args.base_model == 'gpt2':
             config = AutoConfig.from_pretrained('gpt2')
@@ -310,12 +312,25 @@ if __name__ == '__main__':
     logger.info(f'model: {model}')
     logger.info(f'model.dtype: {model.dtype}')
 
-    raw_dataset = datasets.load_dataset('squad')
+    raw_dataset = datasets.load_dataset(args.data_path)
 
+    def preprocess_train_fn(example):
+        context = example['context'].strip() + ' '
+        question = '\n' + example['query'].strip() + ' '
+        answer = example['target'].strip()
+        return {'context': context, 'query': question, 'target': answer}
+
+    # def preprocess_valid_fn(example):
+    #     context = example['context'].strip() + ' '
+    #     question = example['query'].strip() + ' '
+    #     # keep all answers for final metrics with generate method
+    #     answers = [text.strip() for text in example['target']]
+    #     return {'context': context, 'query': question, 'target': answers}
+    
     dataset = datasets.DatasetDict({
         'train': raw_dataset['train'].map(preprocess_train_fn, remove_columns=raw_dataset['train'].column_names),
-        'valid': raw_dataset['validation'].map(preprocess_train_fn,
-                                               remove_columns=raw_dataset['validation'].column_names)
+        'valid': raw_dataset['test'].map(preprocess_train_fn,
+                                               remove_columns=raw_dataset['test'].column_names)
         })
 
     def data_collator(batch):

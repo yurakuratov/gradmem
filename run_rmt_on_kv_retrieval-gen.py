@@ -21,7 +21,6 @@ from transformers import (
 )
 
 from rmt import RMT2Segm, RMT2SegmConfig
-from squad_utils import preprocess_train_fn, preprocess_valid_fn
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -35,7 +34,7 @@ logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
 def collate_fn(batch, tokenizer):
-    context = [item['context'].strip() for item in batch]
+    context = [item['context'] for item in batch]
     query = [item['query'] + item['target'] for item in batch]
 
     context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
@@ -52,9 +51,8 @@ def collate_fn(batch, tokenizer):
         query_seq_len = len(item['query'])
         target_seq_len = len(item['target'])
         target_st, target_end = query_seq_len, query_seq_len + target_seq_len
-
         # find target tokens
-        # since target is closer to the end, search from the end
+        # since target is closer to the end (context, query, target), search from the end
         in_target = False
         for j in range(len(offsets_mapping[i]) - 1, -1, -1):
             st, end = offsets_mapping[i][j]
@@ -177,12 +175,8 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(
-        default='./data/N2-K4V4-S4(32-64)_1M',
-    )
-    tokenizer_path: str = field(
-        default='./tokenizers/kv_alphabet_62/',
-    )
+    data_path: str = field(default='./data/N2-K4V4-S4(32-64)_1M')
+    tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -198,11 +192,9 @@ class ExperimentArgs:
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
     seed: Optional[int] = field(default=142)
-    base_model: Optional[str] = field(default=None)
-    tokenizer: Optional[str] = field(default=None)
+    base_model: Optional[str] = field(default='gpt2')
     pretrained_model: Optional[str] = field(default=None)
-    init_base_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize base model'})
-    init_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize gradmemgpt model'})
+    init_checkpoint: Optional[str] = field(default=None)
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
@@ -276,12 +268,7 @@ if __name__ == '__main__':
         config.use_cache = False
     else:
         config = None
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-            print(f'using pretrained model tokenizer: {args.pretrained_model}')
-        except:
-            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
-            print(f'using base model tokenizer: {args.tokenizer}')
+        tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
@@ -310,20 +297,14 @@ if __name__ == '__main__':
     logger.info(f'model: {model}')
     logger.info(f'model.dtype: {model.dtype}')
 
-    raw_dataset = datasets.load_dataset('squad')
-
-    dataset = datasets.DatasetDict({
-        'train': raw_dataset['train'].map(preprocess_train_fn, remove_columns=raw_dataset['train'].column_names),
-        'valid': raw_dataset['validation'].map(preprocess_train_fn,
-                                               remove_columns=raw_dataset['validation'].column_names)
-        })
+    dataset = datasets.load_from_disk(args.data_path)
 
     def data_collator(batch):
         return collate_fn(batch, tokenizer)
 
     # Target sequence looks like: "XXXX!|"
     # Let's not count ! and | in the accuracy calculation
-    ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in []]
+    ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']]
 
     # Define custom compute metrics function with ignored tokens
     def compute_metrics(eval_pred):
