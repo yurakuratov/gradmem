@@ -6,42 +6,17 @@ LR=1e-04
 TBS=64
 PER_DEVICE_BATCH_SIZE=32
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
-USE_GRAD_CKPT=false
 
 MODEL_NAME=gpt2
 PRETRAINED_MODEL=gpt2
 
-
-# GradMemGPT specific parameters
-N_MEM_TOKENS=8
-N_CTRL_TOKENS=0
-K=2
-USE_MEM_PROJ=true
-MEM_PROJ_MODE="proj"
-USE_WRITE_HEAD=true
-
-RUN_NAME=${MODEL_NAME}_mem${N_MEM_TOKENS}
-if [ "$N_CTRL_TOKENS" -gt 0 ]; then
-  RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
-fi
-RUN_NAME=${RUN_NAME}_K${K}
-if [ "$USE_MEM_PROJ" = true ]; then
-  RUN_NAME=${RUN_NAME}_mem_proj
-  if [ "$MEM_PROJ_MODE" == "per_sample" ]; then
-    RUN_NAME=${RUN_NAME}_ps
-  fi
-fi
-if [ "$USE_WRITE_HEAD" = true ]; then
-  RUN_NAME=${RUN_NAME}_whead
-fi
-RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
+RUN_NAME=${MODEL_NAME}_bs_${TBS}_lr_${LR}
 
 DATA_NAME="squad"
 
 # Run ID
 N_VALUES=(1)
 for N in "${N_VALUES[@]}"; do
-  RND=$(date +%Y%m%d%H%M%S)
   # Path to save experiment results
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
 

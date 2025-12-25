@@ -7,11 +7,9 @@ LR_SCHEDULER_TYPE="constant_with_warmup"
 TBS=64
 PER_DEVICE_BATCH_SIZE=16
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
-USE_GRAD_CKPT=false
 
 MODEL_NAME=gpt2
 PRETRAINED_MODEL=gpt2
-
 
 # GradMemGPT specific parameters
 N_CTRL_TOKENS=0
@@ -43,7 +41,6 @@ for N_MEM_TOKENS in 64; do
   # Run ID
   N_VALUES=(1)
   for N in "${N_VALUES[@]}"; do
-    RND=$(date +%Y%m%d%H%M%S)
     # Path to save experiment results
     EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
 
