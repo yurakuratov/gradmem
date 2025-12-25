@@ -1,5 +1,6 @@
 #!/bin/bash
 
+set -e
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
 LR=3e-04
@@ -12,6 +13,7 @@ WARMUP_STEPS=10000
 MODEL_NAME=gpt2
 PRETRAINED_MODEL=gpt2
 
+DATA_NAME="wikitext"
 RUN_NAME="${MODEL_NAME}"
 
 RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
@@ -20,14 +22,13 @@ if [ -n "$ADAM_BETA2" ]; then
   RUN_NAME=${RUN_NAME}_b2_${ADAM_BETA2}
 fi
 
-for N_PAIRS in 2 4 8 16 32 64; do
-  DATA_NAME="booydar/phonebook_N${N_PAIRS}"
+for SEGMENT_SIZE in 128; do
+  RUN_NAME=${RUN_NAME}_ctx${SEGMENT_SIZE}
 
   # Run ID
-  N_VALUES=(2 3)
+  N_VALUES=(1)  
   for N in "${N_VALUES[@]}"; do
-    # Path to save experiment results
-    EXP_PATH="./runs/${DATA_NAME}/N${N_PAIRS}/${RUN_NAME}/run_$N"
+    EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
 
     # Execute the script using accelerate for parallel processing
     accelerate launch \
@@ -35,12 +36,13 @@ for N_PAIRS in 2 4 8 16 32 64; do
       --num_processes $NP \
       --mixed_precision bf16 \
       --config_file accelerate.yaml \
-      run_gpt2_on_squad.py \
+      run_gpt2_on_lm.py \
       --exp_path $EXP_PATH \
       --per_device_batch_size $PER_DEVICE_BATCH_SIZE \
       --gradient_accumulation_steps $GRAD_ACC_STEPS \
       --total_batch_size $TBS \
       --dataset_name $DATA_NAME \
+      --segment_size $SEGMENT_SIZE \
       --learning_rate $LR \
       $( [ -n "$ADAM_BETA2" ] && echo "--adam_beta2 $ADAM_BETA2" ) \
       $( [ -n "$MAX_POSITION_EMBEDDINGS" ] && echo "--max_position_embeddings $MAX_POSITION_EMBEDDINGS" ) \

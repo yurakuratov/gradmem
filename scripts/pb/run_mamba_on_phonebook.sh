@@ -22,10 +22,11 @@ fi
 for N_PAIRS in 4 8 16 32 64; do
   PER_DEVICE_BATCH_SIZE=$((512/N_PAIRS))
   GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
-  DATA_NAME="booydar/phonebook_N${N_PAIRS}"
+  DATASET="booydar/phonebook_N${N_PAIRS}"
+  DATA_NAME="phonebook"
 
   # Run ID
-  N_VALUES=(1)
+  N_VALUES=(2 3)
   for N in "${N_VALUES[@]}"; do
     # Path to save experiment results
     EXP_PATH="./runs/${DATA_NAME}/N${N_PAIRS}/${RUN_NAME}/run_$N"
@@ -41,7 +42,7 @@ for N_PAIRS in 4 8 16 32 64; do
       --per_device_batch_size $PER_DEVICE_BATCH_SIZE \
       --gradient_accumulation_steps $GRAD_ACC_STEPS \
       --total_batch_size $TBS \
-      --dataset_name $DATA_NAME \
+      --dataset_name $DATASET \
       --learning_rate $LR \
       $( [ -n "$ADAM_BETA2" ] && echo "--adam_beta2 $ADAM_BETA2" ) \
       $( [ -n "$MAX_POSITION_EMBEDDINGS" ] && echo "--max_position_embeddings $MAX_POSITION_EMBEDDINGS" ) \

@@ -9,6 +9,7 @@ WARMUP_STEPS=10000
 
 MODEL_NAME=mamba-130m-hf
 PRETRAINED_MODEL=state-spaces/mamba-130m-hf
+BASE_MODEL=mamba
 
 RUN_NAME="${MODEL_NAME}"
 
@@ -20,7 +21,8 @@ fi
 RUN_NAME=${RUN_NAME}_from_scratch
 
 for N_PAIRS in 4 8 16 32 64; do
-  DATA_NAME="booydar/phonebook_N${N_PAIRS}"
+  DATASET="booydar/phonebook_N${N_PAIRS}"
+  DATA_NAME="phonebook"
   
   PER_DEVICE_BATCH_SIZE=$((512/N_PAIRS))
   GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
@@ -42,11 +44,12 @@ for N_PAIRS in 4 8 16 32 64; do
       --per_device_batch_size $PER_DEVICE_BATCH_SIZE \
       --gradient_accumulation_steps $GRAD_ACC_STEPS \
       --total_batch_size $TBS \
-      --dataset_name $DATA_NAME \
+      --dataset_name $DATASET \
       --learning_rate $LR \
       $( [ -n "$ADAM_BETA2" ] && echo "--adam_beta2 $ADAM_BETA2" ) \
       $( [ -n "$MAX_POSITION_EMBEDDINGS" ] && echo "--max_position_embeddings $MAX_POSITION_EMBEDDINGS" ) \
-      --pretrained_model $PRETRAINED_MODEL \
+      --base_model $BASE_MODEL \
+      --tokenizer_path $PRETRAINED_MODEL \
       --max_steps $MAX_STEPS \
       --eval_steps 500 \
       --logging_steps 500 \
