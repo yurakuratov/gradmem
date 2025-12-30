@@ -23,7 +23,7 @@ class SDPA_FullManualBwd(torch.autograd.Function):
             scores = scores + attn_mask
         if is_causal:
             S, L = scores.size(-2), scores.size(-1)
-            causal = torch.triu(scores.new_full((S, L), float("-inf")), diagonal=1)
+            causal = torch.triu(scores.new_full((S, L), float("-inf")), diagonal=1).to(q.dtype)
             scores = scores + causal
         P = torch.softmax(scores, dim=-1)
         if pdrop and pdrop > 0.0:
@@ -49,11 +49,11 @@ class SDPA_FullManualBwd(torch.autograd.Function):
         scores = (q @ k.transpose(-2, -1)) * scale
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
-                attn_mask = torch.where(attn_mask, 0.0, float('-inf'))
+                attn_mask = torch.where(attn_mask, 0.0, float('-inf')).to(q.dtype)
             scores = scores + attn_mask
         if is_causal:
             S, L = scores.size(-2), scores.size(-1)
-            causal = torch.triu(scores.new_full((S, L), float("-inf")), diagonal=1)
+            causal = torch.triu(scores.new_full((S, L), float("-inf")), diagonal=1).to(q.dtype)
             scores = scores + causal
         P = torch.softmax(scores, dim=-1)
         if pdrop and pdrop > 0.0:
