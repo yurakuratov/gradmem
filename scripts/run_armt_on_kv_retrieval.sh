@@ -1,9 +1,9 @@
 #!/bin/bash
 set -e
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=0,1
 export WANDB_PROJECT=kv_retrieval
 # Define arguments for the script
-NP=${NP:-1}  # Default to 1 process if not set
+NP=$(echo $CUDA_VISIBLE_DEVICES | awk -F',' '{print NF}')
 LR=3e-04
 # ADAM_BETA2=0.95
 
@@ -26,11 +26,11 @@ V=62
 
 TBS=256
 
-NUMS_PAIRS=(2 4 8 16 32 64 128)
-NUMS_PAIRS_PER_SEGMENT=(1 1 2 2 4 4 8)
-BSS=(256 256 256 256 128 64 64)
-ITERSS=(30000 10000 30000 10000 30000 10000 30000)
-NS=(2)
+NUMS_PAIRS=(2 4 8 16 32 64 128 256)
+NUMS_PAIRS_PER_SEGMENT=(1 1 1 1 1 1 1 1)
+BSS=(128 128 128 128 128 64 64 32)
+ITERSS=(10000 10000 10000 10000 10000 10000 10000 10000)
+NS=(72)
 
 for N in "${NS[@]}"; do
 

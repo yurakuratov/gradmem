@@ -3,7 +3,7 @@ set -e
 export CUDA_VISIBLE_DEVICES=0
 export WANDB_PROJECT=kv_retrieval
 # Define arguments for the script
-NP=${NP:-1}  # Default to 1 process if not set
+NP=$(echo $CUDA_VISIBLE_DEVICES | awk -F',' '{print NF}')
 LR=3e-04
 # ADAM_BETA2=0.95
 
