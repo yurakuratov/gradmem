@@ -108,9 +108,7 @@ RUN_NAME=armt_thinking_${BASE_MODEL}_L${L}H${H}D${D}_mem${NUM_MEM_TOKENS}_dmem${
     --warmup_steps 1000 \
     --early_stopping_patience 500 \
     --seed $((142+$N+$i)) \
-    --model_cpt $MODEL_CPT \
-    --repeat_read_segments $REPEAT_READ_SEGMENTS \
-    --repeat_write_segments $REPEAT_WRITE_SEGMENTS
+    --model_cpt $MODEL_CPT
 done
 done
 
