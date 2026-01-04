@@ -21,7 +21,7 @@ V=62
 # DATA_NAME="N0-S1(4-4)_1M"
 # DATA_NAME="N10-K2V2-S4(32-64)_1M"
 # DATA_NAME="N8-K1V1-vocab512-no_noise_1M"
-DATA_NAME="N32-K2V2-V${V}_1M"
+DATA_NAME="N16-K2V2-V${V}_1M"
 DATA_PATH="./data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
@@ -30,14 +30,17 @@ N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
 K=1
 USE_MEM_PROJ=true
-MEM_PROJ_MODE="proj_rw"
-USE_RECONSTRUCTION_LOSS=true
+MEM_PROJ_MODE="proj"
+USE_RECONSTRUCTION_LOSS=false
 RECONSTRUCTION_LOSS_WEIGHT=1.0
-USE_WRITE_HEAD=true
-ATTN_IMPLEMENTATION="flash_attention_2"
+USE_WRITE_HEAD=false
+USE_MEM_RESIDUAL=false
+ATTN_IMPLEMENTATION="eager"
+# ATTN_IMPLEMENTATION="flash_attention_2"
 
-# INIT_CHECKPOINT=./runs/N4-K2V2-V62_1M/rmt2segm_llama_L4H4D128_mem8_mem_proj_bs_64_lr_1e-04/run_2/checkpoint-195500/model.safetensors
-RUN_NAME_SUFFIX=FA2
+# INIT_CHECKPOINT=./runs/N16-K2V2-V62_1M/rmt2segm_llama_L4H4D128_mem8_K1_mem_proj_rw_whead_rec_loss_w1.0_bs_64_lr_1e-04/run_2/checkpoint-294500/model.safetensors
+# INIT_CHECKPOINT=./runs/N16-K2V2-V62_1M/rmt2segm_llama_L4H4D128_mem8_K2_mem_proj_rw_whead_rec_loss_w1.0_bs_64_lr_1e-04/run_3/checkpoint-534500/model.safetensors
+# RUN_NAME_SUFFIX=init_N16_K2_FA2
 
 RUN_NAME=rmt2segm_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}_K${K}
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
@@ -49,6 +52,10 @@ fi
 
 if [ "$USE_WRITE_HEAD" = true ]; then
   RUN_NAME=${RUN_NAME}_whead
+fi
+
+if [ "$USE_MEM_RESIDUAL" = true ]; then
+  RUN_NAME=${RUN_NAME}_res
 fi
 
 if [ "$USE_RECONSTRUCTION_LOSS" = true ]; then
@@ -72,9 +79,9 @@ for N in "${N_VALUES[@]}"; do
 
   # Execute the script using accelerate for parallel processing
   accelerate launch \
-    --main_process_port $((29500+100*$K+$TBS+$N+120)) \
+    --main_process_port $((29500+100*$K+$TBS+$N+920)) \
     --num_processes $NP \
-    --mixed_precision 'bf16' \
+    --mixed_precision 'no' \
     --config_file accelerate.yaml \
     run_rmt_on_kv_retrieval.py \
     --exp_path $EXP_PATH \
@@ -98,10 +105,11 @@ for N in "${N_VALUES[@]}"; do
     $( [ "$USE_RECONSTRUCTION_LOSS" = true ] && echo "--use_reconstruction_loss" ) \
     $( [ "$USE_RECONSTRUCTION_LOSS" = true ] && echo "--reconstruction_loss_weight $RECONSTRUCTION_LOSS_WEIGHT" ) \
     $( [ "$USE_WRITE_HEAD" = true ] && echo "--use_write_head" ) \
+    $( [ "$USE_MEM_RESIDUAL" = true ] && echo "--use_mem_residual" ) \
     --max_steps 1000000 \
     --eval_steps 500 \
     --logging_steps 500 \
-    --warmup_steps 10000 \
+    --warmup_steps 2000 \
     --early_stopping_patience 500 \
     --seed $((142+$N))
 done

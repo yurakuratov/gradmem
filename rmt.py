@@ -29,10 +29,9 @@ class RMT2SegmConfig(PretrainedConfig):
                  use_mem_proj=False,
                  mem_proj_mode="none",
                  use_reconstruction_loss=False,
-                 use_reconstruction_loss_at_first_step=False,
-                 use_reconstruction_loss_all_steps=False,
                  reconstruction_loss_weight=1.0,
                  use_write_head=False,
+                 use_mem_residual=False,
                  use_gradient_checkpointing=False,
                  attn_implementation='eager',
                  **kwargs):
@@ -54,6 +53,7 @@ class RMT2SegmConfig(PretrainedConfig):
         self.use_reconstruction_loss = use_reconstruction_loss
         self.reconstruction_loss_weight = reconstruction_loss_weight
         self.use_write_head = use_write_head
+        self.use_mem_residual = use_mem_residual
 
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.attn_implementation = attn_implementation
@@ -111,6 +111,7 @@ class RMT2Segm(PreTrainedModel):
         self.use_reconstruction_loss = config.use_reconstruction_loss
         self.reconstruction_loss_weight = config.reconstruction_loss_weight
         self.use_write_head = config.use_write_head
+        self.use_mem_residual = config.use_mem_residual
 
         # check args
         assert self.mem_proj_mode in ["none", "proj", "proj_rw"]
@@ -149,6 +150,9 @@ class RMT2Segm(PreTrainedModel):
                 head_params = self.model.get_input_embeddings().weight
             with torch.no_grad():
                 self.write_head.weight.copy_(head_params.detach())
+
+        if self.use_mem_residual:
+            self.mem_residual_ln = nn.LayerNorm(n_embd)
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -212,7 +216,8 @@ class RMT2Segm(PreTrainedModel):
         # K segments write to memory
         # +1 for the last segment that computes reconstruction loss only
         # todo: ignore rec_loss at inference time, use only at training
-        for k in range(self.K + 1):
+        num_loops = self.K + (1 if self.use_reconstruction_loss else 0)
+        for k in range(num_loops):
             mem_inp_write = self.mem_proj(mem_batch) if self.mem_proj_mode in ["proj", "proj_rw"] else mem_batch
 
             if self.n_ctrl_tokens > 0:
@@ -238,7 +243,6 @@ class RMT2Segm(PreTrainedModel):
             h = outs.hidden_states[-1]           # [B,M+S+M,d]
             # extract mem tokens states
             mem_out = h[:, -self.n_mem_tokens:]  # [B,M,d]
-            mem_outs += [mem_out.clone()]
 
             if self.use_reconstruction_loss:
                 # ignore rec_loss at first step, as initial memory is empty, so loss can't be reduced much
@@ -261,18 +265,25 @@ class RMT2Segm(PreTrainedModel):
                         reduction='mean')
                     rec_losses += [rec_loss]
 
+            mem_out = mem_out if (not self.use_mem_residual or k == 0) else mem_batch + self.mem_residual_ln(mem_out)
             if k > 0 and 'step_delta_mem_norm_mean' in stats:
-                step_delta_mem_norm = (mem_out - mem_batch).norm(dim=(1, 2)).detach()
-                stats['step_delta_mem_norm_mean'] += step_delta_mem_norm.mean()
-                stats['step_delta_mem_norm_max'] = max(stats['step_delta_mem_norm_max'], step_delta_mem_norm.max())
-                stats['step_delta_mem_norm_min'] = min(stats['step_delta_mem_norm_min'], step_delta_mem_norm.min())
+                # exclude the final rec-only step from per-step delta stats
+                if not (self.use_reconstruction_loss and k == num_loops - 1):
+                    step_delta_mem_norm = (mem_out - mem_batch).norm(dim=(1, 2)).detach()
+                    stats['step_delta_mem_norm_mean'] += step_delta_mem_norm.mean()
+                    stats['step_delta_mem_norm_max'] = max(stats['step_delta_mem_norm_max'], step_delta_mem_norm.max())
+                    stats['step_delta_mem_norm_min'] = min(stats['step_delta_mem_norm_min'], step_delta_mem_norm.min())
 
+            mem_outs += [mem_out.clone()]
             mem_batch = mem_out
             del h, outs
 
         mem_out_first = mem_outs[0].clone().detach()
-        # ignore mem_out from the last segment that computes reconstruction loss only
-        mem_out = mem_outs[-2]
+        if self.use_reconstruction_loss:
+            # ignore mem_out from the last segment that computes reconstruction loss only
+            mem_out = mem_outs[-2]
+        else:
+            mem_out = mem_outs[-1]
         del mem_outs
 
         mem_norm = mem_out.norm(dim=(1, 2)).detach()  # B

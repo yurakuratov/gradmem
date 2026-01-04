@@ -40,11 +40,24 @@ conda activate /home/jovyan/kuratov/envs/py311_pt2.6_cu12.4  # or the path print
 
 Accelerate is configured via `accelerate.yaml`. The default configuration uses BF16 precision and a single process.
 
-## Dataset generation
+## Datasets
 
+### KV-retrieval
 Datasets consist of sequences containing random text segments with embedded `!key:value!` pairs. The last segment queries one of the previous keys (e.g. `?!K:`) and the model must output the corresponding value.
 
-To generate a dataset run the notebook `notebooks/dump_dataset.ipynb`. It relies on `kv_dataset_utils.generate_sequence` to create individual samples and dumps them using Hugging Face `datasets`. The resulting directory will be saved under `./data/<DATASET_NAME>` where `DATASET_NAME` encodes generation parameters, for example `N10-K4V4-S4(32-64)_1M`.
+To generate a dataset run the notebook `notebooks/dump_dataset.ipynb`. It relies on `kv_dataset_utils.generate_sequence` to create individual samples and dumps them using Hugging Face `datasets`. The resulting directory will be saved under `./data/<DATASET_NAME>` where `DATASET_NAME` encodes generation parameters, for example `N8_K2V2_1M`.
+
+Download KV-retrieval datasets from HF:
+```bash
+./scripts/download_kv_retrieval.sh
+```
+
+### bAbI
+Download bAbI datasets from HF:
+```bash
+./scripts/download_babi.sh
+```
+
 
 ## Training
 
