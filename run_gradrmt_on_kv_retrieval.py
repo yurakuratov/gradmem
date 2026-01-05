@@ -19,6 +19,7 @@ from transformers import (
     EarlyStoppingCallback, TrainerCallback,
     HfArgumentParser
 )
+from transformers.trainer_utils import get_last_checkpoint
 
 from grad_rmt import GradRMT, GradRMTConfig
 
@@ -298,7 +299,9 @@ if __name__ == '__main__':
 
     if args.init_checkpoint is not None:
         logger.info(f'Loading model checkpoint from {args.init_checkpoint}')
-        missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
+        
+        cpt_file = os.path.join(get_last_checkpoint(args.init_checkpoint), "model.safetensors")
+        missing_k, unexpected_k = model.load_state_dict(load_file(cpt_file), strict=False)
         if len(missing_k) != 0:
             logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
         if len(unexpected_k) != 0:

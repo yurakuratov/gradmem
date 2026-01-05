@@ -1,55 +1,12 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig, AttentionInterface, AttentionMaskInterface
-from transformers.masking_utils import sdpa_mask
-from transformers.integrations.sdpa_attention import repeat_kv
-from jvp_attention import JVPAttn
-from typing import Optional
+from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
+import attn_double_bwd  # noqa: F401  # side-effect: registers attention kernels
 
 from accelerate.logging import get_logger
 logger = get_logger('')
 
-def jvp_flash(
-    module: torch.nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    dropout: float = 0.0,
-    scaling: Optional[float] = None,
-    is_causal: Optional[bool] = None,
-    **kwargs,
-) -> tuple[torch.Tensor, None]:
-
-    if hasattr(module, "num_key_value_groups"):
-        key = repeat_kv(key, module.num_key_value_groups)
-        value = repeat_kv(value, module.num_key_value_groups)
-
-    if attention_mask is not None and attention_mask.ndim == 4:
-        attention_mask = attention_mask[:, :, :, : key.shape[-2]]
-        if attention_mask.size(1) < query.size(1):
-            attention_mask = attention_mask.expand(-1, query.size(1), -1, -1)
-    
-    if is_causal is None:
-        is_causal = query.shape[2] > 1 and attention_mask is None and getattr(module, "is_causal", True)
-
-    attn_output = JVPAttn.fwd(
-        query, key, value,
-        attn_mask=attention_mask,
-        dropout_p=dropout,
-        causal=is_causal,
-        sm_scale=scaling,
-    )
-
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, None
-
-def jvp_flash_mask(*args, **kwargs):
-    return sdpa_mask(*args, **kwargs)
-
-AttentionInterface.register("jvp_flash", jvp_flash)
-AttentionMaskInterface.register("jvp_flash", jvp_flash_mask)
 
 def get_backbone(m):
     # most HF CausalLM classes define base_model_prefix, e.g. "transformer" (GPT-2), "model" (LLaMA)
@@ -557,7 +514,7 @@ class GradRMT(PreTrainedModel):
             seq_len = mask.sum(dim=1).clamp_min(1)
             
             # pad to multiple of 32 for compatibility with JVP Flash Attention
-            if self.attn_implementation == 'jvp_flash':
+            if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
                 pad_list = [0, -(ctx_emb.size(1) + mem_offset) % 32, 0, 0]
                 mask = F.pad(mask, pad_list, "constant", 0)
                 lm_labels = F.pad(lm_labels, pad_list, "constant", 0)
@@ -716,7 +673,7 @@ class GradRMT(PreTrainedModel):
             x_qry = torch.cat([mem_inp, qry_emb], dim=1)                      # [B,M+Q,d]
 
         # pad to multiple of 32 for compatibility with JVP Flash Attention
-        if self.attn_implementation == 'jvp_flash':
+        if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
             pad_list = [0, 0, 0, -x_qry.size(1) % 32]
             x_qry = F.pad(x_qry, pad_list, "constant", 0)
             
