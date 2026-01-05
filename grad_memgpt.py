@@ -1,6 +1,8 @@
 import torch
 from torch import nn
+from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
+import attn_double_bwd  # noqa: F401  # side-effect: registers attention kernels
 
 
 def get_backbone(m):
@@ -36,6 +38,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  mem_proj_mode="none",
                  use_write_head=False,
                  use_gradient_checkpointing=False,
+                 attn_implementation="eager",
                  **kwargs):
         """
         Args:
@@ -81,6 +84,7 @@ class GradMemGPTConfig(PretrainedConfig):
             self.last_K_second_order = 0
         self.last_K_second_order = max(0, min(self.last_K_second_order, K))
         self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.attn_implementation = attn_implementation
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -136,9 +140,10 @@ class GradMemGPT(PreTrainedModel):
 
         # initialize base model, attention is eager to support backward pass over backward pass
         if config.pretrained_model is not None:
-            self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model, attn_implementation='eager')
+            self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model, attn_implementation=config.attn_implementation)
         else:
-            self.model = AutoModelForCausalLM.from_config(config.base_config, attn_implementation='eager')
+            self.model = AutoModelForCausalLM.from_config(config.base_config, attn_implementation=config.attn_implementation)
+        self.attn_implementation = config.attn_implementation
 
         # store GradMemGPT parameters
         self.n_mem_tokens = config.n_mem_tokens
@@ -364,6 +369,14 @@ class GradMemGPT(PreTrainedModel):
                 mask = (lm_labels != -100)
                 # n real tokens per sample
                 seq_len = mask.sum(dim=1).clamp_min(1)
+
+                # pad to multiple of 32 for compatibility with JVP Flash Attention
+                if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+                    pad_list = [0, -(ctx_emb.size(1) + mem_offset) % 32, 0, 0]
+                    mask = F.pad(mask, pad_list, "constant", 0)
+                    lm_labels = F.pad(lm_labels, pad_list, "constant", -100)
+                    ctx_emb = F.pad(ctx_emb, [0, 0] + pad_list, "constant", 0)
+
                 for k in range(self.K):
                     if self.mem_proj_mode == 'none':
                         mem_inp = mem_batch
@@ -476,8 +489,13 @@ class GradMemGPT(PreTrainedModel):
         else:
             x_qry = torch.cat([mem_inp, qry_emb], dim=1)                      # [B,M+Q,d]
 
+        # pad to multiple of 32 for compatibility with JVP Flash Attention
+        if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+            pad_list = [0, 0, 0, -x_qry.size(1) % 32]
+            x_qry = F.pad(x_qry, pad_list, "constant", 0)
+
         logits_q = self.model(inputs_embeds=x_qry).logits                     # [B,M+Q,V]
-        logits_q = logits_q[:, mem_offset:, :]    # [B,Q,V]
+        logits_q = logits_q[:, mem_offset:mem_offset+qry_emb.size(1), :]    # [B,Q,V]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:

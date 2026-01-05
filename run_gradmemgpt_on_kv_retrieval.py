@@ -168,12 +168,8 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(
-        default='./data/N2-K4V4-S4(32-64)_1M',
-    )
-    tokenizer_path: str = field(
-        default='./tokenizers/kv_alphabet_62/',
-    )
+    data_path: str = field(default='./data/N2-K4V4-S4(32-64)_1M')
+    tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -206,6 +202,7 @@ class ExperimentArgs:
     mem_proj_mode: Optional[str] = field(default="none")
     use_write_head: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
+    attn_implementation: Optional[str] = field(default="eager")
 
 
 if __name__ == '__main__':
@@ -278,7 +275,8 @@ if __name__ == '__main__':
                                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
                                       use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                       use_write_head=args.use_write_head,
-                                      use_gradient_checkpointing=args.use_gradient_checkpointing)
+                                      use_gradient_checkpointing=args.use_gradient_checkpointing,
+                                      attn_implementation=args.attn_implementation)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)

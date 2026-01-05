@@ -20,9 +20,7 @@ from transformers import (
     HfArgumentParser
 )
 
-from grad_memgpt import GradMemGPT, GradMemGPTConfig
-from squad_utils import preprocess_train_fn, preprocess_valid_fn
-
+from rmt import RMT2Segm, RMT2SegmConfig
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -118,20 +116,27 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
         print('-' * 50)
 
-    return {
+    metrics = {
         "token_accuracy": float(accuracy),
         "exact_match": float(exact_match),
-        "inner_loss": float(inner_loop_stats['inner_loss'].mean()),
-        "inner_grad_norm": float(inner_loop_stats['inner_grad_norm_mean'].mean()),
-        "inner_grad_norm_max": float(inner_loop_stats['inner_grad_norm_max'].max()),
-        "inner_grad_norm_min": float(inner_loop_stats['inner_grad_norm_min'].min()),
         "mem_norm_mean": float(inner_loop_stats['mem_norm_mean'].mean()),
         "mem_norm_max": float(inner_loop_stats['mem_norm_max'].max()),
         "mem_norm_min": float(inner_loop_stats['mem_norm_min'].min()),
-        "delta_mem_norm_mean": float(inner_loop_stats['delta_mem_norm_mean'].mean()),
-        "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
-        "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
     }
+    if 'step_delta_mem_norm_mean' in inner_loop_stats:
+        metrics.update({
+            "step_delta_mem_norm_mean": float(inner_loop_stats['step_delta_mem_norm_mean'].mean()),
+            "step_delta_mem_norm_max": float(inner_loop_stats['step_delta_mem_norm_max'].max()),
+            "step_delta_mem_norm_min": float(inner_loop_stats['step_delta_mem_norm_min'].min()),
+            "delta_mem_norm_mean": float(inner_loop_stats['delta_mem_norm_mean'].mean()),
+            "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
+            "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
+        })
+    if 'rec_loss' in inner_loop_stats:
+        metrics['rec_loss'] = float(inner_loop_stats['rec_loss'].mean())
+    if 'target_loss' in inner_loop_stats:
+        metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
+    return metrics
 
 
 class StopOnMetricValue(TrainerCallback):
@@ -170,9 +175,7 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(
-        default='./data/N2-K4V4-S4(32-64)_1M',
-    )
+    dataset_name: str = field(default='squad')
     tokenizer_path: str = field(
         default='./tokenizers/kv_alphabet_62/',
     )
@@ -185,30 +188,30 @@ class ExperimentArgs:
     eval_steps: Optional[int] = field(default=100)
     weight_decay: Optional[float] = field(default=0.0)
     learning_rate: Optional[float] = field(default=1e-04)
+    adam_beta1: Optional[float] = field(default=0.9)
+    adam_beta2: Optional[float] = field(default=0.999)
+    adam_epsilon: Optional[float] = field(default=1e-8)
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
+    tokenizer: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
     init_base_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize base model'})
     init_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize gradmemgpt model'})
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
-    # GradMemGPT parameters
+    # RMT parameters
     n_mem_tokens: Optional[int] = field(default=8)
-    K: Optional[int] = field(default=3)
-    inner_lr: Optional[float] = field(default=0.01)
-    use_adam: Optional[bool] = field(default=True)
-    grad_mode: Optional[str] = field(default="none")
+    K: Optional[int] = field(default=1)
     n_ctrl_tokens: Optional[int] = field(default=0)
-    inner_clip_value: Optional[float] = field(default=None)
-    inner_clip_norm: Optional[float] = field(default=None)
     use_mem_proj: Optional[bool] = field(default=False)
     mem_proj_mode: Optional[str] = field(default="none")
+    use_reconstruction_loss: Optional[bool] = field(default=False)
+    reconstruction_loss_weight: Optional[float] = field(default=1.0)
     use_write_head: Optional[bool] = field(default=False)
-    use_gradient_checkpointing: Optional[bool] = field(default=False)
-    attn_implementation: Optional[str] = field(default="eager")
+    attn_implementation: Optional[str] = field(default='eager')
 
 
 if __name__ == '__main__':
@@ -233,7 +236,8 @@ if __name__ == '__main__':
         }
         logger.info(f'saving experiment configuration to {args.exp_path}')
         Path(args.exp_path).mkdir(parents=True)
-        json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
+        with open(os.path.join(args.exp_path, 'config.json'), 'w') as f:
+            json.dump(config, f, indent=4)
 
     if args.pretrained_model is None:
         # create tokenizer
@@ -269,36 +273,32 @@ if __name__ == '__main__':
         config.use_cache = False
     else:
         config = None
-        tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
+            print(f'using pretrained model tokenizer: {args.pretrained_model}')
+        except:
+            tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+            print(f'using base model tokenizer: {args.tokenizer}')
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
-                                      n_mem_tokens=args.n_mem_tokens, K=args.K,
-                                      lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
-                                      n_ctrl_tokens=args.n_ctrl_tokens,
-                                      inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
-                                      use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
-                                      use_write_head=args.use_write_head,
-                                      use_gradient_checkpointing=args.use_gradient_checkpointing,
-                                      attn_implementation=args.attn_implementation)
+    rmt_config = RMT2SegmConfig(pretrained_model=args.pretrained_model, base_config=config,
+                                n_mem_tokens=args.n_mem_tokens, K=args.K,
+                                n_ctrl_tokens=args.n_ctrl_tokens,
+                                use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
+                                use_reconstruction_loss=args.use_reconstruction_loss,
+                                reconstruction_loss_weight=args.reconstruction_loss_weight,
+                                use_write_head=args.use_write_head, attn_implementation=args.attn_implementation)
 
-    # Create gradmemgpt model
-    model = GradMemGPT(gradmem_config)
+    # Create rmt model
+    model = RMT2Segm(rmt_config)
 
-    model_to_init_from_ckpt = None
     if args.init_checkpoint is not None:
-        model_to_init_from_ckpt = model
-        init_ckpt_path = args.init_checkpoint
-    elif args.init_base_checkpoint is not None:
-        model_to_init_from_ckpt = model.model
-        init_ckpt_path = args.init_base_checkpoint
-    if model_to_init_from_ckpt is not None:
-        missing_k, unexpected_k = model_to_init_from_ckpt.load_state_dict(load_file(init_ckpt_path), strict=False)
+        missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
         if len(missing_k) != 0:
             logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
         if len(unexpected_k) != 0:
-            logger.info(f'{unexpected_k} were found in checkpoint, but model_to_init_from_ckpt is not expecting them!')
+            logger.info(f'{unexpected_k} were found in checkpoint, but model is not expecting them!')
 
     if accel.mixed_precision == 'bf16':
         model.to(torch.bfloat16)
@@ -307,13 +307,14 @@ if __name__ == '__main__':
     logger.info(f'model: {model}')
     logger.info(f'model.dtype: {model.dtype}')
 
-    raw_dataset = datasets.load_dataset('squad')
-
-    dataset = datasets.DatasetDict({
-        'train': raw_dataset['train'].map(preprocess_train_fn, remove_columns=raw_dataset['train'].column_names),
-        'valid': raw_dataset['validation'].map(preprocess_train_fn,
-                                               remove_columns=raw_dataset['validation'].column_names)
-        })
+    raw_dataset = datasets.load_dataset(args.dataset_name)
+    if args.dataset_name == 'squad':
+        from squad_utils import preprocess_dataset
+    elif 'phonebook' in args.dataset_name:
+        from phonebook_utils import preprocess_dataset
+    else:
+        raise ValueError(f'Unsupported dataset: {args.dataset_name}')
+    dataset = preprocess_dataset(raw_dataset)
 
     def data_collator(batch):
         return collate_fn(batch, tokenizer)
@@ -346,8 +347,10 @@ if __name__ == '__main__':
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        adam_epsilon=args.adam_epsilon,
         lr_scheduler_type=args.lr_scheduler_type,
-        gradient_checkpointing=args.use_gradient_checkpointing,
 
         eval_strategy='steps',
         save_strategy='steps',
