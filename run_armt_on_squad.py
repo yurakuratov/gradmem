@@ -27,8 +27,6 @@ from transformers import (
 submodule_path = Path(__file__).parent / "associative-recurrent-memory-transformer"
 sys.path.insert(0, str(submodule_path))
 
-from modeling_amt.thinking import ThinkingARMTConfig, ThinkingARMTForCausalLM
-
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 logger_fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -49,7 +47,7 @@ def collate_fn(batch, tokenizer):
         return_tensors="pt",
         add_special_tokens=True,
         padding="max_length",
-        max_length=128,
+        max_length=160,
     ).input_ids
 
     query_encoded = tokenizer(
@@ -97,13 +95,23 @@ def collate_fn(batch, tokenizer):
 
 
 def preprocess_logits_for_metrics(eval_pred, labels):
-    # ThinkingARMTForCausalLM may return tuple/dict. We only need argmax(logits) for metrics.
+    # Model may return tuple/dict; we only need argmax(logits) for metrics.
     if isinstance(eval_pred, tuple):
-        logits = eval_pred[0]
-        if len(eval_pred) > 1:
-            inner_loop_stats = eval_pred[1] if isinstance(eval_pred[1], dict) else {}
-        else:
-            inner_loop_stats = {}
+        # HF Trainer sometimes passes a tuple of multiple tensors (e.g., logits, hidden_states, etc).
+        # Prefer the 3D tensor [batch, seq, vocab] as logits; otherwise fall back to the first element.
+        logits = None
+        for item in eval_pred:
+            if hasattr(item, "dim") and callable(item.dim):
+                try:
+                    if item.dim() == 3:
+                        logits = item
+                        break
+                except Exception:
+                    pass
+        if logits is None:
+            logits = eval_pred[0]
+        # Thinking impl may append inner-loop stats dict; old impl typically does not.
+        inner_loop_stats = eval_pred[1] if (len(eval_pred) > 1 and isinstance(eval_pred[1], dict)) else {}
     elif isinstance(eval_pred, dict):
         logits = eval_pred.get("logits", eval_pred)
         inner_loop_stats = {k: v for k, v in eval_pred.items() if k != "logits"}
@@ -141,6 +149,15 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
             "mem_norm_max": torch.tensor(-1.0, device=device) if device else torch.tensor(-1.0),
             "mem_norm_min": torch.tensor(-1.0, device=device) if device else torch.tensor(-1.0),
         }
+
+    # Some older ARMT code paths can end up with flattened predictions (1D) after preprocess/gather.
+    # If that happens, try to reshape back to label shape when possible.
+    try:
+        if hasattr(preds, "ndim") and hasattr(labels, "ndim") and preds.ndim == 1 and labels.ndim == 2:
+            if preds.size == labels.size:
+                preds = preds.reshape(labels.shape)
+    except Exception:
+        pass
 
     preds = preds[..., :-1]
     labels = labels[..., 1:]
@@ -231,6 +248,7 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
+    armt_impl: str = field(default="thinking")  # one of: ["old", "thinking"]
     dataset_name: str = field(default="squad")
     tokenizer_path: str = field(default="./tokenizers/kv_alphabet_62/")
     gradient_accumulation_steps: Optional[int] = field(default=1)
@@ -283,6 +301,9 @@ if __name__ == "__main__":
     logger.info(f"num processes: {accel.num_processes}")
     logger.info(f"mixed precision: {accel.mixed_precision}")
     logger.info(f"accelerator state: {accel.state}")
+
+    if args.armt_impl not in ("thinking", "old"):
+        raise ValueError(f"--armt_impl must be one of ['old', 'thinking'], got: {args.armt_impl}")
 
     assert not (
         args.pretrained_model is not None and args.base_model is not None
@@ -337,38 +358,55 @@ if __name__ == "__main__":
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    if args.armt_impl == "thinking":
+        from modeling_amt.thinking import ThinkingARMTConfig as ARMTConfigCls
+        from modeling_amt.thinking import ThinkingARMTForCausalLM as ARMTModelCls
+    else:
+        from modeling_amt.model import ARMTConfig as ARMTConfigCls
+        from modeling_amt.model import ARMTForCausalLM as ARMTModelCls
+
+    def build_armt_config() -> "ARMTConfigCls":
+        cfg_kwargs = dict(
+            base_model_name=base_model_name,
+            base_model_config=base_config,
+            num_mem_tokens=args.num_mem_tokens,
+            d_mem=args.d_mem,
+            segment_size=args.segment_size,
+            segment_alignment=args.segment_alignment,
+            layers_attr=args.layers_attr,
+            wrap_pos=args.wrap_pos,
+            correction=args.correction,
+            n_heads=args.n_heads,
+            use_denom=args.use_denom,
+        )
+        if args.armt_impl == "thinking":
+            cfg_kwargs.update(
+                dict(
+                    reading_depth_multiplier=args.reading_depth_multiplier,
+                    writing_depth_multiplier=args.writing_depth_multiplier,
+                )
+            )
+        armt_config = ARMTConfigCls(**cfg_kwargs)
+        if base_config is not None:
+            armt_config.vocab_size = base_config.vocab_size
+            armt_config.pad_token_id = base_config.pad_token_id
+            armt_config.bos_token_id = getattr(base_config, "bos_token_id", None)
+            armt_config.eos_token_id = getattr(base_config, "eos_token_id", None)
+        return armt_config
+
     # Load ARMT model from checkpoint or create a new one
     if args.model_cpt is not None and args.model_cpt != "None":
         checkpoint_dir = args.model_cpt
         logger.info(f"Loading ARMT model from checkpoint: {checkpoint_dir}")
         try:
-            model = ThinkingARMTForCausalLM.from_pretrained(checkpoint_dir)
+            model = ARMTModelCls.from_pretrained(checkpoint_dir)
             logger.info(f"Successfully loaded ARMT model from {checkpoint_dir}")
         except Exception as e:
             logger.warning(f"Failed to load as pretrained model: {e}")
             logger.info("Falling back to state-dict loading...")
 
-            armt_config = ThinkingARMTConfig(
-                base_model_name=base_model_name,
-                base_model_config=base_config,
-                num_mem_tokens=args.num_mem_tokens,
-                d_mem=args.d_mem,
-                segment_size=args.segment_size,
-                segment_alignment=args.segment_alignment,
-                layers_attr=args.layers_attr,
-                wrap_pos=args.wrap_pos,
-                correction=args.correction,
-                n_heads=args.n_heads,
-                use_denom=args.use_denom,
-                reading_depth_multiplier=args.reading_depth_multiplier,
-                writing_depth_multiplier=args.writing_depth_multiplier,
-            )
-            if base_config is not None:
-                armt_config.vocab_size = base_config.vocab_size
-                armt_config.pad_token_id = base_config.pad_token_id
-                armt_config.bos_token_id = getattr(base_config, "bos_token_id", None)
-                armt_config.eos_token_id = getattr(base_config, "eos_token_id", None)
-            model = ThinkingARMTForCausalLM(armt_config)
+            armt_config = build_armt_config()
+            model = ARMTModelCls(armt_config)
 
             checkpoint_paths = [
                 os.path.join(checkpoint_dir, "model_best", "model.safetensors"),
@@ -397,27 +435,8 @@ if __name__ == "__main__":
             if not loaded:
                 raise FileNotFoundError(f"Could not find a checkpoint file in {checkpoint_dir}. Tried: {checkpoint_paths}")
     else:
-        armt_config = ThinkingARMTConfig(
-            base_model_name=base_model_name,
-            base_model_config=base_config,
-            num_mem_tokens=args.num_mem_tokens,
-            d_mem=args.d_mem,
-            segment_size=args.segment_size,
-            segment_alignment=args.segment_alignment,
-            layers_attr=args.layers_attr,
-            wrap_pos=args.wrap_pos,
-            correction=args.correction,
-            n_heads=args.n_heads,
-            use_denom=args.use_denom,
-            reading_depth_multiplier=args.reading_depth_multiplier,
-            writing_depth_multiplier=args.writing_depth_multiplier,
-        )
-        if base_config is not None:
-            armt_config.vocab_size = base_config.vocab_size
-            armt_config.pad_token_id = base_config.pad_token_id
-            armt_config.bos_token_id = getattr(base_config, "bos_token_id", None)
-            armt_config.eos_token_id = getattr(base_config, "eos_token_id", None)
-        model = ThinkingARMTForCausalLM(armt_config)
+        armt_config = build_armt_config()
+        model = ARMTModelCls(armt_config)
 
     if args.init_checkpoint is not None:
         missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)

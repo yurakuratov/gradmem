@@ -1,8 +1,9 @@
 #!/bin/bash
 export WANDB_PROJECT=squad
+export HF_Trainer=1
 # export armt_mask_2d=1
 # export NOT_INVERT_ATTN_MASK=1
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=1
 # Train ARMT on SQuAD (mirrors run_armt_on_kv_retrieval.sh structure, but uses HF SQuAD dataset)
 
 NP=$(echo $CUDA_VISIBLE_DEVICES | awk -F',' '{print NF}')
@@ -29,7 +30,7 @@ DATA_NAME="mkairov/short_squad"
 RUN_NAME=armt_thinking_${PRETRAINED_MODEL}_mem${NUM_MEM_TOKENS}_dmem${D_MEM}_seg${SEGMENT_SIZE}_wdm${WRITING_DEPTH_MULTIPLIER}_rdm${READING_DEPTH_MULTIPLIER}_bs_${TBS}_lr_${LR}
 
 # Run ID
-N_VALUES=(2)
+N_VALUES=(5)
 for N in "${N_VALUES[@]}"; do
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
   
@@ -61,7 +62,8 @@ for N in "${N_VALUES[@]}"; do
     --logging_steps 500 \
     --warmup_steps 10000 \
     --early_stopping_patience 500 \
-    --seed $((142+$N))
+    --seed $((142+$N)) \
+    --armt_impl old
 done
 
 echo "Done"
