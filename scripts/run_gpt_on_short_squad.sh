@@ -4,13 +4,13 @@ export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUBLAS_WORKSPACE_CONFIG=:4096:2
 export CUDA_LAUNCH_BLOCKING=1
-export CUDA_VISIBLE_DEVICES=1,3
-NP=2
+export CUDA_VISIBLE_DEVICES=0
+NP=1
 
 # Define arguments for the script
 LR=1e-04
 TBS=64
-PER_DEVICE_BATCH_SIZE=32
+PER_DEVICE_BATCH_SIZE=64
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 
 L=4
@@ -29,7 +29,7 @@ V=62
 # DATA_NAME="N4-K1V1-vocab512_1M"
 # copy task
 # DATA_NAME="N0-S1(4-4)_1M"
-DATA_NAME="squad_short"
+DATA_NAME="short_squad"
 DATA_PATH="./data/${DATA_NAME}"
 TOKENIZER_PATH="gpt2"
 
@@ -50,7 +50,7 @@ fi
 
 
 # Run ID
-N_VALUES=(2)
+N_VALUES=(1)
 for N in "${N_VALUES[@]}"; do
   # Path to save experiment results
   EXP_PATH="/cephfs/home/mkairov/gd_runs/${DATA_NAME}/${RUN_NAME}/run_$N"

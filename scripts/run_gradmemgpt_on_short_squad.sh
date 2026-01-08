@@ -18,9 +18,9 @@ PRETRAINED_MODEL=gpt2
 
 
 # GradMemGPT specific parameters
-N_MEM_TOKENS=8
+N_MEM_TOKENS=32
 N_CTRL_TOKENS=0
-K=2
+K=5
 INNER_LR=0.4
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
@@ -101,8 +101,9 @@ for N in "${N_VALUES[@]}"; do
     --warmup_steps 10000 \
     --early_stopping_patience 500 \
     --seed $((142+$N)) \
-    --base_model $MODEL_NAME
-    # --init_checkpoint "model.safetensors"
+    --attn_implementation "hvp_semi_manual" \
+    --pretrained_model $PRETRAINED_MODEL \
+    --init_base_checkpoint "/cephfs/home/mkairov/gd_runs/short_squad/gpt2_L4H4D128_bs_64_lr_1e-04/run_2/checkpoint-5500/model.safetensors"
 done
 
 echo "Done"

@@ -21,7 +21,7 @@ from transformers import (
 )
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
-from squad_utils import preprocess_train_fn, preprocess_valid_fn
+from squad_utils import preprocess_train_fn
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -208,6 +208,7 @@ class ExperimentArgs:
     mem_proj_mode: Optional[str] = field(default="none")
     use_write_head: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
+    attn_implementation: Optional[str] = field(default="eager")
 
 
 if __name__ == '__main__':
@@ -283,7 +284,8 @@ if __name__ == '__main__':
                                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
                                       use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                       use_write_head=args.use_write_head,
-                                      use_gradient_checkpointing=args.use_gradient_checkpointing)
+                                      use_gradient_checkpointing=args.use_gradient_checkpointing,
+                                      attn_implementation=args.attn_implementation)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
@@ -296,11 +298,15 @@ if __name__ == '__main__':
         model_to_init_from_ckpt = model.model
         init_ckpt_path = args.init_base_checkpoint
     if model_to_init_from_ckpt is not None:
+        logger.info(f'loading checkpoint from {init_ckpt_path}')
         missing_k, unexpected_k = model_to_init_from_ckpt.load_state_dict(load_file(init_ckpt_path), strict=False)
         if len(missing_k) != 0:
             logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
         if len(unexpected_k) != 0:
             logger.info(f'{unexpected_k} were found in checkpoint, but model_to_init_from_ckpt is not expecting them!')
+        if args.init_base_checkpoint is not None:
+            logger.info("Tying model weights for embeddings and lm_head.")
+            model_to_init_from_ckpt.tie_weights()
 
     if accel.mixed_precision == 'bf16':
         model.to(torch.bfloat16)

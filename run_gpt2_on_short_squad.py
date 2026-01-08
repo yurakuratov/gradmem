@@ -21,7 +21,7 @@ from transformers import (
     HfArgumentParser
 )
 
-from squad_utils import preprocess_train_fn, preprocess_valid_fn
+from squad_utils import preprocess_train_fn
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
