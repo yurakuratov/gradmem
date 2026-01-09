@@ -10,15 +10,15 @@ NP=$(echo $CUDA_VISIBLE_DEVICES | awk -F',' '{print NF}')
 LR=3e-04
 LR_SCHEDULER_TYPE="constant_with_warmup"
 TBS=64
-PER_DEVICE_BATCH_SIZE=64
+PER_DEVICE_BATCH_SIZE=32
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 
 # Choose a backbone. For GPT-2, layers live under "transformer.h".
-PRETRAINED_MODEL=gpt2
+PRETRAINED_MODEL=mkairov/gpt2_short_squad
 LAYERS_ATTR="transformer.h"
 
 # ARMT parameters
-NUM_MEM_TOKENS=8
+NUM_MEM_TOKENS=32
 D_MEM=64
 SEGMENT_SIZE=128
 SEGMENT_ALIGNMENT="left"

@@ -47,7 +47,7 @@ def collate_fn(batch, tokenizer):
         return_tensors="pt",
         add_special_tokens=True,
         padding="max_length",
-        max_length=160,
+        max_length=128,
     ).input_ids
 
     query_encoded = tokenizer(
