@@ -6,6 +6,7 @@ from pathlib import Path
 
 import torch
 import numpy as np
+import types
 from typing import Dict, Optional
 from dataclasses import dataclass, field
 import datasets
@@ -26,8 +27,6 @@ from transformers import (
 submodule_path = Path(__file__).parent / "associative-recurrent-memory-transformer"
 sys.path.insert(0, str(submodule_path))
 
-from modeling_amt.thinking import ThinkingARMTConfig, ThinkingARMTForCausalLM
-
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -39,59 +38,119 @@ logger = logging.getLogger('')
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
-def collate_fn(batch, tokenizer):
-    context = [item['context'] for item in batch]
-    query = [item['query'] + item['target'] for item in batch]
+def collate_fn(batch, tokenizer, use_segmented_inputs: bool = False, max_context_length: Optional[int] = None):
+    """
+    If use_segmented_inputs=True (babi runs), build ARMT segmented inputs:
+      - segment 0: context
+      - segment 1: query + target
+    and return `input_segmented=True` similarly to run_armt_on_squad.py.
 
-    context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=False,
-                                  padding=False).input_ids
-    query_encoded = tokenizer(query, return_tensors="pt", add_special_tokens=False,
-                              padding=False, return_offsets_mapping=True)
-    query_input_ids = query_encoded['input_ids']
-    offsets_mapping = query_encoded['offset_mapping']
+    Otherwise keep the legacy KV-retrieval behavior (single concatenated tensor).
+    """
+    context = [item["context"] for item in batch]
+    query = [item["query"] + item["target"] for item in batch]
 
-    # add labels_mask
+    if use_segmented_inputs:
+        # Need a pad token for dynamic padding.
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token_id = tokenizer.eos_token_id
+
+        context_kwargs = dict(
+            return_tensors="pt",
+            add_special_tokens=True,
+            padding=True,
+            pad_to_multiple_of=8,
+        )
+        if max_context_length is not None:
+            context_kwargs.update(dict(max_length=max_context_length, truncation=True))
+
+        context_encoded = tokenizer(context, **context_kwargs)
+        context_input_ids = context_encoded["input_ids"]
+        context_attention_mask = context_encoded["attention_mask"]
+
+        query_encoded = tokenizer(
+            query,
+            return_tensors="pt",
+            add_special_tokens=True,
+            padding=True,
+            pad_to_multiple_of=8,
+            return_offsets_mapping=True,
+        )
+        query_input_ids = query_encoded["input_ids"]
+        query_attention_mask = query_encoded["attention_mask"]
+        offsets_mapping = query_encoded["offset_mapping"]
+
+        # Build labels mask for target tokens inside (query + target)
+        labels_mask = torch.zeros_like(query_input_ids)
+        for i, item in enumerate(batch):
+            query_seq_len = len(item["query"])
+            target_seq_len = len(item["target"])
+            target_st, target_end = query_seq_len, query_seq_len + target_seq_len
+            in_target = False
+            for j in range(len(offsets_mapping[i]) - 1, -1, -1):
+                st, end = offsets_mapping[i][j]
+                if st < target_end and end > target_st:
+                    labels_mask[i, j] = 1
+                    in_target = True
+                elif in_target:
+                    break
+
+        pad_id = tokenizer.pad_token_id
+        query_labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
+        query_labels = query_labels.masked_fill(query_input_ids == pad_id, -100)
+
+        context_labels = torch.full_like(context_input_ids, -100)
+        labels = torch.cat([context_labels, query_labels], dim=1)
+
+        return {
+            "input_ids": [context_input_ids, query_input_ids],
+            "attention_mask": [context_attention_mask, query_attention_mask],
+            "labels": labels,
+            "input_segmented": True,
+        }
+
+    # Legacy (non-babi): single concatenated tensor, no segmented forward.
+    context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=False, padding=False).input_ids
+    query_encoded = tokenizer(
+        query, return_tensors="pt", add_special_tokens=False, padding=False, return_offsets_mapping=True
+    )
+    query_input_ids = query_encoded["input_ids"]
+    offsets_mapping = query_encoded["offset_mapping"]
+
     # input_seq: 0, target_seq: 1, seq = input_seq + target_seq
     labels_mask = torch.zeros_like(query_input_ids)
     for i, item in enumerate(batch):
-        query_seq_len = len(item['query'])
-        target_seq_len = len(item['target'])
+        query_seq_len = len(item["query"])
+        target_seq_len = len(item["target"])
         target_st, target_end = query_seq_len, query_seq_len + target_seq_len
-        # find target tokens
-        # since target is closer to the end (context, query, target), search from the end
         in_target = False
         for j in range(len(offsets_mapping[i]) - 1, -1, -1):
             st, end = offsets_mapping[i][j]
-            # if (target_st, target_end) intersects with (st, end), it is a target token
             if st < target_end and end > target_st:
                 labels_mask[i, j] = 1
                 in_target = True
             elif in_target:
                 break
 
-    # Concatenate context and query for ARMT (which processes segments internally)
-    # ARMT will handle the segmentation based on segment_size
     pad_token_id = tokenizer.pad_token_id
     batch_size = context_input_ids.size(0)
     max_context_len = context_input_ids.size(1)
     max_query_len = query_input_ids.size(1)
-    device = context_input_ids.device  # Get device from input tensors
-    
-    # Concatenate context and query (ensure tensors are on the same device)
-    input_ids = torch.full((batch_size, max_context_len + max_query_len), pad_token_id, 
-                          dtype=torch.long, device=device)
+    device = context_input_ids.device
+
+    input_ids = torch.full(
+        (batch_size, max_context_len + max_query_len), pad_token_id, dtype=torch.long, device=device
+    )
     input_ids[:, :max_context_len] = context_input_ids
-    input_ids[:, max_context_len:max_context_len + max_query_len] = query_input_ids
-    
-    # Create labels: -100 for context, actual labels for query
-    labels = torch.full((batch_size, max_context_len + max_query_len), -100, 
-                       dtype=torch.long, device=device)
+    input_ids[:, max_context_len : max_context_len + max_query_len] = query_input_ids
+
+    labels = torch.full((batch_size, max_context_len + max_query_len), -100, dtype=torch.long, device=device)
     query_labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
-    labels[:, max_context_len:max_context_len + max_query_len] = query_labels
-    
+    labels[:, max_context_len : max_context_len + max_query_len] = query_labels
+
     return {
-        'input_ids': input_ids,
-        'labels': labels,
+        "input_ids": input_ids,
+        "labels": labels,
     }
 
 
@@ -175,24 +234,24 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         if np.any(mask[i])  # Skip samples that are all masked
     ])
 
-    # For debugging: show first 5 examples
-    # Extract query part from concatenated input_ids (assuming context comes first)
-    input_ids = inputs
-    if input_ids is not None:
-        # We need to find where context ends and query begins
-        # For now, just show the full sequence
+    # For debugging: show first 5 examples (only when `inputs` is a dense tensor/array)
+    input_ids = inputs.get("input_ids") if isinstance(inputs, dict) else inputs
+    if isinstance(input_ids, (np.ndarray, torch.Tensor)) and getattr(input_ids, "ndim", 0) >= 2:
         for i in range(min(5, len(preds))):
             pred = preds[i]
             label = labels[i]
-            inp = input_ids[i] if isinstance(input_ids, np.ndarray) else input_ids[i].cpu().numpy()
-            mask_i = (label != -100)
+            if isinstance(input_ids, np.ndarray):
+                inp = input_ids[i]
+            else:
+                inp = input_ids[i].detach().cpu().numpy()
+            mask_i = label != -100
             pred_masked = pred[mask_i]
             label_masked = label[mask_i]
             inp_masked = inp[mask_i] if len(inp) == len(label) else inp
-            print('i:', tokenizer.decode(inp_masked, skip_special_tokens=True).strip())
-            print('p:', tokenizer.decode(pred_masked, skip_special_tokens=True).strip())
-            print('t:', tokenizer.decode(label_masked, skip_special_tokens=True).strip())
-            print('-' * 50)
+            print("i:", tokenizer.decode(inp_masked, skip_special_tokens=True).strip())
+            print("p:", tokenizer.decode(pred_masked, skip_special_tokens=True).strip())
+            print("t:", tokenizer.decode(label_masked, skip_special_tokens=True).strip())
+            print("-" * 50)
 
     # Convert stats to numpy if they're tensors
     if isinstance(inner_loop_stats, dict):
@@ -272,8 +331,10 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
+    armt_impl: str = field(default="thinking")  # one of: ["old", "thinking"]
     data_path: str = field(default='N2-K4V4-S4(32-64)_1M')  # Subset name for HuggingFace Hub dataset irodkin/kv_retrieval
     tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
+    max_context_length: Optional[int] = field(default=None)
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -289,7 +350,7 @@ class ExperimentArgs:
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
     seed: Optional[int] = field(default=142)
-    base_model: Optional[str] = field(default='gpt2')
+    base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
     init_checkpoint: Optional[str] = field(default=None)
     model_cpt: Optional[str] = field(default=None)  # Path to ARMT model checkpoint directory
@@ -323,6 +384,9 @@ if __name__ == '__main__':
     logger.info(f'num processes: {accel.num_processes}')
     logger.info(f'mixed precision: {accel.mixed_precision}')
     logger.info(f'accelerator state: {accel.state}')
+
+    if args.armt_impl not in ("thinking", "old"):
+        raise ValueError(f"--armt_impl must be one of ['old', 'thinking'], got: {args.armt_impl}")
 
     assert not (args.pretrained_model is not None and args.base_model is not None), "only one of these args must be set"
 
@@ -372,6 +436,48 @@ if __name__ == '__main__':
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    if args.armt_impl == "thinking":
+        from modeling_amt.thinking import ThinkingARMTConfig as ARMTConfigCls
+        from modeling_amt.thinking import ThinkingARMTForCausalLM as ARMTModelCls
+    else:
+        from modeling_amt.model import ARMTConfig as ARMTConfigCls
+        from modeling_amt.model import ARMTForCausalLM as ARMTModelCls
+
+    def build_armt_config() -> "ARMTConfigCls":
+        base_model_name = args.pretrained_model
+        base_model_config = config if args.pretrained_model is None else None
+
+        cfg_kwargs = dict(
+            base_model_config=base_model_config,
+            num_mem_tokens=args.num_mem_tokens,
+            d_mem=args.d_mem,
+            segment_size=args.segment_size,
+            segment_alignment=args.segment_alignment,
+            layers_attr=args.layers_attr,
+            wrap_pos=args.wrap_pos,
+            correction=args.correction,
+            n_heads=args.n_heads,
+            use_denom=args.use_denom,
+        )
+        if base_model_name is not None:
+            cfg_kwargs.update(dict(base_model_name=base_model_name))
+            cfg_kwargs.pop("base_model_config", None)
+        if args.armt_impl == "thinking":
+            cfg_kwargs.update(
+                dict(
+                    reading_depth_multiplier=args.reading_depth_multiplier,
+                    writing_depth_multiplier=args.writing_depth_multiplier,
+                )
+            )
+        armt_config = ARMTConfigCls(**cfg_kwargs)
+
+        if base_model_config is not None:
+            armt_config.vocab_size = base_model_config.vocab_size
+            armt_config.pad_token_id = base_model_config.pad_token_id
+            armt_config.bos_token_id = getattr(base_model_config, "bos_token_id", None)
+            armt_config.eos_token_id = getattr(base_model_config, "eos_token_id", None)
+        return armt_config
+
     # Load ARMT model from checkpoint or create new one
     if args.model_cpt is not None and args.model_cpt != 'None':
         # Find the latest checkpoint directory if args.model_cpt is a directory with checkpoint-* subdirectories
@@ -405,40 +511,13 @@ if __name__ == '__main__':
         logger.info(f'Loading ARMT model from checkpoint: {checkpoint_dir}')
         try:
             # Try loading as a saved model directory (from_pretrained)
-            model = ThinkingARMTForCausalLM.from_pretrained(checkpoint_dir)
+            model = ARMTModelCls.from_pretrained(checkpoint_dir)
             logger.info(f'Successfully loaded ARMT model from {checkpoint_dir}')
         except Exception as e:
             logger.warning(f'Failed to load as pretrained model: {e}')
             logger.info('Trying to load from state dict files...')
-            # Need to create model first, so determine config
-            base_model_name = args.pretrained_model
-            base_model_config = config if args.pretrained_model is None else None
-            
-            # Create ARMT config
-            armt_config = ThinkingARMTConfig(
-                base_model_name=base_model_name,
-                base_model_config=base_model_config,
-                num_mem_tokens=args.num_mem_tokens,
-                d_mem=args.d_mem,
-                segment_size=args.segment_size,
-                segment_alignment=args.segment_alignment,
-                layers_attr=args.layers_attr,
-                wrap_pos=args.wrap_pos,
-                correction=args.correction,
-                n_heads=args.n_heads,
-                use_denom=args.use_denom,
-                reading_depth_multiplier=args.reading_depth_multiplier,
-                writing_depth_multiplier=args.writing_depth_multiplier,
-            )
-            
-            # Set vocab and tokenizer settings
-            if base_model_config is not None:
-                armt_config.vocab_size = base_model_config.vocab_size
-                armt_config.pad_token_id = base_model_config.pad_token_id
-                armt_config.bos_token_id = getattr(base_model_config, 'bos_token_id', None)
-                armt_config.eos_token_id = getattr(base_model_config, 'eos_token_id', None)
-            
-            model = ThinkingARMTForCausalLM(armt_config)
+            armt_config = build_armt_config()
+            model = ARMTModelCls(armt_config)
             # Try different checkpoint file locations
             checkpoint_paths = [
                 os.path.join(checkpoint_dir, "model_best", "model.safetensors"),
@@ -466,35 +545,16 @@ if __name__ == '__main__':
                     break
             if not loaded:
                 raise FileNotFoundError(f'Could not find checkpoint file in {checkpoint_dir}. Tried: {checkpoint_paths}')
-        model.segment_size = args.segment_size
-        for layer in model.get_layers():
-            layer.segment_size = args.segment_size
+        if hasattr(model, "segment_size"):
+            model.segment_size = args.segment_size
+        if hasattr(model, "get_layers"):
+            for layer in model.get_layers():
+                if hasattr(layer, "segment_size"):
+                    layer.segment_size = args.segment_size
     else:
         # Create new ARMT model
-        base_model_name = args.pretrained_model
-        base_model_config = config if args.pretrained_model is None else None
-        
-        # Create ARMT config
-        armt_config = ThinkingARMTConfig(
-            base_model_name=base_model_name,
-            base_model_config=base_model_config,
-            num_mem_tokens=args.num_mem_tokens,
-            d_mem=args.d_mem,
-            segment_size=args.segment_size,
-            segment_alignment=args.segment_alignment,
-            layers_attr=args.layers_attr,
-            reading_depth_multiplier=args.reading_depth_multiplier,
-            writing_depth_multiplier=args.writing_depth_multiplier,
-        )
-        
-        # Set vocab and tokenizer settings
-        if base_model_config is not None:
-            armt_config.vocab_size = base_model_config.vocab_size
-            armt_config.pad_token_id = base_model_config.pad_token_id
-            armt_config.bos_token_id = getattr(base_model_config, 'bos_token_id', None)
-            armt_config.eos_token_id = getattr(base_model_config, 'eos_token_id', None)
-
-        model = ThinkingARMTForCausalLM(armt_config)
+        armt_config = build_armt_config()
+        model = ARMTModelCls(armt_config)
 
     if args.init_checkpoint is not None:
         missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
@@ -528,8 +588,17 @@ if __name__ == '__main__':
         logger.info(f"Loading dataset from HuggingFace Hub: irodkin/kv_retrieval (subset: {args.data_path})")
         dataset = datasets.load_dataset("irodkin/kv_retrieval", name=args.data_path)
 
+    use_segmented_inputs = "babi" in str(args.data_path).lower()
+    if use_segmented_inputs:
+        logger.info("Detected babi run (data_path contains 'babi'): using ARMT segmented inputs (context / query+target)")
+
     def data_collator(batch):
-        return collate_fn(batch, tokenizer)
+        return collate_fn(
+            batch,
+            tokenizer,
+            use_segmented_inputs=use_segmented_inputs,
+            max_context_length=args.max_context_length,
+        )
 
     # Target sequence looks like: "XXXX!|"
     # Let's not count ! and | in the accuracy calculation
@@ -587,6 +656,24 @@ if __name__ == '__main__':
         dataloader_pin_memory=True,
         seed=args.seed,
     )
+
+    # HF Trainer FLOPs estimation expects tensor inputs and calls `.numel()` on `inputs[model.main_input_name]`.
+    # With `input_segmented=True`, we pass `input_ids` as a list of segment tensors, so we need a custom estimator.
+    if use_segmented_inputs:
+        def _floating_point_ops_segmented(self, input_dict, exclude_embeddings: bool = True):
+            x = input_dict.get(getattr(self, "main_input_name", "input_ids"))
+            if isinstance(x, (list, tuple)):
+                tokens = 0
+                for t in x:
+                    if hasattr(t, "numel"):
+                        tokens += int(t.numel())
+            elif hasattr(x, "numel"):
+                tokens = int(x.numel())
+            else:
+                tokens = 0
+            return 6 * tokens * self.num_parameters(exclude_embeddings=exclude_embeddings)
+
+        model.floating_point_ops = types.MethodType(_floating_point_ops_segmented, model)
 
     # Initialize Trainer
     trainer = CustomTrainer(
