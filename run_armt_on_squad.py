@@ -9,6 +9,7 @@ import numpy as np
 from typing import Dict, Optional
 from dataclasses import dataclass, field
 import datasets
+import types
 
 import accelerate
 from safetensors.torch import load_file
@@ -38,17 +39,21 @@ logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
 def collate_fn(batch, tokenizer):
-    # Build two parts: context and (query + target), then concatenate in token space.
+    # Build two segments:
+    # - segment 0: context
+    # - segment 1: (query + target)
+    # and enable ARMT segmented forward (input_segmented=True).
     context = [item["context"].strip() for item in batch]
     query = [item["query"] + item["target"] for item in batch]
 
-    context_input_ids = tokenizer(
+    context_encoded = tokenizer(
         context,
         return_tensors="pt",
         add_special_tokens=True,
-        padding="max_length",
-        max_length=128,
-    ).input_ids
+        padding=True,          # dynamic padding to batch max; no fixed-length padding
+    )
+    context_input_ids = context_encoded["input_ids"]
+    context_attention_mask = context_encoded["attention_mask"]
 
     query_encoded = tokenizer(
         query,
@@ -59,6 +64,7 @@ def collate_fn(batch, tokenizer):
         return_offsets_mapping=True,
     )
     query_input_ids = query_encoded["input_ids"]
+    query_attention_mask = query_encoded["attention_mask"]
     offsets_mapping = query_encoded["offset_mapping"]
 
     # Build labels mask for target tokens inside (query + target)
@@ -81,16 +87,16 @@ def collate_fn(batch, tokenizer):
     query_labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
     query_labels = query_labels.masked_fill(query_input_ids == pad_id, -100)
 
-    input_ids = torch.cat([context_input_ids, query_input_ids], dim=1)
-    attention_mask = (input_ids != pad_id).to(dtype=torch.long)
-
-    labels = torch.full_like(input_ids, -100)
-    labels[:, context_input_ids.size(1) :] = query_labels
+    # Concatenated labels for HF Trainer / metrics: ignore all context tokens.
+    context_labels = torch.full_like(context_input_ids, -100)
+    labels = torch.cat([context_labels, query_labels], dim=1)
 
     return {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
+        # Two segments: list-of-tensors, each shaped (bsz, seg_len)
+        "input_ids": [context_input_ids, query_input_ids],
+        "attention_mask": [context_attention_mask, query_attention_mask],
         "labels": labels,
+        "input_segmented": True,
     }
 
 
@@ -444,6 +450,24 @@ if __name__ == "__main__":
             logger.info(f"{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.")
         if len(unexpected_k) != 0:
             logger.info(f"{unexpected_k} were found in checkpoint, but model is not expecting them!")
+
+    # HF Trainer FLOPs estimation expects tensor inputs and calls `.numel()` on `inputs[model.main_input_name]`.
+    # With `input_segmented=True`, we pass `input_ids` as a list of segment tensors, so we need a custom estimator.
+    def _floating_point_ops_segmented(self, input_dict, exclude_embeddings: bool = True):
+        x = input_dict.get(getattr(self, "main_input_name", "input_ids"))
+        if isinstance(x, (list, tuple)):
+            tokens = 0
+            for t in x:
+                if hasattr(t, "numel"):
+                    tokens += int(t.numel())
+        elif hasattr(x, "numel"):
+            tokens = int(x.numel())
+        else:
+            # Fall back to 0 if we can't estimate
+            tokens = 0
+        return 6 * tokens * self.num_parameters(exclude_embeddings=exclude_embeddings)
+
+    model.floating_point_ops = types.MethodType(_floating_point_ops_segmented, model)
 
     if accel.mixed_precision == "bf16":
         model = model.to(torch.bfloat16)
