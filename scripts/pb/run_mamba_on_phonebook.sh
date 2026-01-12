@@ -26,7 +26,7 @@ for N_PAIRS in 4 8 16 32 64; do
   DATA_NAME="phonebook"
 
   # Run ID
-  N_VALUES=(2 3)
+  N_VALUES=(1 2 3)
   for N in "${N_VALUES[@]}"; do
     # Path to save experiment results
     EXP_PATH="./runs/${DATA_NAME}/N${N_PAIRS}/${RUN_NAME}/run_$N"

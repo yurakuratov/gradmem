@@ -236,7 +236,8 @@ if __name__ == '__main__':
         }
         logger.info(f'saving experiment configuration to {args.exp_path}')
         Path(args.exp_path).mkdir(parents=True)
-        json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
+        with open(os.path.join(args.exp_path, 'config.json'), 'w') as f:
+            json.dump(config, f, indent=4)
 
     if args.pretrained_model is None:
         # create tokenizer

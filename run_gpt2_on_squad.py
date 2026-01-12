@@ -151,7 +151,7 @@ class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
     dataset_name: str = field(default='squad')
-    tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62')
+    tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
