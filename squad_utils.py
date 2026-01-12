@@ -103,3 +103,15 @@ def preprocess_dataset(raw_dataset):
         'valid': raw_dataset['validation'].map(preprocess_train_fn,
                                                remove_columns=raw_dataset['validation'].column_names)
         })
+
+# def preprocess_dataset_short(raw_dataset):
+#     return raw_dataset
+    # # replace "question" with "query"
+    # raw_dataset['train'] = raw_dataset['train'].map(lambda x: {'query': x['question']})
+    # raw_dataset['validation'] = raw_dataset['validation'].map(lambda x: {'query': x['question']})
+
+    # return datasets.DatasetDict({
+    #     'train': raw_dataset['train'].map(preprocess_train_fn, remove_columns=raw_dataset['train'].column_names),
+    #     'valid': raw_dataset['validation'].map(preprocess_train_fn,
+    #                                            remove_columns=raw_dataset['validation'].column_names)
+    #     })

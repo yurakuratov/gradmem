@@ -3,9 +3,9 @@
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
 LR=3e-04
-LR_SCHEDULER_TYPE="cosine"
+LR_SCHEDULER_TYPE="constant_with_warmup"
 TBS=64
-PER_DEVICE_BATCH_SIZE=16
+PER_DEVICE_BATCH_SIZE=64
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 USE_GRAD_CKPT=false
 
@@ -16,7 +16,7 @@ PRETRAINED_MODEL=gpt2
 # GradMemGPT specific parameters
 N_CTRL_TOKENS=0
 K=1
-for N_MEM_TOKENS in 32; do
+for N_MEM_TOKENS in 8 16 32; do
   USE_MEM_PROJ=true
   MEM_PROJ_MODE="proj"
   USE_WRITE_HEAD=true
@@ -36,12 +36,12 @@ for N_MEM_TOKENS in 32; do
     RUN_NAME=${RUN_NAME}_whead
   fi
   RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
-  RUN_NAME=${RUN_NAME}_${LR_SCHEDULER_TYPE}
+  # RUN_NAME=${RUN_NAME}_${LR_SCHEDULER_TYPE}
 
-  DATA_NAME="squad"
-
+  DATA_NAME="squad-short"
+  DATASET_NAME="mkairov/short_squad"
   # Run ID
-  N_VALUES=(1 2 3)
+  N_VALUES=(2 3)
   for N in "${N_VALUES[@]}"; do
     RND=$(date +%Y%m%d%H%M%S)
     # Path to save experiment results
@@ -58,7 +58,7 @@ for N_MEM_TOKENS in 32; do
       --per_device_batch_size $PER_DEVICE_BATCH_SIZE \
       --gradient_accumulation_steps $GRAD_ACC_STEPS \
       --total_batch_size $TBS \
-      --dataset_name $DATA_NAME \
+      --dataset_name $DATASET_NAME \
       --learning_rate $LR \
       --pretrained_model $PRETRAINED_MODEL \
       --n_mem_tokens $N_MEM_TOKENS \
@@ -71,7 +71,7 @@ for N_MEM_TOKENS in 32; do
       --eval_steps 500 \
       --logging_steps 500 \
       --warmup_steps 10000 \
-      --early_stopping_patience 1000 \
+      --early_stopping_patience 500 \
       --seed $((142+$N))
   done
 done

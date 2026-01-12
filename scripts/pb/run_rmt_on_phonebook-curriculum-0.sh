@@ -23,20 +23,25 @@ MEM_PROJ_MODE="proj"
 USE_WRITE_HEAD=true
 N_MEM_TOKENS=32
 
-# Curriculum stages - pairs per segment
-PAIRS_PER_SEGMENT_VALUES=(2 4 8 16 32 64)
-N_SEGMENTS_VALUES=(1 1 1 1 1 1)
+# Run ID
 
-for N in 1 2 3; do
-  for i in "${!PAIRS_PER_SEGMENT_VALUES[@]}"; do
-    PAIRS_PER_SEGMENT=${PAIRS_PER_SEGMENT_VALUES[$i]}
-    N_SEGMENTS=${N_SEGMENTS_VALUES[$i]}
+# Initial checkpoint path for the first stage
+INITIAL_CHECKPOINT_PATH=./runs/phonebook/N4/rmt2segm_gpt2_mem32_K1_mem_proj_whead_bs_64_lr_1e-03_constant_with_warmup/run_1
+
+# Curriculum stages
+N_PAIRS_VALUES=(4 8 16 32 64)
+
+for N in 1; do
+  for i in "${!N_PAIRS_VALUES[@]}"; do
+    # if [ $i -lt 4 ]; then
+    #   continue
+    # fi
+    N_PAIRS=${N_PAIRS_VALUES[$i]}
     
-    N_PAIRS=$((N_SEGMENTS * PAIRS_PER_SEGMENT))
     DATA_NAME="booydar/phonebook_N${N_PAIRS}"
     DATA_PATH="booydar/phonebook/N${N_PAIRS}"
 
-    # Build run name with segment notation
+    # Build run name
     RUN_NAME=rmt2segm_${MODEL_NAME}_mem${N_MEM_TOKENS}
     if [ "$N_CTRL_TOKENS" -gt 0 ]; then
       RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
@@ -52,43 +57,22 @@ for N in 1 2 3; do
       RUN_NAME=${RUN_NAME}_whead
     fi
     RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
-    RUN_NAME=${RUN_NAME}_${LR_SCHEDULER_TYPE}-${N_SEGMENTS}x${PAIRS_PER_SEGMENT}-curr
+    RUN_NAME=${RUN_NAME}_${LR_SCHEDULER_TYPE}_curr
 
     # Determine previous checkpoint path
     if [ $i -eq 0 ]; then
-      # First stage: no previous checkpoint
-      PREV_RUN_NAME=None
-      PREV_EXP_PATH=None
+      # First stage: load from initial checkpoint
+      PREV_EXP_PATH=$INITIAL_CHECKPOINT_PATH
     else
       # Subsequent stages: load from previous stage
-      PREV_PAIRS_PER_SEGMENT=${PAIRS_PER_SEGMENT_VALUES[$((i-1))]}
-      PREV_N_SEGMENTS=${N_SEGMENTS_VALUES[$((i-1))]}
-      
-      PREV_N_PAIRS=$((PREV_N_SEGMENTS * PREV_PAIRS_PER_SEGMENT))
+      PREV_N_PAIRS=${N_PAIRS_VALUES[$((i-1))]}
       PREV_DATA_PATH="booydar/phonebook/N${PREV_N_PAIRS}"
-      
-      PREV_RUN_NAME=rmt2segm_${MODEL_NAME}_mem${N_MEM_TOKENS}
-      if [ "$N_CTRL_TOKENS" -gt 0 ]; then
-        PREV_RUN_NAME=${PREV_RUN_NAME}_c${N_CTRL_TOKENS}
-      fi
-      PREV_RUN_NAME=${PREV_RUN_NAME}_K${K}
-      if [ "$USE_MEM_PROJ" = true ]; then
-        PREV_RUN_NAME=${PREV_RUN_NAME}_mem_proj
-        if [ "$MEM_PROJ_MODE" == "per_sample" ]; then
-          PREV_RUN_NAME=${PREV_RUN_NAME}_ps
-        fi
-      fi
-      if [ "$USE_WRITE_HEAD" = true ]; then
-        PREV_RUN_NAME=${PREV_RUN_NAME}_whead
-      fi
-      PREV_RUN_NAME=${PREV_RUN_NAME}_bs_${TBS}_lr_${LR}
-      PREV_RUN_NAME=${PREV_RUN_NAME}_${LR_SCHEDULER_TYPE}-${PREV_N_SEGMENTS}x${PREV_PAIRS_PER_SEGMENT}-curr
-      
-      PREV_EXP_PATH="./runs/${PREV_DATA_PATH}/${PREV_RUN_NAME}/run_$N"
+      PREV_EXP_PATH="./runs/${PREV_DATA_PATH}/${RUN_NAME}/run_$N"
     fi
 
     # Path to save experiment results
     EXP_PATH="./runs/${DATA_PATH}/${RUN_NAME}/run_$N"
+    echo $EXP_PATH
     
     # Check if path already exists, skip if so
     if [ -d "$EXP_PATH" ]; then
@@ -104,7 +88,7 @@ for N in 1 2 3; do
       --config_file accelerate.yaml \
       run_rmt_on_squad.py \
       --exp_path $EXP_PATH \
-      $( [ "$PREV_EXP_PATH" != "None" ] && echo "--init_checkpoint $PREV_EXP_PATH" ) \
+      --init_checkpoint $PREV_EXP_PATH \
       --per_device_batch_size $PER_DEVICE_BATCH_SIZE \
       --gradient_accumulation_steps $GRAD_ACC_STEPS \
       --total_batch_size $TBS \

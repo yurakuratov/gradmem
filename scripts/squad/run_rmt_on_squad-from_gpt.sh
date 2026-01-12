@@ -10,7 +10,7 @@ GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 USE_GRAD_CKPT=false
 
 MODEL_NAME=gpt2
-PRETRAINED_MODEL=gpt2
+PRETRAINED_MODEL=/workspace-SR006.nfs2/bulatov/rmt/models/gpt2_checkpoint_13500
 
 
 # GradMemGPT specific parameters
@@ -37,6 +37,7 @@ for N_MEM_TOKENS in 32; do
   fi
   RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
   RUN_NAME=${RUN_NAME}_${LR_SCHEDULER_TYPE}
+  RUN_NAME=${RUN_NAME}_from_gpt2_13k
 
   DATA_NAME="squad"
 
@@ -61,6 +62,7 @@ for N_MEM_TOKENS in 32; do
       --dataset_name $DATA_NAME \
       --learning_rate $LR \
       --pretrained_model $PRETRAINED_MODEL \
+      --tokenizer gpt2\
       --n_mem_tokens $N_MEM_TOKENS \
       --K $K \
       $( [ "$USE_MEM_PROJ" = true ] && echo "--use_mem_proj" ) \

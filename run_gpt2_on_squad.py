@@ -266,6 +266,9 @@ if __name__ == '__main__':
     raw_dataset = datasets.load_dataset(args.dataset_name)
     if args.dataset_name == 'squad':
         from squad_utils import preprocess_dataset
+    elif args.dataset_name == 'mkairov/short_squad':
+        from squad_utils import preprocess_dataset
+        # from squad_utils import preprocess_dataset_short as preprocess_dataset
     elif 'phonebook' in args.dataset_name:
         from phonebook_utils import preprocess_dataset
     else:
