@@ -685,7 +685,7 @@ if __name__ == '__main__':
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   StopOnMetricValue(metric_name='exact_match', value=0.99, higher_is_better=True),
+                   StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
                    ],
     )
     # Train the model
