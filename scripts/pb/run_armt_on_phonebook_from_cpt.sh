@@ -33,7 +33,7 @@ READING_DEPTH_MULTIPLIER=1
 WRITING_DEPTH_MULTIPLIER=1
 
 # Run ID
-N=3
+N=7
 
 # Resume control:
 # - set START_I to start from a later curriculum stage without editing arrays (0-based index)
@@ -43,7 +43,7 @@ START_I=${START_I:-0}
 # Curriculum schedule (edit as needed). Arrays are aligned by index.
 N_PAIRS_LIST=(2 4 8 16 32 64)
 PER_DEVICE_BATCH_SIZES=(64 32 16 8 4 2)
-MAX_STEPS_LIST=(20000 20000 20000 20000 20000 20000)
+MAX_STEPS_LIST=(20000 30000 50000 50000 50000 50000)
 LR_LIST=(2e-4 1e-4 1e-4 1e-4 1e-4 1e-4)
 
 latest_checkpoint_dir() {
@@ -57,7 +57,7 @@ latest_checkpoint_dir() {
     echo ""
   fi
 }
-
+START_CPT=./runs/booydar/phonebook_N4/N4/armt2segm_gpt2_mem32_dmem64_seg128_wdm1_rdm1_bs_256_lr_1e-4_constant_with_warmup/run_5/checkpoint-20000
 for (( i=0; i<${#N_PAIRS_LIST[@]}; i++ )); do
   if [ "$i" -lt "$START_I" ]; then
     continue
@@ -76,12 +76,12 @@ for (( i=0; i<${#N_PAIRS_LIST[@]}; i++ )); do
 
   # Path to save experiment results (mirrors run_rmt_on_phonebook.sh structure)
   EXP_PATH="./runs/${DATA_NAME}/N${N_PAIRS}/${RUN_NAME}/run_$N"
-
+  
   export WANDB_NAME=armt_phonebook_N${N_PAIRS}_run_${N}
 
   # Curriculum checkpoint: load the latest checkpoint-* from the previous stage output.
-  if [ "$i" -eq 0 ]; then
-    MODEL_CPT=None
+  if [ "$i" -eq "$START_I" ]; then
+    MODEL_CPT=$START_CPT
   else
     PREV_N_PAIRS=${N_PAIRS_LIST[i-1]}
     PREV_LR=${LR_LIST[i-1]}
@@ -91,7 +91,7 @@ for (( i=0; i<${#N_PAIRS_LIST[@]}; i++ )); do
     MODEL_CPT=$(latest_checkpoint_dir "$PREV_EXP_PATH")
     if [ -z "$MODEL_CPT" ]; then
       echo "WARNING: no checkpoint-* found under PREV_EXP_PATH=$PREV_EXP_PATH; starting from scratch" 1>&2
-      MODEL_CPT=None
+      MODEL_CPT=$START_CPT
     fi
   fi
 
