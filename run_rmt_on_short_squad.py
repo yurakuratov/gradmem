@@ -20,8 +20,8 @@ from transformers import (
     HfArgumentParser
 )
 
-from grad_memgpt import GradMemGPT, GradMemGPTConfig
-from transformers.trainer_utils import get_last_checkpoint
+from rmt import RMT2Segm, RMT2SegmConfig
+from squad_utils import preprocess_train_fn
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -35,7 +35,7 @@ logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
 def collate_fn(batch, tokenizer):
-    context = [item['context'].strip() for item in batch]
+    context = [item['context'] for item in batch]
     query = [item['query'] + item['target'] for item in batch]
 
     context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
@@ -52,9 +52,9 @@ def collate_fn(batch, tokenizer):
         query_seq_len = len(item['query'])
         target_seq_len = len(item['target'])
         target_st, target_end = query_seq_len, query_seq_len + target_seq_len
-
+        
         # find target tokens
-        # since target is closer to the end, search from the end
+        # since target is closer to the end (context, query, target), search from the end
         in_target = False
         for j in range(len(offsets_mapping[i]) - 1, -1, -1):
             st, end = offsets_mapping[i][j]
@@ -118,20 +118,27 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
         print('-' * 50)
 
-    return {
+    metrics = {
         "token_accuracy": float(accuracy),
         "exact_match": float(exact_match),
-        "inner_loss": float(inner_loop_stats['inner_loss'].mean()),
-        "inner_grad_norm": float(inner_loop_stats['inner_grad_norm_mean'].mean()),
-        "inner_grad_norm_max": float(inner_loop_stats['inner_grad_norm_max'].max()),
-        "inner_grad_norm_min": float(inner_loop_stats['inner_grad_norm_min'].min()),
         "mem_norm_mean": float(inner_loop_stats['mem_norm_mean'].mean()),
         "mem_norm_max": float(inner_loop_stats['mem_norm_max'].max()),
         "mem_norm_min": float(inner_loop_stats['mem_norm_min'].min()),
-        "delta_mem_norm_mean": float(inner_loop_stats['delta_mem_norm_mean'].mean()),
-        "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
-        "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
     }
+    if 'step_delta_mem_norm_mean' in inner_loop_stats:
+        metrics.update({
+            "step_delta_mem_norm_mean": float(inner_loop_stats['step_delta_mem_norm_mean'].mean()),
+            "step_delta_mem_norm_max": float(inner_loop_stats['step_delta_mem_norm_max'].max()),
+            "step_delta_mem_norm_min": float(inner_loop_stats['step_delta_mem_norm_min'].min()),
+            "delta_mem_norm_mean": float(inner_loop_stats['delta_mem_norm_mean'].mean()),
+            "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
+            "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
+        })
+    if 'rec_loss' in inner_loop_stats:
+        metrics['rec_loss'] = float(inner_loop_stats['rec_loss'].mean())
+    if 'target_loss' in inner_loop_stats:
+        metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
+    return metrics
 
 
 class StopOnMetricValue(TrainerCallback):
@@ -170,13 +177,8 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(
-        default='./data/N2-K4V4-S4(32-64)_1M',
-    )
-    dataset_name: str = field(default='squad')
-    tokenizer_path: str = field(
-        default='./tokenizers/kv_alphabet_62/',
-    )
+    data_path: str = field(default='./data/N2-K4V4-S4(32-64)_1M')
+    tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -186,30 +188,30 @@ class ExperimentArgs:
     eval_steps: Optional[int] = field(default=100)
     weight_decay: Optional[float] = field(default=0.0)
     learning_rate: Optional[float] = field(default=1e-04)
+    adam_beta1: Optional[float] = field(default=0.9)
+    adam_beta2: Optional[float] = field(default=0.999)
+    adam_epsilon: Optional[float] = field(default=1e-8)
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
     init_base_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize base model'})
-    init_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize gradmemgpt model'})
+    init_checkpoint: Optional[str] = field(default=None)
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
-    # GradMemGPT parameters
+    # RMT parameters
     n_mem_tokens: Optional[int] = field(default=8)
-    K: Optional[int] = field(default=3)
-    inner_lr: Optional[float] = field(default=0.01)
-    use_adam: Optional[bool] = field(default=True)
-    grad_mode: Optional[str] = field(default="none")
+    K: Optional[int] = field(default=1)
     n_ctrl_tokens: Optional[int] = field(default=0)
-    inner_clip_value: Optional[float] = field(default=None)
-    inner_clip_norm: Optional[float] = field(default=None)
     use_mem_proj: Optional[bool] = field(default=False)
     mem_proj_mode: Optional[str] = field(default="none")
+    use_reconstruction_loss: Optional[bool] = field(default=False)
+    reconstruction_loss_weight: Optional[float] = field(default=1.0)
     use_write_head: Optional[bool] = field(default=False)
-    use_gradient_checkpointing: Optional[bool] = field(default=False)
-    attn_implementation: Optional[str] = field(default="eager")
+    use_mem_residual: Optional[bool] = field(default=False)
+    attn_implementation: Optional[str] = field(default='eager')
 
 
 if __name__ == '__main__':
@@ -274,33 +276,35 @@ if __name__ == '__main__':
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
-                                      n_mem_tokens=args.n_mem_tokens, K=args.K,
-                                      lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
-                                      n_ctrl_tokens=args.n_ctrl_tokens,
-                                      inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
-                                      use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
-                                      use_write_head=args.use_write_head,
-                                      use_gradient_checkpointing=args.use_gradient_checkpointing,
-                                      attn_implementation=args.attn_implementation)
+    rmt_config = RMT2SegmConfig(pretrained_model=args.pretrained_model, base_config=config,
+                                n_mem_tokens=args.n_mem_tokens, K=args.K,
+                                n_ctrl_tokens=args.n_ctrl_tokens,
+                                use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
+                                use_reconstruction_loss=args.use_reconstruction_loss,
+                                reconstruction_loss_weight=args.reconstruction_loss_weight,
+                                use_write_head=args.use_write_head, use_mem_residual=args.use_mem_residual,
+                                attn_implementation=args.attn_implementation)
 
-    # Create gradmemgpt model
-    model = GradMemGPT(gradmem_config)
+    # Create rmt model
+    model = RMT2Segm(rmt_config)
 
     model_to_init_from_ckpt = None
     if args.init_checkpoint is not None:
         model_to_init_from_ckpt = model
-        init_ckpt_path = os.path.join(get_last_checkpoint(args.init_checkpoint), "model.safetensors")
+        init_ckpt_path = args.init_checkpoint
     elif args.init_base_checkpoint is not None:
         model_to_init_from_ckpt = model.model
         init_ckpt_path = args.init_base_checkpoint
     if model_to_init_from_ckpt is not None:
+        logger.info(f'loading checkpoint from {init_ckpt_path}')
         missing_k, unexpected_k = model_to_init_from_ckpt.load_state_dict(load_file(init_ckpt_path), strict=False)
         if len(missing_k) != 0:
             logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
         if len(unexpected_k) != 0:
             logger.info(f'{unexpected_k} were found in checkpoint, but model_to_init_from_ckpt is not expecting them!')
-    model.model.tie_weights()
+        if args.init_base_checkpoint is not None:
+            logger.info("Tying model weights for embeddings and lm_head.")
+            model_to_init_from_ckpt.tie_weights()
 
     if accel.mixed_precision == 'bf16':
         model.to(torch.bfloat16)
@@ -309,21 +313,20 @@ if __name__ == '__main__':
     logger.info(f'model: {model}')
     logger.info(f'model.dtype: {model.dtype}')
 
-    raw_dataset = datasets.load_dataset(args.dataset_name)
-    if args.dataset_name == 'squad':
-        from squad_utils import preprocess_dataset
-    elif 'phonebook' in args.dataset_name:
-        from phonebook_utils import preprocess_dataset
-    else:
-        raise ValueError(f'Unsupported dataset: {args.dataset_name}')
-    dataset = preprocess_dataset(raw_dataset)
+    raw_dataset = datasets.load_dataset('mkairov/short_squad')
+
+    dataset = datasets.DatasetDict({
+        'train': raw_dataset['train'].map(preprocess_train_fn, remove_columns=raw_dataset['train'].column_names),
+        'valid': raw_dataset['validation'].map(preprocess_train_fn,
+                                               remove_columns=raw_dataset['validation'].column_names)
+        })
 
     def data_collator(batch):
         return collate_fn(batch, tokenizer)
 
     # Target sequence looks like: "XXXX!|"
     # Let's not count ! and | in the accuracy calculation
-    ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in []]
+    ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']]
 
     # Define custom compute metrics function with ignored tokens
     def compute_metrics(eval_pred):
@@ -349,8 +352,10 @@ if __name__ == '__main__':
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
+        adam_epsilon=args.adam_epsilon,
         lr_scheduler_type=args.lr_scheduler_type,
-        gradient_checkpointing=args.use_gradient_checkpointing,
 
         eval_strategy='steps',
         save_strategy='steps',
@@ -381,7 +386,7 @@ if __name__ == '__main__':
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   StopOnMetricValue(metric_name='exact_match', value=0.99, higher_is_better=True),
+                   StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
                    ],
     )
     # Train the model
