@@ -33,12 +33,13 @@ logger = logging.getLogger('')
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
-def collate_fn(batch, tokenizer):
+def collate_fn(batch, tokenizer, max_context_length=None):
     context = [item['context'] for item in batch]
     query = [item['query'] + item['target'] for item in batch]
 
     context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
-                                  padding=True, pad_to_multiple_of=8).input_ids
+                                  padding=True, pad_to_multiple_of=8, max_length=max_context_length,
+                                  truncation=True).input_ids
     query_encoded = tokenizer(query, return_tensors="pt", add_special_tokens=True,
                               padding=True, pad_to_multiple_of=8, return_offsets_mapping=True)
     query_input_ids = query_encoded['input_ids']
@@ -198,6 +199,7 @@ class ExperimentArgs:
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
+    max_context_length: Optional[int] = field(default=None)
     # RMT parameters
     n_mem_tokens: Optional[int] = field(default=8)
     K: Optional[int] = field(default=1)
@@ -302,7 +304,7 @@ if __name__ == '__main__':
     dataset = datasets.load_from_disk(args.data_path)
 
     def data_collator(batch):
-        return collate_fn(batch, tokenizer)
+        return collate_fn(batch, tokenizer, max_context_length=args.max_context_length)
 
     # Target sequence looks like: "XXXX!|"
     # Let's not count ! and | in the accuracy calculation

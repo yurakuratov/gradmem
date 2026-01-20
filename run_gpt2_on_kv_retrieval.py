@@ -33,10 +33,11 @@ logger = logging.getLogger('')
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
-def collate_fn(batch, tokenizer):
+def collate_fn(batch, tokenizer, max_input_length=None):
     seq = [item['context'] + item['query'] + item['target'] for item in batch]
     seq_encoded = tokenizer(seq, return_tensors="pt", add_special_tokens=True,
-                            padding=True, pad_to_multiple_of=8, return_offsets_mapping=True)
+                            padding=True, pad_to_multiple_of=8, max_length=max_input_length, truncation=True,
+                            return_offsets_mapping=True)
     input_ids = seq_encoded['input_ids']
     offsets_mapping = seq_encoded['offset_mapping']
 
@@ -178,6 +179,7 @@ class ExperimentArgs:
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
     max_position_embeddings: Optional[int] = field(default=None)
+    max_input_length: Optional[int] = field(default=None)
     attn_implementation: Optional[str] = field(default=None)
 
     # allow writing to existing folder & resume
@@ -203,7 +205,7 @@ if __name__ == '__main__':
     assert not (args.pretrained_model is not None and args.base_model is not None), "only one of these args must be set"
 
     output_dir = Path(args.exp_path)
-    if output_dir.exists() and not args.overwrite_output_dir and not args.do_eval_only:
+    if accel.is_main_process and output_dir.exists() and not args.overwrite_output_dir and not args.do_eval_only:
         raise RuntimeError(f"Output directory already exists: {output_dir}. "
                            f"Pass --overwrite_output_dir to resume/continue here, or choose a new --exp_path.")
 
@@ -279,6 +281,7 @@ if __name__ == '__main__':
         config.pad_token_id = tokenizer.pad_token_id
         config.bos_token_id = tokenizer.bos_token_id
         config.eos_token_id = tokenizer.eos_token_id
+        tokenizer.truncation_side = 'left'  # to truncate context tokens, not query or target
         # create model
         model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype,
                                                  attn_implementation=args.attn_implementation)
@@ -293,7 +296,7 @@ if __name__ == '__main__':
     dataset = datasets.load_from_disk(args.data_path)
 
     def data_collator(batch):
-        return collate_fn(batch, tokenizer)
+        return collate_fn(batch, tokenizer, max_input_length=args.max_input_length)
 
     # Target sequence looks like: "XXXX!|"
     # Let's not count ! and | in the accuracy calculation
