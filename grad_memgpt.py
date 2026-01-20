@@ -37,6 +37,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  use_mem_proj=False,
                  mem_proj_mode="none",
                  use_write_head=False,
+                 use_context_lm_loss=False,
                  use_gradient_checkpointing=False,
                  attn_implementation="eager",
                  **kwargs):
@@ -56,6 +57,7 @@ class GradMemGPTConfig(PretrainedConfig):
             use_mem_proj: bool, whether to use memory projection
             mem_proj_mode: str, memory projection mode ("none", "proj", "per_sample")
             use_write_head: bool, whether to use write head
+            use_context_lm_loss: bool, whether to add 1st recon loss to outer loss
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
         """
         super().__init__(**kwargs)
@@ -79,6 +81,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.use_mem_proj = use_mem_proj
         self.mem_proj_mode = mem_proj_mode
         self.use_write_head = use_write_head
+        self.use_context_lm_loss = use_context_lm_loss
         self.last_K_second_order = K if last_K_second_order is None else last_K_second_order
         if grad_mode != "second":
             self.last_K_second_order = 0
@@ -158,6 +161,7 @@ class GradMemGPT(PreTrainedModel):
         self.use_mem_proj = config.use_mem_proj
         self.mem_proj_mode = config.mem_proj_mode
         self.use_write_head = config.use_write_head
+        self.use_context_lm_loss = config.use_context_lm_loss
 
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
@@ -454,6 +458,9 @@ class GradMemGPT(PreTrainedModel):
                     elif self.grad_mode in ['first', 'second']:
                         pass  # do nothing, keep gradients flow
 
+                    if self.use_context_lm_loss and k == 0:
+                        inner_loss_1st = inner_loss / B
+
         if self.K:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
             # log average inner loss
@@ -513,5 +520,7 @@ class GradMemGPT(PreTrainedModel):
             labels[:, 1:].reshape(-1),
             ignore_index=-100,
         )
+        if self.use_context_lm_loss:
+            loss = (loss + inner_loss_1st) / 2
         output['loss'] = loss
         return output
