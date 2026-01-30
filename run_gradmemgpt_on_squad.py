@@ -21,7 +21,7 @@ from transformers import (
 )
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
-from squad_utils import preprocess_train_fn, preprocess_valid_fn
+# from squad_utils import preprocess_train_fn, preprocess_valid_fn
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -173,6 +173,7 @@ class ExperimentArgs:
     data_path: str = field(
         default='./data/N2-K4V4-S4(32-64)_1M',
     )
+    dataset_name: str = field(default='squad')
     tokenizer_path: str = field(
         default='./tokenizers/kv_alphabet_62/',
     )
@@ -232,7 +233,7 @@ if __name__ == '__main__':
             'cli_args': dict(vars(args)),
         }
         logger.info(f'saving experiment configuration to {args.exp_path}')
-        Path(args.exp_path).mkdir(parents=True)
+        Path(args.exp_path).mkdir(parents=True, exist_ok=True)
         json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
 
     if args.pretrained_model is None:
@@ -307,13 +308,14 @@ if __name__ == '__main__':
     logger.info(f'model: {model}')
     logger.info(f'model.dtype: {model.dtype}')
 
-    raw_dataset = datasets.load_dataset('squad')
-
-    dataset = datasets.DatasetDict({
-        'train': raw_dataset['train'].map(preprocess_train_fn, remove_columns=raw_dataset['train'].column_names),
-        'valid': raw_dataset['validation'].map(preprocess_train_fn,
-                                               remove_columns=raw_dataset['validation'].column_names)
-        })
+    raw_dataset = datasets.load_dataset(args.dataset_name)
+    if args.dataset_name == 'squad':
+        from squad_utils import preprocess_dataset
+    elif 'phonebook' in args.dataset_name:
+        from phonebook_utils import preprocess_dataset
+    else:
+        raise ValueError(f'Unsupported dataset: {args.dataset_name}')
+    dataset = preprocess_dataset(raw_dataset)
 
     def data_collator(batch):
         return collate_fn(batch, tokenizer)
