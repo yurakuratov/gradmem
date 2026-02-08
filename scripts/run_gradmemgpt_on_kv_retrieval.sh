@@ -28,6 +28,7 @@ TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
 K=2
+LAST_K_SECOND_ORDER=${K}
 INNER_LR=0.04
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
@@ -36,12 +37,22 @@ GRAD_MODE="second"
 USE_MEM_PROJ=false
 MEM_PROJ_MODE="none"
 USE_WRITE_HEAD=true
+ADD_INNER_LOSS_TO_OUTER=true
+INNER_LOSS_WEIGHT=0.5
+
+# INIT_CHECKPOINT=./runs/N16-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.04_whead_grad_second_bs_64_lr_1e-04/run_1/checkpoint-198000/model.safetensors
+# INIT_CHECKPOINT=./runs/N32-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.12_whead_grad_second_bs_64_lr_1e-04/run_1/checkpoint-196500/model.safetensors
+# INIT_CHECKPOINT=./runs/N64-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K5_ilr0.08_whead_grad_second_bs_64_lr_1e-04_init_N16_K2_ilr0.04/run_2/checkpoint-199000/model.safetensors
+# RUN_NAME_SUFFIX=init_N64_K5_ilr0.08
 
 RUN_NAME=gradmem_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
 fi
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
+if [ "$LAST_K_SECOND_ORDER" != "$K" ] && [ "$GRAD_MODE" == "second" ]; then
+  RUN_NAME=${RUN_NAME}_last_K${LAST_K_SECOND_ORDER}
+fi
 if [ "$INNER_CLIP_VALUE" != "None" ]; then
   RUN_NAME=${RUN_NAME}_icv${INNER_CLIP_VALUE}
 fi
@@ -58,17 +69,28 @@ if [ "$USE_WRITE_HEAD" = true ]; then
   RUN_NAME=${RUN_NAME}_whead
 fi
 RUN_NAME=${RUN_NAME}_grad_${GRAD_MODE}
+if [ "$ADD_INNER_LOSS_TO_OUTER" = true ]; then
+  RUN_NAME=${RUN_NAME}_add_inner
+  if [ "$INNER_LOSS_WEIGHT" != "None" ]; then
+    RUN_NAME=${RUN_NAME}_w${INNER_LOSS_WEIGHT}
+  fi
+fi
 if [ "$USE_ADAM" = true ]; then
   RUN_NAME=${RUN_NAME}_with_adam
 fi
 RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
 
+if [ -n "$RUN_NAME_SUFFIX" ]; then
+  RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
+fi
+
 # Run ID
-N_VALUES=(1 2)
+N_VALUES=(1 2 3)
 for N in "${N_VALUES[@]}"; do
   # Path to save experiment results
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
-
+  # --multi_gpu \
+  # --mixed_precision 'bf16' \
   # Execute the script using accelerate for parallel processing
   accelerate launch \
     --main_process_port $((29500+$TBS+$N+1)) \
@@ -87,8 +109,10 @@ for N in "${N_VALUES[@]}"; do
     --n_head $H \
     --n_embd $D \
     --base_model $BASE_MODEL \
+    $( [ -n "$INIT_CHECKPOINT" ] && echo "--init_checkpoint $INIT_CHECKPOINT" ) \
     --n_mem_tokens $N_MEM_TOKENS \
     --K $K \
+    --last_K_second_order $LAST_K_SECOND_ORDER \
     --inner_lr $INNER_LR \
     --use_adam $USE_ADAM \
     --grad_mode $GRAD_MODE \
@@ -97,7 +121,9 @@ for N in "${N_VALUES[@]}"; do
     $( [ "$USE_MEM_PROJ" = true ] && echo "--use_mem_proj" ) \
     $( [ "$USE_MEM_PROJ" = true ] && echo "--mem_proj_mode $MEM_PROJ_MODE" ) \
     $( [ "$USE_WRITE_HEAD" = true ] && echo "--use_write_head" ) \
-    --max_steps 200000 \
+    $( [ "$ADD_INNER_LOSS_TO_OUTER" = true ] && echo "--add_inner_loss_to_outer" ) \
+    $( [ "$INNER_LOSS_WEIGHT" != "None" ] && echo "--inner_loss_weight $INNER_LOSS_WEIGHT" ) \
+    --max_steps 1000000 \
     --eval_steps 500 \
     --logging_steps 500 \
     --warmup_steps 10000 \

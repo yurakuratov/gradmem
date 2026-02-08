@@ -39,6 +39,8 @@ class GradMemGPTConfig(PretrainedConfig):
                  use_write_head=False,
                  use_gradient_checkpointing=False,
                  attn_implementation="eager",
+                 add_inner_loss_to_outer=False,
+                 inner_loss_weight=None,
                  **kwargs):
         """
         Args:
@@ -57,6 +59,8 @@ class GradMemGPTConfig(PretrainedConfig):
             mem_proj_mode: str, memory projection mode ("none", "proj", "per_sample")
             use_write_head: bool, whether to use write head
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
+            add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
+            inner_loss_weight: float, weight of inner loss in combined loss
         """
         super().__init__(**kwargs)
 
@@ -85,6 +89,8 @@ class GradMemGPTConfig(PretrainedConfig):
         self.last_K_second_order = max(0, min(self.last_K_second_order, K))
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.attn_implementation = attn_implementation
+        self.add_inner_loss_to_outer = add_inner_loss_to_outer
+        self.inner_loss_weight = inner_loss_weight
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -158,6 +164,13 @@ class GradMemGPT(PreTrainedModel):
         self.use_mem_proj = config.use_mem_proj
         self.mem_proj_mode = config.mem_proj_mode
         self.use_write_head = config.use_write_head
+        self.add_inner_loss_to_outer = config.add_inner_loss_to_outer
+        self.inner_loss_weight = config.inner_loss_weight
+        if self.add_inner_loss_to_outer:
+            if self.inner_loss_weight is None:
+                self.inner_loss_weight = 1.0
+        else:
+            self.inner_loss_weight = 0.0
 
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
@@ -318,6 +331,7 @@ class GradMemGPT(PreTrainedModel):
         pad_id = self.model.config.pad_token_id
         device = context_input_ids.device
         B = context_input_ids.size(0)
+        inner_loss = torch.tensor(0.0, device=device)
 
         # actual model inputs starts after mem tokens and ctrl tokens
         mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
@@ -508,10 +522,13 @@ class GradMemGPT(PreTrainedModel):
             return output
 
         # lm loss, todo: we never compute loss from the last mem/ctrl token, it's ok until we have prefix/query in x_qry
-        loss = nn.functional.cross_entropy(
+        target_loss = nn.functional.cross_entropy(
             logits_q[:, :-1].reshape(-1, logits_q.size(-1)),
             labels[:, 1:].reshape(-1),
             ignore_index=-100,
         )
-        output['loss'] = loss
+        output['inner_loop_stats']['target_loss'] = target_loss.detach()
+        inner_loss_mean = inner_loss / B
+        combined_loss = target_loss + self.inner_loss_weight * inner_loss_mean
+        output['loss'] = combined_loss
         return output

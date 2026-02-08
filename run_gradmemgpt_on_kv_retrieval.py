@@ -117,7 +117,7 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
         print('-' * 50)
 
-    return {
+    metrics = {
         "token_accuracy": float(accuracy),
         "exact_match": float(exact_match),
         "inner_loss": float(inner_loop_stats['inner_loss'].mean()),
@@ -131,6 +131,9 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
         "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
     }
+    if 'target_loss' in inner_loop_stats:
+        metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
+    return metrics
 
 
 class StopOnMetricValue(TrainerCallback):
@@ -205,6 +208,8 @@ class ExperimentArgs:
     use_write_head: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
+    add_inner_loss_to_outer: Optional[bool] = field(default=False)
+    inner_loss_weight: Optional[float] = field(default=None)
 
 
 if __name__ == '__main__':
@@ -278,7 +283,9 @@ if __name__ == '__main__':
                                       use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                       use_write_head=args.use_write_head,
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
-                                      attn_implementation=args.attn_implementation)
+                                      attn_implementation=args.attn_implementation,
+                                      add_inner_loss_to_outer=args.add_inner_loss_to_outer,
+                                      inner_loss_weight=args.inner_loss_weight)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
