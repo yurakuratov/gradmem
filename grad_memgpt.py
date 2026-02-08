@@ -432,12 +432,14 @@ class GradMemGPT(PreTrainedModel):
 
                     is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
                     create_graph = is_second_order_step
+                    retain_graph = create_graph or (self.add_inner_loss_to_outer and (k == self.K - 1))
                     # get inner loop gradients
                     if self.mem_proj_mode == 'per_sample':
                         g_mem, g_W, g_b = torch.autograd.grad(inner_loss, [mem_batch, W_batch, b_batch],
-                                                              create_graph=create_graph)
+                                                              create_graph=create_graph, retain_graph=retain_graph)
                     else:
-                        g_mem = torch.autograd.grad(inner_loss, mem_batch, create_graph=create_graph)[0]
+                        g_mem = torch.autograd.grad(inner_loss, mem_batch,
+                                                    create_graph=create_graph, retain_graph=retain_graph)[0]
 
                     # track inner grad norm (todo: move to _opt_step?, currently we compute g_norm twice)
                     g_norm = g_mem.reshape(B, -1).norm(dim=1).detach()
@@ -528,7 +530,10 @@ class GradMemGPT(PreTrainedModel):
             ignore_index=-100,
         )
         output['inner_loop_stats']['target_loss'] = target_loss.detach()
-        inner_loss_mean = inner_loss / B
-        combined_loss = target_loss + self.inner_loss_weight * inner_loss_mean
+        if self.add_inner_loss_to_outer:
+            inner_loss_mean = inner_loss / B
+            combined_loss = target_loss + self.inner_loss_weight * inner_loss_mean
+        else:
+            combined_loss = target_loss
         output['loss'] = combined_loss
         return output
