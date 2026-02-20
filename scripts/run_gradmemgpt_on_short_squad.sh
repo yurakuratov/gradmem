@@ -68,7 +68,7 @@ N_VALUES=(1)
 for N in "${N_VALUES[@]}"; do
   RND=$(date +%Y%m%d%H%M%S)
   # Path to save experiment results
-  EXP_PATH="/cephfs/home/mkairov/gd_runs/${DATA_NAME}/${RUN_NAME}/run_$N"
+  EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
 
   # Execute the script using accelerate for parallel processing
   accelerate launch \
@@ -101,9 +101,9 @@ for N in "${N_VALUES[@]}"; do
     --warmup_steps 10000 \
     --early_stopping_patience 500 \
     --seed $((142+$N)) \
-    --attn_implementation "hvp_semi_manual" \
+    --attn_implementation "eager" \
     --pretrained_model $PRETRAINED_MODEL \
-    --init_base_checkpoint "/cephfs/home/mkairov/gd_runs/short_squad/gpt2_L4H4D128_bs_64_lr_1e-04/run_2/checkpoint-5500/model.safetensors"
+    --init_base_checkpoint "./runs/short_squad/gpt2_L4H4D128_bs_64_lr_1e-04/run_2/checkpoint-5500/model.safetensors"
 done
 
 echo "Done"

@@ -2,7 +2,6 @@ import json
 import logging
 import os
 from pathlib import Path
-import math
 
 import torch
 import numpy as np
@@ -13,7 +12,7 @@ import datasets
 import accelerate
 import transformers
 from transformers import (
-    AutoConfig, AutoTokenizer,
+    AutoTokenizer,
     AutoModelForCausalLM,
     Trainer,
     TrainingArguments,
@@ -152,12 +151,6 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(
-        default='./data/N2-K4V4-S4(32-64)_1M',
-    )
-    tokenizer_path: str = field(
-        default='./tokenizers/kv_alphabet_62/',
-    )
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -205,62 +198,10 @@ if __name__ == '__main__':
         Path(args.exp_path).mkdir(parents=True, exist_ok=True)
         json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
 
-    if args.pretrained_model is not None:
-        tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
-        model = AutoModelForCausalLM.from_pretrained(args.pretrained_model)
-    else:
-        # create tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-        # create model config
-        if args.base_model == 'gpt2':
-            config = AutoConfig.from_pretrained('gpt2')
-            config.n_layer = args.n_layer
-            config.n_head = args.n_head
-            config.n_embd = args.n_embd
-            if args.max_position_embeddings is not None:
-                config.n_positions = args.max_position_embeddings
-        elif args.base_model == 'pythia':
-            config = AutoConfig.from_pretrained('EleutherAI/pythia-160m')
-            config.num_hidden_layers = args.n_layer
-            config.num_attention_heads = args.n_head
-            config.hidden_size = args.n_embd
-            config.intermediate_size = config.hidden_size * 4
-            if args.max_position_embeddings is not None:
-                config.max_position_embeddings = args.max_position_embeddings
-        elif args.base_model == 'llama':
-            config = AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B')
-            config.num_hidden_layers = args.n_layer
-            config.num_attention_heads = args.n_head
-            config.num_key_value_heads = args.n_head
-            config.hidden_size = args.n_embd
-            config.head_dim = config.hidden_size // config.num_attention_heads
-            config.intermediate_size = config.hidden_size * 4
-            if args.max_position_embeddings is not None:
-                config.rope_scaling = None
-                config.rope_theta = 10000.0
-                config.max_position_embeddings = args.max_position_embeddings
-        elif args.base_model == 'mamba':
-            config = AutoConfig.from_pretrained('state-spaces/mamba-130m-hf')
-            config.num_hidden_layers = args.n_layer
-            config.n_layer = args.n_layer
-            config.hidden_size = args.n_embd
-            config.d_model = args.n_embd
-            config.expand = 4
-            config.intermediate_size = config.expand * config.hidden_size
-            config.d_inner = config.expand * config.hidden_size
-            config.time_step_rank = math.ceil(config.hidden_size / 16)
-        else:
-            raise ValueError(f'Unsupported base model: {args.base_model}')
-
-        config.torch_dtype = "float32"  # weights in float32, at training precision is controlled by accelerate
-        config.vocab_size = tokenizer.vocab_size
-        config.pad_token_id = tokenizer.pad_token_id
-        config.bos_token_id = tokenizer.bos_token_id
-        config.eos_token_id = tokenizer.eos_token_id
-        # create model
-        model = AutoModelForCausalLM.from_config(config)
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    model = AutoModelForCausalLM.from_pretrained(args.pretrained_model)
 
     model.config.use_cache = False
     if model.config.pad_token_id is None:
