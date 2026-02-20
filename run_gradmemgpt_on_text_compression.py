@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import random
 from pathlib import Path
 
 import torch
@@ -13,7 +14,7 @@ import accelerate
 from safetensors.torch import load_file
 import transformers
 from transformers import (
-    AutoConfig, AutoTokenizer,
+    AutoTokenizer,
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback, TrainerCallback,
@@ -21,7 +22,6 @@ from transformers import (
 )
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
-from squad_utils import preprocess_train_fn  # , preprocess_valid_fn
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -34,41 +34,41 @@ logger = logging.getLogger('')
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
-def collate_fn(batch, tokenizer):
-    # segment 1: query + context
-    # segment 2: target
-    context = [item['query'].strip() + ' ' + item['context'].strip() for item in batch]
-    query_prefix = 'Answer: '
-    query = [query_prefix + item['target'] for item in batch]
+def _sample_chunk(sample, max_context_length=None):
+    context = sample['context']
+    n_sentences = sample['n_sentences']
+    word_count = sample['word_count']
+    sentence_boundaries = sample['sentence_boundaries']
+    if max_context_length is None:
+        max_context_length = word_count * 1.2
+    # estimate on token counts per sentence
+    token_count_per_sentence = word_count * 1.2 / n_sentences
+    # select end position to be enough to cover ~max_context_length
+    sentence_start = random.randint(0, max(0, n_sentences - 1 - int(max_context_length / token_count_per_sentence)))
+    # print(n_sentences, sentence_start, max(0, n_sentences - 1 - int(max_context_length / token_count_per_sentence)))
+    return context[sentence_boundaries[sentence_start][0]:]
 
-    context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
-                                  padding=True, pad_to_multiple_of=8).input_ids
-    query_encoded = tokenizer(query, return_tensors="pt", add_special_tokens=True,
-                              padding=True, pad_to_multiple_of=8, return_offsets_mapping=True)
-    query_input_ids = query_encoded['input_ids']
-    offsets_mapping = query_encoded['offset_mapping']
 
-    # add labels_mask
-    # input_seq: 0, target_seq: 1, seq = input_seq + target_seq
-    labels_mask = torch.zeros_like(query_input_ids)
-    for i, item in enumerate(batch):
-        query_seq_len = len(query_prefix)
-        target_seq_len = len(item['target'])
-        target_st, target_end = query_seq_len, query_seq_len + target_seq_len
+def collate_fn(batch, tokenizer, max_context_length=None):
+    context = []
+    for item in batch:
+        ctx = item['context']
+        if item['split'] == 'train':
+            ctx = _sample_chunk(item, max_context_length=max_context_length)
+        if max_context_length is not None:
+            # chunks are long, so we can cut them for faster tokenization
+            ctx = ctx[:max_context_length*15]
+        context += [ctx]
 
-        # find target tokens
-        # since target is closer to the end, search from the end
-        in_target = False
-        for j in range(len(offsets_mapping[i]) - 1, -1, -1):
-            st, end = offsets_mapping[i][j]
-            # if (target_st, target_end) intersects with (st, end), it is a target token
-            if st < target_end and end > target_st:
-                labels_mask[i, j] = 1
-                in_target = True
-            elif in_target:
-                break
+    context_encoded = tokenizer(context, return_tensors="pt", add_special_tokens=True,
+                                padding=True, pad_to_multiple_of=min(8, max_context_length),
+                                max_length=max_context_length, truncation=True)
+    context_input_ids = context_encoded['input_ids']
+    query_input_ids = context_input_ids
 
-    labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
+    attention_mask = context_encoded['attention_mask'].bool()
+    labels_mask = attention_mask
+    labels = context_input_ids * labels_mask + (~labels_mask) * -100
     return {
         'input_ids': {
             'context_input_ids': context_input_ids,
@@ -80,61 +80,51 @@ def collate_fn(batch, tokenizer):
 
 def preprocess_logits_for_metrics(eval_pred, labels):
     logits, inner_loop_stats = eval_pred
-    # saves gpu RAM, as HF Trainer accumulates all eval logits on GPU
     return (logits.argmax(dim=-1), inner_loop_stats)
 
 
-def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
+def compute_metrics_fn(eval_pred, tokenizer, debug_print_samples=0):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
     preds, inner_loop_stats = predictions
     preds = preds[..., :-1]
+    # we need to predict full context, first token is predicted from memory vectors
     labels = labels[..., :]
 
-    # Create a mask for tokens that are not padding (-100) and ignored tokens (like ! and |)
     mask = (labels != -100)
-    for t_id in ignore_token_ids:
-        mask &= (labels != t_id)
-
-    # Calculate token-level accuracy only on content tokens
     masked_predictions = preds[mask]
     masked_labels = labels[mask]
-
     accuracy = (masked_predictions == masked_labels).mean()
 
-    # get exact_match per-sample accuracy, ignore masked tokens
-    # predictions.shape = (batch_size, seq_len)
     exact_match = np.mean([
         np.all(pred[mask[i]] == lab[mask[i]])
         for i, (pred, lab) in enumerate(zip(preds, labels))
-        if np.any(mask[i])  # Skip samples that are all masked
+        if np.any(mask[i])
     ])
 
-    for pred, label, inp_c, inp_q in zip(preds[:5], labels[:5],
-                                         inputs['context_input_ids'][:5], inputs['query_input_ids'][:5]):
-        mask = (label != -100)
-        pred = pred[mask]
-        inp_c[inp_c == -100] = tokenizer.pad_token_id
-        inp_q[inp_q == -100] = tokenizer.pad_token_id
-        label[label == -100] = tokenizer.pad_token_id
-        print('i:', tokenizer.decode(np.concatenate([inp_c, inp_q]), skip_special_tokens=True).strip())
-        print('p:', tokenizer.decode(pred, skip_special_tokens=True).strip())
-        print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
-        print('-' * 50)
+    if debug_print_samples > 0:
+        for pred, label, inp_c, inp_q in zip(preds[:debug_print_samples], labels[:debug_print_samples],
+                                             inputs['context_input_ids'][:debug_print_samples],
+                                             inputs['query_input_ids'][:debug_print_samples]):
+            mask = (label != -100)
+            pred = pred[mask]
+            inp_c[inp_c == -100] = tokenizer.pad_token_id
+            inp_q[inp_q == -100] = tokenizer.pad_token_id
+            label[label == -100] = tokenizer.pad_token_id
+            print('i:', tokenizer.decode(inp_c, skip_special_tokens=True).strip())
+            print('p:', tokenizer.decode(pred, skip_special_tokens=True).strip())
+            print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
+            print('-' * 50)
 
-    return {
-        "token_accuracy": float(accuracy),
-        "exact_match": float(exact_match),
-        "inner_loss": float(inner_loop_stats['inner_loss'].mean()),
-        "inner_grad_norm": float(inner_loop_stats['inner_grad_norm_mean'].mean()),
-        "inner_grad_norm_max": float(inner_loop_stats['inner_grad_norm_max'].max()),
-        "inner_grad_norm_min": float(inner_loop_stats['inner_grad_norm_min'].min()),
-        "mem_norm_mean": float(inner_loop_stats['mem_norm_mean'].mean()),
-        "mem_norm_max": float(inner_loop_stats['mem_norm_max'].max()),
-        "mem_norm_min": float(inner_loop_stats['mem_norm_min'].min()),
-        "delta_mem_norm_mean": float(inner_loop_stats['delta_mem_norm_mean'].mean()),
-        "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
-        "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
+    metrics = {
+        'token_accuracy': accuracy,
+        'exact_match': exact_match,
     }
+    for k, v in inner_loop_stats.items():
+        if hasattr(v, 'mean'):
+            metrics[k] = v.mean().item()
+        else:
+            metrics[k] = float(v)
+    return metrics
 
 
 class StopOnMetricValue(TrainerCallback):
@@ -173,12 +163,11 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(
-        default='./data/N2-K4V4-S4(32-64)_1M',
-    )
-    tokenizer_path: str = field(
-        default='./tokenizers/kv_alphabet_62/',
-    )
+    dataset_path: str = field()
+    train_split: Optional[str] = field(default="train")
+    eval_split: Optional[str] = field(default=None)
+    max_eval_samples: Optional[int] = field(default=5000)
+    max_context_length: Optional[int] = field(default=256)
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -191,28 +180,32 @@ class ExperimentArgs:
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
     seed: Optional[int] = field(default=142)
-    base_model: Optional[str] = field(default=None)
-    pretrained_model: Optional[str] = field(default=None)
-    init_base_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize base model'})
-    init_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize gradmemgpt model'})
-    n_layer: Optional[int] = field(default=4)
-    n_head: Optional[int] = field(default=4)
-    n_embd: Optional[int] = field(default=128)
+    pretrained_model: Optional[str] = field(default="EleutherAI/pythia-160m")
+    init_checkpoint: Optional[str] = field(default=None)
     # GradMemGPT parameters
     n_mem_tokens: Optional[int] = field(default=8)
-    K: Optional[int] = field(default=3)
+    K: Optional[int] = field(default=2)
     last_K_second_order: Optional[int] = field(default=None)
-    inner_lr: Optional[float] = field(default=0.01)
-    use_adam: Optional[bool] = field(default=True)
-    grad_mode: Optional[str] = field(default="none")
+    inner_lr: Optional[float] = field(default=0.08)
+    use_adam: Optional[bool] = field(default=False)
+    grad_mode: Optional[str] = field(default="second")
     n_ctrl_tokens: Optional[int] = field(default=0)
     inner_clip_value: Optional[float] = field(default=None)
     inner_clip_norm: Optional[float] = field(default=None)
-    use_mem_proj: Optional[bool] = field(default=False)
-    mem_proj_mode: Optional[str] = field(default="none")
-    use_write_head: Optional[bool] = field(default=False)
+    use_mem_proj: Optional[bool] = field(default=True)
+    mem_proj_mode: Optional[str] = field(default="proj")
+    use_write_head: Optional[bool] = field(default=True)
+    use_write_lora: Optional[bool] = field(default=True)
+    write_lora_r: Optional[int] = field(default=8)
+    write_lora_alpha: Optional[int] = field(default=16)
+    write_lora_dropout: Optional[float] = field(default=0.0)
+    write_lora_target_modules: Optional[str] = field(default=None)
+    freeze_backbone: Optional[bool] = field(default=True)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
+    add_inner_loss_to_outer: Optional[bool] = field(default=False)
+    inner_loss_weight: Optional[float] = field(default=None)
+    debug_print_samples: Optional[int] = field(default=5)
 
 
 if __name__ == '__main__':
@@ -222,14 +215,11 @@ if __name__ == '__main__':
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
     logger = get_logger('')
-    # datasets.utils.logging.set_verbosity(logger.log_level)
     transformers.utils.logging.set_verbosity(log_lvl)
 
     logger.info(f'num processes: {accel.num_processes}')
     logger.info(f'mixed precision: {accel.mixed_precision}')
     logger.info(f'accelerator state: {accel.state}')
-
-    assert not (args.pretrained_model is not None and args.base_model is not None), "only one of these args must be set"
 
     if accel.is_main_process:
         config = {
@@ -239,45 +229,41 @@ if __name__ == '__main__':
         Path(args.exp_path).mkdir(parents=True)
         json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
 
-    if args.pretrained_model is None:
-        # create tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
-        # create base model config
-        if args.base_model == 'gpt2':
-            config = AutoConfig.from_pretrained('gpt2')
-            config.n_layer = args.n_layer
-            config.n_head = args.n_head
-            config.n_embd = args.n_embd
-        elif args.base_model == 'pythia':
-            config = AutoConfig.from_pretrained('EleutherAI/pythia-160m')
-            config.num_hidden_layers = args.n_layer
-            config.num_attention_heads = args.n_head
-            config.hidden_size = args.n_embd
-            config.intermediate_size = config.hidden_size * 4
-        elif args.base_model == 'llama':
-            config = AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B')
-            config.num_hidden_layers = args.n_layer
-            config.num_attention_heads = args.n_head
-            config.num_key_value_heads = args.n_head
-            config.hidden_size = args.n_embd
-            config.head_dim = config.hidden_size // config.num_attention_heads
-            config.intermediate_size = config.hidden_size * 4
-        else:
-            raise ValueError(f'Unsupported base model: {args.base_model}')
+    tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
 
-        config.torch_dtype = "float32"  # weights in float32, at training precision is controlled by accelerate
-        config.vocab_size = tokenizer.vocab_size
-        config.pad_token_id = tokenizer.pad_token_id
-        config.bos_token_id = tokenizer.bos_token_id
-        config.eos_token_id = tokenizer.eos_token_id
-        config.use_cache = False
+    dataset = datasets.load_from_disk(args.dataset_path)
+    if not isinstance(dataset, datasets.DatasetDict):
+        raise ValueError("Prepared dataset must be a DatasetDict saved with save_to_disk.")
+
+    train_split = args.train_split or "train"
+    if train_split not in dataset:
+        train_split = list(dataset.keys())[0]
+    train_ds = dataset[train_split]
+
+    if args.eval_split and args.eval_split in dataset:
+        eval_split = args.eval_split
+    elif "validation" in dataset:
+        eval_split = "validation"
+    elif "valid" in dataset:
+        eval_split = "valid"
+    elif "test" in dataset:
+        eval_split = "test"
     else:
-        config = None
-        tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
+        raise ValueError("No eval split found. Provide --eval_split.")
 
-    gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
+    eval_ds = dataset[eval_split]
+    for f in ("context", ):
+        if f not in train_ds.column_names:
+            raise ValueError(f"Prepared dataset must include '{f}' column.")
+
+    if args.max_eval_samples is not None and len(eval_ds) > args.max_eval_samples:
+        eval_ds = eval_ds.select(range(args.max_eval_samples))
+
+    dataset = datasets.DatasetDict(train=train_ds, valid=eval_ds)
+
+    gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
                                       last_K_second_order=args.last_K_second_order,
                                       lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
@@ -285,25 +271,25 @@ if __name__ == '__main__':
                                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
                                       use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                       use_write_head=args.use_write_head,
+                                      use_write_lora=args.use_write_lora,
+                                      write_lora_r=args.write_lora_r,
+                                      write_lora_alpha=args.write_lora_alpha,
+                                      write_lora_dropout=args.write_lora_dropout,
+                                      write_lora_target_modules=args.write_lora_target_modules,
+                                      freeze_backbone=args.freeze_backbone,
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
-                                      attn_implementation=args.attn_implementation)
+                                      attn_implementation=args.attn_implementation,
+                                      add_inner_loss_to_outer=args.add_inner_loss_to_outer,
+                                      inner_loss_weight=args.inner_loss_weight)
 
-    # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
 
-    model_to_init_from_ckpt = None
     if args.init_checkpoint is not None:
-        model_to_init_from_ckpt = model
-        init_ckpt_path = args.init_checkpoint
-    elif args.init_base_checkpoint is not None:
-        model_to_init_from_ckpt = model.model
-        init_ckpt_path = args.init_base_checkpoint
-    if model_to_init_from_ckpt is not None:
-        missing_k, unexpected_k = model_to_init_from_ckpt.load_state_dict(load_file(init_ckpt_path), strict=False)
+        missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
         if len(missing_k) != 0:
             logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
         if len(unexpected_k) != 0:
-            logger.info(f'{unexpected_k} were found in checkpoint, but model_to_init_from_ckpt is not expecting them!')
+            logger.info(f'{unexpected_k} were found in checkpoint, but model is not expecting them!')
 
     if accel.mixed_precision == 'bf16':
         model.to(torch.bfloat16)
@@ -312,24 +298,11 @@ if __name__ == '__main__':
     logger.info(f'model: {model}')
     logger.info(f'model.dtype: {model.dtype}')
 
-    raw_dataset = datasets.load_dataset('squad')
-
-    dataset = datasets.DatasetDict({
-        'train': raw_dataset['train'].map(preprocess_train_fn, remove_columns=raw_dataset['train'].column_names),
-        'valid': raw_dataset['validation'].map(preprocess_train_fn,
-                                               remove_columns=raw_dataset['validation'].column_names)
-        })
-
     def data_collator(batch):
-        return collate_fn(batch, tokenizer)
+        return collate_fn(batch, tokenizer, max_context_length=args.max_context_length)
 
-    # Target sequence looks like: "XXXX!|"
-    # Let's not count ! and | in the accuracy calculation
-    ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in []]
-
-    # Define custom compute metrics function with ignored tokens
     def compute_metrics(eval_pred):
-        return compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer)
+        return compute_metrics_fn(eval_pred, tokenizer, debug_print_samples=args.debug_print_samples)
 
     output_dir = Path(args.exp_path)
 
@@ -339,11 +312,9 @@ if __name__ == '__main__':
         args_total_bs = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
         assert args.total_batch_size == args_total_bs
 
-    # Training arguments
     training_args = TrainingArguments(
         output_dir=output_dir,
         logging_dir=output_dir,
-
         max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_batch_size,
         per_device_eval_batch_size=args.per_device_batch_size,
@@ -353,7 +324,6 @@ if __name__ == '__main__':
         learning_rate=args.learning_rate,
         lr_scheduler_type=args.lr_scheduler_type,
         gradient_checkpointing=args.use_gradient_checkpointing,
-
         eval_strategy='steps',
         save_strategy='steps',
         save_steps=args.eval_steps,
@@ -365,7 +335,7 @@ if __name__ == '__main__':
         eval_on_start=True,
         greater_is_better=True,
         remove_unused_columns=False,
-        include_num_input_tokens_seen=False,  # input_ids is a dict, so HF Trainer cant get number of tokens
+        include_num_input_tokens_seen=False,
         include_for_metrics=['inputs'],
         save_total_limit=1,
         dataloader_num_workers=4,
@@ -373,7 +343,6 @@ if __name__ == '__main__':
         seed=args.seed,
     )
 
-    # Initialize Trainer
     trainer = CustomTrainer(
         model=model,
         args=training_args,
@@ -386,7 +355,7 @@ if __name__ == '__main__':
                    StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
                    ],
     )
-    # Train the model
+
     trainer.train()
     logger.info('training done. running final evaluation...')
     metrics = trainer.evaluate(dataset['valid'])

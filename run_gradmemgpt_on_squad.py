@@ -21,7 +21,6 @@ from transformers import (
 )
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
-# from squad_utils import preprocess_train_fn, preprocess_valid_fn
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -85,7 +84,7 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
     preds, inner_loop_stats = predictions
     preds = preds[..., :-1]
-    labels = labels[..., 1:]
+    labels = labels[..., :]
 
     # Create a mask for tokens that are not padding (-100) and ignored tokens (like ! and |)
     mask = (labels != -100)
