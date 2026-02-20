@@ -633,7 +633,7 @@ class GradMemGPT(PreTrainedModel):
 
         with self._disable_write_lora():
             logits_q = self.model(inputs_embeds=x_qry).logits                 # [B,M+Q,V]
-        logits_q = logits_q[:, mem_offset-1:mem_offset+qry_emb.size(1), :]    # [B,Q,V]
+        logits_q = logits_q[:, mem_offset-1:mem_offset+qry_emb.size(1), :]    # [B,Q+1,V]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:
