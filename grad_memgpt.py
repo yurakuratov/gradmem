@@ -2,15 +2,31 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
+from contextlib import contextmanager
 import attn_double_bwd  # noqa: F401  # side-effect: registers attention kernels
+
+try:
+    from peft import LoraConfig, TaskType, get_peft_model
+except ImportError:  # pragma: no cover - handled via runtime checks
+    LoraConfig = None
+    TaskType = None
+    get_peft_model = None
 
 
 def get_backbone(m):
+    if hasattr(m, "get_base_model"):
+        base = m.get_base_model()
+        if base is not None and base is not m:
+            return get_backbone(base)
+    if hasattr(m, "base_model"):
+        base = getattr(m, "base_model")
+        if base is not None and base is not m:
+            return get_backbone(base)
     # most HF CausalLM classes define base_model_prefix, e.g. "transformer" (GPT-2), "model" (LLaMA)
     if hasattr(m, "base_model_prefix") and hasattr(m, m.base_model_prefix):
         return getattr(m, m.base_model_prefix)
     # robust fallback
-    for attr in ("model", "transformer", "gpt_neox", "backbone", "decoder"):
+    for attr in ("model", "transformer", "gpt_neox", "backbone", "decoder", "base_model"):
         if hasattr(m, attr):
             return getattr(m, attr)
     raise AttributeError("Could not locate backbone submodule")
@@ -37,6 +53,12 @@ class GradMemGPTConfig(PretrainedConfig):
                  use_mem_proj=False,
                  mem_proj_mode="none",
                  use_write_head=False,
+                 use_write_lora=False,
+                 write_lora_r=8,
+                 write_lora_alpha=16,
+                 write_lora_dropout=0.0,
+                 write_lora_target_modules=None,
+                 freeze_backbone=False,
                  use_gradient_checkpointing=False,
                  attn_implementation="eager",
                  add_inner_loss_to_outer=False,
@@ -58,6 +80,12 @@ class GradMemGPTConfig(PretrainedConfig):
             use_mem_proj: bool, whether to use memory projection
             mem_proj_mode: str, memory projection mode ("none", "proj", "per_sample")
             use_write_head: bool, whether to use write head
+            use_write_lora: bool, enable LoRA adapters during WRITE phase only
+            write_lora_r: int, LoRA rank for WRITE adapters
+            write_lora_alpha: int, LoRA alpha for WRITE adapters
+            write_lora_dropout: float, LoRA dropout for WRITE adapters
+            write_lora_target_modules: list[str]|str|None, target module names (None/"auto" for defaults)
+            freeze_backbone: bool, freeze backbone weights (READ+WRITE), except LoRA/write head/mem proj
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
@@ -83,6 +111,12 @@ class GradMemGPTConfig(PretrainedConfig):
         self.use_mem_proj = use_mem_proj
         self.mem_proj_mode = mem_proj_mode
         self.use_write_head = use_write_head
+        self.use_write_lora = use_write_lora
+        self.write_lora_r = write_lora_r
+        self.write_lora_alpha = write_lora_alpha
+        self.write_lora_dropout = write_lora_dropout
+        self.write_lora_target_modules = write_lora_target_modules
+        self.freeze_backbone = freeze_backbone
         self.last_K_second_order = K if last_K_second_order is None else last_K_second_order
         if grad_mode != "second":
             self.last_K_second_order = 0
@@ -146,10 +180,24 @@ class GradMemGPT(PreTrainedModel):
 
         # initialize base model, attention is eager to support backward pass over backward pass
         if config.pretrained_model is not None:
-            self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model, attn_implementation=config.attn_implementation)
+            self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model,
+                                                              attn_implementation=config.attn_implementation)
         else:
-            self.model = AutoModelForCausalLM.from_config(config.base_config, attn_implementation=config.attn_implementation)
+            self.model = AutoModelForCausalLM.from_config(config.base_config,
+                                                          attn_implementation=config.attn_implementation)
         self.attn_implementation = config.attn_implementation
+
+        # write-phase LoRA (applies only during inner loop), additional params to train for WRITE operation
+        self.use_write_lora = getattr(config, "use_write_lora", False)
+        self.write_lora_r = getattr(config, "write_lora_r", 8)
+        self.write_lora_alpha = getattr(config, "write_lora_alpha", 16)
+        self.write_lora_dropout = getattr(config, "write_lora_dropout", 0.0)
+        self.write_lora_target_modules = getattr(config, "write_lora_target_modules", None)
+        self.freeze_backbone = getattr(config, "freeze_backbone", False)
+        if self.use_write_lora:
+            self._init_write_lora()
+        if self.freeze_backbone:
+            self._freeze_backbone_params()
 
         # store GradMemGPT parameters
         self.n_mem_tokens = config.n_mem_tokens
@@ -234,6 +282,79 @@ class GradMemGPT(PreTrainedModel):
             except TypeError:
                 # fallback for older HF versions
                 self.model.gradient_checkpointing_enable()
+
+    @staticmethod
+    def _parse_lora_targets(value):
+        if value is None:
+            return None
+        if isinstance(value, (list, tuple)):
+            targets = [str(v).strip() for v in value if str(v).strip()]
+            return targets or None
+        if isinstance(value, str):
+            cleaned = value.strip()
+            if cleaned == "" or cleaned.lower() in ("none", "auto"):
+                return None
+            targets = [v.strip() for v in cleaned.split(",") if v.strip()]
+            return targets or None
+        return None
+
+    def _resolve_write_lora_targets(self):
+        parsed = self._parse_lora_targets(self.write_lora_target_modules)
+        if parsed:
+            return parsed
+
+        model_type = getattr(self.model.config, "model_type", None)
+        targets_by_type = {
+            "llama": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            "gpt2": ["c_attn", "c_proj", "c_fc"],
+            "gpt_neox": ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
+        }
+        if model_type in targets_by_type:
+            return targets_by_type[model_type]
+
+        raise ValueError(
+            "write_lora_target_modules is not set and model_type is unknown. "
+            "Please provide explicit target modules."
+        )
+
+    def _init_write_lora(self):
+        if get_peft_model is None or LoraConfig is None or TaskType is None:
+            raise ImportError("peft is required for write_lora. Please install the peft package.")
+
+        target_modules = self._resolve_write_lora_targets()
+        lora_config = LoraConfig(
+            r=self.write_lora_r,
+            lora_alpha=self.write_lora_alpha,
+            lora_dropout=self.write_lora_dropout,
+            target_modules=target_modules,
+            task_type=TaskType.CAUSAL_LM,
+        )
+        self.model = get_peft_model(self.model, lora_config)
+        if not (hasattr(self.model, "disable_adapter_layers") and hasattr(self.model, "enable_adapter_layers")):
+            raise RuntimeError("PEFT model does not support adapter toggling; cannot enforce write-only LoRA.")
+
+        # keep base model trainable to preserve previous behavior
+        for param in self.model.parameters():
+            param.requires_grad = True
+
+    def _freeze_backbone_params(self):
+        for _, param in self.model.named_parameters():
+            param.requires_grad = False
+        if self.use_write_lora:
+            for name, param in self.model.named_parameters():
+                if "lora_" in name:
+                    param.requires_grad = True
+
+    @contextmanager
+    def _disable_write_lora(self):
+        if not self.use_write_lora:
+            yield
+            return
+        self.model.disable_adapter_layers()
+        try:
+            yield
+        finally:
+            self.model.enable_adapter_layers()
 
     def _adam_step(self, p, g, state, step_idx, lr, beta1=0.9, beta2=0.999, eps=1e-8, clip_value=10.0):
         """
@@ -510,8 +631,9 @@ class GradMemGPT(PreTrainedModel):
             pad_list = [0, 0, 0, -x_qry.size(1) % 32]
             x_qry = F.pad(x_qry, pad_list, "constant", 0)
 
-        logits_q = self.model(inputs_embeds=x_qry).logits                     # [B,M+Q,V]
-        logits_q = logits_q[:, mem_offset:mem_offset+qry_emb.size(1), :]    # [B,Q,V]
+        with self._disable_write_lora():
+            logits_q = self.model(inputs_embeds=x_qry).logits                 # [B,M+Q,V]
+        logits_q = logits_q[:, mem_offset-1:mem_offset+qry_emb.size(1), :]    # [B,Q,V]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:
@@ -523,12 +645,14 @@ class GradMemGPT(PreTrainedModel):
         if labels is None:
             return output
 
-        # lm loss, todo: we never compute loss from the last mem/ctrl token, it's ok until we have prefix/query in x_qry
+        # logits has prediction for +1 token, so we cut it as we do not have label for it
+        # labels are not shifted, as we take prediction for the first token from mem vectors
         target_loss = nn.functional.cross_entropy(
             logits_q[:, :-1].reshape(-1, logits_q.size(-1)),
-            labels[:, 1:].reshape(-1),
+            labels.reshape(-1),
             ignore_index=-100,
         )
+
         output['inner_loop_stats']['target_loss'] = target_loss.detach()
         if self.add_inner_loss_to_outer:
             inner_loss_mean = inner_loss / B

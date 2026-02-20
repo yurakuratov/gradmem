@@ -84,7 +84,7 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
     preds, inner_loop_stats = predictions
     preds = preds[..., :-1]
-    labels = labels[..., 1:]
+    labels = labels[..., :]
 
     # Create a mask for tokens that are not padding (-100) and ignored tokens (like ! and |)
     mask = (labels != -100)
@@ -206,6 +206,12 @@ class ExperimentArgs:
     use_mem_proj: Optional[bool] = field(default=False)
     mem_proj_mode: Optional[str] = field(default="none")
     use_write_head: Optional[bool] = field(default=False)
+    use_write_lora: Optional[bool] = field(default=False)
+    write_lora_r: Optional[int] = field(default=8)
+    write_lora_alpha: Optional[int] = field(default=16)
+    write_lora_dropout: Optional[float] = field(default=0.0)
+    write_lora_target_modules: Optional[str] = field(default=None)
+    freeze_backbone: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
@@ -282,6 +288,12 @@ if __name__ == '__main__':
                                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
                                       use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                       use_write_head=args.use_write_head,
+                                      use_write_lora=args.use_write_lora,
+                                      write_lora_r=args.write_lora_r,
+                                      write_lora_alpha=args.write_lora_alpha,
+                                      write_lora_dropout=args.write_lora_dropout,
+                                      write_lora_target_modules=args.write_lora_target_modules,
+                                      freeze_backbone=args.freeze_backbone,
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
                                       attn_implementation=args.attn_implementation,
                                       add_inner_loss_to_outer=args.add_inner_loss_to_outer,
