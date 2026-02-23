@@ -1,9 +1,11 @@
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
 from contextlib import contextmanager
 import math
+import logging
 import attn_double_bwd  # noqa: F401  # side-effect: registers attention kernels
 
 try:
@@ -31,6 +33,15 @@ def get_backbone(m):
         if hasattr(m, attr):
             return getattr(m, attr)
     raise AttributeError("Could not locate backbone submodule")
+
+
+logger = logging.getLogger(__name__)
+
+
+def _is_main_process():
+    if not dist.is_available() or not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
 
 
 class GradMemGPTConfig(PretrainedConfig):
@@ -588,6 +599,10 @@ class GradMemGPT(PreTrainedModel):
         if getattr(config, "use_gradient_checkpointing", False):
             self.gradient_checkpointing_enable()
 
+        n_memory_params = self._count_memory_parameters()
+        if _is_main_process():
+            logger.info(f"GradMemGPT memory params (backend={self.memory_backend}): total={n_memory_params}")
+
     def floating_point_ops(self, inputs):
         # dummy method to satisfy base class and it's invocation by trainer:
         # Trainer supposes that `inputs`` is a tensor, not dict.
@@ -604,6 +619,18 @@ class GradMemGPT(PreTrainedModel):
             except TypeError:
                 # fallback for older HF versions
                 self.model.gradient_checkpointing_enable()
+
+    def _count_memory_parameters(self):
+        if self.memory_backend == "prefix":
+            return 0 if self.mem is None else self.mem.numel()
+        if self.memory_backend == "lora":
+            total = 0
+            for p in self.lora_mem_A0.values():
+                total += p.numel()
+            for p in self.lora_mem_B0.values():
+                total += p.numel()
+            return total
+        return 0
 
     @staticmethod
     def _parse_lora_targets(value):
