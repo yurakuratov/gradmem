@@ -6,7 +6,10 @@ from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
 from contextlib import contextmanager
 import math
 import logging
-import attn_double_bwd  # noqa: F401  # side-effect: registers attention kernels
+try:
+    import attn_double_bwd  # noqa: F401  # side-effect: registers attention kernels
+except ImportError:
+    attn_double_bwd = None
 
 try:
     from peft import LoraConfig, TaskType, get_peft_model
@@ -179,7 +182,7 @@ class MemoryBackend:
         yield
 
 
-class PrefixMemoryBackend(MemoryBackend):
+class InputPrefixMemoryBackend(MemoryBackend):
     def init_memory_state(self, batch_size):
         o = self.owner
         mem_batch = o.mem.unsqueeze(0).expand(batch_size, -1, -1).clone()
@@ -496,6 +499,13 @@ class GradMemGPT(PreTrainedModel):
             self.model = AutoModelForCausalLM.from_config(config.base_config,
                                                           attn_implementation=config.attn_implementation)
         self.attn_implementation = config.attn_implementation
+        if self.attn_implementation in ("jvp_flash", "hvp_semi_manual") and attn_double_bwd is None:
+            raise ImportError(
+                f"attn_implementation={self.attn_implementation} requires triton/attn_double_bwd. "
+                "Install triton or use a standard attention implementation (e.g. eager)."
+            )
+        if attn_double_bwd is None and _is_main_process():
+            logger.info("triton/attn_double_bwd is not available; using standard attention kernels")
 
         self.memory_backend = getattr(config, "memory_backend", "prefix")
         self.lora_mem_placement = getattr(config, "lora_mem_placement", "between_layers")
@@ -522,9 +532,11 @@ class GradMemGPT(PreTrainedModel):
             self._init_lora_memory_between_layers()
 
         if self.memory_backend == "prefix":
-            self.memory_backend_impl = PrefixMemoryBackend(self)
-        else:
+            self.memory_backend_impl = InputPrefixMemoryBackend(self)
+        elif self.memory_backend == "lora":
             self.memory_backend_impl = LoraMemoryBackend(self)
+        else:
+            raise ValueError(f"Unsupported memory_backend={self.memory_backend}. Supported: prefix, lora")
 
         # store GradMemGPT parameters
         self.n_mem_tokens = config.n_mem_tokens
@@ -630,7 +642,7 @@ class GradMemGPT(PreTrainedModel):
             for p in self.lora_mem_B0.values():
                 total += p.numel()
             return total
-        return 0
+        raise ValueError(f"Unsupported memory_backend={self.memory_backend}")
 
     @staticmethod
     def _parse_lora_targets(value):
