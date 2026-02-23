@@ -41,6 +41,7 @@ class GradMemGPTConfig(PretrainedConfig):
     def __init__(self,
                  pretrained_model=None,
                  base_config=None,
+                 memory_backend="prefix",
                  n_mem_tokens=8,
                  K=2,
                  lr=0.01,
@@ -58,6 +59,11 @@ class GradMemGPTConfig(PretrainedConfig):
                  write_lora_alpha=16,
                  write_lora_dropout=0.0,
                  write_lora_target_modules=None,
+                 lora_mem_placement="between_layers",
+                 lora_mem_r=8,
+                 lora_mem_alpha=16,
+                 lora_mem_dropout=0.0,
+                 lora_mem_layers=None,
                  freeze_backbone=False,
                  use_gradient_checkpointing=False,
                  attn_implementation="eager",
@@ -68,6 +74,7 @@ class GradMemGPTConfig(PretrainedConfig):
         Args:
             pretrained_model: str, name of pretrained model to load (e.g., 'gpt2')
             base_config: dict or PretrainedConfig, config for base model when creating from scratch
+            memory_backend: str, memory implementation ("prefix", "lora")
             n_mem_tokens: int, number of memory tokens
             K: int, number of inner loop steps
             lr: float, inner loop learning rate, it is a effective learning rate per sample
@@ -85,6 +92,14 @@ class GradMemGPTConfig(PretrainedConfig):
             write_lora_alpha: int, LoRA alpha for WRITE adapters
             write_lora_dropout: float, LoRA dropout for WRITE adapters
             write_lora_target_modules: list[str]|str|None, target module names (None/"auto" for defaults)
+            lora_mem_placement: str, where LoRA memory is injected (currently: "between_layers")
+            lora_mem_r: int, rank of LoRA memory adapters
+            lora_mem_alpha: int, alpha scaling for LoRA memory adapters
+            lora_mem_dropout: float, dropout on hidden states before LoRA memory projection
+            lora_mem_layers: str|list[int]|None, transformer layers to inject LoRA memory
+                examples: None or "all" (all layers), "last_4" (last 4 layers),
+                "0,3,7" (explicit indices), [0, 3, 7] (explicit indices as list),
+                "none"/"auto"/"" (treated as all layers)
             freeze_backbone: bool, freeze backbone weights (READ+WRITE), except LoRA/write head/mem proj
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
@@ -100,6 +115,7 @@ class GradMemGPTConfig(PretrainedConfig):
             self.base_config = base_config
 
         # GradMemGPT specific parameters
+        self.memory_backend = memory_backend
         self.n_mem_tokens = n_mem_tokens
         self.K = K
         self.lr = lr
@@ -116,6 +132,11 @@ class GradMemGPTConfig(PretrainedConfig):
         self.write_lora_alpha = write_lora_alpha
         self.write_lora_dropout = write_lora_dropout
         self.write_lora_target_modules = write_lora_target_modules
+        self.lora_mem_placement = lora_mem_placement
+        self.lora_mem_r = lora_mem_r
+        self.lora_mem_alpha = lora_mem_alpha
+        self.lora_mem_dropout = lora_mem_dropout
+        self.lora_mem_layers = lora_mem_layers
         self.freeze_backbone = freeze_backbone
         self.last_K_second_order = K if last_K_second_order is None else last_K_second_order
         if grad_mode != "second":
@@ -129,6 +150,283 @@ class GradMemGPTConfig(PretrainedConfig):
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
+        assert self.memory_backend in ["prefix", "lora"], "memory_backend must be one of: prefix, lora"
+        if self.memory_backend == "lora":
+            assert self.lora_mem_placement in ["between_layers"], (
+                "lora_mem_placement currently supports only 'between_layers'"
+            )
+
+
+class MemoryBackend:
+    def __init__(self, owner):
+        self.owner = owner
+
+    @contextmanager
+    def activation_context(self, memory_state):
+        _ = memory_state
+        yield
+
+
+class PrefixMemoryBackend(MemoryBackend):
+    def init_memory_state(self, batch_size):
+        o = self.owner
+        mem_batch = o.mem.unsqueeze(0).expand(batch_size, -1, -1).clone()
+        if o.grad_mode == "none":
+            mem_batch = mem_batch.detach().requires_grad_(True)
+        else:
+            mem_batch = mem_batch.requires_grad_(True)
+
+        memory_state = {"mem_batch": mem_batch}
+        memory_state_initial = {"mem_batch": mem_batch.detach().clone()}
+
+        if o.mem_proj_mode == "per_sample":
+            W_batch = o.mem_proj.weight.unsqueeze(0).expand(batch_size, -1, -1).clone()
+            b_batch = o.mem_proj.bias.unsqueeze(0).expand(batch_size, -1).clone()
+            if o.grad_mode == "none":
+                W_batch = W_batch.detach().requires_grad_(True)
+                b_batch = b_batch.detach().requires_grad_(True)
+            else:
+                W_batch = W_batch.requires_grad_(True)
+                b_batch = b_batch.requires_grad_(True)
+            memory_state["W_batch"] = W_batch
+            memory_state["b_batch"] = b_batch
+
+        return memory_state, memory_state_initial
+
+    def prepare_batch(self, context_input_ids, query_input_ids, pad_id):
+        o = self.owner
+        B = context_input_ids.size(0)
+        mem_offset = o.n_mem_tokens + o.n_ctrl_tokens * 2
+
+        batch_ctx = {
+            "context_input_ids": context_input_ids,
+            "query_input_ids": query_input_ids,
+            "ctx_emb": o.model.get_input_embeddings()(context_input_ids),
+            "qry_emb": o.model.get_input_embeddings()(query_input_ids),
+            "mem_offset": mem_offset,
+        }
+
+        lm_labels = context_input_ids.clone()
+        lm_labels[lm_labels == pad_id] = -100
+        mask = (lm_labels != -100)
+
+        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+            pad_list = [0, -(batch_ctx["ctx_emb"].size(1) + mem_offset) % 32, 0, 0]
+            mask = F.pad(mask, pad_list, "constant", 0)
+            lm_labels = F.pad(lm_labels, pad_list, "constant", -100)
+            batch_ctx["ctx_emb"] = F.pad(batch_ctx["ctx_emb"], [0, 0] + pad_list, "constant", 0)
+
+        batch_ctx["lm_labels"] = lm_labels
+        batch_ctx["mask"] = mask
+
+        if o.n_ctrl_tokens > 0:
+            batch_ctx["write_st_batch"] = o.write_st.unsqueeze(0).expand(B, -1, -1)
+            batch_ctx["write_end_batch"] = o.write_end.unsqueeze(0).expand(B, -1, -1)
+            batch_ctx["read_st_batch"] = o.read_st.unsqueeze(0).expand(B, -1, -1)
+            batch_ctx["read_end_batch"] = o.read_end.unsqueeze(0).expand(B, -1, -1)
+
+        return batch_ctx
+
+    def build_write_inputs(self, memory_state, batch_ctx):
+        o = self.owner
+        mem_batch = memory_state["mem_batch"]
+        if o.mem_proj_mode == "none":
+            mem_inp = mem_batch
+        elif o.mem_proj_mode == "proj":
+            mem_inp = o.mem_proj(mem_batch)
+        else:
+            mem_inp = o._apply_linear(mem_batch, memory_state["W_batch"], memory_state["b_batch"])
+
+        if o.n_ctrl_tokens > 0:
+            x_ctx = torch.cat(
+                [batch_ctx["write_st_batch"], mem_inp, batch_ctx["write_end_batch"], batch_ctx["ctx_emb"]],
+                dim=1,
+            )
+        else:
+            x_ctx = torch.cat([mem_inp, batch_ctx["ctx_emb"]], dim=1)
+
+        return {
+            "inputs_embeds": x_ctx,
+            "lm_labels": batch_ctx["lm_labels"],
+            "mask": batch_ctx["mask"],
+            "logits_start": batch_ctx["mem_offset"] - 1,
+            "label_shift": 0,
+        }
+
+    def build_read_inputs(self, memory_state, batch_ctx):
+        o = self.owner
+        mem_batch = memory_state["mem_batch"]
+        if o.mem_proj_mode == "none":
+            mem_inp = mem_batch
+        elif o.mem_proj_mode == "proj":
+            mem_inp = o.mem_proj(mem_batch)
+        else:
+            mem_inp = o._apply_linear(mem_batch, memory_state["W_batch"], memory_state["b_batch"])
+
+        if o.n_ctrl_tokens > 0:
+            x_qry = torch.cat(
+                [batch_ctx["read_st_batch"], mem_inp, batch_ctx["read_end_batch"], batch_ctx["qry_emb"]],
+                dim=1,
+            )
+        else:
+            x_qry = torch.cat([mem_inp, batch_ctx["qry_emb"]], dim=1)
+
+        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+            x_qry = F.pad(x_qry, [0, 0, 0, -x_qry.size(1) % 32], "constant", 0)
+
+        return {
+            "inputs_embeds": x_qry,
+            "logits_start": batch_ctx["mem_offset"] - 1,
+            "pred_len": batch_ctx["qry_emb"].size(1) + 1,
+            "label_shift": 0,
+        }
+
+    def inner_params(self, memory_state):
+        params = [memory_state["mem_batch"]]
+        if self.owner.mem_proj_mode == "per_sample":
+            params += [memory_state["W_batch"], memory_state["b_batch"]]
+        return params
+
+    def assign_inner_params(self, memory_state, new_params):
+        memory_state["mem_batch"] = new_params[0]
+        if self.owner.mem_proj_mode == "per_sample":
+            memory_state["W_batch"] = new_params[1]
+            memory_state["b_batch"] = new_params[2]
+
+    def maybe_detach_after_step(self, memory_state):
+        if self.owner.grad_mode != "none":
+            return
+        memory_state["mem_batch"] = memory_state["mem_batch"].detach().requires_grad_(True)
+        if self.owner.mem_proj_mode == "per_sample":
+            memory_state["W_batch"] = memory_state["W_batch"].detach().requires_grad_(True)
+            memory_state["b_batch"] = memory_state["b_batch"].detach().requires_grad_(True)
+
+    def compute_memory_stats(self, memory_state, memory_state_initial):
+        mem_batch = memory_state["mem_batch"]
+        mem_init = memory_state_initial["mem_batch"]
+        mem_norm = mem_batch.norm(dim=(1, 2)).detach()
+        delta_mem_norm = (mem_batch - mem_init).detach().norm(dim=(1, 2))
+        return mem_norm, delta_mem_norm
+
+    def attach_return_memory(self, output, memory_state):
+        output["mem"] = memory_state["mem_batch"]
+        if self.owner.mem_proj_mode == "per_sample":
+            output["W"] = memory_state["W_batch"]
+            output["b"] = memory_state["b_batch"]
+
+
+class LoraMemoryBackend(MemoryBackend):
+    def init_memory_state(self, batch_size):
+        o = self.owner
+        device = o.model.get_input_embeddings().weight.device
+        memory_state = {"lora_mem": {}}
+        memory_state_initial = {"lora_mem": {}}
+        for layer_idx in o.lora_mem_layer_ids:
+            A0 = o.lora_mem_A0[str(layer_idx)].to(device=device)
+            B0 = o.lora_mem_B0[str(layer_idx)].to(device=device)
+            A_batch = A0.unsqueeze(0).expand(batch_size, -1, -1).clone()
+            B_batch = B0.unsqueeze(0).expand(batch_size, -1, -1).clone()
+            if o.grad_mode == "none":
+                A_batch = A_batch.detach().requires_grad_(True)
+                B_batch = B_batch.detach().requires_grad_(True)
+            else:
+                A_batch = A_batch.requires_grad_(True)
+                B_batch = B_batch.requires_grad_(True)
+            memory_state["lora_mem"][layer_idx] = (A_batch, B_batch)
+            memory_state_initial["lora_mem"][layer_idx] = (A_batch.detach().clone(), B_batch.detach().clone())
+        return memory_state, memory_state_initial
+
+    @contextmanager
+    def activation_context(self, memory_state):
+        with self.owner._enable_lora_memory(memory_state["lora_mem"]):
+            yield
+
+    def prepare_batch(self, context_input_ids, query_input_ids, pad_id):
+        o = self.owner
+        emb_layer = o.model.get_input_embeddings()
+        ctx_emb = emb_layer(context_input_ids)
+        qry_emb = emb_layer(query_input_ids)
+
+        lm_labels = context_input_ids.clone()
+        lm_labels[lm_labels == pad_id] = -100
+        mask = (lm_labels != -100)
+
+        x_ctx = ctx_emb
+        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+            pad_n = (-x_ctx.size(1)) % 32
+            if pad_n:
+                x_ctx = F.pad(x_ctx, [0, 0, 0, pad_n], "constant", 0)
+                lm_labels = F.pad(lm_labels, [0, pad_n], "constant", -100)
+                mask = F.pad(mask, [0, pad_n], "constant", 0)
+
+        return {
+            "x_ctx": x_ctx,
+            "lm_labels": lm_labels,
+            "mask": mask,
+            "qry_emb": qry_emb,
+        }
+
+    def build_write_inputs(self, memory_state, batch_ctx):
+        _ = memory_state
+        return {
+            "inputs_embeds": batch_ctx["x_ctx"],
+            "lm_labels": batch_ctx["lm_labels"],
+            "mask": batch_ctx["mask"],
+            "logits_start": 0,
+            "label_shift": 1,
+        }
+
+    def build_read_inputs(self, memory_state, batch_ctx):
+        _ = memory_state
+        o = self.owner
+        x_qry = batch_ctx["qry_emb"]
+        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+            x_qry = F.pad(x_qry, [0, 0, 0, (-x_qry.size(1)) % 32], "constant", 0)
+        return {
+            "inputs_embeds": x_qry,
+            "logits_start": 0,
+            "pred_len": batch_ctx["qry_emb"].size(1),
+            "label_shift": 1,
+        }
+
+    def inner_params(self, memory_state):
+        params = []
+        for layer_idx in self.owner.lora_mem_layer_ids:
+            A_batch, B_batch = memory_state["lora_mem"][layer_idx]
+            params.extend([A_batch, B_batch])
+        return params
+
+    def assign_inner_params(self, memory_state, new_params):
+        p = 0
+        for layer_idx in self.owner.lora_mem_layer_ids:
+            memory_state["lora_mem"][layer_idx] = (new_params[p], new_params[p + 1])
+            p += 2
+
+    def maybe_detach_after_step(self, memory_state):
+        if self.owner.grad_mode != "none":
+            return
+        for layer_idx in self.owner.lora_mem_layer_ids:
+            A_batch, B_batch = memory_state["lora_mem"][layer_idx]
+            memory_state["lora_mem"][layer_idx] = (
+                A_batch.detach().requires_grad_(True),
+                B_batch.detach().requires_grad_(True),
+            )
+
+    def compute_memory_stats(self, memory_state, memory_state_initial):
+        mem_device = next(iter(memory_state["lora_mem"].values()))[0].device
+        mem_norm_sq = torch.zeros(next(iter(memory_state["lora_mem"].values()))[0].size(0), device=mem_device)
+        delta_mem_norm_sq = torch.zeros_like(mem_norm_sq)
+        for layer_idx in self.owner.lora_mem_layer_ids:
+            A_batch, B_batch = memory_state["lora_mem"][layer_idx]
+            A_init, B_init = memory_state_initial["lora_mem"][layer_idx]
+            mem_norm_sq = mem_norm_sq + A_batch.detach().pow(2).sum(dim=(1, 2))
+            mem_norm_sq = mem_norm_sq + B_batch.detach().pow(2).sum(dim=(1, 2))
+            delta_mem_norm_sq = delta_mem_norm_sq + (A_batch.detach() - A_init).pow(2).sum(dim=(1, 2))
+            delta_mem_norm_sq = delta_mem_norm_sq + (B_batch.detach() - B_init).pow(2).sum(dim=(1, 2))
+        return mem_norm_sq.sqrt(), delta_mem_norm_sq.sqrt()
+
+    def attach_return_memory(self, output, memory_state):
+        output["lora_mem"] = memory_state["lora_mem"]
 
 
 class GradMemGPT(PreTrainedModel):
@@ -187,6 +485,15 @@ class GradMemGPT(PreTrainedModel):
                                                           attn_implementation=config.attn_implementation)
         self.attn_implementation = config.attn_implementation
 
+        self.memory_backend = getattr(config, "memory_backend", "prefix")
+        self.lora_mem_placement = getattr(config, "lora_mem_placement", "between_layers")
+        self.lora_mem_r = getattr(config, "lora_mem_r", 8)
+        self.lora_mem_alpha = getattr(config, "lora_mem_alpha", 16)
+        self.lora_mem_dropout = getattr(config, "lora_mem_dropout", 0.0)
+        self.lora_mem_layers = getattr(config, "lora_mem_layers", None)
+        self._active_lora_memory = None
+        self._lora_mem_hooks = []
+
         # write-phase LoRA (applies only during inner loop), additional params to train for WRITE operation
         self.use_write_lora = getattr(config, "use_write_lora", False)
         self.write_lora_r = getattr(config, "write_lora_r", 8)
@@ -198,6 +505,14 @@ class GradMemGPT(PreTrainedModel):
             self._init_write_lora()
         if self.freeze_backbone:
             self._freeze_backbone_params()
+
+        if self.memory_backend == "lora":
+            self._init_lora_memory_between_layers()
+
+        if self.memory_backend == "prefix":
+            self.memory_backend_impl = PrefixMemoryBackend(self)
+        else:
+            self.memory_backend_impl = LoraMemoryBackend(self)
 
         # store GradMemGPT parameters
         self.n_mem_tokens = config.n_mem_tokens
@@ -211,6 +526,8 @@ class GradMemGPT(PreTrainedModel):
         self.inner_clip_norm = config.inner_clip_norm
         self.use_mem_proj = config.use_mem_proj
         self.mem_proj_mode = config.mem_proj_mode
+        if self.memory_backend != "prefix" and self.mem_proj_mode != "none":
+            raise ValueError("mem_proj_mode is supported only for memory_backend='prefix'")
         self.use_write_head = config.use_write_head
         self.add_inner_loss_to_outer = config.add_inner_loss_to_outer
         self.inner_loss_weight = config.inner_loss_weight
@@ -222,17 +539,21 @@ class GradMemGPT(PreTrainedModel):
 
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
-        # self.mem are inner loop per-sample params, intial states of mem (self.mem) are meta-learned
-        self.mem = nn.Parameter(torch.randn(self.n_mem_tokens, n_embd) * 0.02)
+        if self.memory_backend == "prefix":
+            # self.mem are inner loop per-sample params, intial states of mem (self.mem) are meta-learned
+            self.mem = nn.Parameter(torch.randn(self.n_mem_tokens, n_embd) * 0.02)
 
-        # optional mem projection linear layer
-        if self.mem_proj_mode != "none":
-            self.mem_proj = nn.Linear(n_embd, n_embd, bias=True)
-            # initialize mem_proj to be identity
-            with torch.no_grad():
-                nn.init.eye_(self.mem_proj.weight)
-                self.mem_proj.bias.zero_()
+            # optional mem projection linear layer
+            if self.mem_proj_mode != "none":
+                self.mem_proj = nn.Linear(n_embd, n_embd, bias=True)
+                # initialize mem_proj to be identity
+                with torch.no_grad():
+                    nn.init.eye_(self.mem_proj.weight)
+                    self.mem_proj.bias.zero_()
+            else:
+                self.mem_proj = None
         else:
+            self.mem = None
             self.mem_proj = None
 
         # optional read/write control parameters (shape = n_ctrl_tokens × d)
@@ -438,14 +759,102 @@ class GradMemGPT(PreTrainedModel):
             return mem
         return torch.baddbmm(b.unsqueeze(1), mem, W.transpose(1, 2))
 
-    def forward(self, input_ids, labels=None, return_mem=False):
-        # context_input_ids : B × S   (segments only, each ends with `|`)
-        # query_input_ids   : B × Q   (e.g.  "?!K:V!|") i.e. the last segment
-        # labels            : B × Q   (‑100 everywhere except the target tokens (V!|))
+    def _get_transformer_blocks(self):
+        backbone = get_backbone(self.model)
+        for attr in ("h", "layers", "block", "blocks"):
+            if hasattr(backbone, attr):
+                blocks = getattr(backbone, attr)
+                if isinstance(blocks, (nn.ModuleList, list, tuple)):
+                    return list(blocks)
+        raise ValueError("Could not resolve transformer block list for LoRA memory placement")
 
-        """
-        All tensors already padded to the same length in the datacollator.
-        """
+    @staticmethod
+    def _parse_lora_mem_layers(value, n_layers):
+        if value is None:
+            return list(range(n_layers))
+        if isinstance(value, (list, tuple)):
+            idx = sorted(set(int(v) for v in value))
+            return idx
+        if isinstance(value, str):
+            cleaned = value.strip().lower()
+            if cleaned in ("", "all", "none", "auto"):
+                return list(range(n_layers))
+            if cleaned.startswith("last_"):
+                k = int(cleaned.split("last_", 1)[1])
+                k = max(0, min(k, n_layers))
+                return list(range(n_layers - k, n_layers))
+            idx = sorted(set(int(v.strip()) for v in value.split(",") if v.strip() != ""))
+            return idx
+        raise ValueError("lora_mem_layers should be None, list[int], or str")
+
+    def _init_lora_memory_between_layers(self):
+        blocks = self._get_transformer_blocks()
+        n_layers = len(blocks)
+        layer_ids = self._parse_lora_mem_layers(self.lora_mem_layers, n_layers)
+        for idx in layer_ids:
+            if idx < 0 or idx >= n_layers:
+                raise ValueError(f"lora_mem_layers has out-of-range index {idx} for {n_layers} layers")
+        self.lora_mem_layer_ids = layer_ids
+
+        hidden_size = getattr(self.model.config, "n_embd", getattr(self.model.config, "hidden_size", None))
+        if hidden_size is None:
+            raise ValueError("Could not infer hidden size from model config")
+        self.lora_mem_scale = float(self.lora_mem_alpha) / float(max(1, self.lora_mem_r))
+        self.lora_mem_A0 = nn.ParameterDict()
+        self.lora_mem_B0 = nn.ParameterDict()
+        for layer_idx in self.lora_mem_layer_ids:
+            a = nn.Parameter(
+                torch.zeros(hidden_size, self.lora_mem_r),
+                requires_grad=True,
+            )
+            b = nn.Parameter(
+                torch.zeros(self.lora_mem_r, hidden_size),
+                requires_grad=True,
+            )
+            self.lora_mem_A0[str(layer_idx)] = a
+            self.lora_mem_B0[str(layer_idx)] = b
+
+        self._register_lora_mem_hooks(blocks)
+
+    def _register_lora_mem_hooks(self, blocks):
+        if self._lora_mem_hooks:
+            return
+
+        for layer_idx in self.lora_mem_layer_ids:
+            module = blocks[layer_idx]
+
+            def _hook_fn(_mod, _inp, output, idx=layer_idx):
+                if self._active_lora_memory is None or idx not in self._active_lora_memory:
+                    return output
+
+                x = output[0] if isinstance(output, tuple) else output
+                A_mem, B_mem = self._active_lora_memory[idx]
+                if self.lora_mem_dropout > 0.0:
+                    x_in = F.dropout(x, p=self.lora_mem_dropout, training=self.training)
+                else:
+                    x_in = x
+                low_rank = torch.einsum("bsd,bdr->bsr", x_in, A_mem)
+                delta = torch.einsum("bsr,brd->bsd", low_rank, B_mem)
+                x_new = x + self.lora_mem_scale * delta
+
+                if isinstance(output, tuple):
+                    out_list = list(output)
+                    out_list[0] = x_new
+                    return tuple(out_list)
+                return x_new
+
+            self._lora_mem_hooks.append(module.register_forward_hook(_hook_fn))
+
+    @contextmanager
+    def _enable_lora_memory(self, memory_params):
+        old = self._active_lora_memory
+        self._active_lora_memory = memory_params
+        try:
+            yield
+        finally:
+            self._active_lora_memory = old
+
+    def forward(self, input_ids, labels=None, return_mem=False):
         context_input_ids = input_ids['context_input_ids']
         query_input_ids = input_ids['query_input_ids']
 
@@ -454,202 +863,123 @@ class GradMemGPT(PreTrainedModel):
         B = context_input_ids.size(0)
         inner_loss = torch.tensor(0.0, device=device)
 
-        # actual model inputs starts after mem tokens and ctrl tokens
-        mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
+        backend = self.memory_backend_impl
+        memory_state, memory_state_initial = backend.init_memory_state(B)
+        batch_ctx = backend.prepare_batch(context_input_ids, query_input_ids, pad_id)
+        opt_state = {}
 
-        # ctrl tokens
-        if self.n_ctrl_tokens > 0:
-            write_st_batch = self.write_st.unsqueeze(0).expand(B, -1, -1)
-            write_end_batch = self.write_end.unsqueeze(0).expand(B, -1, -1)
-            read_st_batch = self.read_st.unsqueeze(0).expand(B, -1, -1)
-            read_end_batch = self.read_end.unsqueeze(0).expand(B, -1, -1)
+        inner_loop_stats = {
+            'inner_grad_norm_mean': torch.tensor(0.0, device=device),
+            'inner_grad_norm_max': torch.tensor(-1.0, device=device),
+            'inner_grad_norm_min': torch.tensor(1e06, device=device),
+        }
 
-        # make a copy of the memory that we'll update K times, manage gradients:
-        mem_batch = self.mem.unsqueeze(0).expand(B, -1, -1).clone()  # [B,M,d]
-        mem_batch_initial = mem_batch.clone()
-
-        # per-sample params for mem_proj:
-        if self.mem_proj_mode == "per_sample":
-            W_batch = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1).clone()
-            b_batch = self.mem_proj.bias.unsqueeze(0).expand(B, -1).clone()
-
-        # handling gradients for meta-params:
-        if self.grad_mode == "none":
-            mem_batch = mem_batch.detach().requires_grad_(True)
-            if self.mem_proj_mode == "per_sample":
-                W_batch = W_batch.detach().requires_grad_(True)
-                b_batch = b_batch.detach().requires_grad_(True)
-        else:
-            mem_batch = mem_batch.requires_grad_(True)
-            if self.mem_proj_mode == "per_sample":
-                W_batch = W_batch.requires_grad_(True)
-                b_batch = b_batch.requires_grad_(True)
-
-        opt_state = {}                       # moments for stateless Adam
-        inner_loop_stats = {'inner_grad_norm_mean': torch.tensor(0.0, device=device),
-                            'inner_grad_norm_max': torch.tensor(-1.0, device=device),
-                            'inner_grad_norm_min': torch.tensor(1e06, device=device)}
-        # ---------------------------------------------------------------- #
-        # 1.  INNER loop on context. WRITE context to mem.
-        # ---------------------------------------------------------------- #
         if self.K and context_input_ids.ne(pad_id).any():
-            # re‑enable autograd even if outer context is `no_grad`
             with torch.enable_grad():
-                # build ctx embedding once, then reuse it with updated mem
-                ctx_emb = self.model.get_input_embeddings()(context_input_ids)      # [B,S,d]
-                # lm labels: reconstructing the context, last mem/ctrl token predicts the first token of the context
-                lm_labels = context_input_ids.clone()
-                lm_labels[lm_labels == pad_id] = -100
-                # loss mask
-                mask = (lm_labels != -100)
-                # n real tokens per sample
-                seq_len = mask.sum(dim=1).clamp_min(1)
-
-                # pad to multiple of 32 for compatibility with JVP Flash Attention
-                if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
-                    pad_list = [0, -(ctx_emb.size(1) + mem_offset) % 32, 0, 0]
-                    mask = F.pad(mask, pad_list, "constant", 0)
-                    lm_labels = F.pad(lm_labels, pad_list, "constant", -100)
-                    ctx_emb = F.pad(ctx_emb, [0, 0] + pad_list, "constant", 0)
-
                 for k in range(self.K):
-                    if self.mem_proj_mode == 'none':
-                        mem_inp = mem_batch
-                    elif self.mem_proj_mode == 'proj':
-                        mem_inp = self.mem_proj(mem_batch)
-                    else:  # per-sample
-                        mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
+                    write_batch = backend.build_write_inputs(memory_state, batch_ctx)
+                    with backend.activation_context(memory_state):
+                        if self.use_write_head:
+                            outs = get_backbone(self.model)(inputs_embeds=write_batch['inputs_embeds'],
+                                                            return_dict=True)
+                            hidden = outs.last_hidden_state[:, write_batch['logits_start']:, :]
+                            logits = self.write_head(hidden)
+                        else:
+                            outs = self.model(inputs_embeds=write_batch['inputs_embeds'], return_dict=True)
+                            logits = outs.logits[:, write_batch['logits_start']:, :]
 
-                    if self.n_ctrl_tokens > 0:
-                        # add params that can control write operation to mem in inner loop
-                        x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch, ctx_emb], dim=1)
+                    logits_loss = logits[:, :-1]
+                    label_shift = write_batch.get('label_shift', 0)
+                    labels_loss = write_batch['lm_labels'][:, label_shift:]
+                    mask_loss = write_batch['mask'][:, label_shift:]
+                    common_len = min(logits_loss.size(1), labels_loss.size(1))
+                    if common_len > 0:
+                        logits_loss = logits_loss[:, :common_len]
+                        labels_loss = labels_loss[:, :common_len]
+                        mask_loss = mask_loss[:, :common_len]
+                        inner_loss = nn.functional.cross_entropy(
+                            logits_loss.reshape(-1, logits.size(-1)),
+                            labels_loss.reshape(-1),
+                            ignore_index=-100,
+                            reduction='none',
+                        ).view(B, -1)
+                        seq_len = mask_loss.sum(dim=1).clamp_min(1)
+                        inner_loss = (inner_loss * mask_loss).sum(1) / seq_len
+                        inner_loss = inner_loss.sum()
                     else:
-                        x_ctx = torch.cat([mem_inp, ctx_emb], dim=1)    # [B,M+S,d]
-
-                    if self.use_write_head:
-                        # we do not need to compute read memory head logits here, we need only last hidden state
-                        # to get write head logits
-                        outs = get_backbone(self.model)(inputs_embeds=x_ctx, return_dict=True)
-                        h = outs.last_hidden_state                     # [B,M+S,V]
-                        h = h[:, mem_offset-1:, :]                     # [B,S,V]
-                        logits = self.write_head(h)
-                        del h
-                    else:
-                        outs = self.model(inputs_embeds=x_ctx, return_dict=True)
-                        logits = outs.logits                           # [B,M+S,V]
-                        logits = logits[:, mem_offset-1:, :]           # [B,S,V]
-
-                    inner_loss = nn.functional.cross_entropy(
-                        logits[:, :-1].reshape(-1, logits.size(-1)),
-                        lm_labels.reshape(-1),
-                        ignore_index=-100,
-                        reduction='none',
-                    ).view(B, -1)
-                    # per_sample losses, make per-sample inner loss invariant to batch size B:
-                    # g_i = d inner_loss / d mem_i = d inner_loss_i / d mem_i
-                    inner_loss = (inner_loss * mask).sum(1) / seq_len
-                    inner_loss = inner_loss.sum()
+                        inner_loss = logits_loss.sum() * 0.0
                     del outs, logits
 
                     is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
                     create_graph = is_second_order_step
                     retain_graph = create_graph or (self.add_inner_loss_to_outer and (k == self.K - 1))
-                    # get inner loop gradients
-                    if self.mem_proj_mode == 'per_sample':
-                        g_mem, g_W, g_b = torch.autograd.grad(inner_loss, [mem_batch, W_batch, b_batch],
-                                                              create_graph=create_graph, retain_graph=retain_graph)
-                    else:
-                        g_mem = torch.autograd.grad(inner_loss, mem_batch,
-                                                    create_graph=create_graph, retain_graph=retain_graph)[0]
 
-                    # track inner grad norm (todo: move to _opt_step?, currently we compute g_norm twice)
-                    g_norm = g_mem.reshape(B, -1).norm(dim=1).detach()
+                    inner_params = backend.inner_params(memory_state)
+                    grads = torch.autograd.grad(inner_loss, inner_params,
+                                                create_graph=create_graph, retain_graph=retain_graph)
+
+                    g_sq = torch.zeros(B, device=device)
+                    for g in grads:
+                        g_sq = g_sq + g.reshape(B, -1).pow(2).sum(dim=1)
+                    g_norm = g_sq.sqrt().detach()
                     inner_loop_stats['inner_grad_norm_mean'] += g_norm.mean()
                     inner_loop_stats['inner_grad_norm_max'] = max(inner_loop_stats['inner_grad_norm_max'], g_norm.max())
                     inner_loop_stats['inner_grad_norm_min'] = min(inner_loop_stats['inner_grad_norm_min'], g_norm.min())
 
-                    if self.use_adam:
-                        mem_batch = self._adam_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), k + 1, self.lr)
-                        if self.mem_proj_mode == 'per_sample':
-                            W_batch = self._adam_step(W_batch, g_W, opt_state.setdefault('W', {}), k + 1, self.lr)
-                            b_batch = self._adam_step(b_batch, g_b, opt_state.setdefault('b', {}), k + 1, self.lr)
-                            raise NotImplementedError("Adam is not tested, be careful!")
-                    else:
-                        mem_batch = self._sgd_step(mem_batch, g_mem,
-                                                   clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
-                        if self.mem_proj_mode == 'per_sample':
-                            W_batch = self._sgd_step(W_batch, g_W,
-                                                     clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
-                            b_batch = self._sgd_step(b_batch, g_b,
-                                                     clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
-
-                    if self.grad_mode in ['none']:
-                        mem_batch = mem_batch.detach().requires_grad_(True)
-                        if self.mem_proj_mode == 'per_sample':
-                            W_batch = W_batch.detach().requires_grad_(True)
-                            b_batch = b_batch.detach().requires_grad_(True)
-                    elif self.grad_mode in ['first', 'second']:
-                        pass  # do nothing, keep gradients flow
+                    new_params = []
+                    for p, g, i in zip(inner_params, grads, range(len(inner_params))):
+                        if self.use_adam:
+                            p_new = self._adam_step(p, g, opt_state.setdefault(str(i), {}), k + 1, self.lr)
+                        else:
+                            p_new = self._sgd_step(p, g,
+                                                   clip_value=self.inner_clip_value,
+                                                   clip_norm=self.inner_clip_norm)
+                        new_params.append(p_new)
+                    backend.assign_inner_params(memory_state, new_params)
+                    backend.maybe_detach_after_step(memory_state)
 
         if self.K:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
-            # log average inner loss
             inner_loop_stats['inner_loss'] = inner_loss.detach() / B
-        # mem_batch: [B,M,d]
-        mem_norm = mem_batch.norm(dim=(1, 2)).detach()  # B
+
+        mem_norm, delta_mem_norm = backend.compute_memory_stats(memory_state, memory_state_initial)
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
         inner_loop_stats['mem_norm_max'] = mem_norm.max()
         inner_loop_stats['mem_norm_min'] = mem_norm.min()
-        # log how mem has changed from initial state to state after inner loop
-        detla_mem_norm = (mem_batch - mem_batch_initial).detach().norm(dim=(1, 2))
-        inner_loop_stats['delta_mem_norm_mean'] = detla_mem_norm.mean()
-        inner_loop_stats['delta_mem_norm_max'] = detla_mem_norm.max()
-        inner_loop_stats['delta_mem_norm_min'] = detla_mem_norm.min()
+        inner_loop_stats['delta_mem_norm_mean'] = delta_mem_norm.mean()
+        inner_loop_stats['delta_mem_norm_max'] = delta_mem_norm.max()
+        inner_loop_stats['delta_mem_norm_min'] = delta_mem_norm.min()
 
-        del ctx_emb, lm_labels
+        read_batch = backend.build_read_inputs(memory_state, batch_ctx)
+        with backend.activation_context(memory_state):
+            with self._disable_write_lora():
+                logits_q = self.model(inputs_embeds=read_batch['inputs_embeds']).logits
 
-        # ---------------------------------------------------------------- #
-        # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
-        # ---------------------------------------------------------------- #
-        qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
-
-        if self.mem_proj_mode == "none":
-            mem_inp = mem_batch
-        elif self.mem_proj_mode == "proj":
-            mem_inp = self.mem_proj(mem_batch)
-        else:  # "per_sample"
-            mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
-
-        if self.n_ctrl_tokens > 0:
-            # add params that can control read operation from mem
-            x_qry = torch.cat([read_st_batch, mem_inp, read_end_batch, qry_emb], dim=1)
-        else:
-            x_qry = torch.cat([mem_inp, qry_emb], dim=1)                      # [B,M+Q,d]
-
-        # pad to multiple of 32 for compatibility with JVP Flash Attention
-        if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
-            pad_list = [0, 0, 0, -x_qry.size(1) % 32]
-            x_qry = F.pad(x_qry, pad_list, "constant", 0)
-
-        with self._disable_write_lora():
-            logits_q = self.model(inputs_embeds=x_qry).logits                 # [B,M+Q,V]
-        logits_q = logits_q[:, mem_offset-1:mem_offset+qry_emb.size(1), :]    # [B,Q+1,V]
+        # LoRA memory backend needs one seed token to start autoregressive prediction;
+        # it cannot predict the very first token from memory alone when query is empty.
+        logits_q = logits_q[:, read_batch['logits_start']:read_batch['logits_start'] + read_batch['pred_len'], :]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:
-            output['mem'] = mem_batch
-            if self.mem_proj_mode == "per_sample":
-                output['W'] = W_batch
-                output['b'] = b_batch
+            backend.attach_return_memory(output, memory_state)
 
         if labels is None:
             return output
 
-        # logits has prediction for +1 token, so we cut it as we do not have label for it
-        # labels are not shifted, as we take prediction for the first token from mem vectors
+        target_logits = output['predictions'][:, :-1]
+        target_label_shift = read_batch.get('label_shift', 0)
+        # Prefix memory can predict the first target token from memory itself (label_shift=0),
+        # while LoRA memory without a prepended seed token cannot (label_shift=1).
+        # Backends should produce exactly aligned lengths after this shift.
+        target_labels = labels[:, target_label_shift:]
+        if target_logits.size(1) != target_labels.size(1):
+            raise ValueError(
+                f"Mismatched target lengths after alignment: logits_len={target_logits.size(1)}, "
+                f"labels_len={target_labels.size(1)}, label_shift={target_label_shift}"
+            )
         target_loss = nn.functional.cross_entropy(
-            logits_q[:, :-1].reshape(-1, logits_q.size(-1)),
-            labels.reshape(-1),
+            target_logits.reshape(-1, output['predictions'].size(-1)),
+            target_labels.reshape(-1),
             ignore_index=-100,
         )
 

@@ -86,9 +86,19 @@ def preprocess_logits_for_metrics(eval_pred, labels):
 def compute_metrics_fn(eval_pred, tokenizer, debug_print_samples=0):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
     preds, inner_loop_stats = predictions
-    preds = preds[..., :-1]
-    # we need to predict full context, first token is predicted from memory vectors
-    labels = labels[..., :]
+    # Prefix memory predicts the first token from memory (pred_len = label_len + 1).
+    # LoRA memory without prepended seed token cannot predict the first token from memory alone
+    # in this text-compression setup, so metrics here are not directly comparable across backends.
+    pred_len = preds.shape[1]
+    label_len = labels.shape[1]
+    if pred_len == label_len + 1:
+        preds = preds[:, :-1]
+        labels = labels[:, :]
+    elif pred_len == label_len:
+        preds = preds[:, :-1]
+        labels = labels[:, 1:]
+    else:
+        raise ValueError(f"Unexpected prediction/label lengths: pred_len={pred_len}, label_len={label_len}")
 
     mask = (labels != -100)
     masked_predictions = preds[mask]
@@ -183,6 +193,7 @@ class ExperimentArgs:
     pretrained_model: Optional[str] = field(default="EleutherAI/pythia-160m")
     init_checkpoint: Optional[str] = field(default=None)
     # GradMemGPT parameters
+    memory_backend: Optional[str] = field(default="prefix")
     n_mem_tokens: Optional[int] = field(default=8)
     K: Optional[int] = field(default=2)
     last_K_second_order: Optional[int] = field(default=None)
@@ -200,6 +211,11 @@ class ExperimentArgs:
     write_lora_alpha: Optional[int] = field(default=16)
     write_lora_dropout: Optional[float] = field(default=0.0)
     write_lora_target_modules: Optional[str] = field(default=None)
+    lora_mem_placement: Optional[str] = field(default="between_layers")
+    lora_mem_r: Optional[int] = field(default=8)
+    lora_mem_alpha: Optional[int] = field(default=16)
+    lora_mem_dropout: Optional[float] = field(default=0.0)
+    lora_mem_layers: Optional[str] = field(default="all")
     freeze_backbone: Optional[bool] = field(default=True)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
@@ -264,6 +280,7 @@ if __name__ == '__main__':
     dataset = datasets.DatasetDict(train=train_ds, valid=eval_ds)
 
     gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model,
+                                      memory_backend=args.memory_backend,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
                                       last_K_second_order=args.last_K_second_order,
                                       lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
@@ -276,6 +293,11 @@ if __name__ == '__main__':
                                       write_lora_alpha=args.write_lora_alpha,
                                       write_lora_dropout=args.write_lora_dropout,
                                       write_lora_target_modules=args.write_lora_target_modules,
+                                      lora_mem_placement=args.lora_mem_placement,
+                                      lora_mem_r=args.lora_mem_r,
+                                      lora_mem_alpha=args.lora_mem_alpha,
+                                      lora_mem_dropout=args.lora_mem_dropout,
+                                      lora_mem_layers=args.lora_mem_layers,
                                       freeze_backbone=args.freeze_backbone,
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
                                       attn_implementation=args.attn_implementation,

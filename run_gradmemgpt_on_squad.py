@@ -83,8 +83,16 @@ def preprocess_logits_for_metrics(eval_pred, labels):
 def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
     preds, inner_loop_stats = predictions
-    preds = preds[..., :-1]
-    labels = labels[..., :]
+    pred_len = preds.shape[1]
+    label_len = labels.shape[1]
+    if pred_len == label_len + 1:
+        preds = preds[:, :-1]
+        labels = labels[:, :]
+    elif pred_len == label_len:
+        preds = preds[:, :-1]
+        labels = labels[:, 1:]
+    else:
+        raise ValueError(f"Unexpected prediction/label lengths: pred_len={pred_len}, label_len={label_len}")
 
     # Create a mask for tokens that are not padding (-100) and ignored tokens (like ! and |)
     mask = (labels != -100)
@@ -196,6 +204,7 @@ class ExperimentArgs:
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
     # GradMemGPT parameters
+    memory_backend: Optional[str] = field(default="prefix")
     n_mem_tokens: Optional[int] = field(default=8)
     K: Optional[int] = field(default=3)
     inner_lr: Optional[float] = field(default=0.01)
@@ -207,6 +216,11 @@ class ExperimentArgs:
     use_mem_proj: Optional[bool] = field(default=False)
     mem_proj_mode: Optional[str] = field(default="none")
     use_write_head: Optional[bool] = field(default=False)
+    lora_mem_placement: Optional[str] = field(default="between_layers")
+    lora_mem_r: Optional[int] = field(default=8)
+    lora_mem_alpha: Optional[int] = field(default=16)
+    lora_mem_dropout: Optional[float] = field(default=0.0)
+    lora_mem_layers: Optional[str] = field(default="all")
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
 
@@ -274,12 +288,18 @@ if __name__ == '__main__':
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
     gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
+                                      memory_backend=args.memory_backend,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
                                       lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
                                       n_ctrl_tokens=args.n_ctrl_tokens,
                                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
                                       use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                       use_write_head=args.use_write_head,
+                                      lora_mem_placement=args.lora_mem_placement,
+                                      lora_mem_r=args.lora_mem_r,
+                                      lora_mem_alpha=args.lora_mem_alpha,
+                                      lora_mem_dropout=args.lora_mem_dropout,
+                                      lora_mem_layers=args.lora_mem_layers,
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
                                       attn_implementation=args.attn_implementation)
 
