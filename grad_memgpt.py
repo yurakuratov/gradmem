@@ -3,6 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
 from contextlib import contextmanager
+import math
 import attn_double_bwd  # noqa: F401  # side-effect: registers attention kernels
 
 try:
@@ -811,6 +812,8 @@ class GradMemGPT(PreTrainedModel):
                 torch.zeros(self.lora_mem_r, hidden_size),
                 requires_grad=True,
             )
+            nn.init.kaiming_uniform_(a, a=math.sqrt(5))
+            nn.init.zeros_(b)
             self.lora_mem_A0[str(layer_idx)] = a
             self.lora_mem_B0[str(layer_idx)] = b
 
