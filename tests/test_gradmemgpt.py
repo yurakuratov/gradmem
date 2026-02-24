@@ -59,6 +59,44 @@ def _assert_return_mem_payload(memory_backend: str, output: dict):
         raise ValueError(f"Unknown backend={memory_backend}")
 
 
+def _snapshot_memory_tensors(model: GradMemGPT, memory_backend: str, memory_state: dict):
+    if memory_backend == "prefix":
+        return [memory_state["mem_batch"].detach().clone()]
+    if memory_backend == "lora":
+        tensors = []
+        for layer_idx in model.lora_mem_layer_ids:
+            a_batch, b_batch = memory_state["lora_mem"][layer_idx]
+            tensors.append(a_batch.detach().clone())
+            tensors.append(b_batch.detach().clone())
+        return tensors
+    if memory_backend == "kv_cache":
+        tensors = []
+        for layer_idx in model.kv_mem_layer_ids:
+            k_batch, v_batch = memory_state["kv_mem"][layer_idx]
+            tensors.append(k_batch.detach().clone())
+            tensors.append(v_batch.detach().clone())
+        return tensors
+    raise ValueError(f"Unknown backend={memory_backend}")
+
+
+def _memory_init_params(model: GradMemGPT, memory_backend: str):
+    if memory_backend == "prefix":
+        return [model.mem]
+    if memory_backend == "lora":
+        params = []
+        for key in sorted(model.lora_mem_A0.keys(), key=int):
+            params.append(model.lora_mem_A0[key])
+            params.append(model.lora_mem_B0[key])
+        return params
+    if memory_backend == "kv_cache":
+        params = []
+        for key in sorted(model.kv_mem_K0.keys(), key=int):
+            params.append(model.kv_mem_K0[key])
+            params.append(model.kv_mem_V0[key])
+        return params
+    raise ValueError(f"Unknown backend={memory_backend}")
+
+
 @pytest.mark.forward
 @pytest.mark.all
 @pytest.mark.parametrize("model_family", ["gpt2", "gpt_neox", "llama"])
@@ -71,10 +109,10 @@ def test_forward(model_family: str, memory_backend: str):
         base_config=base_config,
         memory_backend=memory_backend,
         n_mem_tokens=4,
-        K=1,
+        K=2,
         lr=0.01,
         use_adam=False,
-        grad_mode="none",
+        grad_mode="second",
         use_mem_proj=False,
         mem_proj_mode="none",
         use_write_head=False,
@@ -84,6 +122,23 @@ def test_forward(model_family: str, memory_backend: str):
 
     model = GradMemGPT(model_config)
     model.eval()
+
+    backend = model.memory_backend_impl
+    memory_snapshots = []
+    original_init_memory_state = backend.init_memory_state
+    original_assign_inner_params = backend.assign_inner_params
+
+    def _init_memory_state_with_snapshot(batch_size):
+        memory_state, memory_state_initial = original_init_memory_state(batch_size)
+        memory_snapshots.append(_snapshot_memory_tensors(model, memory_backend, memory_state))
+        return memory_state, memory_state_initial
+
+    def _assign_inner_params_with_snapshot(memory_state, new_params):
+        original_assign_inner_params(memory_state, new_params)
+        memory_snapshots.append(_snapshot_memory_tensors(model, memory_backend, memory_state))
+
+    backend.init_memory_state = _init_memory_state_with_snapshot
+    backend.assign_inner_params = _assign_inner_params_with_snapshot
 
     batch_size = 2
     ctx_len = 6
@@ -115,10 +170,24 @@ def test_forward(model_family: str, memory_backend: str):
     stats = output["inner_loop_stats"]
     assert torch.isfinite(stats["inner_grad_norm_mean"]).item()
     assert torch.isfinite(stats["delta_mem_norm_mean"]).item()
+    assert torch.isfinite(stats["inner_loss"]).item()
     assert stats["inner_grad_norm_mean"].item() >= 0
     assert stats["delta_mem_norm_mean"].item() >= 0
 
     _assert_return_mem_payload(memory_backend, output)
+
+    assert len(memory_snapshots) == model_config.K + 1
+    for step_idx in range(1, len(memory_snapshots)):
+        prev_step = memory_snapshots[step_idx - 1]
+        curr_step = memory_snapshots[step_idx]
+        assert len(prev_step) == len(curr_step)
+        total_delta = 0.0
+        for prev_t, curr_t in zip(prev_step, curr_step):
+            total_delta += float((curr_t - prev_t).pow(2).sum().item())
+        assert total_delta > 0.0, (
+            f"Memory did not change across inner steps for backend={memory_backend}, "
+            f"step={step_idx - 1}->{step_idx}"
+        )
 
 
 @pytest.mark.one_batch_train
@@ -133,10 +202,10 @@ def test_single_batch_train(model_family: str, memory_backend: str):
         base_config=base_config,
         memory_backend=memory_backend,
         n_mem_tokens=4,
-        K=1,
+        K=2,
         lr=0.01,
         use_adam=False,
-        grad_mode="none",
+        grad_mode="second",
         use_mem_proj=False,
         mem_proj_mode="none",
         use_write_head=False,
@@ -146,6 +215,9 @@ def test_single_batch_train(model_family: str, memory_backend: str):
 
     model = GradMemGPT(model_config)
     model.train()
+
+    mem_init_params = _memory_init_params(model, memory_backend)
+    assert len(mem_init_params) > 0
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     assert len(trainable_params) > 0
@@ -173,6 +245,11 @@ def test_single_batch_train(model_family: str, memory_backend: str):
     assert torch.isfinite(loss).item()
 
     loss.backward()
+
+    for p in mem_init_params:
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all().item()
+        assert p.grad.detach().norm().item() > 0.0
 
     grad_norm_sq = torch.tensor(0.0)
     params_with_grad = []
