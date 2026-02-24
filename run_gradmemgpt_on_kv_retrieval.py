@@ -225,6 +225,7 @@ class ExperimentArgs:
     lora_mem_alpha: Optional[int] = field(default=16)
     lora_mem_dropout: Optional[float] = field(default=0.0)
     lora_mem_layers: Optional[str] = field(default="all")
+    kv_mem_layers: Optional[str] = field(default="all")
     freeze_backbone: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
@@ -309,11 +310,12 @@ if __name__ == '__main__':
                                       write_lora_dropout=args.write_lora_dropout,
                                       write_lora_target_modules=args.write_lora_target_modules,
                                       lora_mem_placement=args.lora_mem_placement,
-                                      lora_mem_r=args.lora_mem_r,
-                                      lora_mem_alpha=args.lora_mem_alpha,
-                                      lora_mem_dropout=args.lora_mem_dropout,
-                                      lora_mem_layers=args.lora_mem_layers,
-                                      freeze_backbone=args.freeze_backbone,
+                                       lora_mem_r=args.lora_mem_r,
+                                       lora_mem_alpha=args.lora_mem_alpha,
+                                       lora_mem_dropout=args.lora_mem_dropout,
+                                       lora_mem_layers=args.lora_mem_layers,
+                                       kv_mem_layers=args.kv_mem_layers,
+                                       freeze_backbone=args.freeze_backbone,
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
                                       attn_implementation=args.attn_implementation,
                                       add_inner_loss_to_outer=args.add_inner_loss_to_outer,

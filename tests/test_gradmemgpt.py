@@ -53,6 +53,8 @@ def _assert_return_mem_payload(memory_backend: str, output: dict):
         assert "mem" in output
     elif memory_backend == "lora":
         assert "lora_mem" in output
+    elif memory_backend == "kv_cache":
+        assert "kv_mem" in output
     else:
         raise ValueError(f"Unknown backend={memory_backend}")
 
@@ -60,7 +62,7 @@ def _assert_return_mem_payload(memory_backend: str, output: dict):
 @pytest.mark.forward
 @pytest.mark.all
 @pytest.mark.parametrize("model_family", ["gpt2", "gpt_neox", "llama"])
-@pytest.mark.parametrize("memory_backend", ["prefix", "lora"])
+@pytest.mark.parametrize("memory_backend", ["prefix", "lora", "kv_cache"])
 def test_forward(model_family: str, memory_backend: str):
     torch.manual_seed(0)
 
@@ -122,7 +124,7 @@ def test_forward(model_family: str, memory_backend: str):
 @pytest.mark.one_batch_train
 @pytest.mark.all
 @pytest.mark.parametrize("model_family", ["gpt2", "gpt_neox", "llama"])
-@pytest.mark.parametrize("memory_backend", ["prefix", "lora"])
+@pytest.mark.parametrize("memory_backend", ["prefix", "lora", "kv_cache"])
 def test_single_batch_train(model_family: str, memory_backend: str):
     torch.manual_seed(0)
 
@@ -186,3 +188,55 @@ def test_single_batch_train(model_family: str, memory_backend: str):
     optimizer.step()
     changed = any(not torch.equal(before_by_param[id(p)], p.detach()) for p in params_with_grad)
     assert changed
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_fail_fast_on_inner_alignment_mismatch():
+    torch.manual_seed(0)
+
+    base_config = _build_base_config("gpt2")
+    model_config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="lora",
+        n_mem_tokens=4,
+        K=1,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="none",
+        use_mem_proj=False,
+        mem_proj_mode="none",
+        use_write_head=False,
+        attn_implementation="eager",
+        **_backend_extra_kwargs("lora"),
+    )
+
+    model = GradMemGPT(model_config)
+    model.eval()
+
+    original_build_write_inputs = model.memory_backend_impl.build_write_inputs
+
+    def _broken_build_write_inputs(memory_state, batch_ctx):
+        batch = original_build_write_inputs(memory_state, batch_ctx)
+        batch["label_shift"] = 0
+        return batch
+
+    model.memory_backend_impl.build_write_inputs = _broken_build_write_inputs
+
+    batch_size = 2
+    ctx_len = 6
+    qry_len = 4
+    vocab_size = base_config.vocab_size
+
+    context_input_ids = torch.randint(0, vocab_size, (batch_size, ctx_len))
+    query_input_ids = torch.randint(0, vocab_size, (batch_size, qry_len))
+    labels = torch.randint(0, vocab_size, (batch_size, qry_len))
+
+    with pytest.raises(ValueError, match="Invalid inner-loop alignment"):
+        _ = model(
+            {
+                "context_input_ids": context_input_ids,
+                "query_input_ids": query_input_ids,
+            },
+            labels=labels,
+        )

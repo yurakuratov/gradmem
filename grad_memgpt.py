@@ -3,6 +3,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
+from transformers.cache_utils import DynamicCache
 from contextlib import contextmanager
 import math
 import logging
@@ -79,6 +80,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  lora_mem_alpha=16,
                  lora_mem_dropout=0.0,
                  lora_mem_layers=None,
+                 kv_mem_layers=None,
                  freeze_backbone=False,
                  use_gradient_checkpointing=False,
                  attn_implementation="eager",
@@ -89,7 +91,7 @@ class GradMemGPTConfig(PretrainedConfig):
         Args:
             pretrained_model: str, name of pretrained model to load (e.g., 'gpt2')
             base_config: dict or PretrainedConfig, config for base model when creating from scratch
-            memory_backend: str, memory implementation ("prefix", "lora")
+            memory_backend: str, memory implementation ("prefix", "lora", "kv_cache")
             n_mem_tokens: int, number of memory tokens
             K: int, number of inner loop steps
             lr: float, inner loop learning rate, it is a effective learning rate per sample
@@ -112,6 +114,10 @@ class GradMemGPTConfig(PretrainedConfig):
             lora_mem_alpha: int, alpha scaling for LoRA memory adapters
             lora_mem_dropout: float, dropout on hidden states before LoRA memory projection
             lora_mem_layers: str|list[int]|None, transformer layers to inject LoRA memory
+                examples: None or "all" (all layers), "last_4" (last 4 layers),
+                "0,3,7" (explicit indices), [0, 3, 7] (explicit indices as list),
+                "none"/"auto"/"" (treated as all layers)
+            kv_mem_layers: str|list[int]|None, transformer layers to inject KV-cache memory
                 examples: None or "all" (all layers), "last_4" (last 4 layers),
                 "0,3,7" (explicit indices), [0, 3, 7] (explicit indices as list),
                 "none"/"auto"/"" (treated as all layers)
@@ -152,6 +158,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.lora_mem_alpha = lora_mem_alpha
         self.lora_mem_dropout = lora_mem_dropout
         self.lora_mem_layers = lora_mem_layers
+        self.kv_mem_layers = kv_mem_layers
         self.freeze_backbone = freeze_backbone
         self.last_K_second_order = K if last_K_second_order is None else last_K_second_order
         if grad_mode != "second":
@@ -165,7 +172,9 @@ class GradMemGPTConfig(PretrainedConfig):
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
-        assert self.memory_backend in ["prefix", "lora"], "memory_backend must be one of: prefix, lora"
+        assert self.memory_backend in ["prefix", "lora", "kv_cache"], (
+            "memory_backend must be one of: prefix, lora, kv_cache"
+        )
         if self.memory_backend == "lora":
             assert self.lora_mem_placement in ["between_layers"], (
                 "lora_mem_placement currently supports only 'between_layers'"
@@ -444,6 +453,121 @@ class LoraMemoryBackend(MemoryBackend):
         output["lora_mem"] = memory_state["lora_mem"]
 
 
+class KVCacheMemoryBackend(MemoryBackend):
+    def init_memory_state(self, batch_size):
+        o = self.owner
+        device = o.model.get_input_embeddings().weight.device
+        memory_state = {"kv_mem": {}}
+        memory_state_initial = {"kv_mem": {}}
+        for layer_idx in o.kv_mem_layer_ids:
+            K0 = o.kv_mem_K0[str(layer_idx)].to(device=device)
+            V0 = o.kv_mem_V0[str(layer_idx)].to(device=device)
+            K_batch = K0.unsqueeze(0).expand(batch_size, -1, -1, -1).clone()
+            V_batch = V0.unsqueeze(0).expand(batch_size, -1, -1, -1).clone()
+            if o.grad_mode == "none":
+                K_batch = K_batch.detach().requires_grad_(True)
+                V_batch = V_batch.detach().requires_grad_(True)
+            else:
+                K_batch = K_batch.requires_grad_(True)
+                V_batch = V_batch.requires_grad_(True)
+            memory_state["kv_mem"][layer_idx] = (K_batch, V_batch)
+            memory_state_initial["kv_mem"][layer_idx] = (K_batch.detach().clone(), V_batch.detach().clone())
+        return memory_state, memory_state_initial
+
+    def prepare_batch(self, context_input_ids, query_input_ids, pad_id):
+        o = self.owner
+        emb_layer = o.model.get_input_embeddings()
+        ctx_emb = emb_layer(context_input_ids)
+        qry_emb = emb_layer(query_input_ids)
+
+        lm_labels = context_input_ids.clone()
+        lm_labels[lm_labels == pad_id] = -100
+        mask = (lm_labels != -100)
+
+        x_ctx = ctx_emb
+        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+            pad_n = (-x_ctx.size(1)) % 32
+            if pad_n:
+                x_ctx = F.pad(x_ctx, [0, 0, 0, pad_n], "constant", 0)
+                lm_labels = F.pad(lm_labels, [0, pad_n], "constant", -100)
+                mask = F.pad(mask, [0, pad_n], "constant", 0)
+
+        return {
+            "x_ctx": x_ctx,
+            "lm_labels": lm_labels,
+            "mask": mask,
+            "qry_emb": qry_emb,
+        }
+
+    def build_write_inputs(self, memory_state, batch_ctx):
+        return {
+            "inputs_embeds": batch_ctx["x_ctx"],
+            "lm_labels": batch_ctx["lm_labels"],
+            "mask": batch_ctx["mask"],
+            "logits_start": 0,
+            "label_shift": 1,
+            "model_kwargs": {
+                "past_key_values": self.owner._build_dynamic_cache(memory_state["kv_mem"]),
+                "use_cache": True,
+            },
+        }
+
+    def build_read_inputs(self, memory_state, batch_ctx):
+        o = self.owner
+        x_qry = batch_ctx["qry_emb"]
+        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+            x_qry = F.pad(x_qry, [0, 0, 0, (-x_qry.size(1)) % 32], "constant", 0)
+        return {
+            "inputs_embeds": x_qry,
+            "logits_start": 0,
+            "pred_len": batch_ctx["qry_emb"].size(1),
+            "label_shift": 1,
+            "model_kwargs": {
+                "past_key_values": self.owner._build_dynamic_cache(memory_state["kv_mem"]),
+                "use_cache": True,
+            },
+        }
+
+    def inner_params(self, memory_state):
+        params = []
+        for layer_idx in self.owner.kv_mem_layer_ids:
+            K_batch, V_batch = memory_state["kv_mem"][layer_idx]
+            params.extend([K_batch, V_batch])
+        return params
+
+    def assign_inner_params(self, memory_state, new_params):
+        p = 0
+        for layer_idx in self.owner.kv_mem_layer_ids:
+            memory_state["kv_mem"][layer_idx] = (new_params[p], new_params[p + 1])
+            p += 2
+
+    def maybe_detach_after_step(self, memory_state):
+        if self.owner.grad_mode != "none":
+            return
+        for layer_idx in self.owner.kv_mem_layer_ids:
+            K_batch, V_batch = memory_state["kv_mem"][layer_idx]
+            memory_state["kv_mem"][layer_idx] = (
+                K_batch.detach().requires_grad_(True),
+                V_batch.detach().requires_grad_(True),
+            )
+
+    def compute_memory_stats(self, memory_state, memory_state_initial):
+        mem_device = next(iter(memory_state["kv_mem"].values()))[0].device
+        mem_norm_sq = torch.zeros(next(iter(memory_state["kv_mem"].values()))[0].size(0), device=mem_device)
+        delta_mem_norm_sq = torch.zeros_like(mem_norm_sq)
+        for layer_idx in self.owner.kv_mem_layer_ids:
+            K_batch, V_batch = memory_state["kv_mem"][layer_idx]
+            K_init, V_init = memory_state_initial["kv_mem"][layer_idx]
+            mem_norm_sq = mem_norm_sq + K_batch.detach().pow(2).sum(dim=(1, 2, 3))
+            mem_norm_sq = mem_norm_sq + V_batch.detach().pow(2).sum(dim=(1, 2, 3))
+            delta_mem_norm_sq = delta_mem_norm_sq + (K_batch.detach() - K_init).pow(2).sum(dim=(1, 2, 3))
+            delta_mem_norm_sq = delta_mem_norm_sq + (V_batch.detach() - V_init).pow(2).sum(dim=(1, 2, 3))
+        return mem_norm_sq.sqrt(), delta_mem_norm_sq.sqrt()
+
+    def attach_return_memory(self, output, memory_state):
+        output["kv_mem"] = memory_state["kv_mem"]
+
+
 class GradMemGPT(PreTrainedModel):
     """
     Transformer-decoder backbone + writable prefix memory (n_mem_tokens x d).
@@ -513,6 +637,7 @@ class GradMemGPT(PreTrainedModel):
         self.lora_mem_alpha = getattr(config, "lora_mem_alpha", 16)
         self.lora_mem_dropout = getattr(config, "lora_mem_dropout", 0.0)
         self.lora_mem_layers = getattr(config, "lora_mem_layers", None)
+        self.kv_mem_layers = getattr(config, "kv_mem_layers", None)
         self._active_lora_memory = None
         self._lora_mem_hooks = []
 
@@ -530,13 +655,17 @@ class GradMemGPT(PreTrainedModel):
 
         if self.memory_backend == "lora":
             self._init_lora_memory_between_layers()
+        elif self.memory_backend == "kv_cache":
+            self._init_kv_cache_memory()
 
         if self.memory_backend == "prefix":
             self.memory_backend_impl = InputPrefixMemoryBackend(self)
         elif self.memory_backend == "lora":
             self.memory_backend_impl = LoraMemoryBackend(self)
+        elif self.memory_backend == "kv_cache":
+            self.memory_backend_impl = KVCacheMemoryBackend(self)
         else:
-            raise ValueError(f"Unsupported memory_backend={self.memory_backend}. Supported: prefix, lora")
+            raise ValueError(f"Unsupported memory_backend={self.memory_backend}. Supported: prefix, lora, kv_cache")
 
         # store GradMemGPT parameters
         self.n_mem_tokens = config.n_mem_tokens
@@ -640,6 +769,13 @@ class GradMemGPT(PreTrainedModel):
             for p in self.lora_mem_A0.values():
                 total += p.numel()
             for p in self.lora_mem_B0.values():
+                total += p.numel()
+            return total
+        if self.memory_backend == "kv_cache":
+            total = 0
+            for p in self.kv_mem_K0.values():
+                total += p.numel()
+            for p in self.kv_mem_V0.values():
                 total += p.numel()
             return total
         raise ValueError(f"Unsupported memory_backend={self.memory_backend}")
@@ -858,6 +994,52 @@ class GradMemGPT(PreTrainedModel):
 
         self._register_lora_mem_hooks(blocks)
 
+    def _init_kv_cache_memory(self):
+        blocks = self._get_transformer_blocks()
+        n_layers = len(blocks)
+        layer_ids = self._parse_lora_mem_layers(self.kv_mem_layers, n_layers)
+        for idx in layer_ids:
+            if idx < 0 or idx >= n_layers:
+                raise ValueError(f"kv_mem_layers has out-of-range index {idx} for {n_layers} layers")
+        self.kv_mem_layer_ids = layer_ids
+
+        hidden_size = getattr(self.model.config, "n_embd", getattr(self.model.config, "hidden_size", None))
+        if hidden_size is None:
+            raise ValueError("Could not infer hidden size from model config")
+
+        num_attn_heads = getattr(
+            self.model.config,
+            "num_attention_heads",
+            getattr(self.model.config, "n_head", None),
+        )
+        if num_attn_heads is None:
+            raise ValueError("Could not infer number of attention heads from model config")
+
+        num_kv_heads = getattr(self.model.config, "num_key_value_heads", num_attn_heads)
+        head_dim = getattr(self.model.config, "head_dim", hidden_size // num_attn_heads)
+
+        self.kv_mem_K0 = nn.ParameterDict()
+        self.kv_mem_V0 = nn.ParameterDict()
+        n_mem_tokens = int(getattr(self.config, "n_mem_tokens"))
+        for layer_idx in self.kv_mem_layer_ids:
+            k = nn.Parameter(
+                torch.randn(num_kv_heads, n_mem_tokens, head_dim) * 0.02,
+                requires_grad=True,
+            )
+            v = nn.Parameter(
+                torch.randn(num_kv_heads, n_mem_tokens, head_dim) * 0.02,
+                requires_grad=True,
+            )
+            self.kv_mem_K0[str(layer_idx)] = k
+            self.kv_mem_V0[str(layer_idx)] = v
+
+    def _build_dynamic_cache(self, kv_mem):
+        legacy = []
+        for layer_idx in self.kv_mem_layer_ids:
+            K_batch, V_batch = kv_mem[layer_idx]
+            legacy.append((K_batch, V_batch))
+        return DynamicCache.from_legacy_cache(tuple(legacy))
+
     def _register_lora_mem_hooks(self, blocks):
         if self._lora_mem_hooks:
             return
@@ -920,36 +1102,47 @@ class GradMemGPT(PreTrainedModel):
             with torch.enable_grad():
                 for k in range(self.K):
                     write_batch = backend.build_write_inputs(memory_state, batch_ctx)
+                    write_model_kwargs = write_batch.get('model_kwargs', {})
                     with backend.activation_context(memory_state):
                         if self.use_write_head:
                             outs = get_backbone(self.model)(inputs_embeds=write_batch['inputs_embeds'],
-                                                            return_dict=True)
+                                                            return_dict=True,
+                                                            **write_model_kwargs)
                             hidden = outs.last_hidden_state[:, write_batch['logits_start']:, :]
                             logits = self.write_head(hidden)
                         else:
-                            outs = self.model(inputs_embeds=write_batch['inputs_embeds'], return_dict=True)
+                            outs = self.model(inputs_embeds=write_batch['inputs_embeds'],
+                                              return_dict=True,
+                                              **write_model_kwargs)
                             logits = outs.logits[:, write_batch['logits_start']:, :]
 
                     logits_loss = logits[:, :-1]
                     label_shift = write_batch.get('label_shift', 0)
                     labels_loss = write_batch['lm_labels'][:, label_shift:]
                     mask_loss = write_batch['mask'][:, label_shift:]
-                    common_len = min(logits_loss.size(1), labels_loss.size(1))
-                    if common_len > 0:
-                        logits_loss = logits_loss[:, :common_len]
-                        labels_loss = labels_loss[:, :common_len]
-                        mask_loss = mask_loss[:, :common_len]
-                        inner_loss = nn.functional.cross_entropy(
-                            logits_loss.reshape(-1, logits.size(-1)),
-                            labels_loss.reshape(-1),
-                            ignore_index=-100,
-                            reduction='none',
-                        ).view(B, -1)
-                        seq_len = mask_loss.sum(dim=1).clamp_min(1)
-                        inner_loss = (inner_loss * mask_loss).sum(1) / seq_len
-                        inner_loss = inner_loss.sum()
-                    else:
-                        inner_loss = logits_loss.sum() * 0.0
+                    logits_len = logits_loss.size(1)
+                    labels_len = labels_loss.size(1)
+                    mask_len = mask_loss.size(1)
+                    if (logits_len != labels_len) or (labels_len != mask_len) or (labels_len == 0):
+                        raise ValueError(
+                            "Invalid inner-loop alignment: "
+                            f"backend={self.memory_backend}, "
+                            f"logits_len={logits_len}, labels_len={labels_len}, mask_len={mask_len}, "
+                            f"logits_start={write_batch['logits_start']}, label_shift={label_shift}, "
+                            f"mismatch_logits_labels={logits_len != labels_len}, "
+                            f"mismatch_labels_mask={labels_len != mask_len}, "
+                            f"empty_training_tokens={labels_len == 0}"
+                        )
+
+                    inner_loss = nn.functional.cross_entropy(
+                        logits_loss.reshape(-1, logits.size(-1)),
+                        labels_loss.reshape(-1),
+                        ignore_index=-100,
+                        reduction='none',
+                    ).view(B, -1)
+                    seq_len = mask_loss.sum(dim=1).clamp_min(1)
+                    inner_loss = (inner_loss * mask_loss).sum(1) / seq_len
+                    inner_loss = inner_loss.sum()
                     del outs, logits
 
                     is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
@@ -993,12 +1186,14 @@ class GradMemGPT(PreTrainedModel):
         inner_loop_stats['delta_mem_norm_min'] = delta_mem_norm.min()
 
         read_batch = backend.build_read_inputs(memory_state, batch_ctx)
+        read_model_kwargs = read_batch.get('model_kwargs', {})
         with backend.activation_context(memory_state):
             with self._disable_write_lora():
-                logits_q = self.model(inputs_embeds=read_batch['inputs_embeds']).logits
+                logits_q = self.model(inputs_embeds=read_batch['inputs_embeds'],
+                                      **read_model_kwargs).logits
 
-        # LoRA memory backend needs one seed token to start autoregressive prediction;
-        # it cannot predict the very first token from memory alone when query is empty.
+        # LoRA/KV-cache memory backends need one seed token to start autoregressive prediction;
+        # they cannot predict the very first token from memory alone when query is empty.
         logits_q = logits_q[:, read_batch['logits_start']:read_batch['logits_start'] + read_batch['pred_len'], :]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
@@ -1011,7 +1206,7 @@ class GradMemGPT(PreTrainedModel):
         target_logits = output['predictions'][:, :-1]
         target_label_shift = read_batch.get('label_shift', 0)
         # Prefix memory can predict the first target token from memory itself (label_shift=0),
-        # while LoRA memory without a prepended seed token cannot (label_shift=1).
+        # while LoRA/KV-cache memory without a prepended seed token cannot (label_shift=1).
         # Backends should produce exactly aligned lengths after this shift.
         target_labels = labels[:, target_label_shift:]
         if target_logits.size(1) != target_labels.size(1):
