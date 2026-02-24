@@ -141,6 +141,8 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     }
     if 'target_loss' in inner_loop_stats:
         metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
+    if 'mem_attn_read' in inner_loop_stats:
+        metrics['mem_attn_read'] = float(inner_loop_stats['mem_attn_read'].mean())
     return metrics
 
 

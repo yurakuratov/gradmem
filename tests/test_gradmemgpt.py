@@ -176,6 +176,13 @@ def test_forward(model_family: str, memory_backend: str):
 
     _assert_return_mem_payload(memory_backend, output)
 
+    if memory_backend in ("prefix", "kv_cache"):
+        assert "mem_attn_read" in stats
+        mem_attn_read = stats["mem_attn_read"].item()
+        assert 0.0 <= mem_attn_read <= 1.0
+    else:
+        assert "mem_attn_read" not in stats
+
     assert len(memory_snapshots) == model_config.K + 1
     for step_idx in range(1, len(memory_snapshots)):
         prev_step = memory_snapshots[step_idx - 1]

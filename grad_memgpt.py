@@ -1187,10 +1187,38 @@ class GradMemGPT(PreTrainedModel):
 
         read_batch = backend.build_read_inputs(memory_state, batch_ctx)
         read_model_kwargs = read_batch.get('model_kwargs', {})
+        log_mem_attn_read = (self.attn_implementation == "eager") and (self.memory_backend in ("prefix", "kv_cache"))
+        if log_mem_attn_read:
+            read_model_kwargs = dict(read_model_kwargs)
+            read_model_kwargs["output_attentions"] = True
         with backend.activation_context(memory_state):
             with self._disable_write_lora():
-                logits_q = self.model(inputs_embeds=read_batch['inputs_embeds'],
-                                      **read_model_kwargs).logits
+                read_out = self.model(inputs_embeds=read_batch['inputs_embeds'],
+                                      return_dict=True,
+                                      **read_model_kwargs)
+                logits_q = read_out.logits
+
+        if log_mem_attn_read and read_out.attentions is not None:
+            if self.memory_backend == "prefix":
+                mem_start = self.n_ctrl_tokens
+                mem_end = self.n_ctrl_tokens + self.n_mem_tokens
+            else:
+                mem_start = 0
+                mem_end = self.n_mem_tokens
+
+            layer_ratios = []
+            for att in read_out.attentions:
+                if att is None:
+                    continue
+                k_len = att.size(-1)
+                if not (0 <= mem_start < mem_end <= k_len):
+                    raise ValueError(
+                        "GradMem: Invalid memory attention span on read: "
+                        f"backend={self.memory_backend}, mem_start={mem_start}, mem_end={mem_end}, k_len={k_len}"
+                    )
+                layer_ratios.append(att[..., mem_start:mem_end].sum(dim=-1).mean())
+            if layer_ratios:
+                inner_loop_stats['mem_attn_read'] = torch.stack(layer_ratios).mean().detach()
 
         # LoRA/KV-cache memory backends need one seed token to start autoregressive prediction;
         # they cannot predict the very first token from memory alone when query is empty.

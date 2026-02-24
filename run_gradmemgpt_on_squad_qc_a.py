@@ -129,7 +129,7 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
         print('-' * 50)
 
-    return {
+    metrics = {
         "token_accuracy": float(accuracy),
         "exact_match": float(exact_match),
         "inner_loss": float(inner_loop_stats['inner_loss'].mean()),
@@ -143,6 +143,9 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
         "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
     }
+    if 'mem_attn_read' in inner_loop_stats:
+        metrics['mem_attn_read'] = float(inner_loop_stats['mem_attn_read'].mean())
+    return metrics
 
 
 class StopOnMetricValue(TrainerCallback):
