@@ -45,11 +45,14 @@ def _sample_chunk(sample, max_context_length=None):
     token_count_per_sentence = word_count * 1.2 / n_sentences
     # select end position to be enough to cover ~max_context_length
     sentence_start = random.randint(0, max(0, n_sentences - 1 - int(max_context_length / token_count_per_sentence)))
-    # print(n_sentences, sentence_start, max(0, n_sentences - 1 - int(max_context_length / token_count_per_sentence)))
     return context[sentence_boundaries[sentence_start][0]:]
 
 
-def collate_fn(batch, tokenizer, max_context_length=None):
+def collate_fn(batch, tokenizer, special_prefix_ids, special_suffix_ids, max_context_length=None):
+    if max_context_length is None:
+        raise ValueError("max_context_length must be set for text compression collate_fn")
+
+    text_prefix_ids = tokenizer("text: ", add_special_tokens=False)["input_ids"]
     context = []
     for item in batch:
         ctx = item['context']
@@ -60,15 +63,30 @@ def collate_fn(batch, tokenizer, max_context_length=None):
             ctx = ctx[:max_context_length*15]
         context += [ctx]
 
-    context_encoded = tokenizer(context, return_tensors="pt", add_special_tokens=True,
-                                padding=True, pad_to_multiple_of=min(8, max_context_length),
-                                max_length=max_context_length, truncation=True)
-    context_input_ids = context_encoded['input_ids']
-    query_input_ids = context_input_ids
+    context_ids = tokenizer(context, add_special_tokens=False,
+                            max_length=max_context_length, truncation=True)["input_ids"]
 
-    attention_mask = context_encoded['attention_mask'].bool()
-    labels_mask = attention_mask
-    labels = context_input_ids * labels_mask + (~labels_mask) * -100
+    input_ids = []
+    labels = []
+    non_target_len = len(special_prefix_ids) + len(text_prefix_ids)
+    suffix_len = len(special_suffix_ids)
+
+    for ctx_ids in context_ids:
+        full_ids = special_prefix_ids + text_prefix_ids + ctx_ids + special_suffix_ids
+        labels_ids = list(full_ids)
+        labels_ids[:non_target_len] = [-100] * non_target_len
+        if suffix_len > 0:
+            labels_ids[-suffix_len:] = [-100] * suffix_len
+        input_ids += [full_ids]
+        labels += [labels_ids]
+
+    seq_lens = {len(x) for x in input_ids}
+    if len(seq_lens) != 1:
+        raise ValueError(f"All samples in batch must have equal sequence length; got {sorted(seq_lens)}")
+
+    context_input_ids = torch.tensor(input_ids, dtype=torch.long)
+    query_input_ids = context_input_ids
+    labels = torch.tensor(labels, dtype=torch.long)
     return {
         'input_ids': {
             'context_input_ids': context_input_ids,
@@ -250,6 +268,22 @@ if __name__ == '__main__':
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # infer special tokens that wrap text from add_special_tokens behavior
+    probe_raw = tokenizer("Hi", add_special_tokens=False)["input_ids"]
+    probe_full = tokenizer("Hi", add_special_tokens=True)["input_ids"]
+    start_idx = None
+    for i in range(len(probe_full) - len(probe_raw) + 1):
+        if probe_full[i:i + len(probe_raw)] == probe_raw:
+            start_idx = i
+            break
+    if start_idx is None:
+        raise ValueError(
+            "Could not infer tokenizer special-token wrapper from add_special_tokens behavior. "
+            f"probe_raw={probe_raw}, probe_full={probe_full}"
+        )
+    special_prefix_ids = probe_full[:start_idx]
+    special_suffix_ids = probe_full[start_idx + len(probe_raw):]
+
     dataset = datasets.load_from_disk(args.dataset_path)
     if not isinstance(dataset, datasets.DatasetDict):
         raise ValueError("Prepared dataset must be a DatasetDict saved with save_to_disk.")
@@ -323,7 +357,10 @@ if __name__ == '__main__':
     logger.info(f'model.dtype: {model.dtype}')
 
     def data_collator(batch):
-        return collate_fn(batch, tokenizer, max_context_length=args.max_context_length)
+        return collate_fn(batch, tokenizer,
+                          special_prefix_ids=special_prefix_ids,
+                          special_suffix_ids=special_suffix_ids,
+                          max_context_length=args.max_context_length)
 
     def compute_metrics(eval_pred):
         return compute_metrics_fn(eval_pred, tokenizer, debug_print_samples=args.debug_print_samples)
