@@ -7,12 +7,12 @@ from typing import Optional
 
 class SDPA_FullManualBwd(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, grad_out, q, k, v, attn_mask, is_causal, pdrop, scale):
-        ctx.save_for_backward(grad_out, q, k, v)
+    def forward(ctx, grad_out, q, k, v, attn_mask, is_causal, dropout_mask, dropout_scale, scale):
+        ctx.save_for_backward(grad_out, q, k, v, dropout_mask)
         ctx.attn_mask = attn_mask
         ctx.is_causal = is_causal
-        ctx.pdrop = pdrop
         ctx.scale = scale
+        ctx.dropout_scale = dropout_scale
         d = q.size(-1)
         scale = scale if (scale is not None) else (1 / d ** 0.5)
 
@@ -25,9 +25,11 @@ class SDPA_FullManualBwd(torch.autograd.Function):
             S, L = scores.size(-2), scores.size(-1)
             causal = torch.triu(scores.new_full((S, L), float("-inf")), diagonal=1).to(q.dtype)
             scores = scores + causal
+        
         P = torch.softmax(scores, dim=-1)
-        if pdrop and pdrop > 0.0:
-            P = torch.dropout(P, p=pdrop, train=True)
+        # use cached dropout mask
+        if dropout_mask is not None:
+            P = P * dropout_mask * dropout_scale
 
         dV  = P.transpose(-2, -1) @ grad_out
         dP  = grad_out @ v.transpose(-2, -1)
@@ -39,9 +41,9 @@ class SDPA_FullManualBwd(torch.autograd.Function):
     
     @staticmethod
     def backward(ctx, grad_q, grad_k, grad_v, *_):
-        grad_out, q, k, v = ctx.saved_tensors
+        grad_out, q, k, v, dropout_mask = ctx.saved_tensors
         attn_mask, is_causal = ctx.attn_mask, ctx.is_causal
-        pdrop, scale = ctx.pdrop, ctx.scale
+        dropout_scale, scale = ctx.dropout_scale, ctx.scale
 
         d = q.size(-1)
         scale = scale if (scale is not None) else (1 / d ** 0.5)
@@ -55,9 +57,11 @@ class SDPA_FullManualBwd(torch.autograd.Function):
             S, L = scores.size(-2), scores.size(-1)
             causal = torch.triu(scores.new_full((S, L), float("-inf")), diagonal=1).to(q.dtype)
             scores = scores + causal
+
         P = torch.softmax(scores, dim=-1)
-        if pdrop and pdrop > 0.0:
-            P = torch.dropout(P, p=pdrop, train=True)
+        # use cached dropout mask
+        if dropout_mask is not None:
+            P = P * dropout_mask * dropout_scale
 
         dP  = grad_out @ v.transpose(-2, -1)
         Ssm = (dP * P).sum(dim=-1, keepdim=True)
@@ -76,40 +80,51 @@ class SDPA_FullManualBwd(torch.autograd.Function):
         dgrad_k        = (dS.transpose(-2, -1) @ grad_q + bar_scores.transpose(-2, -1) @ q) * scale
         dgrad_v        = bar_dP.transpose(-2, -1) @ grad_out
 
-        return dgrad_grad_out, dgrad_q, dgrad_k, dgrad_v, None, None, None, None
+        return dgrad_grad_out, dgrad_q, dgrad_k, dgrad_v, None, None, None, None, None
     
 
 class SDPA_FullManual(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
-        ctx.save_for_backward(q, k, v)
         ctx.attn_mask = attn_mask
         ctx.is_causal = bool(is_causal)
-        ctx.dropout_p = float(dropout_p or 0.0)
         ctx.scale = scale
 
         d = q.size(-1)
         scale = scale if (scale is not None) else (1 / d ** 0.5)
         scores = (q @ k.transpose(-2, -1)) * scale
+
         if attn_mask is not None:
             if attn_mask.dtype == torch.bool:
                 attn_mask = torch.where(attn_mask, 0.0, float('-inf')).to(q.dtype)
             scores = scores + attn_mask
+
         if is_causal:
             S, L = scores.size(-2), scores.size(-1)
             scores = scores + torch.triu(scores.new_full((S, L), float("-inf")), diagonal=1)
+
         P = torch.softmax(scores, dim=-1)
         if dropout_p and dropout_p > 0.0:
-            P = torch.dropout(P, p=dropout_p, train=True)
+            dropout_mask = (torch.rand_like(P) > dropout_p).to(P.dtype)
+            dropout_scale = 1.0 / (1.0 - dropout_p)
+        else:
+            dropout_mask = None
+            dropout_scale = None
+        if dropout_mask is not None:
+            P = P * dropout_mask * dropout_scale
+
+        ctx.dropout_scale = dropout_scale
+        ctx.save_for_backward(q, k, v, dropout_mask)
+        
         out = P @ v
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
-        q, k, v = ctx.saved_tensors
+        q, k, v, dropout_mask = ctx.saved_tensors
         attn_mask, is_causal = ctx.attn_mask, ctx.is_causal
-        pdrop, scale = ctx.dropout_p, ctx.scale
-        return SDPA_FullManualBwd.apply(grad_out, q, k, v, attn_mask, is_causal, pdrop, scale)
+        scale, dropout_scale = ctx.scale, ctx.dropout_scale
+        return SDPA_FullManualBwd.apply(grad_out, q, k, v, attn_mask, is_causal, dropout_mask, dropout_scale, scale)
 
 
 def hvp_manual(
