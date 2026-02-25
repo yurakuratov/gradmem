@@ -679,8 +679,13 @@ class GradMemGPT(PreTrainedModel):
         self.inner_clip_norm = config.inner_clip_norm
         self.use_mem_proj = config.use_mem_proj
         self.mem_proj_mode = config.mem_proj_mode
-        if self.memory_backend != "prefix" and self.mem_proj_mode != "none":
-            raise ValueError("mem_proj_mode is supported only for memory_backend='prefix'")
+        if self.memory_backend == "lora" and self.mem_proj_mode != "none":
+            raise ValueError("mem_proj_mode is not supported for memory_backend='lora'")
+        if self.memory_backend == "kv_cache" and self.mem_proj_mode == "per_sample":
+            raise ValueError(
+                "mem_proj_mode='per_sample' is not supported for memory_backend='kv_cache'; "
+                "use mem_proj_mode='none' or 'proj'"
+            )
         self.use_write_head = config.use_write_head
         self.add_inner_loss_to_outer = config.add_inner_loss_to_outer
         self.inner_loss_weight = config.inner_loss_weight
@@ -1021,6 +1026,7 @@ class GradMemGPT(PreTrainedModel):
         self.kv_mem_K0 = nn.ParameterDict()
         self.kv_mem_V0 = nn.ParameterDict()
         n_mem_tokens = int(getattr(self.config, "n_mem_tokens"))
+        mem_proj_mode = getattr(self.config, "mem_proj_mode", "none")
         for layer_idx in self.kv_mem_layer_ids:
             k = nn.Parameter(
                 torch.randn(num_kv_heads, n_mem_tokens, head_dim) * 0.02,
@@ -1033,10 +1039,28 @@ class GradMemGPT(PreTrainedModel):
             self.kv_mem_K0[str(layer_idx)] = k
             self.kv_mem_V0[str(layer_idx)] = v
 
+        if mem_proj_mode == "proj":
+            self.mem_proj_K_l = nn.ModuleDict()
+            self.mem_proj_V_l = nn.ModuleDict()
+            for layer_idx in self.kv_mem_layer_ids:
+                proj_k = nn.Linear(head_dim, head_dim, bias=True)
+                proj_v = nn.Linear(head_dim, head_dim, bias=True)
+                with torch.no_grad():
+                    nn.init.eye_(proj_k.weight)
+                    proj_k.bias.zero_()
+                    nn.init.eye_(proj_v.weight)
+                    proj_v.bias.zero_()
+                self.mem_proj_K_l[str(layer_idx)] = proj_k
+                self.mem_proj_V_l[str(layer_idx)] = proj_v
+
     def _build_dynamic_cache(self, kv_mem):
         legacy = []
         for layer_idx in self.kv_mem_layer_ids:
             K_batch, V_batch = kv_mem[layer_idx]
+            if self.mem_proj_mode == "proj":
+                B, H, M, d = K_batch.shape
+                K_batch = self.mem_proj_K_l[str(layer_idx)](K_batch.reshape(B, H * M, d)).reshape(B, H, M, d)
+                V_batch = self.mem_proj_V_l[str(layer_idx)](V_batch.reshape(B, H * M, d)).reshape(B, H, M, d)
             legacy.append((K_batch, V_batch))
         return DynamicCache.from_legacy_cache(tuple(legacy))
 
