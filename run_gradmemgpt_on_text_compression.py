@@ -35,6 +35,7 @@ logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
 def _sample_chunk(sample, max_context_length=None):
+    # select a chunk that starts from a random sentence to the end of the context
     context = sample['context']
     n_sentences = sample['n_sentences']
     word_count = sample['word_count']
@@ -43,14 +44,16 @@ def _sample_chunk(sample, max_context_length=None):
         max_context_length = word_count * 1.2
     # estimate on token counts per sentence
     token_count_per_sentence = word_count * 1.2 / n_sentences
-    # select end position to be enough to cover ~max_context_length
-    sentence_start = random.randint(0, max(0, n_sentences - 1 - int(max_context_length / token_count_per_sentence)))
+    # select end position to be enough to cover ~ 3 x max_context_length
+    sentence_start = random.randint(0, max(0, n_sentences - 1 - int(3 * max_context_length / token_count_per_sentence)))
     return context[sentence_boundaries[sentence_start][0]:]
 
 
 def collate_fn(batch, tokenizer, special_prefix_ids, special_suffix_ids, max_context_length=None):
     if max_context_length is None:
         raise ValueError("max_context_length must be set for text compression collate_fn")
+    if tokenizer.pad_token_id is None:
+        raise ValueError("tokenizer.pad_token_id must be set for text compression collate_fn padding")
 
     text_prefix_ids = tokenizer("text: ", add_special_tokens=False)["input_ids"]
     context = []
@@ -66,6 +69,10 @@ def collate_fn(batch, tokenizer, special_prefix_ids, special_suffix_ids, max_con
     context_ids = tokenizer(context, add_special_tokens=False,
                             max_length=max_context_length, truncation=True)["input_ids"]
 
+    seq_lens = {len(x) for x in context_ids}
+    if len(seq_lens) != 1:
+        logger.warning(f"Not all contexts in batch have equal sequence length; got {sorted(seq_lens)}")
+
     input_ids = []
     labels = []
     non_target_len = len(special_prefix_ids) + len(text_prefix_ids)
@@ -80,9 +87,11 @@ def collate_fn(batch, tokenizer, special_prefix_ids, special_suffix_ids, max_con
         input_ids += [full_ids]
         labels += [labels_ids]
 
-    seq_lens = {len(x) for x in input_ids}
-    if len(seq_lens) != 1:
-        raise ValueError(f"All samples in batch must have equal sequence length; got {sorted(seq_lens)}")
+    # pad
+    max_seq_len = max(len(ids) for ids in input_ids)
+    pad_token_id = tokenizer.pad_token_id
+    input_ids = [ids + [pad_token_id] * (max_seq_len - len(ids)) for ids in input_ids]
+    labels = [ids + [-100] * (max_seq_len - len(ids)) for ids in labels]
 
     context_input_ids = torch.tensor(input_ids, dtype=torch.long)
     query_input_ids = context_input_ids
