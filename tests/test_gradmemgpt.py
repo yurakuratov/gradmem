@@ -2,7 +2,7 @@ import pytest
 import torch
 from transformers import GPT2Config, GPTNeoXConfig, LlamaConfig
 
-from grad_memgpt import GradMemGPT, GradMemGPTConfig
+from grad_memgpt import GradMemGPT, GradMemGPTConfig, get_backbone
 
 
 def _build_base_config(model_family: str):
@@ -41,6 +41,7 @@ def _build_base_config(model_family: str):
 def _backend_extra_kwargs(memory_backend: str):
     if memory_backend == "lora":
         return {
+            "lora_mem_placement": "between_layers",
             "lora_mem_layers": "all",
             "lora_mem_r": 4,
             "lora_mem_alpha": 8,
@@ -64,8 +65,8 @@ def _snapshot_memory_tensors(model: GradMemGPT, memory_backend: str, memory_stat
         return [memory_state["mem_batch"].detach().clone()]
     if memory_backend == "lora":
         tensors = []
-        for layer_idx in model.lora_mem_layer_ids:
-            a_batch, b_batch = memory_state["lora_mem"][layer_idx]
+        for slot_id in model.lora_mem_slot_ids:
+            a_batch, b_batch = memory_state["lora_mem"][slot_id]
             tensors.append(a_batch.detach().clone())
             tensors.append(b_batch.detach().clone())
         return tensors
@@ -84,7 +85,7 @@ def _memory_init_params(model: GradMemGPT, memory_backend: str):
         return [model.mem]
     if memory_backend == "lora":
         params = []
-        for key in sorted(model.lora_mem_A0.keys(), key=int):
+        for key in sorted(model.lora_mem_A0.keys()):
             params.append(model.lora_mem_A0[key])
             params.append(model.lora_mem_B0[key])
         return params
@@ -324,3 +325,223 @@ def test_fail_fast_on_inner_alignment_mismatch():
             },
             labels=labels,
         )
+
+
+@pytest.mark.forward
+@pytest.mark.all
+@pytest.mark.parametrize("model_family", ["gpt2", "gpt_neox", "llama"])
+def test_forward_lora_target_modules_auto(model_family: str):
+    torch.manual_seed(0)
+
+    base_config = _build_base_config(model_family)
+    model_config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="lora",
+        n_mem_tokens=4,
+        K=2,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="second",
+        use_mem_proj=False,
+        mem_proj_mode="none",
+        use_write_head=False,
+        attn_implementation="eager",
+        lora_mem_placement="target_modules",
+        lora_mem_target_modules=None,
+        lora_mem_layers="all",
+        lora_mem_r=4,
+        lora_mem_alpha=8,
+    )
+
+    model = GradMemGPT(model_config)
+    model.eval()
+
+    batch_size = 2
+    ctx_len = 6
+    qry_len = 4
+    vocab_size = base_config.vocab_size
+
+    context_input_ids = torch.randint(0, vocab_size, (batch_size, ctx_len))
+    query_input_ids = torch.randint(0, vocab_size, (batch_size, qry_len))
+    labels = torch.randint(0, vocab_size, (batch_size, qry_len))
+
+    output = model(
+        {
+            "context_input_ids": context_input_ids,
+            "query_input_ids": query_input_ids,
+        },
+        labels=labels,
+        return_mem=True,
+    )
+
+    assert torch.isfinite(output["loss"]).item()
+    assert output["predictions"].shape == (batch_size, qry_len, vocab_size)
+    assert "lora_mem" in output
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+@pytest.mark.parametrize("model_family", ["gpt2", "gpt_neox", "llama"])
+def test_single_batch_train_lora_target_modules_auto(model_family: str):
+    torch.manual_seed(0)
+
+    base_config = _build_base_config(model_family)
+    model_config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="lora",
+        n_mem_tokens=4,
+        K=2,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="second",
+        use_mem_proj=False,
+        mem_proj_mode="none",
+        use_write_head=False,
+        attn_implementation="eager",
+        lora_mem_placement="target_modules",
+        lora_mem_target_modules=None,
+        lora_mem_layers="all",
+        lora_mem_r=4,
+        lora_mem_alpha=8,
+    )
+
+    model = GradMemGPT(model_config)
+    model.train()
+
+    mem_init_params = _memory_init_params(model, "lora")
+    assert len(mem_init_params) > 0
+
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params, lr=1e-3)
+
+    batch_size = 2
+    ctx_len = 6
+    qry_len = 4
+    vocab_size = base_config.vocab_size
+
+    context_input_ids = torch.randint(0, vocab_size, (batch_size, ctx_len))
+    query_input_ids = torch.randint(0, vocab_size, (batch_size, qry_len))
+    labels = torch.randint(0, vocab_size, (batch_size, qry_len))
+
+    optimizer.zero_grad(set_to_none=True)
+    output = model(
+        {
+            "context_input_ids": context_input_ids,
+            "query_input_ids": query_input_ids,
+        },
+        labels=labels,
+    )
+    loss = output["loss"]
+    assert torch.isfinite(loss).item()
+
+    loss.backward()
+    for p in mem_init_params:
+        assert p.grad is not None
+        assert torch.isfinite(p.grad).all().item()
+        assert p.grad.detach().norm().item() > 0.0
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_fail_fast_lora_target_modules_no_match():
+    base_config = _build_base_config("gpt2")
+    model_config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="lora",
+        n_mem_tokens=4,
+        K=1,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="none",
+        use_mem_proj=False,
+        mem_proj_mode="none",
+        use_write_head=False,
+        attn_implementation="eager",
+        lora_mem_placement="target_modules",
+        lora_mem_target_modules="definitely_not_existing_target",
+        lora_mem_layers="all",
+        lora_mem_r=4,
+        lora_mem_alpha=8,
+    )
+
+    with pytest.raises(ValueError, match="resolved zero modules"):
+        _ = GradMemGPT(model_config)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_fail_fast_lora_target_modules_non_linear_not_supported():
+    base_config = _build_base_config("gpt2")
+    model_config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="lora",
+        n_mem_tokens=4,
+        K=1,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="none",
+        use_mem_proj=False,
+        mem_proj_mode="none",
+        use_write_head=False,
+        attn_implementation="eager",
+        lora_mem_placement="target_modules",
+        lora_mem_target_modules="attn",
+        lora_mem_layers="all",
+        lora_mem_r=4,
+        lora_mem_alpha=8,
+    )
+
+    with pytest.raises(ValueError, match="supports only linear-like modules"):
+        _ = GradMemGPT(model_config)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_lora_target_module_delta_matches_linear_formula():
+    torch.manual_seed(0)
+
+    base_config = _build_base_config("gpt2")
+    model_config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="lora",
+        n_mem_tokens=4,
+        K=1,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="none",
+        use_mem_proj=False,
+        mem_proj_mode="none",
+        use_write_head=False,
+        attn_implementation="eager",
+        lora_mem_placement="target_modules",
+        lora_mem_target_modules="c_fc",
+        lora_mem_layers="all",
+        lora_mem_r=4,
+        lora_mem_alpha=8,
+        lora_mem_dropout=0.0,
+    )
+
+    model = GradMemGPT(model_config)
+    model.eval()
+
+    assert len(model.lora_mem_slot_ids) > 0
+    slot_id = model.lora_mem_slot_ids[0]
+    module = dict(get_backbone(model.model).named_modules())[slot_id]
+
+    memory_state, _ = model.memory_backend_impl.init_memory_state(batch_size=1)
+    A_mem, B_mem = memory_state["lora_mem"][slot_id]
+
+    x = torch.randn(1, 3, A_mem.size(1))
+
+    with torch.no_grad():
+        y_base = module(x)
+
+    with torch.no_grad():
+        with model._enable_lora_memory(memory_state["lora_mem"]):
+            y_with_mem = module(x)
+
+    low_rank = torch.einsum("bsi,bir->bsr", x, A_mem)
+    delta = torch.einsum("bsr,bro->bso", low_rank, B_mem)
+    y_expected = y_base + model.lora_mem_scale * delta
+
+    assert torch.allclose(y_with_mem, y_expected, atol=1e-5, rtol=1e-5)
