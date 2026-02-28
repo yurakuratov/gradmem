@@ -7,6 +7,7 @@ from transformers.cache_utils import DynamicCache
 from contextlib import contextmanager
 import math
 import logging
+import re
 try:
     import attn_double_bwd  # noqa: F401  # side-effect: registers attention kernels
 except ImportError:
@@ -80,6 +81,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  lora_mem_alpha=16,
                  lora_mem_dropout=0.0,
                  lora_mem_layers=None,
+                 lora_mem_target_modules=None,
                  kv_mem_layers=None,
                  freeze_backbone=False,
                  use_gradient_checkpointing=False,
@@ -117,6 +119,8 @@ class GradMemGPTConfig(PretrainedConfig):
                 examples: None or "all" (all layers), "last_4" (last 4 layers),
                 "0,3,7" (explicit indices), [0, 3, 7] (explicit indices as list),
                 "none"/"auto"/"" (treated as all layers)
+            lora_mem_target_modules: list[str]|str|None, target module names for
+                lora_mem_placement="target_modules"; None/"auto" uses model defaults
             kv_mem_layers: str|list[int]|None, transformer layers to inject KV-cache memory
                 examples: None or "all" (all layers), "last_4" (last 4 layers),
                 "0,3,7" (explicit indices), [0, 3, 7] (explicit indices as list),
@@ -158,6 +162,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.lora_mem_alpha = lora_mem_alpha
         self.lora_mem_dropout = lora_mem_dropout
         self.lora_mem_layers = lora_mem_layers
+        self.lora_mem_target_modules = lora_mem_target_modules
         self.kv_mem_layers = kv_mem_layers
         self.freeze_backbone = freeze_backbone
         self.last_K_second_order = K if last_K_second_order is None else last_K_second_order
@@ -176,8 +181,8 @@ class GradMemGPTConfig(PretrainedConfig):
             "memory_backend must be one of: prefix, lora, kv_cache"
         )
         if self.memory_backend == "lora":
-            assert self.lora_mem_placement in ["between_layers"], (
-                "lora_mem_placement currently supports only 'between_layers'"
+            assert self.lora_mem_placement in ["between_layers", "target_modules"], (
+                "lora_mem_placement currently supports: 'between_layers', 'target_modules'"
             )
 
 
@@ -345,9 +350,10 @@ class LoraMemoryBackend(MemoryBackend):
         device = o.model.get_input_embeddings().weight.device
         memory_state = {"lora_mem": {}}
         memory_state_initial = {"lora_mem": {}}
-        for layer_idx in o.lora_mem_layer_ids:
-            A0 = o.lora_mem_A0[str(layer_idx)].to(device=device)
-            B0 = o.lora_mem_B0[str(layer_idx)].to(device=device)
+        for slot_id in o.lora_mem_slot_ids:
+            param_key = o._lora_mem_param_key(slot_id)
+            A0 = o.lora_mem_A0[param_key].to(device=device)
+            B0 = o.lora_mem_B0[param_key].to(device=device)
             A_batch = A0.unsqueeze(0).expand(batch_size, -1, -1).clone()
             B_batch = B0.unsqueeze(0).expand(batch_size, -1, -1).clone()
             if o.grad_mode == "none":
@@ -356,8 +362,8 @@ class LoraMemoryBackend(MemoryBackend):
             else:
                 A_batch = A_batch.requires_grad_(True)
                 B_batch = B_batch.requires_grad_(True)
-            memory_state["lora_mem"][layer_idx] = (A_batch, B_batch)
-            memory_state_initial["lora_mem"][layer_idx] = (A_batch.detach().clone(), B_batch.detach().clone())
+            memory_state["lora_mem"][slot_id] = (A_batch, B_batch)
+            memory_state_initial["lora_mem"][slot_id] = (A_batch.detach().clone(), B_batch.detach().clone())
         return memory_state, memory_state_initial
 
     @contextmanager
@@ -415,23 +421,23 @@ class LoraMemoryBackend(MemoryBackend):
 
     def inner_params(self, memory_state):
         params = []
-        for layer_idx in self.owner.lora_mem_layer_ids:
-            A_batch, B_batch = memory_state["lora_mem"][layer_idx]
+        for slot_id in self.owner.lora_mem_slot_ids:
+            A_batch, B_batch = memory_state["lora_mem"][slot_id]
             params.extend([A_batch, B_batch])
         return params
 
     def assign_inner_params(self, memory_state, new_params):
         p = 0
-        for layer_idx in self.owner.lora_mem_layer_ids:
-            memory_state["lora_mem"][layer_idx] = (new_params[p], new_params[p + 1])
+        for slot_id in self.owner.lora_mem_slot_ids:
+            memory_state["lora_mem"][slot_id] = (new_params[p], new_params[p + 1])
             p += 2
 
     def maybe_detach_after_step(self, memory_state):
         if self.owner.grad_mode != "none":
             return
-        for layer_idx in self.owner.lora_mem_layer_ids:
-            A_batch, B_batch = memory_state["lora_mem"][layer_idx]
-            memory_state["lora_mem"][layer_idx] = (
+        for slot_id in self.owner.lora_mem_slot_ids:
+            A_batch, B_batch = memory_state["lora_mem"][slot_id]
+            memory_state["lora_mem"][slot_id] = (
                 A_batch.detach().requires_grad_(True),
                 B_batch.detach().requires_grad_(True),
             )
@@ -440,9 +446,9 @@ class LoraMemoryBackend(MemoryBackend):
         mem_device = next(iter(memory_state["lora_mem"].values()))[0].device
         mem_norm_sq = torch.zeros(next(iter(memory_state["lora_mem"].values()))[0].size(0), device=mem_device)
         delta_mem_norm_sq = torch.zeros_like(mem_norm_sq)
-        for layer_idx in self.owner.lora_mem_layer_ids:
-            A_batch, B_batch = memory_state["lora_mem"][layer_idx]
-            A_init, B_init = memory_state_initial["lora_mem"][layer_idx]
+        for slot_id in self.owner.lora_mem_slot_ids:
+            A_batch, B_batch = memory_state["lora_mem"][slot_id]
+            A_init, B_init = memory_state_initial["lora_mem"][slot_id]
             mem_norm_sq = mem_norm_sq + A_batch.detach().pow(2).sum(dim=(1, 2))
             mem_norm_sq = mem_norm_sq + B_batch.detach().pow(2).sum(dim=(1, 2))
             delta_mem_norm_sq = delta_mem_norm_sq + (A_batch.detach() - A_init).pow(2).sum(dim=(1, 2))
@@ -637,7 +643,10 @@ class GradMemGPT(PreTrainedModel):
         self.lora_mem_alpha = getattr(config, "lora_mem_alpha", 16)
         self.lora_mem_dropout = getattr(config, "lora_mem_dropout", 0.0)
         self.lora_mem_layers = getattr(config, "lora_mem_layers", None)
+        self.lora_mem_target_modules = getattr(config, "lora_mem_target_modules", None)
         self.kv_mem_layers = getattr(config, "kv_mem_layers", None)
+        self.lora_mem_slot_ids = []
+        self.lora_mem_param_keys = {}
         self._active_lora_memory = None
         self._lora_mem_hooks = []
 
@@ -654,7 +663,15 @@ class GradMemGPT(PreTrainedModel):
             self._freeze_backbone_params()
 
         if self.memory_backend == "lora":
-            self._init_lora_memory_between_layers()
+            if self.lora_mem_placement == "between_layers":
+                self._init_lora_memory_between_layers()
+            elif self.lora_mem_placement == "target_modules":
+                self._init_lora_memory_target_modules()
+            else:
+                raise ValueError(
+                    f"Unsupported lora_mem_placement={self.lora_mem_placement}. "
+                    "Supported: between_layers, target_modules"
+                )
         elif self.memory_backend == "kv_cache":
             self._init_kv_cache_memory()
 
@@ -976,6 +993,7 @@ class GradMemGPT(PreTrainedModel):
             if idx < 0 or idx >= n_layers:
                 raise ValueError(f"lora_mem_layers has out-of-range index {idx} for {n_layers} layers")
         self.lora_mem_layer_ids = layer_ids
+        self.lora_mem_slot_ids = list(layer_ids)
 
         hidden_size = getattr(self.model.config, "n_embd", getattr(self.model.config, "hidden_size", None))
         if hidden_size is None:
@@ -983,7 +1001,9 @@ class GradMemGPT(PreTrainedModel):
         self.lora_mem_scale = float(self.lora_mem_alpha) / float(max(1, self.lora_mem_r))
         self.lora_mem_A0 = nn.ParameterDict()
         self.lora_mem_B0 = nn.ParameterDict()
-        for layer_idx in self.lora_mem_layer_ids:
+        self.lora_mem_param_keys = {}
+        for layer_idx in self.lora_mem_slot_ids:
+            param_key = str(layer_idx)
             a = nn.Parameter(
                 torch.zeros(hidden_size, self.lora_mem_r),
                 requires_grad=True,
@@ -994,10 +1014,108 @@ class GradMemGPT(PreTrainedModel):
             )
             nn.init.kaiming_uniform_(a, a=math.sqrt(5))
             nn.init.zeros_(b)
-            self.lora_mem_A0[str(layer_idx)] = a
-            self.lora_mem_B0[str(layer_idx)] = b
+            self.lora_mem_param_keys[str(layer_idx)] = param_key
+            self.lora_mem_A0[param_key] = a
+            self.lora_mem_B0[param_key] = b
 
-        self._register_lora_mem_hooks(blocks)
+        self._register_lora_mem_layer_hooks(blocks)
+
+    @staticmethod
+    def _extract_layer_idx_from_module_name(module_name):
+        patterns = [
+            r"\.h\.(\d+)\.",
+            r"\.layers\.(\d+)\.",
+            r"\.block\.(\d+)\.",
+            r"\.blocks\.(\d+)\.",
+        ]
+        dotted = f".{module_name}."
+        for p in patterns:
+            m = re.search(p, dotted)
+            if m is not None:
+                return int(m.group(1))
+        return None
+
+    @staticmethod
+    def _infer_linear_lora_dims(module, module_name):
+        if isinstance(module, nn.Linear):
+            return int(module.in_features), int(module.out_features)
+
+        if module.__class__.__name__ == "Conv1D":
+            weight = getattr(module, "weight", None)
+            if isinstance(weight, torch.Tensor) and weight.ndim == 2:
+                return int(weight.shape[0]), int(weight.shape[1])
+
+        raise ValueError(
+            "lora_mem target_modules supports only linear-like modules (nn.Linear, Conv1D). "
+            f"Got module={module_name}, type={module.__class__.__name__}"
+        )
+
+    def _resolve_lora_mem_targets(self):
+        parsed = self._parse_lora_targets(self.lora_mem_target_modules)
+        if parsed:
+            return parsed
+
+        model_type = getattr(self.model.config, "model_type", None)
+        targets_by_type = {
+            "llama": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            "gpt2": ["c_attn", "c_proj", "c_fc"],
+            "gpt_neox": ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"],
+        }
+        if model_type in targets_by_type:
+            return targets_by_type[model_type]
+
+        raise ValueError(
+            "lora_mem_target_modules is not set and model_type is unknown. "
+            "Please provide explicit target modules."
+        )
+
+    def _init_lora_memory_target_modules(self):
+        blocks = self._get_transformer_blocks()
+        n_layers = len(blocks)
+        layer_ids = set(self._parse_lora_mem_layers(self.lora_mem_layers, n_layers))
+        for idx in layer_ids:
+            if idx < 0 or idx >= n_layers:
+                raise ValueError(f"lora_mem_layers has out-of-range index {idx} for {n_layers} layers")
+
+        targets = self._resolve_lora_mem_targets()
+        backbone = get_backbone(self.model)
+        selected = []
+        for module_name, module in backbone.named_modules():
+            if module_name == "":
+                continue
+            if not any(module_name == t or module_name.endswith(f".{t}") for t in targets):
+                continue
+            layer_idx = self._extract_layer_idx_from_module_name(module_name)
+            if layer_idx is not None and layer_idx not in layer_ids:
+                continue
+            selected.append((module_name, module))
+
+        if len(selected) == 0:
+            raise ValueError(
+                "lora_mem_placement='target_modules' resolved zero modules. "
+                f"targets={targets}, layers={sorted(layer_ids)}"
+            )
+
+        self.lora_mem_scale = float(self.lora_mem_alpha) / float(max(1, self.lora_mem_r))
+        self.lora_mem_A0 = nn.ParameterDict()
+        self.lora_mem_B0 = nn.ParameterDict()
+        self.lora_mem_slot_ids = []
+        self.lora_mem_param_keys = {}
+        for module_name, module in selected:
+            if module_name in self.lora_mem_slot_ids:
+                raise ValueError(f"Duplicate lora memory slot key: {module_name}")
+            in_dim, out_dim = self._infer_linear_lora_dims(module, module_name)
+            param_key = f"slot_{len(self.lora_mem_slot_ids)}"
+            a = nn.Parameter(torch.zeros(in_dim, self.lora_mem_r), requires_grad=True)
+            b = nn.Parameter(torch.zeros(self.lora_mem_r, out_dim), requires_grad=True)
+            nn.init.kaiming_uniform_(a, a=math.sqrt(5))
+            nn.init.zeros_(b)
+            self.lora_mem_param_keys[str(module_name)] = param_key
+            self.lora_mem_A0[param_key] = a
+            self.lora_mem_B0[param_key] = b
+            self.lora_mem_slot_ids.append(module_name)
+
+        self._register_lora_mem_target_hooks(selected)
 
     def _init_kv_cache_memory(self):
         blocks = self._get_transformer_blocks()
@@ -1064,7 +1182,7 @@ class GradMemGPT(PreTrainedModel):
             legacy.append((K_batch, V_batch))
         return DynamicCache.from_legacy_cache(tuple(legacy))
 
-    def _register_lora_mem_hooks(self, blocks):
+    def _register_lora_mem_layer_hooks(self, blocks):
         if self._lora_mem_hooks:
             return
 
@@ -1092,6 +1210,60 @@ class GradMemGPT(PreTrainedModel):
                 return x_new
 
             self._lora_mem_hooks.append(module.register_forward_hook(_hook_fn))
+
+    def _register_lora_mem_target_hooks(self, modules):
+        if self._lora_mem_hooks:
+            return
+
+        for module_name, module in modules:
+            def _hook_fn(_mod, _inp, output, idx=module_name):
+                if self._active_lora_memory is None or idx not in self._active_lora_memory:
+                    return output
+
+                if len(_inp) == 0:
+                    raise ValueError(f"lora_mem target hook got empty inputs for module={idx}")
+
+                x = _inp[0]
+                if not isinstance(x, torch.Tensor) or x.ndim != 3:
+                    raise ValueError(
+                        "lora_mem target_modules expects tensor input with shape [B,S,D], "
+                        f"got type={type(x)}, ndim={getattr(x, 'ndim', None)} for module={idx}"
+                    )
+
+                base_out = output[0] if isinstance(output, tuple) else output
+                if not isinstance(base_out, torch.Tensor) or base_out.ndim != 3:
+                    raise ValueError(
+                        "lora_mem target_modules expects tensor output with shape [B,S,D], "
+                        f"got type={type(base_out)}, ndim={getattr(base_out, 'ndim', None)} for module={idx}"
+                    )
+
+                A_mem, B_mem = self._active_lora_memory[idx]
+                if self.lora_mem_dropout > 0.0:
+                    x_in = F.dropout(x, p=self.lora_mem_dropout, training=self.training)
+                else:
+                    x_in = x
+                low_rank = torch.einsum("bsi,bir->bsr", x_in, A_mem)
+                delta = torch.einsum("bsr,bro->bso", low_rank, B_mem)
+                if delta.shape != base_out.shape:
+                    raise ValueError(
+                        "lora_mem target delta shape mismatch: "
+                        f"module={idx}, delta_shape={tuple(delta.shape)}, base_out_shape={tuple(base_out.shape)}"
+                    )
+                out_new = base_out + self.lora_mem_scale * delta
+
+                if isinstance(output, tuple):
+                    out_list = list(output)
+                    out_list[0] = out_new
+                    return tuple(out_list)
+                return out_new
+
+            self._lora_mem_hooks.append(module.register_forward_hook(_hook_fn))
+
+    def _lora_mem_param_key(self, slot_id):
+        key = self.lora_mem_param_keys.get(str(slot_id))
+        if key is None:
+            raise ValueError(f"Missing lora memory parameter key for slot_id={slot_id}")
+        return key
 
     @contextmanager
     def _enable_lora_memory(self, memory_params):
