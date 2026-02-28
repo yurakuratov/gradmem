@@ -355,6 +355,8 @@ def test_forward_lora_target_modules_auto(model_family: str):
 
     model = GradMemGPT(model_config)
     model.eval()
+    assert all(not k.startswith("slot_") for k in model.lora_mem_A0.keys())
+    assert all(k.startswith("layer") for k in model.lora_mem_A0.keys())
 
     batch_size = 2
     ctx_len = 6

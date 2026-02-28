@@ -1003,7 +1003,7 @@ class GradMemGPT(PreTrainedModel):
         self.lora_mem_B0 = nn.ParameterDict()
         self.lora_mem_param_keys = {}
         for layer_idx in self.lora_mem_slot_ids:
-            param_key = str(layer_idx)
+            param_key = self._make_between_layer_param_key(layer_idx)
             a = nn.Parameter(
                 torch.zeros(hidden_size, self.lora_mem_r),
                 requires_grad=True,
@@ -1034,6 +1034,32 @@ class GradMemGPT(PreTrainedModel):
             if m is not None:
                 return int(m.group(1))
         return None
+
+    @staticmethod
+    def _sanitize_param_key(text):
+        cleaned = re.sub(r"[^0-9a-zA-Z_]+", "_", str(text)).strip("_")
+        return cleaned or "module"
+
+    def _make_between_layer_param_key(self, layer_idx):
+        return f"layer{int(layer_idx)}"
+
+    def _make_target_module_param_key(self, module_name, used_keys):
+        parts = str(module_name).split(".")
+        leaf = parts[-1] if len(parts) >= 1 else "module"
+        parent = parts[-2] if len(parts) >= 2 else "module"
+        layer_idx = self._extract_layer_idx_from_module_name(module_name)
+        if layer_idx is None:
+            base = f"module_{parent}_{leaf}"
+        else:
+            base = f"layer{layer_idx}_{parent}_{leaf}"
+        base = self._sanitize_param_key(base)
+
+        key = base
+        suffix = 2
+        while key in used_keys:
+            key = f"{base}_{suffix}"
+            suffix += 1
+        return key
 
     @staticmethod
     def _infer_linear_lora_dims(module, module_name):
@@ -1101,11 +1127,13 @@ class GradMemGPT(PreTrainedModel):
         self.lora_mem_B0 = nn.ParameterDict()
         self.lora_mem_slot_ids = []
         self.lora_mem_param_keys = {}
+        used_param_keys = set()
         for module_name, module in selected:
             if module_name in self.lora_mem_slot_ids:
                 raise ValueError(f"Duplicate lora memory slot key: {module_name}")
             in_dim, out_dim = self._infer_linear_lora_dims(module, module_name)
-            param_key = f"slot_{len(self.lora_mem_slot_ids)}"
+            param_key = self._make_target_module_param_key(module_name, used_param_keys)
+            used_param_keys.add(param_key)
             a = nn.Parameter(torch.zeros(in_dim, self.lora_mem_r), requires_grad=True)
             b = nn.Parameter(torch.zeros(self.lora_mem_r, out_dim), requires_grad=True)
             nn.init.kaiming_uniform_(a, a=math.sqrt(5))
