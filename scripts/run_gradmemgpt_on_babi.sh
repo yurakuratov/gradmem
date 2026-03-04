@@ -73,7 +73,7 @@ for task_name in "qa2"; do
   for N in "${N_VALUES[@]}"; do
     # Path to save experiment results
     RND=$(date +%Y%m%d%H%M%S)
-    EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}_dbg/run_${N}"
+    EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_${N}"
     if [ "$MIXED_PRECISION" != "no" ]; then
       EXP_PATH="${EXP_PATH}_${MIXED_PRECISION}"
     fi
