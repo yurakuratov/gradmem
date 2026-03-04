@@ -177,5 +177,5 @@ cython_debug/
 .vscode/
 
 # data
-data/
-runs/
+data
+runs
