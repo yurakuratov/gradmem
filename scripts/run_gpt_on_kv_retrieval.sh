@@ -12,7 +12,8 @@ L=4
 H=4
 D=128
 MAX_POSITION_EMBEDDINGS=1024
-BASE_MODEL=llama
+# BASE_MODEL=llama
+BASE_MODEL=gpt2
 
 INIT_CHECKPOINT=./runs/N64-K2V2-V62_1M/llama_L4H4D128_L1024_bs_64_lr_5e-05_b2_0.98/run_3/checkpoint-168500/model.safetensors
 RUN_NAME_SUFFIX=init_N64
@@ -27,7 +28,7 @@ DATA_NAME="N96-K2V2-V${V}_1M"
 # DATA_NAME="N4-K1V1-vocab512_1M"
 # copy task
 # DATA_NAME="N0-S1(4-4)_1M"
-DATA_PATH="./data/${DATA_NAME}"
+DATA_PATH="/home/jovyan/.cache/test-time-gd-cache/data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
 if [ "$BASE_MODEL" == "mamba" ]; then
@@ -60,7 +61,7 @@ for N in "${N_VALUES[@]}"; do
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
 
   # Execute the script using accelerate for parallel processing
-  accelerate launch \
+  python -m accelerate.commands.launch \
     --main_process_port $((29500+$TBS+$N+1)) \
     --num_processes $NP \
     --mixed_precision bf16 \

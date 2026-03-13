@@ -26,7 +26,7 @@ fi
 
 for task_name in "qa1" "qa2" "qa3" "qa4" "qa5"; do
   DATA_NAME="babilong_${task_name}_0k"
-  DATA_PATH="./data/${DATA_NAME}"
+  DATA_PATH="/home/jovyan/.cache/test-time-gd-cache/data/${DATA_NAME}"
 
   # Run ID
   N_VALUES=(1)
@@ -35,7 +35,7 @@ for task_name in "qa1" "qa2" "qa3" "qa4" "qa5"; do
     EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
 
     # Execute the script using accelerate for parallel processing
-    accelerate launch \
+    python -m accelerate.commands.launch \
       --main_process_port $((29500+$TBS+$N+1)) \
       --num_processes $NP \
       --mixed_precision bf16 \

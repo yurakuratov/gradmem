@@ -52,7 +52,7 @@ RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
 
 for task_name in "qa2"; do
   DATA_NAME="babilong_${task_name}_0k"
-  DATA_PATH="./data/${DATA_NAME}"
+  DATA_PATH="/home/jovyan/.cache/test-time-gd-cache/data/${DATA_NAME}"
 
   # Run ID
   N_VALUES=(1)
@@ -61,7 +61,7 @@ for task_name in "qa2"; do
     EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
 
     # Execute the script using accelerate for parallel processing
-    accelerate launch \
+    python -m accelerate.commands.launch \
       --main_process_port $((29500+$TBS+$N+1)) \
       --num_processes $NP \
       --mixed_precision bf16 \

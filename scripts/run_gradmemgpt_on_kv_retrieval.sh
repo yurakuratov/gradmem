@@ -10,7 +10,8 @@ GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 L=4
 H=4
 D=128
-BASE_MODEL=llama
+# BASE_MODEL=llama
+BASE_MODEL=gpt2
 
 V=62
 # Dataset parameters
@@ -21,7 +22,7 @@ V=62
 # DATA_NAME="N10-K2V2-S4(32-64)_1M"
 # DATA_NAME="N16-K1V1-vocab512_1M"
 DATA_NAME="N8-K2V2-V${V}_1M"
-DATA_PATH="./data/${DATA_NAME}"
+DATA_PATH="/home/jovyan/.cache/test-time-gd-cache/data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
 # GradMemGPT specific parameters
@@ -92,7 +93,7 @@ for N in "${N_VALUES[@]}"; do
   # --multi_gpu \
   # --mixed_precision 'bf16' \
   # Execute the script using accelerate for parallel processing
-  accelerate launch \
+  python -m accelerate.commands.launch \
     --main_process_port $((29500+$TBS+$N+1)) \
     --num_processes $NP \
     --mixed_precision 'no' \

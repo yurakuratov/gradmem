@@ -1,0 +1,48 @@
+container:
+  image: "cr.ai.cloud.ru/0be50883-779e-4f89-a2c2-6befd3879c6f/test-time-gd:latest"
+
+  # CMD to run
+  command: scripts/run_gradmemgpt_on_kv_retrieval.sh
+  # ENV vars
+  environment:
+    "HF_HOME": "$HF_HOME"
+    "WANDB_API_KEY": "$WANDB_API_KEY"
+    "WANDB_DIR": "$WANDB_DIR"
+    "WANDB_DATA_DIR": "$WANDB_DATA_DIR"
+    "WANDB_ARTIFACT_DIR": "$WANDB_ARTIFACT_DIR"
+    "WANDB_CACHE_DIR": "$WANDB_CACHE_DIR"
+    "WANDB_HTTPS_PROXY": "$WANDB_HTTPS_PROXY"
+    "TRITON_CACHE_DIR": "$TRITON_CACHE_DIR"
+    # Added to job description
+    "TEAM_NAME": "gradmem/$ME"
+    "MY_HOME": "$MY_HOME"
+  
+  # Local working directory, recommend leaving as default
+  work_dir: '.'
+
+  # Whether to run from a copy of the working directory
+  run_from_copy: True
+
+  # Local path for creating working directory copies
+  cry_copy_dir: "$MY_HOME/.cryri"
+  exclude_from_copy:
+    - ".git/"
+    - "notebooks/"
+    - "build/"
+    - "lolora.egg-info"
+
+cloud:
+  region: "SR006"
+  
+  # Type of cloud instance (check the command to list available instances in cryri readme)
+  instance_type: "a100plus.1gpu.80vG.12C.96G"
+
+  # Number of worker instances, 1 is the only option
+  n_workers: 1
+  
+  # Job priority. Options: ['high', 'medium', 'low']. 
+  #   Jobs with higher priority will stop running jobs with lower priority if all resources are allocated.
+  priority: "medium"
+  
+  # Job description 
+  description: "test"
