@@ -57,7 +57,8 @@ def _scalar_from_tensor_proto_fast(t) -> Optional[float]:
         v = float(t.double_val[0])
         return v if math.isfinite(v) else None
 
-    if dt in (types_pb2.DT_INT8, types_pb2.DT_INT16, types_pb2.DT_INT32, types_pb2.DT_UINT8, types_pb2.DT_UINT16) and t.int_val:
+    if dt in (types_pb2.DT_INT8, types_pb2.DT_INT16, types_pb2.DT_INT32,
+              types_pb2.DT_UINT8, types_pb2.DT_UINT16) and t.int_val:
         v = float(t.int_val[0])
         return v if math.isfinite(v) else None
 
@@ -171,6 +172,8 @@ def main() -> int:
 
     wanted_tags = {tag for group in args.tag for tag in group} if args.tag else None
 
+    print(f'path: {os.path.abspath(args.path)}')
+
     try:
         rows = list(read_fast(args.path, wanted_tags).values())
     except Exception as e:
@@ -209,6 +212,7 @@ def main() -> int:
 
 
 """
+Extracts metrics from tensorboard event files.
 USAGE example, from experiment folder:
 python ~/data/test_time_gd/tbtail.py . --tag eval/exact_match eval/token_accuracy train/patience
 eval/exact_match     last=0.4344       step=31000     min=0.3024       step=4000      max=0.478        step=0      n=63
