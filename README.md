@@ -4,6 +4,10 @@ This repository contains code for **GradMem**, a memory mechanism where the mode
 
 The key idea is not just to optimize memory at inference, but to **meta-learn the model so that a few (<=5) test-time updates are effective**.
 
+<p align="center">
+  <img src="./imgs/GradMem_overview_short.png" width="80%" />
+</p>
+
 ## Concept
 
 Each example is split into:
