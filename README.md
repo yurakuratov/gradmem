@@ -4,6 +4,8 @@ This repository contains code for **GradMem**, a memory mechanism where the mode
 
 The key idea is not just to optimize memory at inference, but to **meta-learn the model so that a few (<=5) test-time updates are effective**.
 
+arXiv: https://arxiv.org/abs/2603.13875
+
 <p align="center">
   <img src="./imgs/GradMem_overview_short.png" width="80%" />
 </p>
@@ -135,3 +137,16 @@ Second-order mode is more expensive in memory/compute, but it is what we found t
 ## Outputs
 
 All runs write checkpoints, metrics, and trainer state under `--exp_path` (typically in `./runs/...`).
+
+## Citation
+```
+@misc{kuratov2026gradmem,
+      title={GradMem: Learning to Write Context into Memory with Test-Time Gradient Descent}, 
+      author={Yuri Kuratov and Matvey Kairov and Aydar Bulatov and Ivan Rodkin and Mikhail Burtsev},
+      year={2026},
+      eprint={2603.13875},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2603.13875}, 
+}
+```
