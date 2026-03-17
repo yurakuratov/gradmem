@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 from safetensors.torch import load_file
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
 
@@ -127,13 +127,52 @@ def load_checkpoint_state_dict(model_path):
     )
 
 
-def build_model_config(cli_args):
+def build_kv_base_config(cli_args, tokenizer):
+    base_model = cli_args.get("base_model")
+    if base_model is None:
+        raise ValueError("KV retrieval run config requires base_model when pretrained_model is not set")
+
+    n_layer = int(cli_args.get("n_layer", 4))
+    n_head = int(cli_args.get("n_head", 4))
+    n_embd = int(cli_args.get("n_embd", 128))
+
+    if base_model == "gpt2":
+        config = AutoConfig.from_pretrained("gpt2")
+        config.n_layer = n_layer
+        config.n_head = n_head
+        config.n_embd = n_embd
+    elif base_model == "pythia":
+        config = AutoConfig.from_pretrained("EleutherAI/pythia-160m")
+        config.num_hidden_layers = n_layer
+        config.num_attention_heads = n_head
+        config.hidden_size = n_embd
+        config.intermediate_size = config.hidden_size * 4
+    elif base_model == "llama":
+        config = AutoConfig.from_pretrained("meta-llama/Llama-3.2-1B")
+        config.num_hidden_layers = n_layer
+        config.num_attention_heads = n_head
+        config.num_key_value_heads = n_head
+        config.hidden_size = n_embd
+        config.head_dim = config.hidden_size // config.num_attention_heads
+        config.intermediate_size = config.hidden_size * 4
+    else:
+        raise ValueError(f"Unsupported base_model for KV retrieval: {base_model}")
+
+    config.torch_dtype = "float32"
+    config.vocab_size = tokenizer.vocab_size
+    config.pad_token_id = tokenizer.pad_token_id
+    config.bos_token_id = tokenizer.bos_token_id
+    config.eos_token_id = tokenizer.eos_token_id
+    config.use_cache = False
+    return config
+
+
+def build_model_config(cli_args, base_config=None):
     pretrained_model = cli_args.get("pretrained_model")
-    if pretrained_model is None:
-        raise ValueError("This playground currently supports runs with pretrained_model set in config.json")
 
     return GradMemGPTConfig(
         pretrained_model=pretrained_model,
+        base_config=base_config,
         memory_backend=cli_args["memory_backend"],
         n_mem_tokens=cli_args["n_mem_tokens"],
         K=cli_args["K"],
@@ -195,6 +234,18 @@ def encode_write_ids(tokenizer, text, special_prefix_ids, special_suffix_ids, ma
 def encode_query_ids(tokenizer, text, special_prefix_ids, special_suffix_ids):
     q_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
     return special_prefix_ids + q_ids + special_suffix_ids
+
+
+def encode_write_ids_kv(tokenizer, text, max_context_length):
+    kwargs = {"add_special_tokens": True}
+    if max_context_length is not None:
+        kwargs["max_length"] = max_context_length
+        kwargs["truncation"] = True
+    return tokenizer(text, **kwargs)["input_ids"]
+
+
+def encode_query_ids_kv(tokenizer, text):
+    return tokenizer(text, add_special_tokens=True)["input_ids"]
 
 
 @torch.no_grad()
@@ -375,15 +426,17 @@ def generate_without_memory(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Interactive playground for GradMemGPT text-compression runs")
+    parser = argparse.ArgumentParser(description="Interactive playground for GradMemGPT runs")
     parser.add_argument("--run_path", required=True, help="Path to run directory containing config.json")
     parser.add_argument("--checkpoint", default=None, help="Checkpoint dir or model.safetensors path")
+    parser.add_argument("--task", required=True, choices=["text_compression", "kv_retrieval"])
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Inference device")
     parser.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"], help="Model dtype")
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--do_sample", action="store_true")
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--show_token_ids", action="store_true", help="Show token id diagnostics in /write and /ask")
     parser.add_argument("--plain_repl", action="store_true", help="Use basic input() even if prompt_toolkit is in env")
     args = parser.parse_args()
 
@@ -397,10 +450,37 @@ def main():
     cli_args = run_cfg.get("cli_args")
     if not isinstance(cli_args, dict):
         raise ValueError(f"Invalid run config format in {config_path}: missing cli_args dict")
+    task = args.task
 
     model_path = resolve_model_path(run_path, args.checkpoint)
 
-    model_cfg = build_model_config(cli_args)
+    pretrained_model = cli_args.get("pretrained_model")
+    if task == "text_compression":
+        if pretrained_model is None:
+            raise ValueError("text_compression chat expects pretrained_model in run config")
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
+        model_base_config = None
+        model_source = f"pretrained:{pretrained_model}"
+        tokenizer_source = pretrained_model
+    else:
+        if pretrained_model is not None:
+            tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
+            model_base_config = None
+            model_source = f"pretrained:{pretrained_model}"
+            tokenizer_source = pretrained_model
+        else:
+            tokenizer_path = cli_args.get("tokenizer_path")
+            if tokenizer_path is None:
+                raise ValueError("kv_retrieval run config requires tokenizer_path when pretrained_model is not set")
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            model_base_config = build_kv_base_config(cli_args, tokenizer)
+            model_source = f"base_config:{cli_args.get('base_model')}"
+            tokenizer_source = tokenizer_path
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    model_cfg = build_model_config(cli_args, base_config=model_base_config)
     model = GradMemGPT(model_cfg)
     state_dict, checkpoint_format = load_checkpoint_state_dict(model_path)
     missing_k, unexpected_k = model.load_state_dict(state_dict, strict=False)
@@ -431,20 +511,32 @@ def main():
         model.to(torch.bfloat16)
     model.eval()
 
-    pretrained_model = cli_args.get("pretrained_model")
-    if pretrained_model is None:
-        raise ValueError("pretrained_model is required in run config to load tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(pretrained_model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    special_prefix_ids, special_suffix_ids = infer_special_wrapper_ids(tokenizer)
     max_context_length = cli_args.get("max_context_length")
+    if task == "text_compression":
+        special_prefix_ids, special_suffix_ids = infer_special_wrapper_ids(tokenizer)
 
-    print_status(f"Loaded run: {run_path}")
-    print_status(f"Loaded checkpoint: {model_path}")
-    print_status(f"Checkpoint format: {checkpoint_format}")
-    print_status(f"Memory backend: {model.memory_backend}")
+        def encode_write(text):
+            return encode_write_ids(tokenizer, text, special_prefix_ids, special_suffix_ids, max_context_length)
+
+        def encode_query(text):
+            return encode_query_ids(tokenizer, text, special_prefix_ids, special_suffix_ids)
+    else:
+        special_prefix_ids, special_suffix_ids = [], []
+
+        def encode_write(text):
+            return encode_write_ids_kv(tokenizer, text, max_context_length)
+
+        def encode_query(text):
+            return encode_query_ids_kv(tokenizer, text)
+
+    print_status(
+        f"Run: {run_path}\n"
+        f"Checkpoint: {model_path} (format={checkpoint_format})\n"
+        f"Task: {task}\n"
+        f"Model source: {model_source}\n"
+        f"Tokenizer source: {tokenizer_source}\n"
+        f"Memory backend: {model.memory_backend}"
+    )
     if PromptSession is None:
         print_status("prompt_toolkit is not installed; using plain REPL. Install via: pip install prompt_toolkit")
     elif args.plain_repl:
@@ -491,35 +583,26 @@ def main():
                 print_status("Empty write text.")
                 continue
             print_bubble("You", f"/write {text}")
-            write_ids = encode_write_ids(
-                tokenizer,
-                text,
-                special_prefix_ids=special_prefix_ids,
-                special_suffix_ids=special_suffix_ids,
-                max_context_length=max_context_length,
-            )
+            write_ids = encode_write(text)
             memory_state, inner_loop_stats = write_memory_once(model, write_ids, device)
             inner_loss = inner_loop_stats.get("inner_loss")
             written_text = tokenizer.decode(write_ids, skip_special_tokens=False)
-            token_ids_str = ", ".join(str(t) for t in write_ids)
             if inner_loss is None:
-                print_status(
-                    f"text in memory: {written_text}\n"
-                    f"n_tokens={len(write_ids)}\n"
-                    f"token_ids=[{token_ids_str}]\n"
-                    "inner_loss=NA"
-                )
+                msg = f"text in memory: {written_text}\ninner_loss=NA"
+                if args.show_token_ids:
+                    token_ids_str = ", ".join(str(t) for t in write_ids)
+                    msg = f"{msg}\nn_tokens={len(write_ids)}\ntoken_ids=[{token_ids_str}]"
+                print_status(msg)
             else:
                 if torch.is_tensor(inner_loss):
                     inner_loss = float(inner_loss.detach().item())
                 else:
                     inner_loss = float(inner_loss)
-                print_status(
-                    f"text in memory: {written_text}\n"
-                    f"n_tokens={len(write_ids)}\n"
-                    f"token_ids=[{token_ids_str}]\n"
-                    f"inner_loss={inner_loss:.4f}"
-                )
+                msg = f"text in memory: {written_text}\ninner_loss={inner_loss:.4f}"
+                if args.show_token_ids:
+                    token_ids_str = ", ".join(str(t) for t in write_ids)
+                    msg = f"{msg}\nn_tokens={len(write_ids)}\ntoken_ids=[{token_ids_str}]"
+                print_status(msg)
             continue
 
         if line.startswith("/ask "):
@@ -531,7 +614,7 @@ def main():
                 print_status("Empty query.")
                 continue
             print_bubble("You", f"/ask {query}")
-            query_ids = encode_query_ids(tokenizer, query, special_prefix_ids, special_suffix_ids)
+            query_ids = encode_query(query)
             new_tokens = generate_from_memory(
                 model=model,
                 memory_state=memory_state,
@@ -545,14 +628,15 @@ def main():
             )
             answer = tokenizer.decode(new_tokens, skip_special_tokens=True)
             print_bubble("Memory + Base Model", answer)
-            query_ids_str = ", ".join(str(t) for t in query_ids)
-            gen_ids_str = ", ".join(str(t) for t in new_tokens)
-            print_status(
-                f"read_input_token_ids=[{query_ids_str}]\n"
-                f"read_input_n_tokens={len(query_ids)}\n"
-                f"generated_token_ids=[{gen_ids_str}]\n"
-                f"generated_n_tokens={len(new_tokens)}"
-            )
+            if args.show_token_ids:
+                query_ids_str = ", ".join(str(t) for t in query_ids)
+                gen_ids_str = ", ".join(str(t) for t in new_tokens)
+                print_status(
+                    f"read_input_token_ids=[{query_ids_str}]\n"
+                    f"read_input_n_tokens={len(query_ids)}\n"
+                    f"generated_token_ids=[{gen_ids_str}]\n"
+                    f"generated_n_tokens={len(new_tokens)}"
+                )
             continue
 
         if line.startswith("/ask_base "):
@@ -561,7 +645,7 @@ def main():
                 print_status("Empty query.")
                 continue
             print_bubble("You", f"/ask_base {query}")
-            query_ids = encode_query_ids(tokenizer, query, special_prefix_ids, special_suffix_ids)
+            query_ids = encode_query(query)
             new_tokens = generate_without_memory(
                 model=model,
                 prompt_ids=query_ids,
@@ -574,14 +658,15 @@ def main():
             )
             answer = tokenizer.decode(new_tokens, skip_special_tokens=True)
             print_bubble("Base", answer)
-            query_ids_str = ", ".join(str(t) for t in query_ids)
-            gen_ids_str = ", ".join(str(t) for t in new_tokens)
-            print_status(
-                f"read_input_token_ids=[{query_ids_str}]\n"
-                f"read_input_n_tokens={len(query_ids)}\n"
-                f"generated_token_ids=[{gen_ids_str}]\n"
-                f"generated_n_tokens={len(new_tokens)}"
-            )
+            if args.show_token_ids:
+                query_ids_str = ", ".join(str(t) for t in query_ids)
+                gen_ids_str = ", ".join(str(t) for t in new_tokens)
+                print_status(
+                    f"read_input_token_ids=[{query_ids_str}]\n"
+                    f"read_input_n_tokens={len(query_ids)}\n"
+                    f"generated_token_ids=[{gen_ids_str}]\n"
+                    f"generated_n_tokens={len(new_tokens)}"
+                )
             continue
 
         print_status("Unknown command. Use /help")
@@ -589,7 +674,7 @@ def main():
 
 # CUDA_VISIBLE_DEVICES=2 python chat_with_gradmem.py \
 # --run_path ./runs/pg19_chunks_w8000/gradmem_Llama-3.2-3B_N16_lora_target_modules_r8a16_gate_proj_up_proj_down_proj_layers_all_K1_ilr0.04_frozen_grad_second_bs_64_lr_5e-05/run_1_20260228142413_bf16 \
-# --max_new_tokens 32 --dtype bf16
+# --max_new_tokens 32 --dtype bf16 --task text_compression
 # todo: chat templates?
 if __name__ == "__main__":
     main()
