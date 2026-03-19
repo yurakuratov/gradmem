@@ -312,7 +312,7 @@ if __name__ == '__main__':
         save_steps=args.eval_steps,
         eval_steps=args.eval_steps,
         logging_steps=args.logging_steps,
-        report_to='tensorboard',
+        report_to='comet_ml',
         metric_for_best_model=args.metric_for_best_model,
         load_best_model_at_end=True,
         eval_on_start=True,

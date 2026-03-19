@@ -13,6 +13,11 @@ container:
     "WANDB_CACHE_DIR": "$WANDB_CACHE_DIR"
     "WANDB_HTTPS_PROXY": "$WANDB_HTTPS_PROXY"
     "TRITON_CACHE_DIR": "$TRITON_CACHE_DIR"
+    "COMET_API_KEY": "$COMET_API_KEY"
+    "COMET_PROJECT_NAME": "gradmem"
+    "COMET_EXPERIMENT_NAME": "test"
+    # "COMET_WORKSPACE": "$COMET_WORKSPACE"
+    "COMET_MODE": "online"
     # Added to job description
     "TEAM_NAME": "gradmem/$ME"
     "MY_HOME": "$MY_HOME"
@@ -39,10 +44,6 @@ cloud:
 
   # Number of worker instances, 1 is the only option
   n_workers: 1
-  
-  # Job priority. Options: ['high', 'medium', 'low']. 
-  #   Jobs with higher priority will stop running jobs with lower priority if all resources are allocated.
-  priority: "medium"
   
   # Job description 
   description: "test"
