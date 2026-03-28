@@ -39,6 +39,8 @@ class GradMemGPTConfig(PretrainedConfig):
                  use_write_head=False,
                  use_gradient_checkpointing=False,
                  attn_implementation="eager",
+                 early_stop_acc=None,
+                 early_stop_check_every=100,
                  **kwargs):
         """
         Args:
@@ -85,6 +87,8 @@ class GradMemGPTConfig(PretrainedConfig):
         self.last_K_second_order = max(0, min(self.last_K_second_order, K))
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.attn_implementation = attn_implementation
+        self.early_stop_acc = early_stop_acc
+        self.early_stop_check_every = early_stop_check_every
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -158,6 +162,8 @@ class GradMemGPT(PreTrainedModel):
         self.use_mem_proj = config.use_mem_proj
         self.mem_proj_mode = config.mem_proj_mode
         self.use_write_head = config.use_write_head
+        self.early_stop_acc = getattr(config, 'early_stop_acc', None)
+        self.early_stop_check_every = getattr(config, 'early_stop_check_every', 100)
 
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
@@ -357,6 +363,7 @@ class GradMemGPT(PreTrainedModel):
         # ---------------------------------------------------------------- #
         # 1.  INNER loop on context. WRITE context to mem.
         # ---------------------------------------------------------------- #
+        _early_stop = False
         if self.K and context_input_ids.ne(pad_id).any():
             # re‑enable autograd even if outer context is `no_grad`
             with torch.enable_grad():
@@ -414,7 +421,18 @@ class GradMemGPT(PreTrainedModel):
                     # g_i = d inner_loss / d mem_i = d inner_loss_i / d mem_i
                     inner_loss = (inner_loss * mask).sum(1) / seq_len
                     inner_loss = inner_loss.sum()
+
+                    _early_stop = False
+                    if (self.early_stop_acc is not None
+                            and (k + 1) % self.early_stop_check_every == 0):
+                        with torch.no_grad():
+                            _hits = (logits[:, :-1].argmax(-1) == lm_labels) & mask
+                            _early_stop = (_hits.sum() / mask.sum()).item() >= self.early_stop_acc
+
                     del outs, logits
+
+                    if _early_stop:
+                        break
 
                     is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
                     create_graph = is_second_order_step
@@ -455,9 +473,10 @@ class GradMemGPT(PreTrainedModel):
                         pass  # do nothing, keep gradients flow
 
         if self.K:
-            inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
-            # log average inner loss
+            _n_grad_steps = k if _early_stop else self.K
+            inner_loop_stats['inner_grad_norm_mean'] /= max(1, _n_grad_steps)
             inner_loop_stats['inner_loss'] = inner_loss.detach() / B
+            inner_loop_stats['inner_steps'] = _n_grad_steps
         # mem_batch: [B,M,d]
         mem_norm = mem_batch.norm(dim=(1, 2)).detach()  # B
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
