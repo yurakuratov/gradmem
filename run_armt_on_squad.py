@@ -100,11 +100,51 @@ def collate_fn(batch, tokenizer):
     }
 
 
+def collate_fn_dict(batch, tokenizer):
+    """Collate for GradMemGPT / GradLoRA: returns input_ids as a dict."""
+    context = [item["context"].strip() for item in batch]
+    query = [item["query"] + item["target"] for item in batch]
+
+    context_input_ids = tokenizer(
+        context, return_tensors="pt", add_special_tokens=True,
+        padding=True, pad_to_multiple_of=8,
+    ).input_ids
+    query_encoded = tokenizer(
+        query, return_tensors="pt", add_special_tokens=True,
+        padding=True, pad_to_multiple_of=8, return_offsets_mapping=True,
+    )
+    query_input_ids = query_encoded["input_ids"]
+    offsets_mapping = query_encoded["offset_mapping"]
+
+    labels_mask = torch.zeros_like(query_input_ids)
+    for i, item in enumerate(batch):
+        query_seq_len = len(item["query"])
+        target_seq_len = len(item["target"])
+        target_st, target_end = query_seq_len, query_seq_len + target_seq_len
+        in_target = False
+        for j in range(len(offsets_mapping[i]) - 1, -1, -1):
+            st, end = offsets_mapping[i][j]
+            if st < target_end and end > target_st:
+                labels_mask[i, j] = 1
+                in_target = True
+            elif in_target:
+                break
+
+    labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
+    return {
+        "input_ids": {
+            "context_input_ids": context_input_ids,
+            "query_input_ids": query_input_ids,
+        },
+        "labels": labels,
+    }
+
+
 def preprocess_logits_for_metrics(eval_pred, labels):
-    # Model may return tuple/dict; we only need argmax(logits) for metrics.
+    # Extract the 3D logits tensor from whatever the model returned.
+    # Accelerate's pad_across_processes cannot handle dicts with scalar
+    # tensors / ints, so we only return the argmax predictions tensor.
     if isinstance(eval_pred, tuple):
-        # HF Trainer sometimes passes a tuple of multiple tensors (e.g., logits, hidden_states, etc).
-        # Prefer the 3D tensor [batch, seq, vocab] as logits; otherwise fall back to the first element.
         logits = None
         for item in eval_pred:
             if hasattr(item, "dim") and callable(item.dim):
@@ -116,21 +156,12 @@ def preprocess_logits_for_metrics(eval_pred, labels):
                     pass
         if logits is None:
             logits = eval_pred[0]
-        # Thinking impl may append inner-loop stats dict; old impl typically does not.
-        inner_loop_stats = eval_pred[1] if (len(eval_pred) > 1 and isinstance(eval_pred[1], dict)) else {}
     elif isinstance(eval_pred, dict):
-        logits = eval_pred.get("logits", eval_pred)
-        inner_loop_stats = {k: v for k, v in eval_pred.items() if k != "logits"}
+        logits = eval_pred.get("logits", eval_pred.get("predictions", eval_pred))
     else:
         logits = eval_pred
-        device = logits.device if hasattr(logits, "device") else None
-        inner_loop_stats = {
-            "mem_norm_mean": torch.tensor(-1.0, device=device) if device else torch.tensor(-1.0),
-            "mem_norm_max": torch.tensor(-1.0, device=device) if device else torch.tensor(-1.0),
-            "mem_norm_min": torch.tensor(-1.0, device=device) if device else torch.tensor(-1.0),
-        }
 
-    return (logits.argmax(dim=-1), inner_loop_stats)
+    return logits.argmax(dim=-1)
 
 
 def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
@@ -146,15 +177,9 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
 
     if isinstance(predictions, tuple):
-        preds, inner_loop_stats = predictions
+        preds = predictions[0]
     else:
         preds = predictions
-        device = preds.device if hasattr(preds, "device") else None
-        inner_loop_stats = {
-            "mem_norm_mean": torch.tensor(-1.0, device=device) if device else torch.tensor(-1.0),
-            "mem_norm_max": torch.tensor(-1.0, device=device) if device else torch.tensor(-1.0),
-            "mem_norm_min": torch.tensor(-1.0, device=device) if device else torch.tensor(-1.0),
-        }
 
     # Some older ARMT code paths can end up with flattened predictions (1D) after preprocess/gather.
     # If that happens, try to reshape back to label shape when possible.
@@ -201,20 +226,6 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         "token_accuracy": float(accuracy),
         "exact_match": float(exact_match),
     }
-
-    # Add memory stats if present
-    if isinstance(inner_loop_stats, dict) and "mem_norm_mean" in inner_loop_stats:
-        try:
-            metrics.update(
-                {
-                    "mem_norm_mean": float(np.mean(inner_loop_stats["mem_norm_mean"])),
-                    "mem_norm_max": float(np.max(inner_loop_stats["mem_norm_max"])),
-                    "mem_norm_min": float(np.min(inner_loop_stats["mem_norm_min"])),
-                }
-            )
-        except Exception:
-            # stats may be missing / wrong dtype; ignore
-            pass
     return metrics
 
 
@@ -249,6 +260,19 @@ class CustomTrainer(Trainer):
                 break
         return super().log(logs, start_time=start_time)
 
+    def floating_point_ops(self, inputs: Dict[str, any]):
+        main_input = getattr(self.model, "main_input_name", "input_ids")
+        x = inputs.get(main_input, inputs)
+        if isinstance(x, (list, tuple)):
+            tokens = sum(int(t.numel()) for t in x if hasattr(t, "numel"))
+        elif isinstance(x, dict):
+            tokens = sum(int(v.numel()) for v in x.values() if hasattr(v, "numel"))
+        elif hasattr(x, "numel"):
+            tokens = int(x.numel())
+        else:
+            return 0
+        return 6 * tokens * self.model.num_parameters(exclude_embeddings=True)
+
 
 @dataclass
 class ExperimentArgs:
@@ -280,6 +304,8 @@ class ExperimentArgs:
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
+    # Model class: "armt", "gradmem", or "gradlora"
+    model_class: Optional[str] = field(default="armt")
     # ARMT parameters
     num_mem_tokens: Optional[int] = field(default=8)
     d_mem: Optional[int] = field(default=512)
@@ -292,6 +318,26 @@ class ExperimentArgs:
     use_denom: Optional[bool] = field(default=True)
     reading_depth_multiplier: Optional[int] = field(default=1)
     writing_depth_multiplier: Optional[int] = field(default=1)
+    # GradMemGPT / GradLoRA shared inner-loop parameters
+    n_mem_tokens: Optional[int] = field(default=8)
+    K: Optional[int] = field(default=2)
+    last_K_second_order: Optional[int] = field(default=None)
+    inner_lr: Optional[float] = field(default=0.03)
+    use_inner_adam: Optional[bool] = field(default=False)
+    grad_mode: Optional[str] = field(default="second")
+    inner_clip_value: Optional[float] = field(default=None)
+    inner_clip_norm: Optional[float] = field(default=None)
+    attn_implementation: Optional[str] = field(default="eager")
+    use_gradient_checkpointing: Optional[bool] = field(default=False)
+    # GradMemGPT-only
+    n_ctrl_tokens: Optional[int] = field(default=0)
+    use_mem_proj: Optional[bool] = field(default=False)
+    mem_proj_mode: Optional[str] = field(default="none")
+    use_write_head: Optional[bool] = field(default=False)
+    # GradLoRA-only
+    lora_mode: Optional[str] = field(default="residual")
+    layer_idx: Optional[int] = field(default=0)
+    rank: Optional[int] = field(default=4)
 
 
 if __name__ == "__main__":
@@ -308,7 +354,7 @@ if __name__ == "__main__":
     logger.info(f"mixed precision: {accel.mixed_precision}")
     logger.info(f"accelerator state: {accel.state}")
 
-    if args.armt_impl not in ("thinking", "old"):
+    if args.model_class == "armt" and args.armt_impl not in ("thinking", "old"):
         raise ValueError(f"--armt_impl must be one of ['old', 'thinking'], got: {args.armt_impl}")
 
     assert not (
@@ -364,85 +410,133 @@ if __name__ == "__main__":
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    if args.armt_impl == "thinking":
-        from modeling_amt.thinking import ThinkingARMTConfig as ARMTConfigCls
-        from modeling_amt.thinking import ThinkingARMTForCausalLM as ARMTModelCls
-    else:
-        from modeling_amt.model import ARMTConfig as ARMTConfigCls
-        from modeling_amt.model import ARMTForCausalLM as ARMTModelCls
-
-    def build_armt_config() -> "ARMTConfigCls":
-        cfg_kwargs = dict(
-            base_model_name=base_model_name,
-            base_model_config=base_config,
-            num_mem_tokens=args.num_mem_tokens,
-            d_mem=args.d_mem,
-            segment_size=args.segment_size,
-            segment_alignment=args.segment_alignment,
-            layers_attr=args.layers_attr,
-            wrap_pos=args.wrap_pos,
-            correction=args.correction,
-            n_heads=args.n_heads,
-            use_denom=args.use_denom,
-        )
+    # ── model construction (branched on model_class) ─────────────────────
+    if args.model_class == "armt":
         if args.armt_impl == "thinking":
-            cfg_kwargs.update(
-                dict(
+            from modeling_amt.thinking import ThinkingARMTConfig as ARMTConfigCls
+            from modeling_amt.thinking import ThinkingARMTForCausalLM as ARMTModelCls
+        else:
+            from modeling_amt.model import ARMTConfig as ARMTConfigCls
+            from modeling_amt.model import ARMTForCausalLM as ARMTModelCls
+
+        def build_armt_config():
+            cfg_kwargs = dict(
+                base_model_name=base_model_name,
+                base_model_config=base_config,
+                num_mem_tokens=args.num_mem_tokens,
+                d_mem=args.d_mem,
+                segment_size=args.segment_size,
+                segment_alignment=args.segment_alignment,
+                layers_attr=args.layers_attr,
+                wrap_pos=args.wrap_pos,
+                correction=args.correction,
+                n_heads=args.n_heads,
+                use_denom=args.use_denom,
+            )
+            if args.armt_impl == "thinking":
+                cfg_kwargs.update(dict(
                     reading_depth_multiplier=args.reading_depth_multiplier,
                     writing_depth_multiplier=args.writing_depth_multiplier,
-                )
-            )
-        armt_config = ARMTConfigCls(**cfg_kwargs)
-        if base_config is not None:
-            armt_config.vocab_size = base_config.vocab_size
-            armt_config.pad_token_id = base_config.pad_token_id
-            armt_config.bos_token_id = getattr(base_config, "bos_token_id", None)
-            armt_config.eos_token_id = getattr(base_config, "eos_token_id", None)
-        return armt_config
+                ))
+            armt_config = ARMTConfigCls(**cfg_kwargs)
+            if base_config is not None:
+                armt_config.vocab_size = base_config.vocab_size
+                armt_config.pad_token_id = base_config.pad_token_id
+                armt_config.bos_token_id = getattr(base_config, "bos_token_id", None)
+                armt_config.eos_token_id = getattr(base_config, "eos_token_id", None)
+            return armt_config
 
-    # Load ARMT model from checkpoint or create a new one
-    if args.model_cpt is not None and args.model_cpt != "None":
-        checkpoint_dir = args.model_cpt
-        logger.info(f"Loading ARMT model from checkpoint: {checkpoint_dir}")
-        try:
-            model = ARMTModelCls.from_pretrained(checkpoint_dir)
-            logger.info(f"Successfully loaded ARMT model from {checkpoint_dir}")
-        except Exception as e:
-            logger.warning(f"Failed to load as pretrained model: {e}")
-            logger.info("Falling back to state-dict loading...")
-
+        if args.model_cpt is not None and args.model_cpt != "None":
+            checkpoint_dir = args.model_cpt
+            logger.info(f"Loading ARMT model from checkpoint: {checkpoint_dir}")
+            try:
+                model = ARMTModelCls.from_pretrained(checkpoint_dir)
+                logger.info(f"Successfully loaded ARMT model from {checkpoint_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to load as pretrained model: {e}")
+                logger.info("Falling back to state-dict loading...")
+                armt_config = build_armt_config()
+                model = ARMTModelCls(armt_config)
+                checkpoint_paths = [
+                    os.path.join(checkpoint_dir, "model_best", "model.safetensors"),
+                    os.path.join(checkpoint_dir, "model_best", "pytorch_model.bin"),
+                    os.path.join(checkpoint_dir, "model.safetensors"),
+                    os.path.join(checkpoint_dir, "pytorch_model.bin"),
+                    checkpoint_dir,
+                ]
+                loaded = False
+                for cpt_path in checkpoint_paths:
+                    if os.path.exists(cpt_path):
+                        logger.info(f"Loading from: {cpt_path}")
+                        if cpt_path.endswith(".safetensors"):
+                            state_dict = load_file(cpt_path)
+                        else:
+                            state_dict = torch.load(cpt_path, map_location="cpu")
+                            if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+                                state_dict = state_dict["model_state_dict"]
+                        missing_k, unexpected_k = model.load_state_dict(state_dict, strict=False)
+                        if len(missing_k) != 0:
+                            logger.info(f"{missing_k} were not loaded from checkpoint!")
+                        if len(unexpected_k) != 0:
+                            logger.info(f"{unexpected_k} unexpected in checkpoint!")
+                        loaded = True
+                        break
+                if not loaded:
+                    raise FileNotFoundError(
+                        f"Could not find checkpoint in {checkpoint_dir}. Tried: {checkpoint_paths}")
+        else:
             armt_config = build_armt_config()
             model = ARMTModelCls(armt_config)
 
-            checkpoint_paths = [
-                os.path.join(checkpoint_dir, "model_best", "model.safetensors"),
-                os.path.join(checkpoint_dir, "model_best", "pytorch_model.bin"),
-                os.path.join(checkpoint_dir, "model.safetensors"),
-                os.path.join(checkpoint_dir, "pytorch_model.bin"),
-                checkpoint_dir,
-            ]
-            loaded = False
-            for cpt_path in checkpoint_paths:
-                if os.path.exists(cpt_path):
-                    logger.info(f"Loading from: {cpt_path}")
-                    if cpt_path.endswith(".safetensors"):
-                        state_dict = load_file(cpt_path)
-                    else:
-                        state_dict = torch.load(cpt_path, map_location="cpu")
-                        if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
-                            state_dict = state_dict["model_state_dict"]
-                    missing_k, unexpected_k = model.load_state_dict(state_dict, strict=False)
-                    if len(missing_k) != 0:
-                        logger.info(f"{missing_k} were not loaded from checkpoint! These params were initialized.")
-                    if len(unexpected_k) != 0:
-                        logger.info(f"{unexpected_k} were found in checkpoint, but model is not expecting them!")
-                    loaded = True
-                    break
-            if not loaded:
-                raise FileNotFoundError(f"Could not find a checkpoint file in {checkpoint_dir}. Tried: {checkpoint_paths}")
+        # ARMT: patch FLOPs for segmented inputs
+        def _floating_point_ops_segmented(self, input_dict, exclude_embeddings=True):
+            x = input_dict.get(getattr(self, "main_input_name", "input_ids"))
+            if isinstance(x, (list, tuple)):
+                tokens = sum(int(t.numel()) for t in x if hasattr(t, "numel"))
+            elif hasattr(x, "numel"):
+                tokens = int(x.numel())
+            else:
+                tokens = 0
+            return 6 * tokens * self.num_parameters(exclude_embeddings=exclude_embeddings)
+        model.floating_point_ops = types.MethodType(_floating_point_ops_segmented, model)
+
+    elif args.model_class in ("gradmem", "gradlora"):
+        inner_kw = dict(
+            pretrained_model=args.pretrained_model, base_config=base_config,
+            K=args.K, last_K_second_order=args.last_K_second_order,
+            lr=args.inner_lr, use_adam=args.use_inner_adam, grad_mode=args.grad_mode,
+            inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
+            use_gradient_checkpointing=args.use_gradient_checkpointing,
+            attn_implementation=args.attn_implementation,
+        )
+        if args.model_class == "gradmem":
+            from grad_memgpt import GradMemGPT, GradMemGPTConfig
+            model_config = GradMemGPTConfig(
+                n_mem_tokens=args.n_mem_tokens, n_ctrl_tokens=args.n_ctrl_tokens,
+                use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
+                use_write_head=args.use_write_head, **inner_kw)
+            model = GradMemGPT(model_config)
+        else:
+            from grad_lora import GradLoRA, GradLoRAConfig
+            model_config = GradLoRAConfig(
+                mode=args.lora_mode, layer_idx=args.layer_idx,
+                rank=args.rank, **inner_kw)
+            model = GradLoRA(model_config)
+
+        def _floating_point_ops_dict(self, input_dict, exclude_embeddings=True):
+            x = input_dict.get(getattr(self, "main_input_name", "input_ids"))
+            tokens = 0
+            if isinstance(x, dict):
+                for v in x.values():
+                    if hasattr(v, "numel"):
+                        tokens += int(v.numel())
+            elif hasattr(x, "numel"):
+                tokens = int(x.numel())
+            return 6 * tokens * self.num_parameters(exclude_embeddings=exclude_embeddings)
+        model.floating_point_ops = types.MethodType(_floating_point_ops_dict, model)
+        model.config.keys_to_ignore_at_inference = ["inner_loop_stats"]
     else:
-        armt_config = build_armt_config()
-        model = ARMTModelCls(armt_config)
+        raise ValueError(f"Unknown model_class: {args.model_class}")
 
     if args.init_checkpoint is not None:
         missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
@@ -451,24 +545,6 @@ if __name__ == "__main__":
         if len(unexpected_k) != 0:
             logger.info(f"{unexpected_k} were found in checkpoint, but model is not expecting them!")
 
-    # HF Trainer FLOPs estimation expects tensor inputs and calls `.numel()` on `inputs[model.main_input_name]`.
-    # With `input_segmented=True`, we pass `input_ids` as a list of segment tensors, so we need a custom estimator.
-    def _floating_point_ops_segmented(self, input_dict, exclude_embeddings: bool = True):
-        x = input_dict.get(getattr(self, "main_input_name", "input_ids"))
-        if isinstance(x, (list, tuple)):
-            tokens = 0
-            for t in x:
-                if hasattr(t, "numel"):
-                    tokens += int(t.numel())
-        elif hasattr(x, "numel"):
-            tokens = int(x.numel())
-        else:
-            # Fall back to 0 if we can't estimate
-            tokens = 0
-        return 6 * tokens * self.num_parameters(exclude_embeddings=exclude_embeddings)
-
-    model.floating_point_ops = types.MethodType(_floating_point_ops_segmented, model)
-
     if accel.mixed_precision == "bf16":
         model = model.to(torch.bfloat16)
 
@@ -476,7 +552,7 @@ if __name__ == "__main__":
     logger.info(f"model: {model}")
     logger.info(f"model.dtype: {model.dtype}")
 
-    raw_dataset = datasets.load_dataset(args.dataset_name)
+    raw_dataset = datasets.load_dataset(args.dataset_name, trust_remote_code=True)
     if "squad" in args.dataset_name:
         from squad_utils import preprocess_dataset
     elif "phonebook" in args.dataset_name:
@@ -485,8 +561,12 @@ if __name__ == "__main__":
         raise ValueError(f"Unsupported dataset: {args.dataset_name}")
     dataset = preprocess_dataset(raw_dataset)
 
-    def data_collator(batch):
-        return collate_fn(batch, tokenizer)
+    if args.model_class == "armt":
+        def data_collator(batch):
+            return collate_fn(batch, tokenizer)
+    else:
+        def data_collator(batch):
+            return collate_fn_dict(batch, tokenizer)
 
     ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in []]
 
