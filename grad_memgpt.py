@@ -1,8 +1,11 @@
+import os
 import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
 import attn_double_bwd  # noqa: F401  # side-effect: registers attention kernels
+
+GRAD_VERBOSE = os.environ.get("GRAD_VERBOSE", "0") == "1"
 
 
 def get_backbone(m):
@@ -211,6 +214,13 @@ class GradMemGPT(PreTrainedModel):
         if getattr(config, "use_gradient_checkpointing", False):
             self.gradient_checkpointing_enable()
 
+    def mem_state_numel(self):
+        """Number of optimisable floats in the memory state."""
+        n = self.mem.numel()
+        if self.mem_proj_mode == "per_sample" and self.mem_proj is not None:
+            n += self.mem_proj.weight.numel() + self.mem_proj.bias.numel()
+        return n
+
     def floating_point_ops(self, inputs):
         # dummy method to satisfy base class and it's invocation by trainer:
         # Trainer supposes that `inputs`` is a tensor, not dict.
@@ -384,7 +394,12 @@ class GradMemGPT(PreTrainedModel):
                     lm_labels = F.pad(lm_labels, pad_list, "constant", -100)
                     ctx_emb = F.pad(ctx_emb, [0, 0] + pad_list, "constant", 0)
 
-                for k in range(self.K):
+                _iter = range(self.K)
+                if GRAD_VERBOSE:
+                    from tqdm import tqdm
+                    _iter = tqdm(_iter, desc="inner", leave=False)
+
+                for k in _iter:
                     if self.mem_proj_mode == 'none':
                         mem_inp = mem_batch
                     elif self.mem_proj_mode == 'proj':
@@ -422,12 +437,20 @@ class GradMemGPT(PreTrainedModel):
                     inner_loss = (inner_loss * mask).sum(1) / seq_len
                     inner_loss = inner_loss.sum()
 
+                    _cur_acc = None
                     _early_stop = False
                     if (self.early_stop_acc is not None
                             and (k + 1) % self.early_stop_check_every == 0):
                         with torch.no_grad():
                             _hits = (logits[:, :-1].argmax(-1) == lm_labels) & mask
-                            _early_stop = (_hits.sum() / mask.sum()).item() >= self.early_stop_acc
+                            _cur_acc = (_hits.sum() / mask.sum()).item()
+                            _early_stop = _cur_acc >= self.early_stop_acc
+
+                    if GRAD_VERBOSE:
+                        _postfix = {"loss": f"{inner_loss.item() / B:.4f}"}
+                        if _cur_acc is not None:
+                            _postfix["acc"] = f"{_cur_acc:.4f}"
+                        _iter.set_postfix(_postfix)
 
                     del outs, logits
 
