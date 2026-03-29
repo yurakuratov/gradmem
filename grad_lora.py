@@ -1,21 +1,27 @@
 """
-GradLoRA: test-time low-rank residual injection into a frozen causal LM.
+GradLoRA: test-time low-rank injection into a frozen causal LM.
 
-Instead of prepending trainable memory tokens (as in GradMemGPT), this model
-inserts a low-rank residual  ``x ← x + B A x``  before the *l*-th transformer
-layer.  A ∈ ℝ^{r×d} and B ∈ ℝ^{d×r} are optimised per-sample in an inner loop
-to compress context, then used at read time to answer queries.
+Two modes are supported (selected via ``GradLoRAConfig.mode``):
 
-B is initialised to zero (so the initial residual is the identity) and A is
-random.  The interface (context / query / predictions dict) matches GradMemGPT
-so the two can be swapped in evaluation scripts.
+* **residual** – adds ``x ← x + B A x`` before the *l*-th transformer layer.
+  A ∈ ℝ^{r×d} and B ∈ ℝ^{d×r}.
+* **ffn** – applies LoRA to the output projection of the MLP at layer *l*:
+  ``(W_out + A B) σ(W_in x)``.  A ∈ ℝ^{d×r} and B ∈ ℝ^{r×d_ff}.
+
+In both modes the zero-initialised matrix ensures the model starts at the
+identity.  Per-sample copies of A and B are optimised in an inner loop to
+compress context, then used at read time.  The interface (context / query /
+predictions dict) matches GradMemGPT so the models can be swapped freely.
 """
 
+import os
 import torch
 from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
 import attn_double_bwd  # noqa: F401  – registers custom attention kernels
+
+GRAD_VERBOSE = os.environ.get("GRAD_VERBOSE", "0") == "1"
 
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -39,7 +45,26 @@ def _find_layers(model):
     raise AttributeError("Cannot find transformer layer list in model")
 
 
-# ── layer wrapper ───────────────────────────────────────────────────────────
+def _find_output_proj(layer):
+    """Return ``(mlp_module, attr_name, d_ff)`` for the MLP output projection."""
+    mlp = getattr(layer, "mlp", getattr(layer, "feed_forward", None))
+    if mlp is None:
+        raise AttributeError("Cannot find MLP sub-module in layer")
+    for name in ("c_proj", "down_proj", "dense_4h_to_h", "fc2", "w2"):
+        proj = getattr(mlp, name, None)
+        if proj is None:
+            continue
+        if hasattr(proj, "in_features"):
+            d_ff = proj.in_features
+        elif hasattr(proj, "nf"):            # transformers Conv1D
+            d_ff = proj.weight.shape[0]
+        else:
+            d_ff = proj.weight.shape[1]
+        return mlp, name, d_ff
+    raise AttributeError("Cannot find output projection in MLP")
+
+
+# ── layer wrappers ──────────────────────────────────────────────────────────
 
 class LowRankWrapper(nn.Module):
     """Wraps a single transformer layer.
@@ -81,6 +106,46 @@ class LowRankWrapper(nn.Module):
                 f"'{type(self).__name__}' has no attribute '{name}'")
 
 
+class FFNLoRAWrapper(nn.Module):
+    """Wraps the MLP output projection (e.g. ``c_proj`` / ``down_proj``).
+
+    When per-sample A ``[B, d_model, r]`` and B ``[B, r, d_ff]`` are set,
+    the forward pass becomes ``layer(x) + x @ Bᵀ @ Aᵀ``, which is equivalent
+    to replacing W_out with ``W_out + A @ B``.
+    """
+
+    def __init__(self, layer):
+        super().__init__()
+        self.layer = layer
+        self._A = None
+        self._B = None
+
+    def set_params(self, A, B):
+        self._A, self._B = A, B
+
+    def clear_params(self):
+        self._A = self._B = None
+
+    def forward(self, hidden_states, *args, **kwargs):
+        out = self.layer(hidden_states, *args, **kwargs)
+        if self._A is not None and self._B is not None:
+            proj = torch.bmm(hidden_states, self._B.transpose(1, 2))  # [B,S,r]
+            out = out + torch.bmm(proj, self._A.transpose(1, 2))      # [B,S,d]
+        return out
+
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            pass
+        try:
+            layer = super().__getattr__("layer")
+            return getattr(layer, name)
+        except AttributeError:
+            raise AttributeError(
+                f"'{type(self).__name__}' has no attribute '{name}'")
+
+
 # ── config ──────────────────────────────────────────────────────────────────
 
 class GradLoRAConfig(PretrainedConfig):
@@ -89,6 +154,7 @@ class GradLoRAConfig(PretrainedConfig):
     def __init__(self,
                  pretrained_model=None,
                  base_config=None,
+                 mode="residual",
                  layer_idx=0,
                  rank=4,
                  K=2,
@@ -104,6 +170,7 @@ class GradLoRAConfig(PretrainedConfig):
                  early_stop_check_every=100,
                  **kwargs):
         super().__init__(**kwargs)
+        assert mode in ("residual", "ffn"), f"Unknown mode {mode!r}"
         if pretrained_model is not None:
             self.pretrained_model = pretrained_model
             self.base_config = None
@@ -111,6 +178,7 @@ class GradLoRAConfig(PretrainedConfig):
             self.pretrained_model = None
             self.base_config = base_config
 
+        self.mode = mode
         self.layer_idx = layer_idx
         self.rank = rank
         self.K = K
@@ -132,10 +200,11 @@ class GradLoRAConfig(PretrainedConfig):
 # ── model ───────────────────────────────────────────────────────────────────
 
 class GradLoRA(PreTrainedModel):
-    """Frozen causal LM + test-time low-rank residual at layer *l*.
+    """Frozen causal LM + test-time low-rank injection at layer *l*.
 
-    Before layer *l*: ``x ← x + B @ A @ x`` where A ``[r, d]`` and B ``[d, r]``
-    are optimised per-sample in an inner gradient-descent loop.
+    Two modes:
+      * **residual** — ``x ← x + B A x`` before layer *l*.
+      * **ffn** — ``(W_out + A B) σ(W_in x)`` at layer *l*'s MLP.
     """
     config_class = GradLoRAConfig
 
@@ -158,6 +227,7 @@ class GradLoRA(PreTrainedModel):
 
         d = getattr(self.model.config, "n_embd", self.model.config.hidden_size)
         self.d_model = d
+        self.lora_mode = config.mode
         self.rank = config.rank
         self.layer_idx = config.layer_idx
         self.K = config.K
@@ -170,17 +240,28 @@ class GradLoRA(PreTrainedModel):
         self.early_stop_acc = getattr(config, "early_stop_acc", None)
         self.early_stop_check_every = getattr(config, "early_stop_check_every", 100)
 
-        # wrap the target layer
         layers = _find_layers(self.model)
         idx = self.layer_idx if self.layer_idx >= 0 else len(layers) + self.layer_idx
         assert 0 <= idx < len(layers), \
             f"layer_idx {config.layer_idx} out of range [0, {len(layers)})"
-        self.wrapped_layer = LowRankWrapper(layers[idx])
-        layers[idx] = self.wrapped_layer
 
-        # meta-learned initial values (B=0 → identity at init)
-        self.A_init = nn.Parameter(torch.randn(self.rank, d) * 0.02)
-        self.B_init = nn.Parameter(torch.zeros(d, self.rank))
+        if self.lora_mode == "residual":
+            wrapper = LowRankWrapper(layers[idx])
+            layers[idx] = wrapper
+            # A [r, d], B [d, r] — B=0 so initial residual is zero
+            self.A_init = nn.Parameter(torch.randn(self.rank, d) * 0.02)
+            self.B_init = nn.Parameter(torch.zeros(d, self.rank))
+        elif self.lora_mode == "ffn":
+            mlp, proj_name, d_ff = _find_output_proj(layers[idx])
+            wrapper = FFNLoRAWrapper(getattr(mlp, proj_name))
+            setattr(mlp, proj_name, wrapper)
+            # A [d, r], B [r, d_ff] — B=0 so initial LoRA is zero
+            self.A_init = nn.Parameter(torch.randn(d, self.rank) * 0.02)
+            self.B_init = nn.Parameter(torch.zeros(self.rank, d_ff))
+        else:
+            raise ValueError(f"Unknown mode {self.lora_mode}")
+        # Store without nn.Module registration to avoid duplicate parameter paths
+        self._wrapped_ref = [wrapper]
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -192,6 +273,10 @@ class GradLoRA(PreTrainedModel):
             self.gradient_checkpointing_enable()
 
     # ── boilerplate (same as GradMemGPT) ────────────────────────────────────
+
+    def mem_state_numel(self):
+        """Number of optimisable floats in the memory state (A + B)."""
+        return self.A_init.numel() + self.B_init.numel()
 
     def floating_point_ops(self, inputs):
         return 0
@@ -274,8 +359,13 @@ class GradLoRA(PreTrainedModel):
                 mask = (targets != -100)
                 seq_len = mask.sum(1).clamp_min(1)
 
-                for k in range(self.K):
-                    self.wrapped_layer.set_params(A_batch, B_batch)
+                _iter = range(self.K)
+                if GRAD_VERBOSE:
+                    from tqdm import tqdm
+                    _iter = tqdm(_iter, desc="inner", leave=False)
+
+                for k in _iter:
+                    self._wrapped_ref[0].set_params(A_batch, B_batch)
                     logits = self.model(input_ids=context_input_ids).logits
 
                     inner_loss = F.cross_entropy(
@@ -286,14 +376,20 @@ class GradLoRA(PreTrainedModel):
                     inner_loss = (inner_loss * mask).sum(1) / seq_len
                     inner_loss = inner_loss.sum()
 
+                    _cur_acc = None
                     _early_stop = False
                     if (self.early_stop_acc is not None
                             and (k + 1) % self.early_stop_check_every == 0):
                         with torch.no_grad():
                             _hits = (logits[:, :-1].argmax(-1) == targets) & mask
-                            _early_stop = (
-                                (_hits.sum() / mask.sum()).item()
-                                >= self.early_stop_acc)
+                            _cur_acc = (_hits.sum() / mask.sum()).item()
+                            _early_stop = _cur_acc >= self.early_stop_acc
+
+                    if GRAD_VERBOSE:
+                        _postfix = {"loss": f"{inner_loss.item() / B:.4f}"}
+                        if _cur_acc is not None:
+                            _postfix["acc"] = f"{_cur_acc:.4f}"
+                        _iter.set_postfix(_postfix)
 
                     del logits
 
@@ -343,9 +439,9 @@ class GradLoRA(PreTrainedModel):
             inner_loop_stats["inner_steps"] = _n
 
         # ── 2. READ phase — reconstruct from query using optimised (A, B) ──
-        self.wrapped_layer.set_params(A_batch, B_batch)
+        self._wrapped_ref[0].set_params(A_batch, B_batch)
         logits_q = self.model(input_ids=query_input_ids).logits
-        self.wrapped_layer.clear_params()
+        self._wrapped_ref[0].clear_params()
 
         output = {"predictions": logits_q,
                   "inner_loop_stats": inner_loop_stats}
