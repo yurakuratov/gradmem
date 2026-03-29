@@ -7,6 +7,7 @@ MODEL=${MODEL:-gpt2}
 DTYPE=${DTYPE:-float32}
 DEVICE=${DEVICE:-cuda:1}
 
+LORA_MODE=${LORA_MODE:-residual}   # "residual" or "ffn"
 RANK=${RANK:-2}
 N_STEPS=${N_STEPS:-1000}
 LR=${LR:-0.01}
@@ -28,13 +29,20 @@ OUTPUT_DIR=${OUTPUT_DIR:-cramming_results}
 LAYER_MIN=${LAYER_MIN:-0}
 LAYER_MAX=${LAYER_MAX:-11}
 
-echo "═══ Layer sweep: layers $LAYER_MIN..$LAYER_MAX  rank=$RANK  lr=$LR  steps=$N_STEPS ═══"
+echo "═══ Layer sweep: mode=$LORA_MODE  layers $LAYER_MIN..$LAYER_MAX  rank=$RANK  lr=$LR  steps=$N_STEPS ═══"
+
+if [ "$LORA_MODE" = "ffn" ]; then
+    MODE_TAG="ffn"
+else
+    MODE_TAG="lora"
+fi
 
 for L in $(seq $LAYER_MIN $LAYER_MAX); do
     echo ""
     echo "──────────────── layer $L ────────────────"
-    LAYER_IDX=$L python run_cramming.py \
+    python run_cramming.py \
         --model_class gradlora \
+        --lora_mode $LORA_MODE \
         --model $MODEL \
         --dtype $DTYPE \
         --device $DEVICE \
@@ -59,8 +67,8 @@ echo "═══ All layers done. Plotting… ═══"
 
 python scripts/cramming/plot_sweep.py \
     --results_dir $OUTPUT_DIR \
-    --pattern "lora_l*_r${RANK}_${OPTIMIZER}_lr${LR}_steps${N_STEPS}" \
+    --pattern "${MODE_TAG}_l*_r${RANK}_${OPTIMIZER}_lr${LR}_steps${N_STEPS}" \
     --x_field config.layer_idx \
     --x_label "Layer index" \
-    --title "GradLoRA layer sweep (rank=$RANK, lr=$LR, steps=$N_STEPS)" \
-    --output $OUTPUT_DIR/sweep_layers_r${RANK}_${OPTIMIZER}_lr${LR}_steps${N_STEPS}.png
+    --title "GradLoRA ($LORA_MODE) layer sweep (rank=$RANK, lr=$LR, steps=$N_STEPS)" \
+    --output $OUTPUT_DIR/sweep_layers_${MODE_TAG}_r${RANK}_${OPTIMIZER}_lr${LR}_steps${N_STEPS}.png
