@@ -91,9 +91,11 @@ def main():
     g.add_argument("--n_mem_tokens", type=int, default=1,
                    help="(gradmem only) number of memory tokens")
     g.add_argument("--layer_idx", type=int, default=0,
-                   help="(gradlora only) layer index for low-rank residual")
+                   help="(gradlora only) layer index for low-rank injection")
     g.add_argument("--rank", type=int, default=4,
                    help="(gradlora only) rank of A, B matrices")
+    g.add_argument("--lora_mode", choices=["residual", "ffn"], default="residual",
+                   help="(gradlora only) 'residual' = x+BAx, 'ffn' = LoRA on MLP out proj")
     g.add_argument("--n_steps", type=int, default=1000)
     g.add_argument("--lr", type=float, default=0.01)
     g.add_argument("--optimizer", choices=["adam", "sgd"], default="adam")
@@ -128,7 +130,8 @@ def main():
             args.run_name = (f"{args.model.split('/')[-1]}_mem{args.n_mem_tokens}"
                              f"_{args.optimizer}_lr{args.lr}_steps{args.n_steps}")
         else:
-            args.run_name = (f"{args.model.split('/')[-1]}_lora_l{args.layer_idx}"
+            mode_tag = "ffn" if args.lora_mode == "ffn" else "lora"
+            args.run_name = (f"{args.model.split('/')[-1]}_{mode_tag}_l{args.layer_idx}"
                              f"_r{args.rank}_{args.optimizer}_lr{args.lr}"
                              f"_steps{args.n_steps}")
 
@@ -172,6 +175,7 @@ def main():
     else:
         from grad_lora import GradLoRA, GradLoRAConfig
         config = GradLoRAConfig(
+            mode=args.lora_mode,
             layer_idx=args.layer_idx, rank=args.rank, **common_kw)
         model = GradLoRA(config).to(device=device, dtype=dtype)
         mem_prefix_len = 0
@@ -184,7 +188,9 @@ def main():
     max_ctx = getattr(base_model.config, "max_position_embeddings",
                       getattr(base_model.config, "n_positions", 1024))
     max_text = max_ctx - mem_prefix_len
+    mem_numel = model.mem_state_numel()
     log.info(f"Context window {max_ctx}, max text length {max_text}")
+    log.info(f"Memory state size: {mem_numel} floats")
 
     # ── data ───────────────────────────────────────────────────────────────
     log.info(f"Loading {args.dataset} ({args.split})")
@@ -271,7 +277,8 @@ def main():
                  f"{steps:>6}")
 
     with open(json_path, "w") as f:
-        json.dump(dict(config=vars(args), results=results), f, indent=2)
+        json.dump(dict(config=vars(args), mem_state_numel=mem_numel,
+                       results=results), f, indent=2)
     log.info(f"Results saved to {json_path}")
     log.info(f"Log saved to {log_path}")
 
