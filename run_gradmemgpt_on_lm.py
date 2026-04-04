@@ -80,8 +80,6 @@ def compute_metrics_fn(eval_pred, tokenizer):
     return {
         "token_accuracy": float(accuracy),
         "inner_loss": float(inner_loop_stats['inner_loss'].mean()),
-        "1st_seg_loss": float(inner_loop_stats['1st_seg_loss'].mean()),
-        "2nd_seg_loss": float(inner_loop_stats['2nd_seg_loss'].mean()),
         "inner_grad_norm": float(inner_loop_stats['inner_grad_norm_mean'].mean()),
         "inner_grad_norm_max": float(inner_loop_stats['inner_grad_norm_max'].max()),
         "inner_grad_norm_min": float(inner_loop_stats['inner_grad_norm_min'].min()),

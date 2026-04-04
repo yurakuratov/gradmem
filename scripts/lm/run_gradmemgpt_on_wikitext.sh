@@ -1,9 +1,7 @@
 #!/bin/bash
 
 # Define arguments for the script
-export CUDA_VISIBLE_DEVICES=0
-NP=1
-# NP=${NP:-1}  # Default to 1 process if not set
+NP=${NP:-1}  # Default to 1 process if not set
 
 LR=1e-03
 TBS=64
@@ -63,18 +61,18 @@ fi
 if [ "$USE_CONTEXT_LM_LOSS" = true ]; then
   RUN_NAME=${RUN_NAME}_closs
 fi
-RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}_linear_init_rmt
 
+RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
 RUN_NAME=${RUN_NAME}_ctx${CONTEXT_SIZE}-${SEGMENT_SIZE}
 
 DATA_NAME="wikitext"
 
 # Run ID
-N_VALUES=(1)
+N_VALUES=(3)
 for N in "${N_VALUES[@]}"; do
   RND=$(date +%Y%m%d%H%M%S)
   # Path to save experiment results
-  EXP_PATH="/cephfs/home/mkairov/gd_runs/${DATA_NAME}/${RUN_NAME}/run_$N"
+  EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
 
   # Execute the script using accelerate for parallel processing
   accelerate launch \
@@ -97,6 +95,7 @@ for N in "${N_VALUES[@]}"; do
     --inner_lr $INNER_LR \
     --use_adam $USE_ADAM \
     --grad_mode $GRAD_MODE \
+    $( [ -n "$INIT_CHECKPOINT" ] && echo "--init_checkpoint $INIT_CHECKPOINT" ) \
     $( [ "$INNER_CLIP_VALUE" != "None" ] && echo "--inner_clip_value $INNER_CLIP_VALUE" ) \
     $( [ "$INNER_CLIP_NORM" != "None" ] && echo "--inner_clip_norm $INNER_CLIP_NORM" ) \
     $( [ "$USE_MEM_PROJ" = true ] && echo "--use_mem_proj" ) \
@@ -110,7 +109,7 @@ for N in "${N_VALUES[@]}"; do
     --logging_steps 500 \
     --warmup_steps 1000 \
     --early_stopping_patience 500 \
-    --attn_implementation hvp_manual \
+    --attn_implementation eager \
     --seed $((142+$N))
 done
 

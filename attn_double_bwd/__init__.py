@@ -4,6 +4,8 @@ from transformers.masking_utils import sdpa_mask
 from attn_double_bwd.jvp_attention import jvp_flash
 from attn_double_bwd.hvp_manual import hvp_manual
 from attn_double_bwd.hvp_semi_manual import hvp_semi_manual
+# from attn_double_bwd.hvp_flash import hvp_flash
+# from attn_double_bwd import flash_hvp_backend
 
 
 AttentionInterface.register("jvp_flash", jvp_flash)
@@ -14,3 +16,6 @@ AttentionMaskInterface.register("hvp_manual", sdpa_mask)
 
 AttentionInterface.register("hvp_semi_manual", hvp_semi_manual)
 AttentionMaskInterface.register("hvp_semi_manual", sdpa_mask)
+
+# AttentionInterface.register("hvp_flash", hvp_flash)
+# AttentionMaskInterface.register("hvp_flash", sdpa_mask)
