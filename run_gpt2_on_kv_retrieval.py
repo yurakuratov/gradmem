@@ -3,6 +3,7 @@ import logging
 import os
 from pathlib import Path
 import math
+import yaml
 
 import torch
 import numpy as np
@@ -151,8 +152,9 @@ class CustomTrainer(Trainer):
 
 @dataclass
 class ExperimentArgs:
-    exp_path: str = field()
-    per_device_batch_size: int = field()
+    config: Optional[str] = field(default=None)
+    exp_path: Optional[str] = field(default=None)
+    per_device_batch_size: int = field(default=64)
     data_path: str = field(
         default='./data/N2-K4V4-S4(32-64)_1M',
     )
@@ -191,8 +193,44 @@ class ExperimentArgs:
 
 
 if __name__ == '__main__':
+    main()
+
+
+def main(config_path: Optional[str] = None):
     parser = HfArgumentParser(ExperimentArgs)
-    args = parser.parse_args_into_dataclasses()[0]
+    args = parser.parse_args_into_dataclasses([])[0]
+
+    # Load config from YAML if provided
+    if config_path is not None:
+        args.config = config_path
+
+    # Load config from YAML if provided
+    if args.config is not None:
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f)
+
+        # Flatten config to args (CLI args override YAML)
+        for section in ['model', 'training', 'dataset']:
+            if section in cfg:
+                for key, value in cfg[section].items():
+                    if not hasattr(args, key) or getattr(args, key) is None:
+                        setattr(args, key, value)
+
+        # Set exp_path from config if not explicitly set
+        if args.exp_path is None:
+            from generate_run_name import generate_run_name, get_exp_path, get_data_path
+            run_name = generate_run_name(cfg)
+            exp_path = get_exp_path(cfg)
+            args.exp_path = str(exp_path)
+
+            # Set data_path from config
+            dataset = cfg.get('dataset', {})
+            if 'data_path' in dataset:
+                args.data_path = dataset['data_path']
+            elif 'data_name' in dataset:
+                args.data_path = get_data_path(cfg)
+            if 'tokenizer_path' in dataset:
+                args.tokenizer_path = dataset['tokenizer_path']
 
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger

@@ -3,17 +3,17 @@
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
 LR=1e-04
-TBS=64
-PER_DEVICE_BATCH_SIZE=32
+TBS=2
+PER_DEVICE_BATCH_SIZE=2
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 USE_GRAD_CKPT=false
 
-MODEL_NAME=gpt2
-PRETRAINED_MODEL=gpt2
+MODEL_NAME=pythia
+PRETRAINED_MODEL=pythia
 
 
 # GradMemGPT specific parameters
-N_MEM_TOKENS=8
+N_MEM_TOKENS=2
 N_CTRL_TOKENS=0
 K=2
 INNER_LR=0.25

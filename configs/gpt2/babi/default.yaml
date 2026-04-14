@@ -1,0 +1,19 @@
+# GPT2 on bAbI - default configuration
+
+model:
+  pretrained_model: state-spaces/mamba-130m-hf
+
+training:
+  per_device_batch_size: 64
+  total_batch_size: 64
+  learning_rate: 1.0e-4
+  max_steps: 200000
+  eval_steps: 500
+  logging_steps: 500
+  warmup_steps: 10000
+  early_stopping_patience: 500
+  seed: 142
+
+dataset:
+  data_name: "babilong_qa2_0k"
+  data_path: "/home/jovyan/.cache/test-time-gd-cache/data/babilong_qa2_0k"

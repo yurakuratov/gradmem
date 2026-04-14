@@ -1,0 +1,18 @@
+# GPT2 on SQuAD - default configuration
+
+model:
+  pretrained_model: gpt2
+
+training:
+  per_device_batch_size: 32
+  total_batch_size: 64
+  learning_rate: 1.0e-4
+  max_steps: 200000
+  eval_steps: 500
+  logging_steps: 500
+  warmup_steps: 10000
+  early_stopping_patience: 500
+  seed: 142
+
+dataset:
+  data_name: "squad"

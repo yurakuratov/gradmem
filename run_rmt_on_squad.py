@@ -2,6 +2,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import yaml
 
 import torch
 import numpy as np
@@ -173,8 +174,9 @@ class CustomTrainer(Trainer):
 
 @dataclass
 class ExperimentArgs:
-    exp_path: str = field()
-    per_device_batch_size: int = field()
+    config: Optional[str] = field(default=None)
+    exp_path: Optional[str] = field(default=None)
+    per_device_batch_size: int = field(default=2)
     dataset_name: str = field(default='squad')
     tokenizer_path: str = field(
         default='./tokenizers/kv_alphabet_62/',
@@ -215,8 +217,39 @@ class ExperimentArgs:
 
 
 if __name__ == '__main__':
+    main()
+
+
+def main(config_path: Optional[str] = None):
     parser = HfArgumentParser(ExperimentArgs)
-    args = parser.parse_args_into_dataclasses()[0]
+    args = parser.parse_args_into_dataclasses([])[0]
+
+    # Load config from YAML if provided
+    if config_path is not None:
+        args.config = config_path
+
+    # Load config from YAML if provided
+    if args.config is not None:
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f)
+
+        for section in ['model', 'training', 'dataset', 'rmt']:
+            if section in cfg:
+                for key, value in cfg[section].items():
+                    if not hasattr(args, key) or getattr(args, key) is None:
+                        setattr(args, key, value)
+
+        if args.exp_path is None:
+            from generate_run_name import generate_run_name, get_exp_path
+            run_name = generate_run_name(cfg)
+            exp_path = get_exp_path(cfg)
+            args.exp_path = str(exp_path)
+
+            dataset = cfg.get('dataset', {})
+            if 'tokenizer_path' in dataset:
+                args.tokenizer_path = dataset['tokenizer_path']
+            if 'data_name' in dataset:
+                args.dataset_name = dataset['data_name']
 
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
