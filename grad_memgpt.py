@@ -281,32 +281,18 @@ class GradMemGPT(PreTrainedModel):
         self.hopfield_grad_through_retrieval = getattr(config, "hopfield_grad_through_retrieval", False)
 
         if self.use_hopfield_memory:
-            effective_dim = self.hopfield_dim if self.hopfield_dim > 0 else n_embd
-
-            # Random projection layer for dimension expansion
-            if self.hopfield_dim > 0:
-                self.rand_proj = nn.Linear(n_embd, self.hopfield_dim, bias=False)
-                if self.hopfield_proj_freeze:
-                    with torch.no_grad():
-                        nn.init.orthogonal_(self.rand_proj.weight)
-                    self.rand_proj.weight.requires_grad = False
-
-                # Projection for retrieving back to original dimension
-                self.rand_proj_back = nn.Linear(self.hopfield_dim, n_embd, bias=False)
-                with torch.no_grad():
-                    nn.init.eye_(self.rand_proj_back.weight)
-            else:
-                self.rand_proj = None
-                self.rand_proj_back = None
+            # Hopfield pattern dimension = n_mem_tokens * embedding_dim
+            # This concatenates all memory tokens into one pattern
+            hopfield_pattern_dim = self.n_mem_tokens * n_embd
 
             # Hopfield weight matrix (Hebbian-style storage)
-            self.W_hopfield = nn.Parameter(torch.zeros(effective_dim, effective_dim))
+            # Shape: [hopfield_pattern_dim, hopfield_pattern_dim]
+            # Initialize with zeros - Hebbian updates accumulate patterns
+            self.W_hopfield = nn.Parameter(torch.zeros(hopfield_pattern_dim, hopfield_pattern_dim))
 
             # Track steps for reset interval
             self._hopfield_step_counter = 0
         else:
-            self.rand_proj = None
-            self.rand_proj_back = None
             self.W_hopfield = None
             self._hopfield_step_counter = 0
 
@@ -707,18 +693,12 @@ class GradMemGPT(PreTrainedModel):
         # ---------------------------------------------------------------- #
         if self.use_hopfield_memory and self.K and context_input_ids.ne(pad_id).any():
             # Step 2: Store gradmem tokens in Hopfield memory (Hebbian update)
-            # gradmem_sum: [B, d]
-            gradmem_sum = mem_batch.sum(dim=1)
-
-            # Project to expanded dimension if needed
-            if self.rand_proj is not None:
-                gradmem_expanded = self.rand_proj(gradmem_sum)  # [B, d_expanded]
-            else:
-                gradmem_expanded = gradmem_sum
+            # Concatenate all memory tokens into one pattern: [B, M*d]
+            gradmem_pattern = mem_batch.view(B, -1)  # [B, M*d]
 
             # Hebbian update: W += outer_product(gradmem, gradmem)
             # For each sample: outer = v_i @ v_i.T, accumulate over batch
-            hopfield_update = torch.bmm(gradmem_expanded.unsqueeze(2), gradmem_expanded.unsqueeze(1))  # [B, d_exp, d_exp]
+            hopfield_update = torch.bmm(gradmem_pattern.unsqueeze(2), gradmem_pattern.unsqueeze(1))  # [B, M*d, M*d]
             with torch.no_grad():
                 self.W_hopfield.data += hopfield_update.sum(0)
 
@@ -742,23 +722,14 @@ class GradMemGPT(PreTrainedModel):
             query_memory_tokens = outs_q.last_hidden_state[:, :self.n_mem_tokens, :]  # [B, M, d]
 
             # Step 4: Hopfield retrieval
-            # Project query memory to expanded dimension
-            if self.rand_proj is not None:
-                query_expanded = self.rand_proj(query_memory_tokens)  # [B, M, d_expanded]
-            else:
-                query_expanded = query_memory_tokens
+            # Concatenate query memory tokens into one pattern: [B, M*d]
+            query_pattern = query_memory_tokens.view(B, -1)  # [B, M*d]
 
-            # Retrieve: assoc = query @ W_hopfield
-            retrieved_expanded = torch.bmm(
-                query_expanded.view(B * self.n_mem_tokens, -1),
-                self.W_hopfield.data
-            ).view(B, self.n_mem_tokens, -1)  # [B, M, d_expanded]
+            # Retrieve: assoc_pattern = query_pattern @ W_hopfield
+            retrieved_pattern = query_pattern @ self.W_hopfield.data  # [B, M*d]
 
-            # Project back to original dimension
-            if self.rand_proj_back is not None:
-                assoc_memory = self.rand_proj_back(retrieved_expanded)  # [B, M, d]
-            else:
-                assoc_memory = retrieved_expanded
+            # Reshape back to individual memory tokens: [B, M, d]
+            assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)
 
             # Optionally concatenate with original memory
             if self.concat_hopfield_memory:
