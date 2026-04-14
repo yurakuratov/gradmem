@@ -63,6 +63,12 @@ class GradMemGPTConfig(PretrainedConfig):
                  attn_implementation="eager",
                  add_inner_loss_to_outer=False,
                  inner_loss_weight=None,
+                 use_hopfield_memory=False,
+                 hopfield_dim=0,
+                 hopfield_proj_freeze=True,
+                 hopfield_reset_interval=None,
+                 concat_hopfield_memory=False,
+                 hopfield_grad_through_retrieval=False,
                  **kwargs):
         """
         Args:
@@ -89,6 +95,12 @@ class GradMemGPTConfig(PretrainedConfig):
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
+            use_hopfield_memory: bool, enable Hopfield-like external memory
+            hopfield_dim: int, expanded dimension for Hopfield memory (0 = no expansion)
+            hopfield_proj_freeze: bool, freeze random projection weights
+            hopfield_reset_interval: int, reset Hopfield memory every N steps (None = never)
+            concat_hopfield_memory: bool, concatenate Hopfield retrieved memory with original memory
+            hopfield_grad_through_retrieval: bool, backprop through retrieval step
         """
         super().__init__(**kwargs)
 
@@ -125,6 +137,12 @@ class GradMemGPTConfig(PretrainedConfig):
         self.attn_implementation = attn_implementation
         self.add_inner_loss_to_outer = add_inner_loss_to_outer
         self.inner_loss_weight = inner_loss_weight
+        self.use_hopfield_memory = use_hopfield_memory
+        self.hopfield_dim = hopfield_dim
+        self.hopfield_proj_freeze = hopfield_proj_freeze
+        self.hopfield_reset_interval = hopfield_reset_interval
+        self.concat_hopfield_memory = concat_hopfield_memory
+        self.hopfield_grad_through_retrieval = hopfield_grad_through_retrieval
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -253,6 +271,44 @@ class GradMemGPT(PreTrainedModel):
                 head_params = self.model.get_input_embeddings().weight
             with torch.no_grad():
                 self.write_head.weight.copy_(head_params.detach())
+
+        # Hopfield-like external memory
+        self.use_hopfield_memory = getattr(config, "use_hopfield_memory", False)
+        self.hopfield_dim = getattr(config, "hopfield_dim", 0)
+        self.hopfield_proj_freeze = getattr(config, "hopfield_proj_freeze", True)
+        self.hopfield_reset_interval = getattr(config, "hopfield_reset_interval", None)
+        self.concat_hopfield_memory = getattr(config, "concat_hopfield_memory", False)
+        self.hopfield_grad_through_retrieval = getattr(config, "hopfield_grad_through_retrieval", False)
+
+        if self.use_hopfield_memory:
+            effective_dim = self.hopfield_dim if self.hopfield_dim > 0 else n_embd
+
+            # Random projection layer for dimension expansion
+            if self.hopfield_dim > 0:
+                self.rand_proj = nn.Linear(n_embd, self.hopfield_dim, bias=False)
+                if self.hopfield_proj_freeze:
+                    with torch.no_grad():
+                        nn.init.orthogonal_(self.rand_proj.weight)
+                    self.rand_proj.weight.requires_grad = False
+
+                # Projection for retrieving back to original dimension
+                self.rand_proj_back = nn.Linear(self.hopfield_dim, n_embd, bias=False)
+                with torch.no_grad():
+                    nn.init.eye_(self.rand_proj_back.weight)
+            else:
+                self.rand_proj = None
+                self.rand_proj_back = None
+
+            # Hopfield weight matrix (Hebbian-style storage)
+            self.W_hopfield = nn.Parameter(torch.zeros(effective_dim, effective_dim))
+
+            # Track steps for reset interval
+            self._hopfield_step_counter = 0
+        else:
+            self.rand_proj = None
+            self.rand_proj_back = None
+            self.W_hopfield = None
+            self._hopfield_step_counter = 0
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -438,6 +494,43 @@ class GradMemGPT(PreTrainedModel):
             return mem
         return torch.baddbmm(b.unsqueeze(1), mem, W.transpose(1, 2))
 
+    def _forward_full_attn(self, inputs_embeds, output_hidden_states=True):
+        """
+        Forward pass with full (non-causal) attention.
+        Used for query compression in Hopfield memory retrieval.
+        """
+        # Get the underlying transformer
+        hidden_states = inputs_embeds
+
+        # Manually run through transformer layers with full attention
+        for layer in self.model.transformer.h:
+            # Create causal mask (full attention = no mask)
+            # shape: (1, 1, seq_len, seq_len) with all True = attend to all
+            seq_len = hidden_states.size(1)
+            attn_mask = torch.ones(seq_len, seq_len, device=hidden_states.device, dtype=torch.bool)
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+
+            # LayerNorm + Attention
+            ln_1_out = layer.ln_1(hidden_states)
+            attn_output, _ = layer.attn(ln_1_out, attn_mask=attn_mask)
+            hidden_states = hidden_states + attn_output
+
+            # LayerNorm + MLP
+            ln_2_out = layer.ln_2(hidden_states)
+            mlp_output = layer.mlp(ln_2_out)
+            hidden_states = hidden_states + mlp_output
+
+        # Final layer norm
+        hidden_states = self.model.transformer.ln_f(hidden_states)
+
+        # Project to vocabulary if needed (but we only need hidden states here)
+        # Return as a mock output object with last_hidden_state
+        class FakeOutput:
+            def __init__(self, hidden_states):
+                self.last_hidden_state = hidden_states
+
+        return FakeOutput(hidden_states)
+
     def forward(self, input_ids, labels=None, return_mem=False):
         # context_input_ids : B × S   (segments only, each ends with `|`)
         # query_input_ids   : B × Q   (e.g.  "?!K:V!|") i.e. the last segment
@@ -608,17 +701,97 @@ class GradMemGPT(PreTrainedModel):
 
         del ctx_emb, lm_labels
 
+        qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
+        # ---------------------------------------------------------------- #
+        # Hopfield-like external memory (if enabled)
+        # ---------------------------------------------------------------- #
+        if self.use_hopfield_memory and self.K and context_input_ids.ne(pad_id).any():
+            # Step 2: Store gradmem tokens in Hopfield memory (Hebbian update)
+            # gradmem_sum: [B, d]
+            gradmem_sum = mem_batch.sum(dim=1)
+
+            # Project to expanded dimension if needed
+            if self.rand_proj is not None:
+                gradmem_expanded = self.rand_proj(gradmem_sum)  # [B, d_expanded]
+            else:
+                gradmem_expanded = gradmem_sum
+
+            # Hebbian update: W += outer_product(gradmem, gradmem)
+            # For each sample: outer = v_i @ v_i.T, accumulate over batch
+            hopfield_update = torch.bmm(gradmem_expanded.unsqueeze(2), gradmem_expanded.unsqueeze(1))  # [B, d_exp, d_exp]
+            with torch.no_grad():
+                self.W_hopfield.data += hopfield_update.sum(0)
+
+            # Increment step counter for reset interval
+            self._hopfield_step_counter += 1
+            if self.hopfield_reset_interval is not None and self._hopfield_step_counter >= self.hopfield_reset_interval:
+                with torch.no_grad():
+                    self.W_hopfield.data.zero_()
+                self._hopfield_step_counter = 0
+
+            # Step 3: Query compression - forward pass with initial memory + query (full attention)
+            # Build input: [read_st][mem_init][read_end][query]
+            if self.n_ctrl_tokens > 0:
+                x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
+            else:
+                x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
+
+            # Forward with full attention
+            outs_q = self._forward_full_attn(x_qry_comp)
+            # Extract query memory tokens (first n_mem_tokens positions)
+            query_memory_tokens = outs_q.last_hidden_state[:, :self.n_mem_tokens, :]  # [B, M, d]
+
+            # Step 4: Hopfield retrieval
+            # Project query memory to expanded dimension
+            if self.rand_proj is not None:
+                query_expanded = self.rand_proj(query_memory_tokens)  # [B, M, d_expanded]
+            else:
+                query_expanded = query_memory_tokens
+
+            # Retrieve: assoc = query @ W_hopfield
+            retrieved_expanded = torch.bmm(
+                query_expanded.view(B * self.n_mem_tokens, -1),
+                self.W_hopfield.data
+            ).view(B, self.n_mem_tokens, -1)  # [B, M, d_expanded]
+
+            # Project back to original dimension
+            if self.rand_proj_back is not None:
+                assoc_memory = self.rand_proj_back(retrieved_expanded)  # [B, M, d]
+            else:
+                assoc_memory = retrieved_expanded
+
+            # Optionally concatenate with original memory
+            if self.concat_hopfield_memory:
+                # mem_inp will be concatenated with assoc_memory later
+                hopfield_mem = assoc_memory
+            else:
+                # Use only Hopfield-retrieved memory
+                mem_batch = assoc_memory
+
         # ---------------------------------------------------------------- #
         # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
         # ---------------------------------------------------------------- #
-        qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
-
-        if self.mem_proj_mode == "none":
-            mem_inp = mem_batch
-        elif self.mem_proj_mode == "proj":
-            mem_inp = self.mem_proj(mem_batch)
-        else:  # "per_sample"
-            mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
+        # Determine memory input for READ phase
+        if self.use_hopfield_memory and self.concat_hopfield_memory and 'hopfield_mem' in dir():
+            # Concatenate Hopfield-retrieved memory with original memory
+            if self.mem_proj_mode == "none":
+                mem_for_concat = mem_batch
+            elif self.mem_proj_mode == "proj":
+                mem_for_concat = self.mem_proj(mem_batch)
+            else:  # "per_sample"
+                mem_for_concat = self._apply_linear(mem_batch, W_batch, b_batch)
+            mem_inp = torch.cat([hopfield_mem, mem_for_concat], dim=1)
+            # Adjust mem_offset for concatenated memory (need to handle both memory sections)
+            read_mem_offset = self.n_mem_tokens * 2 + self.n_ctrl_tokens * 2
+        else:
+            # Original behavior
+            if self.mem_proj_mode == "none":
+                mem_inp = mem_batch
+            elif self.mem_proj_mode == "proj":
+                mem_inp = self.mem_proj(mem_batch)
+            else:  # "per_sample"
+                mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
+            read_mem_offset = mem_offset
 
         if self.n_ctrl_tokens > 0:
             # add params that can control read operation from mem
@@ -633,7 +806,7 @@ class GradMemGPT(PreTrainedModel):
 
         with self._disable_write_lora():
             logits_q = self.model(inputs_embeds=x_qry).logits                 # [B,M+Q,V]
-        logits_q = logits_q[:, mem_offset-1:mem_offset+qry_emb.size(1), :]    # [B,Q+1,V]
+        logits_q = logits_q[:, read_mem_offset-1:read_mem_offset+qry_emb.size(1), :]    # [B,Q+1,V]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:

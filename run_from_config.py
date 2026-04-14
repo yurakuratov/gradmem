@@ -96,7 +96,7 @@ def apply_overrides(cfg: dict, overrides: dict) -> dict:
 
     for key, value in overrides.items():
         applied = False
-        for section in ['model', 'training', 'gradmem', 'rmt', 'dataset']:
+        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'dataset']:
             if section in result and key in result[section]:
                 result[section][key] = value
                 applied = True
@@ -185,6 +185,16 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
             args.append(f'--{cli_key}={val}')
 
     for key, val in rmt.items():
+        if val is None or val is False:
+            continue
+        cli_key = key.replace('_', '-')
+        if val is True:
+            args.append(f'--{cli_key}')
+        else:
+            args.append(f'--{cli_key}={val}')
+
+    hopfield = cfg.get('hopfield', {})
+    for key, val in hopfield.items():
         if val is None or val is False:
             continue
         cli_key = key.replace('_', '-')

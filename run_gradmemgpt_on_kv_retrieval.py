@@ -219,6 +219,12 @@ class ExperimentArgs:
     attn_implementation: Optional[str] = field(default="eager")
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
     inner_loss_weight: Optional[float] = field(default=None)
+    use_hopfield_memory: Optional[bool] = field(default=False)
+    hopfield_dim: Optional[int] = field(default=0)
+    hopfield_proj_freeze: Optional[bool] = field(default=True)
+    hopfield_reset_interval: Optional[int] = field(default=None)
+    concat_hopfield_memory: Optional[bool] = field(default=False)
+    hopfield_grad_through_retrieval: Optional[bool] = field(default=False)
 
 
 if __name__ == '__main__':
@@ -239,7 +245,7 @@ def main(config_path: Optional[str] = None):
             cfg = yaml.safe_load(f)
 
         # Flatten config to args (CLI args override YAML)
-        for section in ['model', 'training', 'dataset', 'gradmem']:
+        for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield']:
             if section in cfg:
                 for key, value in cfg[section].items():
                     if not hasattr(args, key) or getattr(args, key) is None:
@@ -340,7 +346,13 @@ def main(config_path: Optional[str] = None):
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
                                       attn_implementation=args.attn_implementation,
                                       add_inner_loss_to_outer=args.add_inner_loss_to_outer,
-                                      inner_loss_weight=args.inner_loss_weight)
+                                      inner_loss_weight=args.inner_loss_weight,
+                                      use_hopfield_memory=args.use_hopfield_memory,
+                                      hopfield_dim=args.hopfield_dim,
+                                      hopfield_proj_freeze=args.hopfield_proj_freeze,
+                                      hopfield_reset_interval=args.hopfield_reset_interval,
+                                      concat_hopfield_memory=args.concat_hopfield_memory,
+                                      hopfield_grad_through_retrieval=args.hopfield_grad_through_retrieval)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
