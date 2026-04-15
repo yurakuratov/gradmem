@@ -250,7 +250,7 @@ def main(config_path: Optional[str] = None):
                         pass  # Keep CLI value
 
         # Set exp_path from config if not explicitly set
-        if 'exp_path' not in vars(args) or args.exp_path == './runs/exp1':
+        if 'exp_path' not in vars(args) or args.exp_path is None:
             from generate_run_name import generate_run_name, get_exp_path, get_data_path
             run_name = generate_run_name(cfg)
             exp_path = get_exp_path(cfg)
@@ -277,13 +277,12 @@ def main(config_path: Optional[str] = None):
 
     assert not (args.pretrained_model is not None and args.base_model is not None), "only one of these args must be set"
 
+    output_dir = Path(args.exp_path) if args.exp_path else Path('./runs/hopfield_eval')
     if accel.is_main_process:
-        config = {
-            'cli_args': dict(vars(args)),
-        }
-        logger.info(f'saving experiment configuration to {args.exp_path}')
-        Path(args.exp_path).mkdir(parents=True)
-        json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
+        config_dict = {'cli_args': dict(vars(args))}
+        logger.info(f'saving experiment configuration to {output_dir}')
+        output_dir.mkdir(parents=True, exist_ok=True)
+        json.dump(config_dict, open(output_dir / 'config.json', 'w'), indent=4)
 
     if args.pretrained_model is None:
         # create tokenizer

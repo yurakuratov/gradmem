@@ -18,7 +18,7 @@ training:
   seed: 142
 
 dataset:
-  data_name: "N8-K2V2-V62_1M"
+  data_path: "./data/N4-K2V2-V62_1M"
   tokenizer_path: "./tokenizers/kv_alphabet_62/"
 
 gradmem:
