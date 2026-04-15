@@ -289,9 +289,11 @@ class GradMemGPT(PreTrainedModel):
 
             # Track steps for reset interval (not persisted in state_dict, not synced by DDP)
             self.register_buffer('_hopfield_step_counter', torch.tensor(0, dtype=torch.long), persistent=False)
+            self.register_buffer('_hopfield_has_patterns', torch.tensor(False))
         else:
             self.register_buffer('W_hopfield', None)
             self.register_buffer('_hopfield_step_counter', torch.tensor(0, dtype=torch.long), persistent=False)
+            self.register_buffer('_hopfield_has_patterns', torch.tensor(False))
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -598,6 +600,7 @@ class GradMemGPT(PreTrainedModel):
         # ---------------------------------------------------------------- #
         # 1.  INNER loop on context. WRITE context to mem.
         # ---------------------------------------------------------------- #
+        ctx_emb = None
         if self.K and context_input_ids.ne(pad_id).any():
             # re‑enable autograd even if outer context is `no_grad`
             with torch.enable_grad():
@@ -711,84 +714,91 @@ class GradMemGPT(PreTrainedModel):
         inner_loop_stats['delta_mem_norm_mean'] = detla_mem_norm.mean()
         inner_loop_stats['delta_mem_norm_max'] = detla_mem_norm.max()
         inner_loop_stats['delta_mem_norm_min'] = detla_mem_norm.min()
-
-        del lm_labels
+        if ctx_emb is not None:
+            del lm_labels
 
         qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
         # ---------------------------------------------------------------- #
         # Hopfield-like external memory (if enabled)
         # ---------------------------------------------------------------- #
         hopfield_mem = None
-        if self.use_hopfield_memory and self.K and context_input_ids.ne(pad_id).any():
-            # Step 1: Value patterns = gradient-updated memory (detailed compression)
-            # These are the patterns we want to store and retrieve
-            value_pattern = mem_batch.view(B, -1)  # [B, M*d]
+        if self.use_hopfield_memory and self.K:
+            has_context = ctx_emb is not None
 
-            # Step 2: Context key = forward-pass compressed representation of context
-            # Uses initial (pre-update) memory + context with full (bidirectional) attention
-            # so memory tokens can attend to the context they are compressing
-            # This makes the memory content-addressable by context content
-            with torch.no_grad():
-                if self.n_ctrl_tokens > 0:
-                    x_ctx_comp = torch.cat([write_st_batch, mem_batch_initial, write_end_batch, ctx_emb], dim=1)
-                else:
-                    x_ctx_comp = torch.cat([mem_batch_initial, ctx_emb], dim=1)
+            # STORE phase: write patterns to W_hopfield (requires context)
+            if has_context:
+                # Value patterns = gradient-updated memory (detailed compression)
+                value_pattern = mem_batch.view(B, -1)  # [B, M*d]
 
-                with self._disable_write_lora():
-                    outs_ctx = self._forward_full_attn(x_ctx_comp)
-                # Extract hidden states at memory token positions as context key
-                context_key = outs_ctx.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
-                del outs_ctx
-
-            # Step 3: Query key = forward-pass compressed representation of query
-            # Uses initial (pre-update) memory + query with full attention
-            # so memory tokens can attend bidirectionally to the initial memory
-            with torch.no_grad():
-                if self.n_ctrl_tokens > 0:
-                    x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
-                else:
-                    x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
-
-                with self._disable_write_lora():
-                    outs_q = self._forward_full_attn(x_qry_comp)
-                # Extract hidden states at memory token positions as query key
-                query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
-                del outs_q
-
-            # L2-normalize patterns before Hebbian update/retrieval
-            value_pattern = F.normalize(value_pattern, dim=-1)
-            context_key = F.normalize(context_key, dim=-1)
-            query_key = F.normalize(query_key, dim=-1)
-
-            # Step 4: Hetero-associative Hebbian storage: W += value.T @ context_key
-            # Maps from context_key (content-based index) to value (detailed gradient-based memory)
-            # This allows retrieval of context by content similarity:
-            # similar queries will produce similar query_keys, matching stored context_keys
-            hopfield_update = torch.bmm(value_pattern.unsqueeze(2), context_key.unsqueeze(1))  # [B, M*d, M*d]
-            with torch.no_grad():
-                self.W_hopfield += hopfield_update.sum(0)
-
-            # Increment step counter for reset interval
-            self._hopfield_step_counter.add_(1)
-            if self.hopfield_reset_interval is not None and self._hopfield_step_counter >= self.hopfield_reset_interval:
+                # Context key = forward-pass compressed representation of context
+                # Uses initial (pre-update) memory + context with full (bidirectional) attention
+                # so memory tokens can attend to the context they are compressing
+                # This makes the memory content-addressable by context content
                 with torch.no_grad():
-                    self.W_hopfield.zero_()
-                self._hopfield_step_counter.zero_()
+                    if self.n_ctrl_tokens > 0:
+                        x_ctx_comp = torch.cat([write_st_batch, mem_batch_initial, write_end_batch, ctx_emb], dim=1)
+                    else:
+                        x_ctx_comp = torch.cat([mem_batch_initial, ctx_emb], dim=1)
 
-            # Step 5: Hopfield retrieval using query key
-            # Hetero-associative retrieval: given query_key, retrieve associated value
-            # query_key @ W ≈ weighted sum of stored values whose context_keys match the query
-            retrieved_pattern = query_key @ self.W_hopfield.detach()  # [B, M*d]
+                    with self._disable_write_lora():
+                        outs_ctx = self._forward_full_attn(x_ctx_comp)
+                    # Extract hidden states at memory token positions as context key
+                    context_key = outs_ctx.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                    del outs_ctx
 
-            # Reshape back to individual memory tokens: [B, M, d]
-            assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)
+                # L2-normalize store patterns
+                value_pattern = F.normalize(value_pattern, dim=-1)
+                context_key = F.normalize(context_key, dim=-1)
 
-            # Optionally concatenate with original memory
-            if self.concat_hopfield_memory:
-                hopfield_mem = assoc_memory
-            else:
-                # Use only Hopfield-retrieved memory
-                mem_batch = assoc_memory
+                # Hetero-associative Hebbian storage: W += value.T @ context_key
+                # Maps from context_key (content-based index) to value (detailed gradient-based memory)
+                # This allows retrieval of context by content similarity:
+                # similar queries will produce similar query_keys, matching stored context_keys
+                hopfield_update = torch.bmm(value_pattern.unsqueeze(2), context_key.unsqueeze(1))  # [B, M*d, M*d]
+                with torch.no_grad():
+                    self.W_hopfield += hopfield_update.sum(0)
+                    self._hopfield_has_patterns.fill_(True)
+
+                # Increment step counter for reset interval
+                self._hopfield_step_counter.add_(1)
+                if self.hopfield_reset_interval is not None and self._hopfield_step_counter >= self.hopfield_reset_interval:
+                    with torch.no_grad():
+                        self.W_hopfield.zero_()
+                    self._hopfield_step_counter.zero_()
+                    self._hopfield_has_patterns.fill_(False)
+
+            # RETRIEVE phase: read patterns from W_hopfield
+            if self._hopfield_has_patterns:
+                # Query key = forward-pass compressed representation of query
+                # Uses initial (pre-update) memory + query with full attention
+                # so memory tokens can attend bidirectionally to the initial memory
+                with torch.no_grad():
+                    if self.n_ctrl_tokens > 0:
+                        x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
+                    else:
+                        x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
+
+                    with self._disable_write_lora():
+                        outs_q = self._forward_full_attn(x_qry_comp)
+                    # Extract hidden states at memory token positions as query key
+                    query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                    del outs_q
+
+                query_key = F.normalize(query_key, dim=-1)
+
+                # Hetero-associative retrieval: given query_key, retrieve associated value
+                # query_key @ W ≈ weighted sum of stored values whose context_keys match the query
+                retrieved_pattern = query_key @ self.W_hopfield.detach()  # [B, M*d]
+
+                # Reshape back to individual memory tokens: [B, M, d]
+                assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)
+
+                # Optionally concatenate with original memory
+                if self.concat_hopfield_memory:
+                    hopfield_mem = assoc_memory
+                else:
+                    # Use only Hopfield-retrieved memory
+                    mem_batch = assoc_memory
 
         del ctx_emb
 
