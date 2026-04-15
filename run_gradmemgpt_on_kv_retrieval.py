@@ -174,7 +174,6 @@ class ExperimentArgs:
     config: Optional[str] = field(default=None)
     exp_path: Optional[str] = field(default=None)
     per_device_batch_size: int = field(default=64)
-    per_device_batch_size: int = field()
     data_path: str = field(default='./data/N2-K4V4-S4(32-64)_1M')
     tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
     gradient_accumulation_steps: Optional[int] = field(default=1)
@@ -224,10 +223,6 @@ class ExperimentArgs:
     hopfield_proj_freeze: Optional[bool] = field(default=True)
     hopfield_reset_interval: Optional[int] = field(default=None)
     concat_hopfield_memory: Optional[bool] = field(default=False)
-
-
-if __name__ == '__main__':
-    main()
 
 
 def main(config_path: Optional[str] = None):
@@ -444,3 +439,7 @@ concat_hopfield_memory=args.concat_hopfield_memory)
     logger.info(f'{metrics}')
     trainer.save_metrics(split='all', metrics=metrics)
     trainer.state.save_to_json(output_dir / 'trainer_state.json')
+
+
+if __name__ == '__main__':
+    main()

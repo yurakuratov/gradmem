@@ -236,8 +236,10 @@ class HopfieldResetCallback(TrainerCallback):
 
 
 class HopfieldTrainer(CustomTrainer):
-    def _get_train_sampler(self):
-        chunk_ids = self.train_dataset['chunk_id']
+    def _get_train_sampler(self, dataset=None):
+        if dataset is None:
+            dataset = self.train_dataset
+        chunk_ids = dataset['chunk_id']
         epoch = int(self.state.epoch) if self.state.epoch is not None else 0
         return ChunkPreservingSampler(
             chunk_ids, shuffle=True, seed=self.args.seed, epoch=epoch,
