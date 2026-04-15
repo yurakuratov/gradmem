@@ -712,7 +712,7 @@ class GradMemGPT(PreTrainedModel):
         inner_loop_stats['delta_mem_norm_max'] = detla_mem_norm.max()
         inner_loop_stats['delta_mem_norm_min'] = detla_mem_norm.min()
 
-        del ctx_emb, lm_labels
+        del lm_labels
 
         qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
         # ---------------------------------------------------------------- #
@@ -724,29 +724,47 @@ class GradMemGPT(PreTrainedModel):
             # These are the patterns we want to store and retrieve
             value_pattern = mem_batch.view(B, -1)  # [B, M*d]
 
-            # Step 2: Key patterns = forward-pass compressed representation (coarse compression)
-            # Build input with initial (pre-update) memory + query, using full attention
-            # so the query can attend bidirectionally to the initial memory
-            if self.n_ctrl_tokens > 0:
-                x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
-            else:
-                x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
+            # Step 2: Context key = forward-pass compressed representation of context
+            # Uses initial (pre-update) memory + context with full (bidirectional) attention
+            # so memory tokens can attend to the context they are compressing
+            # This makes the memory content-addressable by context content
+            with torch.no_grad():
+                if self.n_ctrl_tokens > 0:
+                    x_ctx_comp = torch.cat([write_st_batch, mem_batch_initial, write_end_batch, ctx_emb], dim=1)
+                else:
+                    x_ctx_comp = torch.cat([mem_batch_initial, ctx_emb], dim=1)
 
-            # Forward with full (non-causal) attention for bidirectional compression
-            with self._disable_write_lora():
-                outs_q = self._forward_full_attn(x_qry_comp)
-            # Extract hidden states at memory token positions as key patterns
-            key_pattern = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
-            del outs_q
+                with self._disable_write_lora():
+                    outs_ctx = self._forward_full_attn(x_ctx_comp)
+                # Extract hidden states at memory token positions as context key
+                context_key = outs_ctx.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                del outs_ctx
+
+            # Step 3: Query key = forward-pass compressed representation of query
+            # Uses initial (pre-update) memory + query with full attention
+            # so memory tokens can attend bidirectionally to the initial memory
+            with torch.no_grad():
+                if self.n_ctrl_tokens > 0:
+                    x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
+                else:
+                    x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
+
+                with self._disable_write_lora():
+                    outs_q = self._forward_full_attn(x_qry_comp)
+                # Extract hidden states at memory token positions as query key
+                query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                del outs_q
 
             # L2-normalize patterns before Hebbian update/retrieval
             value_pattern = F.normalize(value_pattern, dim=-1)
-            key_pattern = F.normalize(key_pattern, dim=-1)
+            context_key = F.normalize(context_key, dim=-1)
+            query_key = F.normalize(query_key, dim=-1)
 
-            # Step 3: Hetero-associative Hebbian storage: W += value.T @ key
-            # Maps from key (coarse forward-pass representation) to value (detailed gradient-based memory)
-            # For each sample: outer product of value and key, accumulate over batch
-            hopfield_update = torch.bmm(value_pattern.unsqueeze(2), key_pattern.unsqueeze(1))  # [B, M*d, M*d]
+            # Step 4: Hetero-associative Hebbian storage: W += value.T @ context_key
+            # Maps from context_key (content-based index) to value (detailed gradient-based memory)
+            # This allows retrieval of context by content similarity:
+            # similar queries will produce similar query_keys, matching stored context_keys
+            hopfield_update = torch.bmm(value_pattern.unsqueeze(2), context_key.unsqueeze(1))  # [B, M*d, M*d]
             with torch.no_grad():
                 self.W_hopfield += hopfield_update.sum(0)
 
@@ -757,10 +775,10 @@ class GradMemGPT(PreTrainedModel):
                     self.W_hopfield.zero_()
                 self._hopfield_step_counter.zero_()
 
-            # Step 4: Hopfield retrieval using the same key pattern
-            # Hetero-associative retrieval: given key, retrieve associated value
-            # retrieved = key @ W ≈ weighted sum of stored values whose keys match the query
-            retrieved_pattern = key_pattern @ self.W_hopfield.detach()  # [B, M*d]
+            # Step 5: Hopfield retrieval using query key
+            # Hetero-associative retrieval: given query_key, retrieve associated value
+            # query_key @ W ≈ weighted sum of stored values whose context_keys match the query
+            retrieved_pattern = query_key @ self.W_hopfield.detach()  # [B, M*d]
 
             # Reshape back to individual memory tokens: [B, M, d]
             assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)
@@ -771,6 +789,8 @@ class GradMemGPT(PreTrainedModel):
             else:
                 # Use only Hopfield-retrieved memory
                 mem_batch = assoc_memory
+
+        del ctx_emb
 
         # ---------------------------------------------------------------- #
         # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
