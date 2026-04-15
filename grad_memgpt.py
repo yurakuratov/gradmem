@@ -68,7 +68,6 @@ class GradMemGPTConfig(PretrainedConfig):
                  hopfield_proj_freeze=True,
                  hopfield_reset_interval=None,
                  concat_hopfield_memory=False,
-                 hopfield_grad_through_retrieval=False,
                  **kwargs):
         """
         Args:
@@ -100,7 +99,6 @@ class GradMemGPTConfig(PretrainedConfig):
             hopfield_proj_freeze: bool, freeze random projection weights
             hopfield_reset_interval: int, reset Hopfield memory every N steps (None = never)
             concat_hopfield_memory: bool, concatenate Hopfield retrieved memory with original memory
-            hopfield_grad_through_retrieval: bool, backprop through retrieval step
         """
         super().__init__(**kwargs)
 
@@ -142,7 +140,6 @@ class GradMemGPTConfig(PretrainedConfig):
         self.hopfield_proj_freeze = hopfield_proj_freeze
         self.hopfield_reset_interval = hopfield_reset_interval
         self.concat_hopfield_memory = concat_hopfield_memory
-        self.hopfield_grad_through_retrieval = hopfield_grad_through_retrieval
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -278,23 +275,23 @@ class GradMemGPT(PreTrainedModel):
         self.hopfield_proj_freeze = getattr(config, "hopfield_proj_freeze", True)
         self.hopfield_reset_interval = getattr(config, "hopfield_reset_interval", None)
         self.concat_hopfield_memory = getattr(config, "concat_hopfield_memory", False)
-        self.hopfield_grad_through_retrieval = getattr(config, "hopfield_grad_through_retrieval", False)
 
         if self.use_hopfield_memory:
             # Hopfield pattern dimension = n_mem_tokens * embedding_dim
-            # This concatenates all memory tokens into one pattern
+            # Hetero-associative: key dim = value dim (both compress memory tokens into one pattern)
             hopfield_pattern_dim = self.n_mem_tokens * n_embd
 
-            # Hopfield weight matrix (Hebbian-style storage)
+            # Hopfield weight matrix (Hebbian-style storage, hetero-associative: W += value.T @ key)
             # Shape: [hopfield_pattern_dim, hopfield_pattern_dim]
             # Initialize with zeros - Hebbian updates accumulate patterns
-            self.W_hopfield = nn.Parameter(torch.zeros(hopfield_pattern_dim, hopfield_pattern_dim))
+            # Registered as buffer (not parameter) since it's updated via Hebbian rule, not gradient descent
+            self.register_buffer('W_hopfield', torch.zeros(hopfield_pattern_dim, hopfield_pattern_dim))
 
-            # Track steps for reset interval
-            self._hopfield_step_counter = 0
+            # Track steps for reset interval (not persisted in state_dict, not synced by DDP)
+            self.register_buffer('_hopfield_step_counter', torch.tensor(0, dtype=torch.long), persistent=False)
         else:
-            self.W_hopfield = None
-            self._hopfield_step_counter = 0
+            self.register_buffer('W_hopfield', None)
+            self.register_buffer('_hopfield_step_counter', torch.tensor(0, dtype=torch.long), persistent=False)
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -480,42 +477,72 @@ class GradMemGPT(PreTrainedModel):
             return mem
         return torch.baddbmm(b.unsqueeze(1), mem, W.transpose(1, 2))
 
-    def _forward_full_attn(self, inputs_embeds, output_hidden_states=True):
+    @contextmanager
+    def _full_attention(self):
+        """Context manager that enables full (non-causal) attention.
+
+        For models with hardcoded causal bias buffers (e.g. GPT-2 eager attention),
+        temporarily overrides those buffers to enable bidirectional attention.
+        For SDPA and custom attention kernels (jvp_flash, hvp_manual, hvp_semi_manual),
+        a 4D all-zeros attention mask suffices (is_causal=False when attention_mask is not None).
         """
-        Forward pass with full (non-causal) attention.
-        Used for query compression in Hopfield memory retrieval.
+        backbone = get_backbone(self.model)
+        saved = {}
+
+        has_eager_causal_bias = (
+            self.attn_implementation == 'eager'
+            and any(
+                hasattr(m, 'bias') and isinstance(getattr(m, 'bias', None), torch.Tensor)
+                and getattr(m, 'bias').dim() == 4 and getattr(m, 'bias').dtype == torch.bool
+                for m in backbone.modules()
+            )
+        )
+
+        if has_eager_causal_bias:
+            for module in backbone.modules():
+                if hasattr(module, 'bias') and isinstance(getattr(module, 'bias', None), torch.Tensor):
+                    bias = getattr(module, 'bias')
+                    if bias.dim() == 4 and bias.dtype == torch.bool:
+                        saved[id(module)] = bias.clone()
+                        module.bias.fill_(True)
+        try:
+            yield
+        finally:
+            for module in backbone.modules():
+                if id(module) in saved and hasattr(module, 'bias'):
+                    module.bias.copy_(saved[id(module)])
+
+    def _forward_full_attn(self, inputs_embeds):
+        """Forward pass with full (non-causal) attention using the model's standard interface.
+
+        Uses a 4D all-zeros attention mask (0.0 = attend everywhere) to disable causal masking,
+        and overrides GPT-2-style hardcoded causal bias buffers when using eager attention.
+        Correctly handles JVP flash attention sequence length requirements.
+        Architecture-agnostic: works with GPT-2, LLaMA, GPT-NeoX, etc.
         """
-        # Get the underlying transformer
-        hidden_states = inputs_embeds
+        B, S, D = inputs_embeds.shape
 
-        # Manually run through transformer layers with full attention
-        for layer in self.model.transformer.h:
-            # Create causal mask (full attention = no mask)
-            # shape: (1, 1, seq_len, seq_len) with all True = attend to all
-            seq_len = hidden_states.size(1)
-            attn_mask = torch.ones(seq_len, seq_len, device=hidden_states.device, dtype=torch.bool)
-            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+        # Pad to multiple of 32 for compatibility with JVP Flash Attention
+        if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+            pad_len = -S % 32
+            if pad_len > 0:
+                # Pad embedding dimension, then sequence dimension
+                inputs_embeds = F.pad(inputs_embeds, [0, 0, 0, pad_len], "constant", 0)
 
-            # LayerNorm + Attention
-            ln_1_out = layer.ln_1(hidden_states)
-            attn_output, _ = layer.attn(ln_1_out, attn_mask=attn_mask)
-            hidden_states = hidden_states + attn_output
+        S_padded = inputs_embeds.size(1)
 
-            # LayerNorm + MLP
-            ln_2_out = layer.ln_2(hidden_states)
-            mlp_output = layer.mlp(ln_2_out)
-            hidden_states = hidden_states + mlp_output
+        # 4D all-zeros float mask: 0.0 = attend everywhere (no masking)
+        # For padded sequences, mask out padding positions so real tokens don't attend to them
+        full_mask = torch.zeros(B, 1, S_padded, S_padded, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
+        if S_padded > S:
+            full_mask[:, :, :, S:] = float('-inf')  # don't attend to padding keys
+            full_mask[:, :, S:, :] = float('-inf')   # padding queries produce zero outputs
 
-        # Final layer norm
-        hidden_states = self.model.transformer.ln_f(hidden_states)
+        backbone = get_backbone(self.model)
+        with self._full_attention():
+            outs = backbone(inputs_embeds=inputs_embeds, attention_mask=full_mask, return_dict=True)
 
-        # Project to vocabulary if needed (but we only need hidden states here)
-        # Return as a mock output object with last_hidden_state
-        class FakeOutput:
-            def __init__(self, hidden_states):
-                self.last_hidden_state = hidden_states
-
-        return FakeOutput(hidden_states)
+        return outs
 
     def forward(self, input_ids, labels=None, return_mem=False):
         # context_input_ids : B × S   (segments only, each ends with `|`)
@@ -691,49 +718,55 @@ class GradMemGPT(PreTrainedModel):
         # ---------------------------------------------------------------- #
         # Hopfield-like external memory (if enabled)
         # ---------------------------------------------------------------- #
+        hopfield_mem = None
         if self.use_hopfield_memory and self.K and context_input_ids.ne(pad_id).any():
-            # Step 2: Store gradmem tokens in Hopfield memory (Hebbian update)
-            # Concatenate all memory tokens into one pattern: [B, M*d]
-            gradmem_pattern = mem_batch.view(B, -1)  # [B, M*d]
+            # Step 1: Value patterns = gradient-updated memory (detailed compression)
+            # These are the patterns we want to store and retrieve
+            value_pattern = mem_batch.view(B, -1)  # [B, M*d]
 
-            # Hebbian update: W += outer_product(gradmem, gradmem)
-            # For each sample: outer = v_i @ v_i.T, accumulate over batch
-            hopfield_update = torch.bmm(gradmem_pattern.unsqueeze(2), gradmem_pattern.unsqueeze(1))  # [B, M*d, M*d]
-            with torch.no_grad():
-                self.W_hopfield.data += hopfield_update.sum(0)
-
-            # Increment step counter for reset interval
-            self._hopfield_step_counter += 1
-            if self.hopfield_reset_interval is not None and self._hopfield_step_counter >= self.hopfield_reset_interval:
-                with torch.no_grad():
-                    self.W_hopfield.data.zero_()
-                self._hopfield_step_counter = 0
-
-            # Step 3: Query compression - forward pass with initial memory + query (full attention)
-            # Build input: [read_st][mem_init][read_end][query]
+            # Step 2: Key patterns = forward-pass compressed representation (coarse compression)
+            # Build input with initial (pre-update) memory + query, using full attention
+            # so the query can attend bidirectionally to the initial memory
             if self.n_ctrl_tokens > 0:
                 x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
             else:
                 x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
 
-            # Forward with full attention
-            outs_q = self._forward_full_attn(x_qry_comp)
-            # Extract query memory tokens (first n_mem_tokens positions)
-            query_memory_tokens = outs_q.last_hidden_state[:, :self.n_mem_tokens, :]  # [B, M, d]
+            # Forward with full (non-causal) attention for bidirectional compression
+            with self._disable_write_lora():
+                outs_q = self._forward_full_attn(x_qry_comp)
+            # Extract hidden states at memory token positions as key patterns
+            key_pattern = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+            del outs_q
 
-            # Step 4: Hopfield retrieval
-            # Concatenate query memory tokens into one pattern: [B, M*d]
-            query_pattern = query_memory_tokens.view(B, -1)  # [B, M*d]
+            # L2-normalize patterns before Hebbian update/retrieval
+            value_pattern = F.normalize(value_pattern, dim=-1)
+            key_pattern = F.normalize(key_pattern, dim=-1)
 
-            # Retrieve: assoc_pattern = query_pattern @ W_hopfield
-            retrieved_pattern = query_pattern @ self.W_hopfield.data  # [B, M*d]
+            # Step 3: Hetero-associative Hebbian storage: W += value.T @ key
+            # Maps from key (coarse forward-pass representation) to value (detailed gradient-based memory)
+            # For each sample: outer product of value and key, accumulate over batch
+            hopfield_update = torch.bmm(value_pattern.unsqueeze(2), key_pattern.unsqueeze(1))  # [B, M*d, M*d]
+            with torch.no_grad():
+                self.W_hopfield += hopfield_update.sum(0)
+
+            # Increment step counter for reset interval
+            self._hopfield_step_counter.add_(1)
+            if self.hopfield_reset_interval is not None and self._hopfield_step_counter >= self.hopfield_reset_interval:
+                with torch.no_grad():
+                    self.W_hopfield.zero_()
+                self._hopfield_step_counter.zero_()
+
+            # Step 4: Hopfield retrieval using the same key pattern
+            # Hetero-associative retrieval: given key, retrieve associated value
+            # retrieved = key @ W ≈ weighted sum of stored values whose keys match the query
+            retrieved_pattern = key_pattern @ self.W_hopfield.detach()  # [B, M*d]
 
             # Reshape back to individual memory tokens: [B, M, d]
             assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)
 
             # Optionally concatenate with original memory
             if self.concat_hopfield_memory:
-                # mem_inp will be concatenated with assoc_memory later
                 hopfield_mem = assoc_memory
             else:
                 # Use only Hopfield-retrieved memory
@@ -743,7 +776,7 @@ class GradMemGPT(PreTrainedModel):
         # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
         # ---------------------------------------------------------------- #
         # Determine memory input for READ phase
-        if self.use_hopfield_memory and self.concat_hopfield_memory and 'hopfield_mem' in dir():
+        if hopfield_mem is not None and self.concat_hopfield_memory:
             # Concatenate Hopfield-retrieved memory with original memory
             if self.mem_proj_mode == "none":
                 mem_for_concat = mem_batch

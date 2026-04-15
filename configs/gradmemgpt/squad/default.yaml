@@ -32,3 +32,9 @@ gradmem:
   mem_proj_mode: "proj"
   use_write_head: true
   add_inner_loss_to_outer: false
+
+# Hopfield-like external memory configuration
+hopfield:
+  use_hopfield_memory: true
+  hopfield_reset_interval: null
+  concat_hopfield_memory: true

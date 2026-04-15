@@ -224,7 +224,6 @@ class ExperimentArgs:
     hopfield_proj_freeze: Optional[bool] = field(default=True)
     hopfield_reset_interval: Optional[int] = field(default=None)
     concat_hopfield_memory: Optional[bool] = field(default=False)
-    hopfield_grad_through_retrieval: Optional[bool] = field(default=False)
 
 
 if __name__ == '__main__':
@@ -351,8 +350,7 @@ def main(config_path: Optional[str] = None):
                                       hopfield_dim=args.hopfield_dim,
                                       hopfield_proj_freeze=args.hopfield_proj_freeze,
                                       hopfield_reset_interval=args.hopfield_reset_interval,
-                                      concat_hopfield_memory=args.concat_hopfield_memory,
-                                      hopfield_grad_through_retrieval=args.hopfield_grad_through_retrieval)
+concat_hopfield_memory=args.concat_hopfield_memory)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)

@@ -41,4 +41,3 @@ hopfield:
   use_hopfield_memory: true
   hopfield_reset_interval: null
   concat_hopfield_memory: true
-  hopfield_grad_through_retrieval: false
