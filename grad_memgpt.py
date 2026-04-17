@@ -561,7 +561,8 @@ class GradMemGPT(PreTrainedModel):
             W_hopfield = torch.zeros(B, hopfield_pattern_dim, hopfield_pattern_dim, device=device)
             hopfield_stored = torch.zeros(B, dtype=torch.bool, device=device)
 
-        last_inner_loss = torch.tensor(0.0, device=device)
+        total_inner_loss_detached = torch.tensor(0.0, device=device)
+        last_segment_inner_loss = None
         total_inner_steps = 0
         n_segments_with_context = 0
 
@@ -685,6 +686,9 @@ class GradMemGPT(PreTrainedModel):
 
                         is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
                         create_graph = is_second_order_step
+                        # Only retain graph for add_inner_loss_to_outer on the last K-step;
+                        # earlier segments' inner_loss will be detached, so their graphs are waste
+                        # but retaining them is safe and simplifies the logic
                         retain_graph = create_graph or (self.add_inner_loss_to_outer and (k == self.K - 1))
 
                         # get inner loop gradients
@@ -724,8 +728,9 @@ class GradMemGPT(PreTrainedModel):
                         elif self.grad_mode in ['first', 'second']:
                             pass  # do nothing, keep gradients flow
 
-                    # Accumulate last-step inner loss for this segment
-                    last_inner_loss = last_inner_loss + inner_loss
+                    # Accumulate inner loss for stats (detached) and for combined loss (graph-connected, last segment only)
+                    total_inner_loss_detached = total_inner_loss_detached + inner_loss.detach()
+                    last_segment_inner_loss = inner_loss
                     n_segments_with_context += 1
 
                     # Per-segment Hopfield STORE (per-sample Hebbian update)
@@ -764,7 +769,7 @@ class GradMemGPT(PreTrainedModel):
         if total_inner_steps > 0:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / total_inner_steps
             if n_segments_with_context > 0:
-                inner_loop_stats['inner_loss'] = (last_inner_loss / n_segments_with_context).detach() / B
+                inner_loop_stats['inner_loss'] = (total_inner_loss_detached / n_segments_with_context) / B
         # mem stats from last segment
         mem_norm = last_mem_batch.norm(dim=(1, 2)).detach()  # B
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
@@ -854,9 +859,8 @@ class GradMemGPT(PreTrainedModel):
         )
 
         output['inner_loop_stats']['target_loss'] = target_loss.detach()
-        if self.add_inner_loss_to_outer and n_segments_with_context > 0:
-            inner_loss_mean = (last_inner_loss / n_segments_with_context) / B
-            combined_loss = target_loss + self.inner_loss_weight * inner_loss_mean
+        if self.add_inner_loss_to_outer and last_segment_inner_loss is not None:
+            combined_loss = target_loss + self.inner_loss_weight * last_segment_inner_loss / B
         else:
             combined_loss = target_loss
         output['loss'] = combined_loss
