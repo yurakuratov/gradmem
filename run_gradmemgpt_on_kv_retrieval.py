@@ -238,16 +238,12 @@ def main(config_path: Optional[str] = None):
         with open(args.config) as f:
             cfg = yaml.safe_load(f)
 
-        # Flatten config to args (CLI args override YAML)
+        # Flatten config to args (YAML values override ExperimentArgs defaults)
         for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield']:
             if section in cfg:
                 for key, value in cfg[section].items():
-                    if not hasattr(args, key) or getattr(args, key) is None:
+                    if hasattr(args, key):
                         setattr(args, key, value)
-                    # Override if CLI value matches default
-                    elif key in vars(args) and value is not None:
-                        # Check if CLI arg was explicitly set vs default
-                        pass  # Keep CLI value
 
         # Set exp_path from config if not explicitly set
         if 'exp_path' not in vars(args) or args.exp_path is None:

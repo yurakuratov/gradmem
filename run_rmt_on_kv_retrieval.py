@@ -235,7 +235,7 @@ def main(config_path: Optional[str] = None):
         for section in ['model', 'training', 'dataset', 'rmt']:
             if section in cfg:
                 for key, value in cfg[section].items():
-                    if not hasattr(args, key) or getattr(args, key) is None:
+                    if hasattr(args, key):
                         setattr(args, key, value)
 
         if args.exp_path is None:

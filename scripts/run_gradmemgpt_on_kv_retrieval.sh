@@ -21,8 +21,8 @@ V=62
 # DATA_NAME="N0-S1(4-4)_1M"
 # DATA_NAME="N10-K2V2-S4(32-64)_1M"
 # DATA_NAME="N16-K1V1-vocab512_1M"
-DATA_NAME="N8-K2V2-V${V}_1M"
-DATA_PATH="/home/jovyan/.cache/test-time-gd-cache/data/${DATA_NAME}"
+DATA_NAME="N4-K2V2-V${V}_1M"
+DATA_PATH="./data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
 # GradMemGPT specific parameters

@@ -414,18 +414,14 @@ def main(config_path: Optional[str] = None):
         for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield']:
             if section in cfg:
                 for key, value in cfg[section].items():
-                    if not hasattr(args, key) or getattr(args, key) is None:
+                    if hasattr(args, key):
                         setattr(args, key, value)
-                    elif key in vars(args) and value is not None:
-                        pass
 
         if 'hopfield_eval' in cfg:
             for key, value in cfg['hopfield_eval'].items():
                 arg_name = f'hopfield_eval_{key}'
-                if not hasattr(args, arg_name) or getattr(args, arg_name) is None:
+                if hasattr(args, arg_name):
                     setattr(args, arg_name, value)
-                elif arg_name in vars(args) and value is not None:
-                    pass
 
         if 'exp_path' not in vars(args) or args.exp_path is None:
             from generate_run_name import generate_run_name, get_exp_path, get_data_path
