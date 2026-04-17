@@ -15,10 +15,10 @@ training:
   logging_steps: 500
   warmup_steps: 10000
   early_stopping_patience: 500
-  seed: 142
+  seed: 143
 
 dataset:
-  data_name: "N8-K2V2-V62_1M"
+  data_path: "./data/N4-K2V2-V62_1M"
   tokenizer_path: "./tokenizers/kv_alphabet_62/"
 
 gradmem:
@@ -38,5 +38,5 @@ gradmem:
   inner_loss_weight: 0.5
 
 hopfield:
-  use_hopfield_memory: true
+  use_hopfield_memory: false
   hopfield_n_segments: 1
