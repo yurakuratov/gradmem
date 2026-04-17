@@ -325,7 +325,7 @@ def main():
         logger.info(f"\nRunning in debug mode: {module_name}.main('{actual_config_path}')")
         module.main(actual_config_path)
     else:
-        command = f"accelerate launch --config_file accelerate.yaml {script} --config {args.config}"
+        command = f"accelerate launch --mixed_precision 'no' --config_file accelerate.yaml {script} --config {args.config}"
         logger.info(f"\nRunning:\n{command}")
         result = subprocess.run(command, shell=True)
         sys.exit(result.returncode)
