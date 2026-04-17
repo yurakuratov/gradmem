@@ -478,14 +478,14 @@ class GradMemGPT(PreTrainedModel):
                 if hasattr(module, 'bias') and isinstance(getattr(module, 'bias', None), torch.Tensor):
                     bias = getattr(module, 'bias')
                     if bias.dim() == 4 and bias.dtype == torch.bool:
-                        saved[id(module)] = bias.clone()
-                        module.bias.fill_(True)
+                        saved[id(module)] = bias
+                        module.bias = torch.ones_like(bias)
         try:
             yield
         finally:
             for module in backbone.modules():
                 if id(module) in saved and hasattr(module, 'bias'):
-                    module.bias.copy_(saved[id(module)])
+                    module.bias = saved[id(module)]
 
     def _forward_full_attn(self, inputs_embeds):
         """Forward pass with full (non-causal) attention using the model's standard interface.
