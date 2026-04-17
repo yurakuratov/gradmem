@@ -39,19 +39,5 @@ gradmem:
 
 hopfield:
   use_hopfield_memory: true
-  hopfield_reset_interval: null  # is null it's set automatically
+  hopfield_n_segments: 1
   concat_hopfield_memory: false
-  hopfield_chunk_size: 448  # 7 * 64
-  hopfield_n_chunks: 2000
-  hopfield_pairs_per_sample: 8
-  hopfield_k_length: 2
-  hopfield_v_length: 2
-  hopfield_n_valid_chunks: 1
-
-hopfield_eval:
-  n_store_batches: "1,2,5,10,20"
-  eval_batch_size: 64
-  n_kv_pairs: 8
-  k_length: 2
-  v_length: 2
-  seed: 999

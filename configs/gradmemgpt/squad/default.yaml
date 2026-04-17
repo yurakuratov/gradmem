@@ -36,5 +36,5 @@ gradmem:
 # Hopfield-like external memory configuration
 hopfield:
   use_hopfield_memory: true
-  hopfield_reset_interval: null
+  hopfield_n_segments: 1
   concat_hopfield_memory: true

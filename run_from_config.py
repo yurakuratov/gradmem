@@ -41,7 +41,7 @@ SCRIPT_MAP = {
     'gradmemgpt_squad_qc_a': 'run_gradmemgpt_on_squad_qc_a.py',
     'gradmemgpt_babi': 'run_gradmemgpt_on_kv_retrieval.py',
     'gradmemgpt_phonebook': 'run_gradmemgpt_on_squad.py',
-    'gradmemgpt_hopfield': 'run_hopfield_kv_eval.py',
+    'gradmemgpt_hopfield': 'run_gradmemgpt_on_kv_retrieval.py',
     'rmt': 'run_rmt_on_kv_retrieval.py',
     'rmt_squad': 'run_rmt_on_squad.py',
     'rmt_phonebook': 'run_rmt_on_squad.py',
@@ -50,9 +50,6 @@ SCRIPT_MAP = {
 
 def detect_dataset_type(cfg, config_path=None) -> str:
     """Detect dataset type from config."""
-    if cfg.get('hopfield_eval'):
-        return 'hopfield'
-
     if config_path is not None:
         path_str = str(config_path).lower()
         if 'squad_cq_a' in path_str:
@@ -67,8 +64,6 @@ def detect_dataset_type(cfg, config_path=None) -> str:
             return 'phonebook'
 
     path_str = str(config_path or '').lower()
-    if 'hopfield' in path_str and 'kv_retrieval' in path_str:
-        return 'hopfield'
 
     dataset = cfg.get('dataset', {})
     data_name = dataset.get('data_name', '').lower()
@@ -89,8 +84,6 @@ def detect_dataset_type(cfg, config_path=None) -> str:
 
 def get_script_for_model(model_type: str, dataset_type: str = 'kv_retrieval') -> str:
     """Get the appropriate script for the model type."""
-    if dataset_type == 'hopfield' and model_type == 'gradmemgpt':
-        return SCRIPT_MAP['gradmemgpt_hopfield']
     key = f"{model_type}_{dataset_type}" if dataset_type != 'kv_retrieval' else model_type
     return SCRIPT_MAP.get(key, SCRIPT_MAP.get(model_type, 'run_gpt2_on_kv_retrieval.py'))
 
@@ -104,7 +97,7 @@ def apply_overrides(cfg: dict, overrides: dict) -> dict:
 
     for key, value in overrides.items():
         applied = False
-        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'hopfield_eval', 'dataset']:
+        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'dataset']:
             if section in result and key in result[section]:
                 result[section][key] = value
                 applied = True
@@ -206,16 +199,6 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
         if val is None or val is False:
             continue
         cli_key = key.replace('_', '-')
-        if val is True:
-            args.append(f'--{cli_key}')
-        else:
-            args.append(f'--{cli_key}={val}')
-
-    hopfield_eval = cfg.get('hopfield_eval', {})
-    for key, val in hopfield_eval.items():
-        if val is None or val is False:
-            continue
-        cli_key = f"hopfield-eval-{key.replace('_', '-')}"
         if val is True:
             args.append(f'--{cli_key}')
         else:

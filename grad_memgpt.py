@@ -66,7 +66,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  use_hopfield_memory=False,
                  hopfield_dim=0,
                  hopfield_proj_freeze=True,
-                 hopfield_reset_interval=None,
+                 hopfield_n_segments=1,
                  concat_hopfield_memory=False,
                  **kwargs):
         """
@@ -97,7 +97,7 @@ class GradMemGPTConfig(PretrainedConfig):
             use_hopfield_memory: bool, enable Hopfield-like external memory
             hopfield_dim: int, expanded dimension for Hopfield memory (0 = no expansion)
             hopfield_proj_freeze: bool, freeze random projection weights
-            hopfield_reset_interval: int, reset Hopfield memory every N steps (None = never)
+            hopfield_n_segments: int, number of segments to split context into for Hopfield storage (1 = whole context)
             concat_hopfield_memory: bool, concatenate Hopfield retrieved memory with original memory
         """
         super().__init__(**kwargs)
@@ -138,7 +138,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.use_hopfield_memory = use_hopfield_memory
         self.hopfield_dim = hopfield_dim
         self.hopfield_proj_freeze = hopfield_proj_freeze
-        self.hopfield_reset_interval = hopfield_reset_interval
+        self.hopfield_n_segments = hopfield_n_segments
         self.concat_hopfield_memory = concat_hopfield_memory
 
         # Validate mem_proj_mode settings
@@ -273,27 +273,12 @@ class GradMemGPT(PreTrainedModel):
         self.use_hopfield_memory = getattr(config, "use_hopfield_memory", False)
         self.hopfield_dim = getattr(config, "hopfield_dim", 0)
         self.hopfield_proj_freeze = getattr(config, "hopfield_proj_freeze", True)
-        self.hopfield_reset_interval = getattr(config, "hopfield_reset_interval", None)
+        self.hopfield_n_segments = getattr(config, "hopfield_n_segments", 1)
         self.concat_hopfield_memory = getattr(config, "concat_hopfield_memory", False)
 
         if self.use_hopfield_memory:
-            # Hopfield pattern dimension = n_mem_tokens * embedding_dim
-            # Hetero-associative: key dim = value dim (both compress memory tokens into one pattern)
-            hopfield_pattern_dim = self.n_mem_tokens * n_embd
-
-            # Hopfield weight matrix (Hebbian-style storage, hetero-associative: W += value.T @ key)
-            # Shape: [hopfield_pattern_dim, hopfield_pattern_dim]
-            # Initialize with zeros - Hebbian updates accumulate patterns
-            # Registered as buffer (not parameter) since it's updated via Hebbian rule, not gradient descent
-            self.register_buffer('W_hopfield', torch.zeros(hopfield_pattern_dim, hopfield_pattern_dim))
-
-            # Track steps for reset interval (not persisted in state_dict, not synced by DDP)
-            self.register_buffer('_hopfield_step_counter', torch.tensor(0, dtype=torch.long), persistent=False)
-            self.register_buffer('_hopfield_has_patterns', torch.tensor(False))
-        else:
-            self.register_buffer('W_hopfield', None)
-            self.register_buffer('_hopfield_step_counter', torch.tensor(0, dtype=torch.long), persistent=False)
-            self.register_buffer('_hopfield_has_patterns', torch.tensor(False))
+            if self.hopfield_n_segments < 1:
+                raise ValueError(f"hopfield_n_segments must be >= 1, got {self.hopfield_n_segments}")
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -560,7 +545,6 @@ class GradMemGPT(PreTrainedModel):
         pad_id = self.model.config.pad_token_id
         device = context_input_ids.device
         B = context_input_ids.size(0)
-        inner_loss = torch.tensor(0.0, device=device)
 
         # actual model inputs starts after mem tokens and ctrl tokens
         mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
@@ -572,259 +556,295 @@ class GradMemGPT(PreTrainedModel):
             read_st_batch = self.read_st.unsqueeze(0).expand(B, -1, -1)
             read_end_batch = self.read_end.unsqueeze(0).expand(B, -1, -1)
 
-        # make a copy of the memory that we'll update K times, manage gradients:
-        mem_batch = self.mem.unsqueeze(0).expand(B, -1, -1).clone()  # [B,M,d]
-        mem_batch_initial = mem_batch.clone()
+        # mem_batch_initial is always self.mem — used for Hopfield keys and as reset point
+        mem_batch_initial = self.mem.unsqueeze(0).expand(B, -1, -1).clone()  # [B,M,d]
 
-        # per-sample params for mem_proj:
+        # per-sample params for mem_proj (initialized from outer loop params, reset per segment)
         if self.mem_proj_mode == "per_sample":
             W_batch = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1).clone()
             b_batch = self.mem_proj.bias.unsqueeze(0).expand(B, -1).clone()
 
-        # handling gradients for meta-params:
-        if self.grad_mode == "none":
-            mem_batch = mem_batch.detach().requires_grad_(True)
-            if self.mem_proj_mode == "per_sample":
-                W_batch = W_batch.detach().requires_grad_(True)
-                b_batch = b_batch.detach().requires_grad_(True)
-        else:
-            mem_batch = mem_batch.requires_grad_(True)
-            if self.mem_proj_mode == "per_sample":
-                W_batch = W_batch.requires_grad_(True)
-                b_batch = b_batch.requires_grad_(True)
+        n_segments = self.hopfield_n_segments if self.use_hopfield_memory else 1
 
-        opt_state = {}                       # moments for stateless Adam
+        # Per-sample W_hopfield (fresh each forward call = reset per batch)
+        if self.use_hopfield_memory:
+            n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
+            hopfield_pattern_dim = self.n_mem_tokens * n_embd
+            W_hopfield = torch.zeros(B, hopfield_pattern_dim, hopfield_pattern_dim, device=device)
+            hopfield_stored = torch.zeros(B, dtype=torch.bool, device=device)
+
+        total_inner_loss = torch.tensor(0.0, device=device)
+        total_inner_steps = 0
+
         inner_loop_stats = {'inner_grad_norm_mean': torch.tensor(0.0, device=device),
                             'inner_grad_norm_max': torch.tensor(-1.0, device=device),
                             'inner_grad_norm_min': torch.tensor(1e06, device=device)}
+
+        # Track last segment's mem_batch for stats and as fallback for READ phase
+        last_mem_batch = mem_batch_initial
+
         # ---------------------------------------------------------------- #
-        # 1.  INNER loop on context. WRITE context to mem.
+        # 1.  INNER loop on context. WRITE context to mem, segment by segment.
         # ---------------------------------------------------------------- #
         ctx_emb = None
         if self.K and context_input_ids.ne(pad_id).any():
             # re‑enable autograd even if outer context is `no_grad`
             with torch.enable_grad():
-                # build ctx embedding once, then reuse it with updated mem
+                # build ctx embedding once
                 ctx_emb = self.model.get_input_embeddings()(context_input_ids)      # [B,S,d]
                 # lm labels: reconstructing the context, last mem/ctrl token predicts the first token of the context
                 lm_labels = context_input_ids.clone()
                 lm_labels[lm_labels == pad_id] = -100
                 # loss mask
                 mask = (lm_labels != -100)
-                # n real tokens per sample
-                seq_len = mask.sum(dim=1).clamp_min(1)
 
-                # pad to multiple of 32 for compatibility with JVP Flash Attention
-                if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
-                    pad_list = [0, -(ctx_emb.size(1) + mem_offset) % 32, 0, 0]
-                    mask = F.pad(mask, pad_list, "constant", 0)
-                    lm_labels = F.pad(lm_labels, pad_list, "constant", -100)
-                    ctx_emb = F.pad(ctx_emb, [0, 0] + pad_list, "constant", 0)
+                # Split context into segments (ceil-padded to equal size)
+                S = ctx_emb.size(1)
+                segment_size = (S + n_segments - 1) // n_segments  # ceil division
+                pad_len = segment_size * n_segments - S
 
-                for k in range(self.K):
-                    if self.mem_proj_mode == 'none':
-                        mem_inp = mem_batch
-                    elif self.mem_proj_mode == 'proj':
-                        mem_inp = self.mem_proj(mem_batch)
-                    else:  # per-sample
-                        mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
+                if pad_len > 0:
+                    ctx_emb = F.pad(ctx_emb, [0, 0, 0, pad_len], "constant", 0)
+                    mask = F.pad(mask, [0, pad_len], "constant", 0)
+                    lm_labels = F.pad(lm_labels, [0, pad_len], "constant", -100)
 
-                    if self.n_ctrl_tokens > 0:
-                        # add params that can control write operation to mem in inner loop
-                        x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch, ctx_emb], dim=1)
+                for seg_idx in range(n_segments):
+                    seg_start = seg_idx * segment_size
+                    seg_end = seg_start + segment_size
+                    seg_emb = ctx_emb[:, seg_start:seg_end, :]
+                    seg_mask = mask[:, seg_start:seg_end]
+                    seg_labels = lm_labels[:, seg_start:seg_end]
+
+                    # Per-sample: does this segment have any real tokens?
+                    seg_has_tokens = seg_mask.any(dim=1)  # [B]
+
+                    if not seg_has_tokens.any():
+                        continue
+
+                    seg_seq_len = seg_mask.sum(dim=1).clamp_min(1)  # [B]
+
+                    # Pad segment for JVP Flash Attention compatibility
+                    if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+                        seg_pad_len = -(seg_emb.size(1) + mem_offset) % 32
+                        seg_pad_list = [0, seg_pad_len, 0, 0]
+                        cur_seg_mask = F.pad(seg_mask, seg_pad_list, "constant", 0)
+                        cur_seg_labels = F.pad(seg_labels, seg_pad_list, "constant", -100)
+                        cur_seg_emb = F.pad(seg_emb, [0, 0] + seg_pad_list, "constant", 0)
                     else:
-                        x_ctx = torch.cat([mem_inp, ctx_emb], dim=1)    # [B,M+S,d]
+                        cur_seg_emb = seg_emb
+                        cur_seg_mask = seg_mask
+                        cur_seg_labels = seg_labels
 
-                    if self.use_write_head:
-                        # we do not need to compute read memory head logits here, we need only last hidden state
-                        # to get write head logits
-                        outs = get_backbone(self.model)(inputs_embeds=x_ctx, return_dict=True)
-                        h = outs.last_hidden_state                     # [B,M+S,V]
-                        h = h[:, mem_offset-1:, :]                     # [B,S,V]
-                        logits = self.write_head(h)
-                        del h
-                    else:
-                        outs = self.model(inputs_embeds=x_ctx, return_dict=True)
-                        logits = outs.logits                           # [B,M+S,V]
-                        logits = logits[:, mem_offset-1:, :]           # [B,S,V]
+                    # Reset mem_batch to initial for each segment
+                    mem_batch = self.mem.unsqueeze(0).expand(B, -1, -1).clone()  # [B,M,d]
 
-                    inner_loss = nn.functional.cross_entropy(
-                        logits[:, :-1].reshape(-1, logits.size(-1)),
-                        lm_labels.reshape(-1),
-                        ignore_index=-100,
-                        reduction='none',
-                    ).view(B, -1)
-                    # per_sample losses, make per-sample inner loss invariant to batch size B:
-                    # g_i = d inner_loss / d mem_i = d inner_loss_i / d mem_i
-                    inner_loss = (inner_loss * mask).sum(1) / seq_len
-                    inner_loss = inner_loss.sum()
-                    del outs, logits
+                    # Reset per-sample params for each segment
+                    if self.mem_proj_mode == "per_sample":
+                        W_batch = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1).clone()
+                        b_batch = self.mem_proj.bias.unsqueeze(0).expand(B, -1).clone()
 
-                    is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
-                    create_graph = is_second_order_step
-                    retain_graph = create_graph or (self.add_inner_loss_to_outer and (k == self.K - 1))
-                    # get inner loop gradients
-                    if self.mem_proj_mode == 'per_sample':
-                        g_mem, g_W, g_b = torch.autograd.grad(inner_loss, [mem_batch, W_batch, b_batch],
-                                                              create_graph=create_graph, retain_graph=retain_graph)
-                    else:
-                        g_mem = torch.autograd.grad(inner_loss, mem_batch,
-                                                    create_graph=create_graph, retain_graph=retain_graph)[0]
-
-                    # track inner grad norm (todo: move to _opt_step?, currently we compute g_norm twice)
-                    g_norm = g_mem.reshape(B, -1).norm(dim=1).detach()
-                    inner_loop_stats['inner_grad_norm_mean'] += g_norm.mean()
-                    inner_loop_stats['inner_grad_norm_max'] = max(inner_loop_stats['inner_grad_norm_max'], g_norm.max())
-                    inner_loop_stats['inner_grad_norm_min'] = min(inner_loop_stats['inner_grad_norm_min'], g_norm.min())
-
-                    if self.use_adam:
-                        mem_batch = self._adam_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), k + 1, self.lr)
-                        if self.mem_proj_mode == 'per_sample':
-                            W_batch = self._adam_step(W_batch, g_W, opt_state.setdefault('W', {}), k + 1, self.lr)
-                            b_batch = self._adam_step(b_batch, g_b, opt_state.setdefault('b', {}), k + 1, self.lr)
-                            raise NotImplementedError("Adam is not tested, be careful!")
-                    else:
-                        mem_batch = self._sgd_step(mem_batch, g_mem,
-                                                   clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
-                        if self.mem_proj_mode == 'per_sample':
-                            W_batch = self._sgd_step(W_batch, g_W,
-                                                     clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
-                            b_batch = self._sgd_step(b_batch, g_b,
-                                                     clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
-
-                    if self.grad_mode in ['none']:
+                    # handling gradients for meta-params:
+                    if self.grad_mode == "none":
                         mem_batch = mem_batch.detach().requires_grad_(True)
-                        if self.mem_proj_mode == 'per_sample':
+                        if self.mem_proj_mode == "per_sample":
                             W_batch = W_batch.detach().requires_grad_(True)
                             b_batch = b_batch.detach().requires_grad_(True)
-                    elif self.grad_mode in ['first', 'second']:
-                        pass  # do nothing, keep gradients flow
+                    else:
+                        mem_batch = mem_batch.requires_grad_(True)
+                        if self.mem_proj_mode == "per_sample":
+                            W_batch = W_batch.requires_grad_(True)
+                            b_batch = b_batch.requires_grad_(True)
 
-        if self.K:
-            inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
-            # log average inner loss
-            inner_loop_stats['inner_loss'] = inner_loss.detach() / B
-        # mem_batch: [B,M,d]
-        mem_norm = mem_batch.norm(dim=(1, 2)).detach()  # B
+                    # Reset Adam state per segment
+                    opt_state = {}
+
+                    for k in range(self.K):
+                        if self.mem_proj_mode == 'none':
+                            mem_inp = mem_batch
+                        elif self.mem_proj_mode == 'proj':
+                            mem_inp = self.mem_proj(mem_batch)
+                        else:  # per-sample
+                            mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
+
+                        if self.n_ctrl_tokens > 0:
+                            x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch, cur_seg_emb], dim=1)
+                        else:
+                            x_ctx = torch.cat([mem_inp, cur_seg_emb], dim=1)    # [B,M+seg_size,d]
+
+                        if self.use_write_head:
+                            outs = get_backbone(self.model)(inputs_embeds=x_ctx, return_dict=True)
+                            h = outs.last_hidden_state                     # [B,M+seg_size,V]
+                            h = h[:, mem_offset-1:, :]                     # [B,seg_size,V]
+                            logits = self.write_head(h)
+                            del h
+                        else:
+                            outs = self.model(inputs_embeds=x_ctx, return_dict=True)
+                            logits = outs.logits                           # [B,M+seg_size,V]
+                            logits = logits[:, mem_offset-1:, :]           # [B,seg_size,V]
+
+                        inner_loss = nn.functional.cross_entropy(
+                            logits[:, :-1].reshape(-1, logits.size(-1)),
+                            cur_seg_labels.reshape(-1),
+                            ignore_index=-100,
+                            reduction='none',
+                        ).view(B, -1)
+                        inner_loss = (inner_loss * cur_seg_mask).sum(1) / seg_seq_len
+                        inner_loss = inner_loss.sum()
+                        del outs, logits
+
+                        total_inner_loss = total_inner_loss + inner_loss
+                        total_inner_steps += 1
+
+                        is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
+                        create_graph = is_second_order_step
+                        # retain_graph must be True for ALL steps when add_inner_loss_to_outer
+                        # because total_inner_loss accumulates inner_loss from all steps
+                        retain_graph = create_graph or self.add_inner_loss_to_outer
+
+                        # get inner loop gradients
+                        if self.mem_proj_mode == 'per_sample':
+                            g_mem, g_W, g_b = torch.autograd.grad(inner_loss, [mem_batch, W_batch, b_batch],
+                                                                  create_graph=create_graph, retain_graph=retain_graph)
+                        else:
+                            g_mem = torch.autograd.grad(inner_loss, mem_batch,
+                                                        create_graph=create_graph, retain_graph=retain_graph)[0]
+
+                        # track inner grad norm
+                        g_norm = g_mem.reshape(B, -1).norm(dim=1).detach()
+                        inner_loop_stats['inner_grad_norm_mean'] += g_norm.mean()
+                        inner_loop_stats['inner_grad_norm_max'] = max(inner_loop_stats['inner_grad_norm_max'], g_norm.max())
+                        inner_loop_stats['inner_grad_norm_min'] = min(inner_loop_stats['inner_grad_norm_min'], g_norm.min())
+
+                        if self.use_adam:
+                            mem_batch = self._adam_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), k + 1, self.lr)
+                            if self.mem_proj_mode == 'per_sample':
+                                W_batch = self._adam_step(W_batch, g_W, opt_state.setdefault('W', {}), k + 1, self.lr)
+                                b_batch = self._adam_step(b_batch, g_b, opt_state.setdefault('b', {}), k + 1, self.lr)
+                                raise NotImplementedError("Adam is not tested, be careful!")
+                        else:
+                            mem_batch = self._sgd_step(mem_batch, g_mem,
+                                                       clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
+                            if self.mem_proj_mode == 'per_sample':
+                                W_batch = self._sgd_step(W_batch, g_W,
+                                                         clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
+                                b_batch = self._sgd_step(b_batch, g_b,
+                                                         clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
+
+                        if self.grad_mode in ['none']:
+                            mem_batch = mem_batch.detach().requires_grad_(True)
+                            if self.mem_proj_mode == 'per_sample':
+                                W_batch = W_batch.detach().requires_grad_(True)
+                                b_batch = b_batch.detach().requires_grad_(True)
+                        elif self.grad_mode in ['first', 'second']:
+                            pass  # do nothing, keep gradients flow
+
+                    # Per-segment Hopfield STORE (per-sample Hebbian update)
+                    if self.use_hopfield_memory and seg_has_tokens.any():
+                        with torch.no_grad():
+                            # Key: forward-pass compressed representation of this segment
+                            # Uses initial (pre-update) memory + segment with full attention
+                            if self.n_ctrl_tokens > 0:
+                                x_seg_comp = torch.cat([write_st_batch, mem_batch_initial, write_end_batch, seg_emb], dim=1)
+                            else:
+                                x_seg_comp = torch.cat([mem_batch_initial, seg_emb], dim=1)
+
+                            with self._disable_write_lora():
+                                outs_seg = self._forward_full_attn(x_seg_comp)
+                            seg_key = outs_seg.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                            del outs_seg
+
+                        # Value: gradient-updated mem_batch after inner loop on this segment
+                        value_pattern = mem_batch.detach().view(B, -1)  # [B, M*d]
+                        seg_key = seg_key.detach()
+
+                        # L2-normalize
+                        value_pattern = F.normalize(value_pattern, dim=-1)
+                        seg_key = F.normalize(seg_key, dim=-1)
+
+                        # Hebbian update: W_hopfield[b] += value[b] @ key[b].T
+                        # Mask out samples where this segment is all-padding
+                        update = torch.bmm(value_pattern.unsqueeze(2), seg_key.unsqueeze(1))  # [B, M*d, M*d]
+                        update = update * seg_has_tokens.unsqueeze(1).unsqueeze(2).float()
+                        W_hopfield = W_hopfield + update
+                        hopfield_stored = hopfield_stored | seg_has_tokens
+
+                    # Keep last segment's mem_batch for stats and READ phase fallback
+                    last_mem_batch = mem_batch
+
+        if total_inner_steps > 0:
+            inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / total_inner_steps
+            inner_loop_stats['inner_loss'] = (total_inner_loss / n_segments).detach() / B
+        # mem stats from last segment
+        mem_norm = last_mem_batch.norm(dim=(1, 2)).detach()  # B
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
         inner_loop_stats['mem_norm_max'] = mem_norm.max()
         inner_loop_stats['mem_norm_min'] = mem_norm.min()
-        # log how mem has changed from initial state to state after inner loop
-        detla_mem_norm = (mem_batch - mem_batch_initial).detach().norm(dim=(1, 2))
+        detla_mem_norm = (last_mem_batch - mem_batch_initial).detach().norm(dim=(1, 2))
         inner_loop_stats['delta_mem_norm_mean'] = detla_mem_norm.mean()
         inner_loop_stats['delta_mem_norm_max'] = detla_mem_norm.max()
         inner_loop_stats['delta_mem_norm_min'] = detla_mem_norm.min()
-        if ctx_emb is not None:
-            del lm_labels
 
         qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
         # ---------------------------------------------------------------- #
-        # Hopfield-like external memory (if enabled)
+        # Hopfield RETRIEVE phase (if enabled)
         # ---------------------------------------------------------------- #
         hopfield_mem = None
-        if self.use_hopfield_memory and self.K:
-            has_context = ctx_emb is not None
-
-            # STORE phase: write patterns to W_hopfield (requires context)
-            if has_context:
-                # Value patterns = gradient-updated memory (detailed compression)
-                value_pattern = mem_batch.view(B, -1)  # [B, M*d]
-
-                # Context key = forward-pass compressed representation of context
-                # Uses initial (pre-update) memory + context with full (bidirectional) attention
-                # so memory tokens can attend to the context they are compressing
-                # This makes the memory content-addressable by context content
-                with torch.no_grad():
-                    if self.n_ctrl_tokens > 0:
-                        x_ctx_comp = torch.cat([write_st_batch, mem_batch_initial, write_end_batch, ctx_emb], dim=1)
-                    else:
-                        x_ctx_comp = torch.cat([mem_batch_initial, ctx_emb], dim=1)
-
-                    with self._disable_write_lora():
-                        outs_ctx = self._forward_full_attn(x_ctx_comp)
-                    # Extract hidden states at memory token positions as context key
-                    context_key = outs_ctx.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
-                    del outs_ctx
-
-                # L2-normalize store patterns
-                value_pattern = F.normalize(value_pattern, dim=-1)
-                context_key = F.normalize(context_key, dim=-1)
-
-                # Hetero-associative Hebbian storage: W += value.T @ context_key
-                # Maps from context_key (content-based index) to value (detailed gradient-based memory)
-                # This allows retrieval of context by content similarity:
-                # similar queries will produce similar query_keys, matching stored context_keys
-                hopfield_update = torch.bmm(value_pattern.unsqueeze(2), context_key.unsqueeze(1))  # [B, M*d, M*d]
-                with torch.no_grad():
-                    self.W_hopfield += hopfield_update.sum(0)
-                    self._hopfield_has_patterns.fill_(True)
-
-                # Increment step counter for reset interval
-                self._hopfield_step_counter.add_(1)
-                if self.hopfield_reset_interval is not None and self._hopfield_step_counter >= self.hopfield_reset_interval:
-                    with torch.no_grad():
-                        self.W_hopfield.zero_()
-                    self._hopfield_step_counter.zero_()
-                    self._hopfield_has_patterns.fill_(False)
-
-            # RETRIEVE phase: read patterns from W_hopfield
-            if self._hopfield_has_patterns:
-                # Query key = forward-pass compressed representation of query
-                # Uses initial (pre-update) memory + query with full attention
-                # so memory tokens can attend bidirectionally to the initial memory
-                with torch.no_grad():
-                    if self.n_ctrl_tokens > 0:
-                        x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
-                    else:
-                        x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
-
-                    with self._disable_write_lora():
-                        outs_q = self._forward_full_attn(x_qry_comp)
-                    # Extract hidden states at memory token positions as query key
-                    query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
-                    del outs_q
-
-                query_key = F.normalize(query_key, dim=-1)
-
-                # Hetero-associative retrieval: given query_key, retrieve associated value
-                # query_key @ W ≈ weighted sum of stored values whose context_keys match the query
-                retrieved_pattern = query_key @ self.W_hopfield.detach()  # [B, M*d]
-
-                # Reshape back to individual memory tokens: [B, M, d]
-                assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)
-
-                # Optionally concatenate with original memory
-                if self.concat_hopfield_memory:
-                    hopfield_mem = assoc_memory
+        if self.use_hopfield_memory and self.K and hopfield_stored.any():
+            with torch.no_grad():
+                if self.n_ctrl_tokens > 0:
+                    x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
                 else:
-                    # Use only Hopfield-retrieved memory
-                    mem_batch = assoc_memory
+                    x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
 
-        del ctx_emb
+                with self._disable_write_lora():
+                    outs_q = self._forward_full_attn(x_qry_comp)
+                query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                del outs_q
+
+            query_key = F.normalize(query_key, dim=-1)
+
+            # Per-sample retrieval: query_key[b] @ W_hopfield[b]
+            retrieved_pattern = torch.bmm(query_key.unsqueeze(1), W_hopfield.detach()).squeeze(1)  # [B, M*d]
+
+            # Reshape back to individual memory tokens: [B, M, d]
+            assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)
+
+            if self.concat_hopfield_memory:
+                hopfield_mem = assoc_memory
+            else:
+                last_mem_batch = assoc_memory
+
+        if ctx_emb is not None:
+            del lm_labels
 
         # ---------------------------------------------------------------- #
         # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
         # ---------------------------------------------------------------- #
+        mem_batch = last_mem_batch
+
         # Determine memory input for READ phase
         if hopfield_mem is not None and self.concat_hopfield_memory:
-            # Concatenate Hopfield-retrieved memory with original memory
+            # Concatenate Hopfield-retrieved memory with projected initial memory
             if self.mem_proj_mode == "none":
-                mem_for_concat = mem_batch
+                mem_for_concat = mem_batch_initial
             elif self.mem_proj_mode == "proj":
-                mem_for_concat = self.mem_proj(mem_batch)
+                mem_for_concat = self.mem_proj(mem_batch_initial)
             else:  # "per_sample"
-                mem_for_concat = self._apply_linear(mem_batch, W_batch, b_batch)
+                W_concat = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1)
+                b_concat = self.mem_proj.bias.unsqueeze(0).expand(B, -1)
+                mem_for_concat = self._apply_linear(mem_batch_initial, W_concat, b_concat)
             mem_inp = torch.cat([hopfield_mem, mem_for_concat], dim=1)
-            # Adjust mem_offset for concatenated memory (need to handle both memory sections)
             read_mem_offset = self.n_mem_tokens * 2 + self.n_ctrl_tokens * 2
         else:
-            # Original behavior
+            # mem_batch is either Hopfield-retrieved (replace mode) or last segment's inner-loop mem
             if self.mem_proj_mode == "none":
                 mem_inp = mem_batch
             elif self.mem_proj_mode == "proj":
                 mem_inp = self.mem_proj(mem_batch)
             else:  # "per_sample"
-                mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
+                W_read = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1)
+                b_read = self.mem_proj.bias.unsqueeze(0).expand(B, -1)
+                mem_inp = self._apply_linear(mem_batch, W_read, b_read)
             read_mem_offset = mem_offset
 
         if self.n_ctrl_tokens > 0:
@@ -846,8 +866,10 @@ class GradMemGPT(PreTrainedModel):
         if return_mem:
             output['mem'] = mem_batch
             if self.mem_proj_mode == "per_sample":
-                output['W'] = W_batch
-                output['b'] = b_batch
+                W_out = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1)
+                b_out = self.mem_proj.bias.unsqueeze(0).expand(B, -1)
+                output['W'] = W_out
+                output['b'] = b_out
 
         if labels is None:
             return output
@@ -861,8 +883,8 @@ class GradMemGPT(PreTrainedModel):
         )
 
         output['inner_loop_stats']['target_loss'] = target_loss.detach()
-        if self.add_inner_loss_to_outer:
-            inner_loss_mean = inner_loss / B
+        if self.add_inner_loss_to_outer and total_inner_steps > 0:
+            inner_loss_mean = (total_inner_loss / n_segments) / B
             combined_loss = target_loss + self.inner_loss_weight * inner_loss_mean
         else:
             combined_loss = target_loss
