@@ -37,4 +37,3 @@ gradmem:
 hopfield:
   use_hopfield_memory: true
   hopfield_n_segments: 1
-  concat_hopfield_memory: true

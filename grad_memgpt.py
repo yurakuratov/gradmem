@@ -64,10 +64,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  add_inner_loss_to_outer=False,
                  inner_loss_weight=None,
                  use_hopfield_memory=False,
-                 hopfield_dim=0,
-                 hopfield_proj_freeze=True,
                  hopfield_n_segments=1,
-                 concat_hopfield_memory=False,
                  **kwargs):
         """
         Args:
@@ -95,10 +92,7 @@ class GradMemGPTConfig(PretrainedConfig):
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
             use_hopfield_memory: bool, enable Hopfield-like external memory
-            hopfield_dim: int, expanded dimension for Hopfield memory (0 = no expansion)
-            hopfield_proj_freeze: bool, freeze random projection weights
             hopfield_n_segments: int, number of segments to split context into for Hopfield storage (1 = whole context)
-            concat_hopfield_memory: bool, concatenate Hopfield retrieved memory with original memory
         """
         super().__init__(**kwargs)
 
@@ -136,10 +130,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.add_inner_loss_to_outer = add_inner_loss_to_outer
         self.inner_loss_weight = inner_loss_weight
         self.use_hopfield_memory = use_hopfield_memory
-        self.hopfield_dim = hopfield_dim
-        self.hopfield_proj_freeze = hopfield_proj_freeze
         self.hopfield_n_segments = hopfield_n_segments
-        self.concat_hopfield_memory = concat_hopfield_memory
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -271,10 +262,7 @@ class GradMemGPT(PreTrainedModel):
 
         # Hopfield-like external memory
         self.use_hopfield_memory = getattr(config, "use_hopfield_memory", False)
-        self.hopfield_dim = getattr(config, "hopfield_dim", 0)
-        self.hopfield_proj_freeze = getattr(config, "hopfield_proj_freeze", True)
         self.hopfield_n_segments = getattr(config, "hopfield_n_segments", 1)
-        self.concat_hopfield_memory = getattr(config, "concat_hopfield_memory", False)
 
         if self.use_hopfield_memory:
             if self.hopfield_n_segments < 1:
@@ -788,7 +776,6 @@ class GradMemGPT(PreTrainedModel):
         # ---------------------------------------------------------------- #
         # Hopfield RETRIEVE phase (if enabled)
         # ---------------------------------------------------------------- #
-        hopfield_mem = None
         if self.use_hopfield_memory and self.K and hopfield_stored.any():
             with torch.no_grad():
                 if self.n_ctrl_tokens > 0:
@@ -808,11 +795,7 @@ class GradMemGPT(PreTrainedModel):
 
             # Reshape back to individual memory tokens: [B, M, d]
             assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)
-
-            if self.concat_hopfield_memory:
-                hopfield_mem = assoc_memory
-            else:
-                last_mem_batch = assoc_memory
+            last_mem_batch = assoc_memory
 
         if ctx_emb is not None:
             del lm_labels
@@ -822,30 +805,15 @@ class GradMemGPT(PreTrainedModel):
         # ---------------------------------------------------------------- #
         mem_batch = last_mem_batch
 
-        # Determine memory input for READ phase
-        if hopfield_mem is not None and self.concat_hopfield_memory:
-            # Concatenate Hopfield-retrieved memory with projected initial memory
-            if self.mem_proj_mode == "none":
-                mem_for_concat = mem_batch_initial
-            elif self.mem_proj_mode == "proj":
-                mem_for_concat = self.mem_proj(mem_batch_initial)
-            else:  # "per_sample"
-                W_concat = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1)
-                b_concat = self.mem_proj.bias.unsqueeze(0).expand(B, -1)
-                mem_for_concat = self._apply_linear(mem_batch_initial, W_concat, b_concat)
-            mem_inp = torch.cat([hopfield_mem, mem_for_concat], dim=1)
-            read_mem_offset = self.n_mem_tokens * 2 + self.n_ctrl_tokens * 2
-        else:
-            # mem_batch is either Hopfield-retrieved (replace mode) or last segment's inner-loop mem
-            if self.mem_proj_mode == "none":
-                mem_inp = mem_batch
-            elif self.mem_proj_mode == "proj":
-                mem_inp = self.mem_proj(mem_batch)
-            else:  # "per_sample"
-                W_read = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1)
-                b_read = self.mem_proj.bias.unsqueeze(0).expand(B, -1)
-                mem_inp = self._apply_linear(mem_batch, W_read, b_read)
-            read_mem_offset = mem_offset
+        if self.mem_proj_mode == "none":
+            mem_inp = mem_batch
+        elif self.mem_proj_mode == "proj":
+            mem_inp = self.mem_proj(mem_batch)
+        else:  # "per_sample"
+            W_read = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1)
+            b_read = self.mem_proj.bias.unsqueeze(0).expand(B, -1)
+            mem_inp = self._apply_linear(mem_batch, W_read, b_read)
+        read_mem_offset = mem_offset
 
         if self.n_ctrl_tokens > 0:
             # add params that can control read operation from mem

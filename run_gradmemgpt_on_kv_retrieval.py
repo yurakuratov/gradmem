@@ -219,10 +219,7 @@ class ExperimentArgs:
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
     inner_loss_weight: Optional[float] = field(default=None)
     use_hopfield_memory: Optional[bool] = field(default=False)
-    hopfield_dim: Optional[int] = field(default=0)
-    hopfield_proj_freeze: Optional[bool] = field(default=True)
     hopfield_n_segments: Optional[int] = field(default=1)
-    concat_hopfield_memory: Optional[bool] = field(default=False)
 
 
 def main(config_path: Optional[str] = None):
@@ -336,11 +333,8 @@ def main(config_path: Optional[str] = None):
                                       attn_implementation=args.attn_implementation,
                                       add_inner_loss_to_outer=args.add_inner_loss_to_outer,
                                       inner_loss_weight=args.inner_loss_weight,
-                                      use_hopfield_memory=args.use_hopfield_memory,
-                                      hopfield_dim=args.hopfield_dim,
-                                      hopfield_proj_freeze=args.hopfield_proj_freeze,
-                                      hopfield_n_segments=args.hopfield_n_segments,
-                                       concat_hopfield_memory=args.concat_hopfield_memory)
+use_hopfield_memory=args.use_hopfield_memory,
+                                       hopfield_n_segments=args.hopfield_n_segments)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
