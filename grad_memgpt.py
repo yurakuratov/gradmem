@@ -69,6 +69,8 @@ class GradMemGPTConfig(PretrainedConfig):
                  hopfield_beta_init=1.0,
                  use_separate_hopfield_mem=False,
                  hopfield_proj_dim=None,
+                 hopfield_direct_query=False,
+                 hopfield_value_as_key=False,
                  **kwargs):
         """
         Args:
@@ -101,6 +103,8 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
              hopfield_beta_init: float, initial value for learnable beta parameter (only used with "beta_softmax")
              use_separate_hopfield_mem: bool, use separate initial memory tokens for key/query/value roles in Hopfield
              hopfield_proj_dim: int|None, dimension for key/query projection layers (None = no projection)
+             hopfield_direct_query: bool, skip forward pass for query key, use self.mem_query directly (requires use_separate_hopfield_mem)
+             hopfield_value_as_key: bool, use value pattern as key in Hopfield STORE instead of forward pass
          """
         super().__init__(**kwargs)
 
@@ -143,6 +147,8 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
         self.hopfield_beta_init = hopfield_beta_init
         self.use_separate_hopfield_mem = use_separate_hopfield_mem
         self.hopfield_proj_dim = hopfield_proj_dim
+        self.hopfield_direct_query = hopfield_direct_query
+        self.hopfield_value_as_key = hopfield_value_as_key
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -151,6 +157,10 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
             f"hopfield_retrieval_mode must be 'raw', 'softmax', or 'beta_softmax', got '{hopfield_retrieval_mode}'"
         assert not (use_separate_hopfield_mem and not use_hopfield_memory), \
             "use_separate_hopfield_mem requires use_hopfield_memory=True"
+        assert not (hopfield_direct_query and not use_separate_hopfield_mem), \
+            "hopfield_direct_query requires use_separate_hopfield_mem=True"
+        assert not (hopfield_value_as_key and not use_hopfield_memory), \
+            "hopfield_value_as_key requires use_hopfield_memory=True"
         if hopfield_proj_dim is not None:
             assert hopfield_proj_dim > 0, f"hopfield_proj_dim must be positive, got {hopfield_proj_dim}"
 
@@ -285,6 +295,8 @@ class GradMemGPT(PreTrainedModel):
         self.hopfield_beta_init = getattr(config, "hopfield_beta_init", 1.0)
         self.use_separate_hopfield_mem = getattr(config, "use_separate_hopfield_mem", False)
         self.hopfield_proj_dim = getattr(config, "hopfield_proj_dim", None)
+        self.hopfield_direct_query = getattr(config, "hopfield_direct_query", False)
+        self.hopfield_value_as_key = getattr(config, "hopfield_value_as_key", False)
 
         if self.use_hopfield_memory:
             if self.hopfield_n_segments < 1:
@@ -772,29 +784,33 @@ class GradMemGPT(PreTrainedModel):
 
                     # Per-segment Hopfield STORE
                     if self.use_hopfield_memory and seg_has_tokens.any():
-                        # Key: forward-pass compressed representation of this segment
-                        # Choose memory prefix: separate mem_key or shared mem_batch_initial
-                        if self.use_separate_hopfield_mem:
-                            mem_key_prefix = self.mem_key.unsqueeze(0).expand(B, -1, -1)
-                        else:
-                            mem_key_prefix = mem_batch_initial
+                        # Value: gradient-connected mem_batch after inner loop on this segment
+                        value_pattern = mem_batch.view(B, -1)  # [B, M*d]
 
-                        if self.n_ctrl_tokens > 0:
-                            x_seg_comp = torch.cat([write_st_batch, mem_key_prefix, write_end_batch, seg_emb], dim=1)
+                        if self.hopfield_value_as_key:
+                            # Use value pattern directly as key (no forward pass)
+                            seg_key = value_pattern
                         else:
-                            x_seg_comp = torch.cat([mem_key_prefix, seg_emb], dim=1)
+                            # Key: forward-pass compressed representation of this segment
+                            # Choose memory prefix: separate mem_key or shared mem_batch_initial
+                            if self.use_separate_hopfield_mem:
+                                mem_key_prefix = self.mem_key.unsqueeze(0).expand(B, -1, -1)
+                            else:
+                                mem_key_prefix = mem_batch_initial
 
-                        with self._disable_write_lora():
-                            outs_seg = self._forward_full_attn(x_seg_comp)
-                        seg_key = outs_seg.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
-                        del outs_seg
+                            if self.n_ctrl_tokens > 0:
+                                x_seg_comp = torch.cat([write_st_batch, mem_key_prefix, write_end_batch, seg_emb], dim=1)
+                            else:
+                                x_seg_comp = torch.cat([mem_key_prefix, seg_emb], dim=1)
+
+                            with self._disable_write_lora():
+                                outs_seg = self._forward_full_attn(x_seg_comp)
+                            seg_key = outs_seg.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                            del outs_seg
 
                         # Apply key projection if configured
                         if self.hopfield_proj_dim is not None:
                             seg_key = self.hopfield_key_proj(seg_key)
-
-                        # Value: gradient-connected mem_batch after inner loop on this segment
-                        value_pattern = mem_batch.view(B, -1)  # [B, M*d]
 
                         # L2-normalize keys only (values keep their magnitude)
                         seg_key = F.normalize(seg_key, dim=-1)
@@ -827,21 +843,25 @@ class GradMemGPT(PreTrainedModel):
         # Hopfield RETRIEVE phase (if enabled)
         # ---------------------------------------------------------------- #
         if self.use_hopfield_memory and self.K and hopfield_stored.any():
-            # Compute query key with gradients (enables learning retrieval)
-            if self.use_separate_hopfield_mem:
-                mem_query_prefix = self.mem_query.unsqueeze(0).expand(B, -1, -1)
+            if self.hopfield_direct_query:
+                # Use self.mem_query directly as query key (no forward pass)
+                query_key = self.mem_query.unsqueeze(0).expand(B, -1, -1).reshape(B, -1)  # [B, M*d]
             else:
-                mem_query_prefix = mem_batch_initial
+                # Compute query key with gradients (enables learning retrieval)
+                if self.use_separate_hopfield_mem:
+                    mem_query_prefix = self.mem_query.unsqueeze(0).expand(B, -1, -1)
+                else:
+                    mem_query_prefix = mem_batch_initial
 
-            if self.n_ctrl_tokens > 0:
-                x_qry_comp = torch.cat([read_st_batch, mem_query_prefix, read_end_batch, qry_emb], dim=1)
-            else:
-                x_qry_comp = torch.cat([mem_query_prefix, qry_emb], dim=1)
+                if self.n_ctrl_tokens > 0:
+                    x_qry_comp = torch.cat([read_st_batch, mem_query_prefix, read_end_batch, qry_emb], dim=1)
+                else:
+                    x_qry_comp = torch.cat([mem_query_prefix, qry_emb], dim=1)
 
-            with self._disable_write_lora():
-                outs_q = self._forward_full_attn(x_qry_comp)
-            query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
-            del outs_q
+                with self._disable_write_lora():
+                    outs_q = self._forward_full_attn(x_qry_comp)
+                query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                del outs_q
 
             # Apply query projection if configured
             if self.hopfield_proj_dim is not None:

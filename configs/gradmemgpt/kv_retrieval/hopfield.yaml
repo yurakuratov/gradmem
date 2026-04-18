@@ -40,7 +40,9 @@ gradmem:
 hopfield:
   use_hopfield_memory: true
   hopfield_n_segments: 2
-  hopfield_retrieval_mode: "softmax"  # raw | softmax | beta_softmax
+  hopfield_retrieval_mode: raw  # raw | softmax | beta_softmax
   hopfield_beta_init: 1.0
-  use_separate_hopfield_mem: false
-  hopfield_proj_dim: null
+  use_separate_hopfield_mem: true  # use separate M_0 values for value, key and query memory tokens
+  hopfield_proj_dim: null  # if null use M*d key/query size, otherwise add learnable key/query linear projections
+  hopfield_direct_query: False  # use only meta-learned query vector, skip forward pass for query
+  hopfield_value_as_key: False  # skip forward pass for key, use value_pattern or its projection as key
