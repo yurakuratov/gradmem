@@ -153,8 +153,8 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
-        assert hopfield_retrieval_mode in ("raw", "softmax", "beta_softmax"), \
-            f"hopfield_retrieval_mode must be 'raw', 'softmax', or 'beta_softmax', got '{hopfield_retrieval_mode}'"
+        assert hopfield_retrieval_mode in ("raw", "softmax", "beta_softmax", "mean"), \
+            f"hopfield_retrieval_mode must be 'raw', 'softmax', 'beta_softmax', or 'mean', got '{hopfield_retrieval_mode}'"
         assert not (use_separate_hopfield_mem and not use_hopfield_memory), \
             "use_separate_hopfield_mem requires use_hopfield_memory=True"
         assert not (hopfield_direct_query and not use_separate_hopfield_mem), \
@@ -843,56 +843,55 @@ class GradMemGPT(PreTrainedModel):
         # Hopfield RETRIEVE phase (if enabled)
         # ---------------------------------------------------------------- #
         if self.use_hopfield_memory and self.K and hopfield_stored.any():
-            if self.hopfield_direct_query:
-                # Use self.mem_query directly as query key (no forward pass)
-                query_key = self.mem_query.unsqueeze(0).expand(B, -1, -1).reshape(B, -1)  # [B, M*d]
-            else:
-                # Compute query key with gradients (enables learning retrieval)
-                if self.use_separate_hopfield_mem:
-                    mem_query_prefix = self.mem_query.unsqueeze(0).expand(B, -1, -1)
-                else:
-                    mem_query_prefix = mem_batch_initial
-
-                if self.n_ctrl_tokens > 0:
-                    x_qry_comp = torch.cat([read_st_batch, mem_query_prefix, read_end_batch, qry_emb], dim=1)
-                else:
-                    x_qry_comp = torch.cat([mem_query_prefix, qry_emb], dim=1)
-
-                with self._disable_write_lora():
-                    outs_q = self._forward_full_attn(x_qry_comp)
-                query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
-                del outs_q
-
-            # Apply query projection if configured
-            if self.hopfield_proj_dim is not None:
-                query_key = self.hopfield_query_proj(query_key)
-
-            # L2-normalize query key
-            query_key = F.normalize(query_key, dim=-1)
-
             # Stack stored keys and values for attention-based retrieval
             keys = torch.stack(stored_keys, dim=1)    # [B, n_stored, M*d]
             values = torch.stack(stored_values, dim=1)  # [B, n_stored, M*d]
             mask = torch.stack(stored_masks, dim=1)      # [B, n_stored]
 
-            # Compute attention scores: query_key @ keys^T
-            scores = torch.bmm(query_key.unsqueeze(1), keys.transpose(1, 2)).squeeze(1)  # [B, n_stored]
-
-            # Apply retrieval mode
-            if self.hopfield_retrieval_mode == "raw":
-                scores = scores * mask.float()
-                retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
-            elif self.hopfield_retrieval_mode == "softmax":
-                scores = scores.masked_fill(~mask.bool(), float('-inf'))
-                scores = F.softmax(scores, dim=-1)
-                retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
-            elif self.hopfield_retrieval_mode == "beta_softmax":
-                scores = scores * self.hopfield_beta
-                scores = scores.masked_fill(~mask.bool(), float('-inf'))
-                scores = F.softmax(scores, dim=-1)
-                retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
+            if self.hopfield_retrieval_mode == "mean":
+                # Average all stored value patterns with equal weight
+                weights = mask.float() / mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+                retrieved_pattern = (weights.unsqueeze(2) * values).sum(dim=1)  # [B, M*d]
             else:
-                raise ValueError(f"Unknown hopfield_retrieval_mode: {self.hopfield_retrieval_mode}")
+                if self.hopfield_direct_query:
+                    query_key = self.mem_query.unsqueeze(0).expand(B, -1, -1).reshape(B, -1)  # [B, M*d]
+                else:
+                    if self.use_separate_hopfield_mem:
+                        mem_query_prefix = self.mem_query.unsqueeze(0).expand(B, -1, -1)
+                    else:
+                        mem_query_prefix = mem_batch_initial
+
+                    if self.n_ctrl_tokens > 0:
+                        x_qry_comp = torch.cat([read_st_batch, mem_query_prefix, read_end_batch, qry_emb], dim=1)
+                    else:
+                        x_qry_comp = torch.cat([mem_query_prefix, qry_emb], dim=1)
+
+                    with self._disable_write_lora():
+                        outs_q = self._forward_full_attn(x_qry_comp)
+                    query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                    del outs_q
+
+                if self.hopfield_proj_dim is not None:
+                    query_key = self.hopfield_query_proj(query_key)
+
+                query_key = F.normalize(query_key, dim=-1)
+
+                scores = torch.bmm(query_key.unsqueeze(1), keys.transpose(1, 2)).squeeze(1)  # [B, n_stored]
+
+                if self.hopfield_retrieval_mode == "raw":
+                    scores = scores * mask.float()
+                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
+                elif self.hopfield_retrieval_mode == "softmax":
+                    scores = scores.masked_fill(~mask.bool(), float('-inf'))
+                    scores = F.softmax(scores, dim=-1)
+                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
+                elif self.hopfield_retrieval_mode == "beta_softmax":
+                    scores = scores * self.hopfield_beta
+                    scores = scores.masked_fill(~mask.bool(), float('-inf'))
+                    scores = F.softmax(scores, dim=-1)
+                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
+                else:
+                    raise ValueError(f"Unknown hopfield_retrieval_mode: {self.hopfield_retrieval_mode}")
 
             # Handle samples with no stored segments: fall back to initial memory
             if not hopfield_stored.all():
