@@ -38,5 +38,7 @@ gradmem:
   inner_loss_weight: 0.5
 
 hopfield:
-  use_hopfield_memory: false
-  hopfield_n_segments: 1
+  use_hopfield_memory: true
+  hopfield_n_segments: 2
+  hopfield_retrieval_mode: "softmax"
+  hopfield_beta_init: 1.0

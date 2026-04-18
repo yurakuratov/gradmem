@@ -65,6 +65,8 @@ class GradMemGPTConfig(PretrainedConfig):
                  inner_loss_weight=None,
                  use_hopfield_memory=False,
                  hopfield_n_segments=1,
+                 hopfield_retrieval_mode="softmax",
+                 hopfield_beta_init=1.0,
                  **kwargs):
         """
         Args:
@@ -91,9 +93,11 @@ class GradMemGPTConfig(PretrainedConfig):
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
-            use_hopfield_memory: bool, enable Hopfield-like external memory
-            hopfield_n_segments: int, number of segments to split context into for Hopfield storage (1 = whole context)
-        """
+use_hopfield_memory: bool, enable Hopfield-like external memory
+             hopfield_n_segments: int, number of segments to split context into for Hopfield storage (1 = whole context)
+             hopfield_retrieval_mode: str, retrieval mode ("raw", "softmax", "beta_softmax")
+             hopfield_beta_init: float, initial value for learnable beta parameter (only used with "beta_softmax")
+         """
         super().__init__(**kwargs)
 
         if pretrained_model is not None:
@@ -135,6 +139,8 @@ class GradMemGPTConfig(PretrainedConfig):
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
+        assert hopfield_retrieval_mode in ("raw", "softmax", "beta_softmax"), \
+            f"hopfield_retrieval_mode must be 'raw', 'softmax', or 'beta_softmax', got '{hopfield_retrieval_mode}'"
 
 
 class GradMemGPT(PreTrainedModel):
@@ -263,10 +269,14 @@ class GradMemGPT(PreTrainedModel):
         # Hopfield-like external memory
         self.use_hopfield_memory = getattr(config, "use_hopfield_memory", False)
         self.hopfield_n_segments = getattr(config, "hopfield_n_segments", 1)
+        self.hopfield_retrieval_mode = getattr(config, "hopfield_retrieval_mode", "softmax")
+        self.hopfield_beta_init = getattr(config, "hopfield_beta_init", 1.0)
 
         if self.use_hopfield_memory:
             if self.hopfield_n_segments < 1:
                 raise ValueError(f"hopfield_n_segments must be >= 1, got {self.hopfield_n_segments}")
+            if self.hopfield_retrieval_mode == "beta_softmax":
+                self.hopfield_beta = nn.Parameter(torch.tensor(self.hopfield_beta_init))
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -554,11 +564,11 @@ class GradMemGPT(PreTrainedModel):
 
         n_segments = self.hopfield_n_segments if self.use_hopfield_memory else 1
 
-        # Per-sample W_hopfield (fresh each forward call = reset per batch)
+        # Hopfield memory storage (fresh each forward call)
         if self.use_hopfield_memory:
-            n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
-            hopfield_pattern_dim = self.n_mem_tokens * n_embd
-            W_hopfield = torch.zeros(B, hopfield_pattern_dim, hopfield_pattern_dim, device=device)
+            stored_keys = []
+            stored_values = []
+            stored_masks = []
             hopfield_stored = torch.zeros(B, dtype=torch.bool, device=device)
 
         total_inner_loss_detached = torch.tensor(0.0, device=device)
@@ -733,34 +743,30 @@ class GradMemGPT(PreTrainedModel):
                     last_segment_inner_loss = inner_loss
                     n_segments_with_context += 1
 
-                    # Per-segment Hopfield STORE (per-sample Hebbian update)
+                    # Per-segment Hopfield STORE
                     if self.use_hopfield_memory and seg_has_tokens.any():
-                        with torch.no_grad():
-                            # Key: forward-pass compressed representation of this segment
-                            # Uses initial (pre-update) memory + segment with full attention
-                            if self.n_ctrl_tokens > 0:
-                                x_seg_comp = torch.cat([write_st_batch, mem_batch_initial, write_end_batch, seg_emb], dim=1)
-                            else:
-                                x_seg_comp = torch.cat([mem_batch_initial, seg_emb], dim=1)
+                        # Key: forward-pass compressed representation of this segment
+                        # Uses initial (pre-update) memory + segment with full attention
+                        if self.n_ctrl_tokens > 0:
+                            x_seg_comp = torch.cat([write_st_batch, mem_batch_initial, write_end_batch, seg_emb], dim=1)
+                        else:
+                            x_seg_comp = torch.cat([mem_batch_initial, seg_emb], dim=1)
 
-                            with self._disable_write_lora():
-                                outs_seg = self._forward_full_attn(x_seg_comp)
-                            seg_key = outs_seg.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
-                            del outs_seg
+                        with self._disable_write_lora():
+                            outs_seg = self._forward_full_attn(x_seg_comp)
+                        seg_key = outs_seg.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                        del outs_seg
 
-                        # Value: gradient-updated mem_batch after inner loop on this segment
-                        value_pattern = mem_batch.detach().view(B, -1)  # [B, M*d]
-                        seg_key = seg_key.detach()
+                        # Value: gradient-connected mem_batch after inner loop on this segment
+                        value_pattern = mem_batch.view(B, -1)  # [B, M*d]
 
-                        # L2-normalize
-                        value_pattern = F.normalize(value_pattern, dim=-1)
+                        # L2-normalize keys only (values keep their magnitude)
                         seg_key = F.normalize(seg_key, dim=-1)
 
-                        # Hebbian update: W_hopfield[b] += value[b] @ key[b].T
-                        # Mask out samples where this segment is all-padding
-                        update = torch.bmm(value_pattern.unsqueeze(2), seg_key.unsqueeze(1))  # [B, M*d, M*d]
-                        update = update * seg_has_tokens.unsqueeze(1).unsqueeze(2).float()
-                        W_hopfield = W_hopfield + update
+                        # Store for attention-based retrieval
+                        stored_keys.append(seg_key)
+                        stored_values.append(value_pattern)
+                        stored_masks.append(seg_has_tokens)
                         hopfield_stored = hopfield_stored | seg_has_tokens
 
                     # Keep last segment's mem_batch for stats and READ phase fallback
@@ -785,21 +791,51 @@ class GradMemGPT(PreTrainedModel):
         # Hopfield RETRIEVE phase (if enabled)
         # ---------------------------------------------------------------- #
         if self.use_hopfield_memory and self.K and hopfield_stored.any():
-            with torch.no_grad():
-                if self.n_ctrl_tokens > 0:
-                    x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
-                else:
-                    x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
+            # Compute query key with gradients (enables learning retrieval)
+            if self.n_ctrl_tokens > 0:
+                x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
+            else:
+                x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
 
-                with self._disable_write_lora():
-                    outs_q = self._forward_full_attn(x_qry_comp)
-                query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
-                del outs_q
+            with self._disable_write_lora():
+                outs_q = self._forward_full_attn(x_qry_comp)
+            query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+            del outs_q
 
+            # L2-normalize query key
             query_key = F.normalize(query_key, dim=-1)
 
-            # Per-sample retrieval: query_key[b] @ W_hopfield[b]
-            retrieved_pattern = torch.bmm(query_key.unsqueeze(1), W_hopfield.detach()).squeeze(1)  # [B, M*d]
+            # Stack stored keys and values for attention-based retrieval
+            keys = torch.stack(stored_keys, dim=1)    # [B, n_stored, M*d]
+            values = torch.stack(stored_values, dim=1)  # [B, n_stored, M*d]
+            mask = torch.stack(stored_masks, dim=1)      # [B, n_stored]
+
+            # Compute attention scores: query_key @ keys^T
+            scores = torch.bmm(query_key.unsqueeze(1), keys.transpose(1, 2)).squeeze(1)  # [B, n_stored]
+
+            # Apply retrieval mode
+            if self.hopfield_retrieval_mode == "raw":
+                scores = scores * mask.float()
+                retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
+            elif self.hopfield_retrieval_mode == "softmax":
+                scores = scores.masked_fill(~mask.bool(), float('-inf'))
+                scores = F.softmax(scores, dim=-1)
+                retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
+            elif self.hopfield_retrieval_mode == "beta_softmax":
+                scores = scores * self.hopfield_beta
+                scores = scores.masked_fill(~mask.bool(), float('-inf'))
+                scores = F.softmax(scores, dim=-1)
+                retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
+            else:
+                raise ValueError(f"Unknown hopfield_retrieval_mode: {self.hopfield_retrieval_mode}")
+
+            # Handle samples with no stored segments: fall back to initial memory
+            if not hopfield_stored.all():
+                retrieved_pattern = torch.where(
+                    hopfield_stored.unsqueeze(1),
+                    retrieved_pattern,
+                    mem_batch_initial.view(B, -1),
+                )
 
             # Reshape back to individual memory tokens: [B, M, d]
             assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)
