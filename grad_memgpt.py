@@ -71,6 +71,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  hopfield_proj_dim=None,
                  hopfield_direct_query=False,
                  hopfield_value_as_key=False,
+                 hopfield_forward_value=False,
                  **kwargs):
         """
         Args:
@@ -105,6 +106,7 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
              hopfield_proj_dim: int|None, dimension for key/query projection layers (None = no projection)
              hopfield_direct_query: bool, skip forward pass for query key, use self.mem_query directly (requires use_separate_hopfield_mem)
              hopfield_value_as_key: bool, use value pattern as key in Hopfield STORE instead of forward pass
+             hopfield_forward_value: bool, compute value pattern via forward pass (useful when K=0, no inner loop updates)
          """
         super().__init__(**kwargs)
 
@@ -149,6 +151,7 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
         self.hopfield_proj_dim = hopfield_proj_dim
         self.hopfield_direct_query = hopfield_direct_query
         self.hopfield_value_as_key = hopfield_value_as_key
+        self.hopfield_forward_value = hopfield_forward_value
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -161,6 +164,10 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
             "hopfield_direct_query requires use_separate_hopfield_mem=True"
         assert not (hopfield_value_as_key and not use_hopfield_memory), \
             "hopfield_value_as_key requires use_hopfield_memory=True"
+        assert not (hopfield_forward_value and not use_hopfield_memory), \
+            "hopfield_forward_value requires use_hopfield_memory=True"
+        assert not (hopfield_forward_value and K > 0), \
+            "hopfield_forward_value requires K=0 (no inner loop)"
         if hopfield_proj_dim is not None:
             assert hopfield_proj_dim > 0, f"hopfield_proj_dim must be positive, got {hopfield_proj_dim}"
 
@@ -297,6 +304,7 @@ class GradMemGPT(PreTrainedModel):
         self.hopfield_proj_dim = getattr(config, "hopfield_proj_dim", None)
         self.hopfield_direct_query = getattr(config, "hopfield_direct_query", False)
         self.hopfield_value_as_key = getattr(config, "hopfield_value_as_key", False)
+        self.hopfield_forward_value = getattr(config, "hopfield_forward_value", False)
 
         if self.use_hopfield_memory:
             if self.hopfield_n_segments < 1:
@@ -626,7 +634,7 @@ class GradMemGPT(PreTrainedModel):
         # 1.  INNER loop on context. WRITE context to mem, segment by segment.
         # ---------------------------------------------------------------- #
         ctx_emb = None
-        if self.K and context_input_ids.ne(pad_id).any():
+        if (self.K or (self.use_hopfield_memory and self.hopfield_forward_value)) and context_input_ids.ne(pad_id).any():
             # re‑enable autograd even if outer context is `no_grad`
             with torch.enable_grad():
                 # build ctx embedding once
@@ -778,26 +786,23 @@ class GradMemGPT(PreTrainedModel):
                             pass  # do nothing, keep gradients flow
 
                     # Accumulate inner loss for stats (detached) and for combined loss (graph-connected, last segment only)
-                    total_inner_loss_detached = total_inner_loss_detached + inner_loss.detach()
-                    last_segment_inner_loss = inner_loss
-                    n_segments_with_context += 1
+                    if self.K > 0:
+                        total_inner_loss_detached = total_inner_loss_detached + inner_loss.detach()
+                        last_segment_inner_loss = inner_loss
+                        n_segments_with_context += 1
 
                     # Per-segment Hopfield STORE
                     if self.use_hopfield_memory and seg_has_tokens.any():
-                        # Value: gradient-connected mem_batch after inner loop on this segment
-                        value_pattern = mem_batch.view(B, -1)  # [B, M*d]
-
+                        # Key: forward-pass compressed representation of this segment
                         if self.hopfield_value_as_key:
-                            # Use value pattern directly as key (no forward pass)
-                            seg_key = value_pattern
+                            # Use value pattern directly as key (no forward pass) — computed below
+                            pass  # seg_key will be set to value_pattern after it's computed
+                        elif self.use_separate_hopfield_mem:
+                            mem_key_prefix = self.mem_key.unsqueeze(0).expand(B, -1, -1)
                         else:
-                            # Key: forward-pass compressed representation of this segment
-                            # Choose memory prefix: separate mem_key or shared mem_batch_initial
-                            if self.use_separate_hopfield_mem:
-                                mem_key_prefix = self.mem_key.unsqueeze(0).expand(B, -1, -1)
-                            else:
-                                mem_key_prefix = mem_batch_initial
+                            mem_key_prefix = mem_batch_initial
 
+                        if not self.hopfield_value_as_key:
                             if self.n_ctrl_tokens > 0:
                                 x_seg_comp = torch.cat([write_st_batch, mem_key_prefix, write_end_batch, seg_emb], dim=1)
                             else:
@@ -807,6 +812,28 @@ class GradMemGPT(PreTrainedModel):
                                 outs_seg = self._forward_full_attn(x_seg_comp)
                             seg_key = outs_seg.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
                             del outs_seg
+
+                        # Value: gradient-connected mem_batch or forward-pass computed
+                        if self.hopfield_forward_value:
+                            if self.use_separate_hopfield_mem:
+                                mem_value_prefix = self.mem_key.unsqueeze(0).expand(B, -1, -1)
+                            else:
+                                mem_value_prefix = mem_batch_initial
+
+                            if self.n_ctrl_tokens > 0:
+                                x_seg_val = torch.cat([write_st_batch, mem_value_prefix, write_end_batch, seg_emb], dim=1)
+                            else:
+                                x_seg_val = torch.cat([mem_value_prefix, seg_emb], dim=1)
+
+                            with self._disable_write_lora():
+                                outs_val = self._forward_full_attn(x_seg_val)
+                            value_pattern = outs_val.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                            del outs_val
+                        else:
+                            value_pattern = mem_batch.view(B, -1)  # [B, M*d]
+
+                        if self.hopfield_value_as_key:
+                            seg_key = value_pattern
 
                         # Apply key projection if configured
                         if self.hopfield_proj_dim is not None:
@@ -824,6 +851,7 @@ class GradMemGPT(PreTrainedModel):
                     # Keep last segment's mem_batch for stats and READ phase fallback
                     last_mem_batch = mem_batch
 
+        inner_loop_stats['inner_loss'] = torch.tensor(0)
         if total_inner_steps > 0:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / total_inner_steps
             if n_segments_with_context > 0:
@@ -842,7 +870,7 @@ class GradMemGPT(PreTrainedModel):
         # ---------------------------------------------------------------- #
         # Hopfield RETRIEVE phase (if enabled)
         # ---------------------------------------------------------------- #
-        if self.use_hopfield_memory and self.K and hopfield_stored.any():
+        if self.use_hopfield_memory and hopfield_stored.any():
             # Stack stored keys and values for attention-based retrieval
             keys = torch.stack(stored_keys, dim=1)    # [B, n_stored, M*d]
             values = torch.stack(stored_values, dim=1)  # [B, n_stored, M*d]

@@ -24,7 +24,7 @@ dataset:
 gradmem:
   n_mem_tokens: 8
   n_ctrl_tokens: 0
-  K: 2
+  K: 0
   last_K_second_order: 2
   inner_lr: 0.04
   inner_clip_value: null
@@ -39,10 +39,11 @@ gradmem:
 
 hopfield:
   use_hopfield_memory: true
-  hopfield_n_segments: 2
+  hopfield_n_segments: 1
   hopfield_retrieval_mode: raw  # raw | softmax | beta_softmax | mean
   hopfield_beta_init: 1.0
   use_separate_hopfield_mem: true  # use separate M_0 values for value, key and query memory tokens
   hopfield_proj_dim: null  # if null use M*d key/query size, otherwise add learnable key/query linear projections
-  hopfield_direct_query: True  # use only meta-learned query vector, skip forward pass for query
-  hopfield_value_as_key: True  # skip forward pass for key, use value_pattern or its projection as key
+  hopfield_direct_query: true  # use only meta-learned query vector, skip forward pass for query
+  hopfield_value_as_key: true  # skip forward pass for key, use value_pattern or its projection as key
+  hopfield_forward_value: true  # works for K=0, in that case, compress context using only forward passes
