@@ -40,5 +40,7 @@ gradmem:
 hopfield:
   use_hopfield_memory: true
   hopfield_n_segments: 2
-  hopfield_retrieval_mode: "softmax"
+  hopfield_retrieval_mode: "softmax"  # raw | softmax | beta_softmax
   hopfield_beta_init: 1.0
+  use_separate_hopfield_mem: false
+  hopfield_proj_dim: null

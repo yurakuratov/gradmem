@@ -67,6 +67,8 @@ class GradMemGPTConfig(PretrainedConfig):
                  hopfield_n_segments=1,
                  hopfield_retrieval_mode="softmax",
                  hopfield_beta_init=1.0,
+                 use_separate_hopfield_mem=False,
+                 hopfield_proj_dim=None,
                  **kwargs):
         """
         Args:
@@ -97,6 +99,8 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
              hopfield_n_segments: int, number of segments to split context into for Hopfield storage (1 = whole context)
              hopfield_retrieval_mode: str, retrieval mode ("raw", "softmax", "beta_softmax")
              hopfield_beta_init: float, initial value for learnable beta parameter (only used with "beta_softmax")
+             use_separate_hopfield_mem: bool, use separate initial memory tokens for key/query/value roles in Hopfield
+             hopfield_proj_dim: int|None, dimension for key/query projection layers (None = no projection)
          """
         super().__init__(**kwargs)
 
@@ -135,12 +139,20 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
         self.inner_loss_weight = inner_loss_weight
         self.use_hopfield_memory = use_hopfield_memory
         self.hopfield_n_segments = hopfield_n_segments
+        self.hopfield_retrieval_mode = hopfield_retrieval_mode
+        self.hopfield_beta_init = hopfield_beta_init
+        self.use_separate_hopfield_mem = use_separate_hopfield_mem
+        self.hopfield_proj_dim = hopfield_proj_dim
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
         assert hopfield_retrieval_mode in ("raw", "softmax", "beta_softmax"), \
             f"hopfield_retrieval_mode must be 'raw', 'softmax', or 'beta_softmax', got '{hopfield_retrieval_mode}'"
+        assert not (use_separate_hopfield_mem and not use_hopfield_memory), \
+            "use_separate_hopfield_mem requires use_hopfield_memory=True"
+        if hopfield_proj_dim is not None:
+            assert hopfield_proj_dim > 0, f"hopfield_proj_dim must be positive, got {hopfield_proj_dim}"
 
 
 class GradMemGPT(PreTrainedModel):
@@ -271,12 +283,27 @@ class GradMemGPT(PreTrainedModel):
         self.hopfield_n_segments = getattr(config, "hopfield_n_segments", 1)
         self.hopfield_retrieval_mode = getattr(config, "hopfield_retrieval_mode", "softmax")
         self.hopfield_beta_init = getattr(config, "hopfield_beta_init", 1.0)
+        self.use_separate_hopfield_mem = getattr(config, "use_separate_hopfield_mem", False)
+        self.hopfield_proj_dim = getattr(config, "hopfield_proj_dim", None)
 
         if self.use_hopfield_memory:
             if self.hopfield_n_segments < 1:
                 raise ValueError(f"hopfield_n_segments must be >= 1, got {self.hopfield_n_segments}")
             if self.hopfield_retrieval_mode == "beta_softmax":
                 self.hopfield_beta = nn.Parameter(torch.tensor(self.hopfield_beta_init))
+            if self.use_separate_hopfield_mem:
+                self.mem_key = nn.Parameter(torch.randn(self.n_mem_tokens, n_embd) * 0.02)
+                self.mem_query = nn.Parameter(torch.randn(self.n_mem_tokens, n_embd) * 0.02)
+            if self.hopfield_proj_dim is not None:
+                pattern_dim = self.n_mem_tokens * n_embd
+                self.hopfield_key_proj = nn.Linear(pattern_dim, self.hopfield_proj_dim, bias=True)
+                self.hopfield_query_proj = nn.Linear(pattern_dim, self.hopfield_proj_dim, bias=True)
+                if self.hopfield_proj_dim == pattern_dim:
+                    with torch.no_grad():
+                        nn.init.eye_(self.hopfield_key_proj.weight)
+                        self.hopfield_key_proj.bias.zero_()
+                        nn.init.eye_(self.hopfield_query_proj.weight)
+                        self.hopfield_query_proj.bias.zero_()
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -746,16 +773,25 @@ class GradMemGPT(PreTrainedModel):
                     # Per-segment Hopfield STORE
                     if self.use_hopfield_memory and seg_has_tokens.any():
                         # Key: forward-pass compressed representation of this segment
-                        # Uses initial (pre-update) memory + segment with full attention
-                        if self.n_ctrl_tokens > 0:
-                            x_seg_comp = torch.cat([write_st_batch, mem_batch_initial, write_end_batch, seg_emb], dim=1)
+                        # Choose memory prefix: separate mem_key or shared mem_batch_initial
+                        if self.use_separate_hopfield_mem:
+                            mem_key_prefix = self.mem_key.unsqueeze(0).expand(B, -1, -1)
                         else:
-                            x_seg_comp = torch.cat([mem_batch_initial, seg_emb], dim=1)
+                            mem_key_prefix = mem_batch_initial
+
+                        if self.n_ctrl_tokens > 0:
+                            x_seg_comp = torch.cat([write_st_batch, mem_key_prefix, write_end_batch, seg_emb], dim=1)
+                        else:
+                            x_seg_comp = torch.cat([mem_key_prefix, seg_emb], dim=1)
 
                         with self._disable_write_lora():
                             outs_seg = self._forward_full_attn(x_seg_comp)
                         seg_key = outs_seg.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
                         del outs_seg
+
+                        # Apply key projection if configured
+                        if self.hopfield_proj_dim is not None:
+                            seg_key = self.hopfield_key_proj(seg_key)
 
                         # Value: gradient-connected mem_batch after inner loop on this segment
                         value_pattern = mem_batch.view(B, -1)  # [B, M*d]
@@ -792,15 +828,24 @@ class GradMemGPT(PreTrainedModel):
         # ---------------------------------------------------------------- #
         if self.use_hopfield_memory and self.K and hopfield_stored.any():
             # Compute query key with gradients (enables learning retrieval)
-            if self.n_ctrl_tokens > 0:
-                x_qry_comp = torch.cat([read_st_batch, mem_batch_initial, read_end_batch, qry_emb], dim=1)
+            if self.use_separate_hopfield_mem:
+                mem_query_prefix = self.mem_query.unsqueeze(0).expand(B, -1, -1)
             else:
-                x_qry_comp = torch.cat([mem_batch_initial, qry_emb], dim=1)
+                mem_query_prefix = mem_batch_initial
+
+            if self.n_ctrl_tokens > 0:
+                x_qry_comp = torch.cat([read_st_batch, mem_query_prefix, read_end_batch, qry_emb], dim=1)
+            else:
+                x_qry_comp = torch.cat([mem_query_prefix, qry_emb], dim=1)
 
             with self._disable_write_lora():
                 outs_q = self._forward_full_attn(x_qry_comp)
             query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
             del outs_q
+
+            # Apply query projection if configured
+            if self.hopfield_proj_dim is not None:
+                query_key = self.hopfield_query_proj(query_key)
 
             # L2-normalize query key
             query_key = F.normalize(query_key, dim=-1)

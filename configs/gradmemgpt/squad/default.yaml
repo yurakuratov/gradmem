@@ -39,3 +39,5 @@ hopfield:
   hopfield_n_segments: 1
   hopfield_retrieval_mode: "softmax"
   hopfield_beta_init: 1.0
+  use_separate_hopfield_mem: false
+  hopfield_proj_dim: null

@@ -222,6 +222,8 @@ class ExperimentArgs:
     hopfield_n_segments: Optional[int] = field(default=1)
     hopfield_retrieval_mode: Optional[str] = field(default="softmax")
     hopfield_beta_init: Optional[float] = field(default=1.0)
+    use_separate_hopfield_mem: Optional[bool] = field(default=False)
+    hopfield_proj_dim: Optional[int] = field(default=None)
 
 
 def main(config_path: Optional[str] = None):
@@ -338,7 +340,9 @@ def main(config_path: Optional[str] = None):
 use_hopfield_memory=args.use_hopfield_memory,
                                        hopfield_n_segments=args.hopfield_n_segments,
                                        hopfield_retrieval_mode=args.hopfield_retrieval_mode,
-                                       hopfield_beta_init=args.hopfield_beta_init)
+                                       hopfield_beta_init=args.hopfield_beta_init,
+                                       use_separate_hopfield_mem=args.use_separate_hopfield_mem,
+                                       hopfield_proj_dim=args.hopfield_proj_dim)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
