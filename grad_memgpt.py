@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -65,6 +67,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  inner_loss_weight=None,
                  use_hopfield_memory=False,
                  hopfield_n_segments=1,
+                 hopfield_segment_size=None,
                  hopfield_retrieval_mode="softmax",
                  hopfield_beta_init=1.0,
                  use_separate_hopfield_mem=False,
@@ -103,6 +106,7 @@ class GradMemGPTConfig(PretrainedConfig):
             inner_loss_weight: float, weight of inner loss in combined loss
 use_hopfield_memory: bool, enable Hopfield-like external memory
              hopfield_n_segments: int, number of segments to split context into for Hopfield storage (1 = whole context)
+             hopfield_segment_size: int|None, fixed segment size (tokens per segment); mutually exclusive with hopfield_n_segments
              hopfield_retrieval_mode: str, retrieval mode ("raw", "softmax", "beta_softmax")
              hopfield_beta_init: float, initial value for learnable beta parameter (only used with "beta_softmax")
              use_separate_hopfield_mem: bool, use separate initial memory tokens for key/query/value roles in Hopfield
@@ -151,6 +155,7 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
         self.inner_loss_weight = inner_loss_weight
         self.use_hopfield_memory = use_hopfield_memory
         self.hopfield_n_segments = hopfield_n_segments
+        self.hopfield_segment_size = hopfield_segment_size
         self.hopfield_retrieval_mode = hopfield_retrieval_mode
         self.hopfield_beta_init = hopfield_beta_init
         self.use_separate_hopfield_mem = use_separate_hopfield_mem
@@ -173,6 +178,11 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
             "hopfield_direct_query requires use_separate_hopfield_mem=True"
         assert not (hopfield_value_as_key and not use_hopfield_memory), \
             "hopfield_value_as_key requires use_hopfield_memory=True"
+        if hopfield_segment_size is not None:
+            assert hopfield_n_segments == 1, \
+                f"hopfield_segment_size and hopfield_n_segments are mutually exclusive, got segment_size={hopfield_segment_size} and n_segments={hopfield_n_segments}"
+            assert hopfield_segment_size >= 1, \
+                f"hopfield_segment_size must be >= 1, got {hopfield_segment_size}"
         if hopfield_proj_dim is not None:
             assert hopfield_proj_dim > 0, f"hopfield_proj_dim must be positive, got {hopfield_proj_dim}"
         assert memory_update in ("gradient", "forward"), \
@@ -322,6 +332,7 @@ class GradMemGPT(PreTrainedModel):
         # Hopfield-like external memory
         self.use_hopfield_memory = getattr(config, "use_hopfield_memory", False)
         self.hopfield_n_segments = getattr(config, "hopfield_n_segments", 1)
+        self.hopfield_segment_size = getattr(config, "hopfield_segment_size", None)
         self.hopfield_retrieval_mode = getattr(config, "hopfield_retrieval_mode", "softmax")
         self.hopfield_beta_init = getattr(config, "hopfield_beta_init", 1.0)
         self.use_separate_hopfield_mem = getattr(config, "use_separate_hopfield_mem", False)
@@ -565,7 +576,7 @@ class GradMemGPT(PreTrainedModel):
             W_batch = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1).clone()
             b_batch = self.mem_proj.bias.unsqueeze(0).expand(B, -1).clone()
 
-        n_segments = self.hopfield_n_segments if self.use_hopfield_memory else 1
+        n_segments = self.hopfield_n_segments  # default; overridden inside inner loop if hopfield_segment_size is set
 
         # Hopfield memory storage (fresh each forward call)
         if self.use_hopfield_memory:
@@ -605,7 +616,12 @@ class GradMemGPT(PreTrainedModel):
 
                 # Split context into segments (ceil-padded to equal size)
                 S = ctx_emb.size(1)
-                segment_size = (S + n_segments - 1) // n_segments  # ceil division
+                if self.use_hopfield_memory and self.hopfield_segment_size is not None:
+                    n_segments = math.ceil(S / self.hopfield_segment_size)
+                    segment_size = self.hopfield_segment_size
+                else:
+                    n_segments = self.hopfield_n_segments
+                    segment_size = (S + n_segments - 1) // n_segments  # ceil division
                 pad_len = segment_size * n_segments - S
 
                 if pad_len > 0:
