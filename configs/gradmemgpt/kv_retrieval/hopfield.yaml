@@ -24,7 +24,7 @@ dataset:
 gradmem:
   n_mem_tokens: 8
   n_ctrl_tokens: 0
-  K: 1
+  K: 2
   last_K_second_order: 2
   inner_lr: 0.04
   inner_clip_value: null
@@ -36,7 +36,7 @@ gradmem:
   use_write_head: true
   add_inner_loss_to_outer: true
   inner_loss_weight: 0.5
-  memory_update: forward  # gradient | forward (RMT style)
+  memory_update: gradient  # gradient | forward (RMT style)
   # RMT forward
   use_mem_residual: false  # for RMT
   use_reconstruction_loss: false  # reconstruction loss for RMT

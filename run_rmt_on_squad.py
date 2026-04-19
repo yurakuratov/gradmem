@@ -222,7 +222,13 @@ if __name__ == '__main__':
 
 def main(config_path: Optional[str] = None):
     parser = HfArgumentParser(ExperimentArgs)
-    args = parser.parse_args_into_dataclasses()[0]
+    # When called programmatically (config_path provided), skip sys.argv parsing
+    # to avoid conflicts with caller's CLI args (e.g., --debug from run_from_config.py)
+    if config_path is not None:
+        args = parser.parse_args_into_dataclasses(args=[])[0]
+        args.config = config_path
+    else:
+        args = parser.parse_args_into_dataclasses()[0]
 
     # Load config from YAML if provided
     if config_path is not None:
