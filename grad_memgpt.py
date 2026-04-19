@@ -532,73 +532,6 @@ class GradMemGPT(PreTrainedModel):
             return mem
         return torch.baddbmm(b.unsqueeze(1), mem, W.transpose(1, 2))
 
-    @contextmanager
-    def _full_attention(self):
-        """Context manager that enables full (non-causal) attention.
-
-        For models with hardcoded causal bias buffers (e.g. GPT-2 eager attention),
-        temporarily overrides those buffers to enable bidirectional attention.
-        For SDPA and custom attention kernels (jvp_flash, hvp_manual, hvp_semi_manual),
-        a 4D all-zeros attention mask suffices (is_causal=False when attention_mask is not None).
-        """
-        backbone = get_backbone(self.model)
-        saved = {}
-
-        has_eager_causal_bias = (
-            self.attn_implementation == 'eager'
-            and any(
-                hasattr(m, 'bias') and isinstance(getattr(m, 'bias', None), torch.Tensor)
-                and getattr(m, 'bias').dim() == 4 and getattr(m, 'bias').dtype == torch.bool
-                for m in backbone.modules()
-            )
-        )
-
-        if has_eager_causal_bias:
-            for module in backbone.modules():
-                if hasattr(module, 'bias') and isinstance(getattr(module, 'bias', None), torch.Tensor):
-                    bias = getattr(module, 'bias')
-                    if bias.dim() == 4 and bias.dtype == torch.bool:
-                        saved[id(module)] = bias
-                        module.bias = torch.ones_like(bias)
-        try:
-            yield
-        finally:
-            for module in backbone.modules():
-                if id(module) in saved and hasattr(module, 'bias'):
-                    module.bias = saved[id(module)]
-
-    def _forward_full_attn(self, inputs_embeds):
-        """Forward pass with full (non-causal) attention using the model's standard interface.
-
-        Uses a 4D all-zeros attention mask (0.0 = attend everywhere) to disable causal masking,
-        and overrides GPT-2-style hardcoded causal bias buffers when using eager attention.
-        Correctly handles JVP flash attention sequence length requirements.
-        Architecture-agnostic: works with GPT-2, LLaMA, GPT-NeoX, etc.
-        """
-        B, S, D = inputs_embeds.shape
-
-        # Pad to multiple of 32 for compatibility with JVP Flash Attention
-        if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
-            pad_len = -S % 32
-            if pad_len > 0:
-                # Pad embedding dimension, then sequence dimension
-                inputs_embeds = F.pad(inputs_embeds, [0, 0, 0, pad_len], "constant", 0)
-
-        S_padded = inputs_embeds.size(1)
-
-        # 4D all-zeros float mask: 0.0 = attend everywhere (no masking)
-        # For padded sequences, mask out padding positions so real tokens don't attend to them
-        full_mask = torch.zeros(B, 1, S_padded, S_padded, device=inputs_embeds.device, dtype=inputs_embeds.dtype)
-        if S_padded > S:
-            full_mask[:, :, :, S:] = float('-inf')  # don't attend to padding keys
-            full_mask[:, :, S:, :] = float('-inf')   # padding queries produce zero outputs
-
-        backbone = get_backbone(self.model)
-        with self._full_attention():
-            outs = backbone(inputs_embeds=inputs_embeds, attention_mask=full_mask, return_dict=True)
-
-        return outs
-
     def forward(self, input_ids, labels=None, return_mem=False):
         # context_input_ids : B × S   (segments only, each ends with `|`)
         # query_input_ids   : B × Q   (e.g.  "?!K:V!|") i.e. the last segment
@@ -914,21 +847,26 @@ class GradMemGPT(PreTrainedModel):
                             # Use value pattern directly as key (no forward pass)
                             seg_key = value_pattern
                         else:
-                            # Key: forward-pass compressed representation of this segment
-                            # Choose memory prefix: separate mem_key or shared mem_batch_initial
+                            # Key: causal forward-pass to compress segment into mem tokens
+                            # mem_key at END so it can attend to all preceding content tokens
                             if self.use_separate_hopfield_mem:
                                 mem_key_prefix = self.mem_key.unsqueeze(0).expand(B, -1, -1)
                             else:
                                 mem_key_prefix = mem_batch_initial
 
+                            hopf_mem_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
                             if self.n_ctrl_tokens > 0:
-                                x_seg_comp = torch.cat([write_st_batch, mem_key_prefix, write_end_batch, seg_emb], dim=1)
+                                hopf_ctrl_mask = torch.ones(B, self.n_ctrl_tokens, dtype=torch.long, device=device)
+                                x_seg_comp = torch.cat([write_st_batch, seg_emb, write_end_batch, mem_key_prefix], dim=1)
+                                seg_attn_mask = torch.cat([hopf_ctrl_mask, seg_mask.long(), hopf_ctrl_mask, hopf_mem_mask], dim=1)
                             else:
-                                x_seg_comp = torch.cat([mem_key_prefix, seg_emb], dim=1)
+                                x_seg_comp = torch.cat([seg_emb, mem_key_prefix], dim=1)
+                                seg_attn_mask = torch.cat([seg_mask.long(), hopf_mem_mask], dim=1)
 
-                            with self._disable_write_lora():
-                                outs_seg = self._forward_full_attn(x_seg_comp)
-                            seg_key = outs_seg.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                            position_ids = seg_attn_mask.cumsum(-1) - 1
+                            outs_seg = get_backbone(self.model)(inputs_embeds=x_seg_comp, attention_mask=seg_attn_mask,
+                                                                position_ids=position_ids, return_dict=True)
+                            seg_key = outs_seg.last_hidden_state[:, -self.n_mem_tokens:, :].view(B, -1)  # [B, M*d]
                             del outs_seg
 
                         # Apply key projection if configured
@@ -989,14 +927,20 @@ class GradMemGPT(PreTrainedModel):
                     else:
                         mem_query_prefix = mem_batch_initial
 
+                    qry_mask = (query_input_ids != pad_id).to(dtype=torch.long)
+                    hopf_mem_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
                     if self.n_ctrl_tokens > 0:
-                        x_qry_comp = torch.cat([read_st_batch, mem_query_prefix, read_end_batch, qry_emb], dim=1)
+                        hopf_ctrl_mask = torch.ones(B, self.n_ctrl_tokens, dtype=torch.long, device=device)
+                        x_qry_comp = torch.cat([read_st_batch, qry_emb, read_end_batch, mem_query_prefix], dim=1)
+                        qry_attn_mask = torch.cat([hopf_ctrl_mask, qry_mask, hopf_ctrl_mask, hopf_mem_mask], dim=1)
                     else:
-                        x_qry_comp = torch.cat([mem_query_prefix, qry_emb], dim=1)
+                        x_qry_comp = torch.cat([qry_emb, mem_query_prefix], dim=1)
+                        qry_attn_mask = torch.cat([qry_mask, hopf_mem_mask], dim=1)
 
-                    with self._disable_write_lora():
-                        outs_q = self._forward_full_attn(x_qry_comp)
-                    query_key = outs_q.last_hidden_state[:, :self.n_mem_tokens, :].view(B, -1)  # [B, M*d]
+                    position_ids = qry_attn_mask.cumsum(-1) - 1
+                    outs_q = get_backbone(self.model)(inputs_embeds=x_qry_comp, attention_mask=qry_attn_mask,
+                                                      position_ids=position_ids, return_dict=True)
+                    query_key = outs_q.last_hidden_state[:, -self.n_mem_tokens:, :].view(B, -1)  # [B, M*d]
                     del outs_q
 
                 if self.hopfield_proj_dim is not None:

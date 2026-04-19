@@ -46,3 +46,8 @@ hopfield:
   hopfield_proj_dim: null  # if null use M*d key/query size, otherwise add learnable key/query linear projections
   hopfield_direct_query: True  # use only meta-learned query vector, skip forward pass for query
   hopfield_value_as_key: True  # skip forward pass for key, use value_pattern or its projection as key
+  memory_update: gradient  # gradient | forward (RMT style)
+  # RMT forward
+  use_mem_residual: False  # for RMT
+  use_reconstruction_loss: False  # reconstruction loss for RMT
+  reconstruction_loss_weight: 1.0
