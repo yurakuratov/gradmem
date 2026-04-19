@@ -175,7 +175,8 @@ class CurriculumCallback(TrainerCallback):
             return
         if metric_value >= self.threshold:
             self.threshold_reached = True
-            logger.info(f'curriculum: {self.metric_name}={metric_value:.4f} >= {self.threshold:.4f}, threshold reached!')
+            control.should_training_stop = True
+            logger.info(f'curriculum: {self.metric_name}={metric_value:.4f} >= {self.threshold:.4f}, threshold reached! advancing to next stage')
 
 
 class CustomTrainer(Trainer):
