@@ -97,7 +97,7 @@ def apply_overrides(cfg: dict, overrides: dict) -> dict:
 
     for key, value in overrides.items():
         applied = False
-        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'dataset']:
+        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'dataset', 'curriculum']:
             if section in result and key in result[section]:
                 result[section][key] = value
                 applied = True
@@ -203,6 +203,16 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
             args.append(f'--{cli_key}')
         else:
             args.append(f'--{cli_key}={val}')
+
+    curriculum = cfg.get('curriculum', {})
+    if curriculum.get('enabled'):
+        args.append('--curriculum_enabled')
+        if 'threshold' in curriculum:
+            args.append(f'--curriculum_threshold={curriculum["threshold"]}')
+        if 'levels' in curriculum:
+            args.append(f'--curriculum_levels={curriculum["levels"]}')
+        if 'data_dir' in curriculum:
+            args.append(f'--curriculum_data_dir={curriculum["data_dir"]}')
 
     return args
 

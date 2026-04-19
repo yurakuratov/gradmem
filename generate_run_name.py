@@ -106,6 +106,12 @@ def generate_run_name_gradmemgpt(cfg: Dict[str, Any]) -> str:
 
     run_name += f"_bs_{tbs}_lr_{lr}"
 
+    curriculum = cfg.get('curriculum', {})
+    if curriculum.get('enabled'):
+        threshold = curriculum.get('threshold', 0.95)
+        levels = curriculum.get('levels', '4,8,16,32,64,128')
+        run_name += f"_curr_t{threshold}_N{levels}"
+
     suffix = cfg.get('run_name_suffix')
     if suffix:
         run_name += f"_{suffix}"
@@ -170,8 +176,13 @@ def get_exp_path(cfg: Dict[str, Any], seed: Optional[int] = None) -> Path:
     """Generate experiment path from config."""
     dataset = cfg.get('dataset', {})
     training = cfg.get('training', {})
+    curriculum = cfg.get('curriculum', {})
 
-    data_name = dataset.get('data_name', 'default')
+    if curriculum.get('enabled'):
+        levels = curriculum.get('levels', '4,8,16,32,64,128')
+        data_name = f"curriculum_N{levels}"
+    else:
+        data_name = dataset.get('data_name', 'default')
     run_name = generate_run_name(cfg)
 
     s = seed if seed is not None else training.get('seed', 1)

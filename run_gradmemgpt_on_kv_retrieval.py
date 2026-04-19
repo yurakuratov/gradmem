@@ -161,6 +161,23 @@ class StopOnMetricValue(TrainerCallback):
             logger.info(f'metric {self.metric_name}={metric_value:.4f} >= {self.value:.4f}, stopping training..')
 
 
+class CurriculumCallback(TrainerCallback):
+    def __init__(self, metric_name: str = "exact_match", threshold: float = 0.95):
+        self.metric_name = metric_name
+        self.threshold = threshold
+        self.threshold_reached = False
+
+    def on_evaluate(self, args, state, control, metrics, **kwargs):
+        if not self.metric_name.startswith("eval_"):
+            metric_to_check = f"eval_{self.metric_name}"
+        metric_value = metrics.get(metric_to_check)
+        if metric_value is None:
+            return
+        if metric_value >= self.threshold:
+            self.threshold_reached = True
+            logger.info(f'curriculum: {self.metric_name}={metric_value:.4f} >= {self.threshold:.4f}, threshold reached!')
+
+
 class CustomTrainer(Trainer):
     def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
         num_training_steps = int(num_training_steps / 0.9)  # to make final lr not zero, for linear it is lr/10.
@@ -236,6 +253,11 @@ class ExperimentArgs:
     use_mem_residual: Optional[bool] = field(default=False)
     use_reconstruction_loss: Optional[bool] = field(default=False)
     reconstruction_loss_weight: Optional[float] = field(default=1.0)
+    # Curriculum learning parameters
+    curriculum_enabled: Optional[bool] = field(default=False)
+    curriculum_threshold: Optional[float] = field(default=0.95)
+    curriculum_levels: Optional[str] = field(default="4,8,16,32,64,128")
+    curriculum_data_dir: Optional[str] = field(default="./data")
 
 
 def main(config_path: Optional[str] = None):
@@ -254,7 +276,7 @@ def main(config_path: Optional[str] = None):
             cfg = yaml.safe_load(f)
 
         # Flatten config to args (YAML values override ExperimentArgs defaults)
-        for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield']:
+        for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield', 'curriculum']:
             if section in cfg:
                 for key, value in cfg[section].items():
                     if hasattr(args, key):
@@ -388,11 +410,8 @@ def main(config_path: Optional[str] = None):
     def data_collator(batch):
         return collate_fn(batch, tokenizer, max_context_length=args.max_context_length)
 
-    # Target sequence looks like: "XXXX!|"
-    # Let's not count ! and | in the accuracy calculation
     ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']]
 
-    # Define custom compute metrics function with ignored tokens
     def compute_metrics(eval_pred):
         return compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer)
 
@@ -404,60 +423,164 @@ def main(config_path: Optional[str] = None):
         args_total_bs = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
         assert args.total_batch_size == args_total_bs
 
-    # Training arguments
-    training_args = TrainingArguments(
-        output_dir=output_dir,
-        logging_dir=output_dir,
+    if args.curriculum_enabled:
+        curriculum_levels = [int(x.strip()) for x in args.curriculum_levels.split(',')]
+        logger.info(f'curriculum learning enabled: levels={curriculum_levels}, threshold={args.curriculum_threshold}')
 
-        max_steps=args.max_steps,
-        per_device_train_batch_size=args.per_device_batch_size,
-        per_device_eval_batch_size=args.per_device_batch_size,
-        gradient_accumulation_steps=args.gradient_accumulation_steps,
-        warmup_steps=args.warmup_steps,
-        weight_decay=args.weight_decay,
-        learning_rate=args.learning_rate,
-        lr_scheduler_type=args.lr_scheduler_type,
-        gradient_checkpointing=args.use_gradient_checkpointing,
+        data_dir = Path(args.curriculum_data_dir)
+        dataset_name_template = "N{n_kv}-K2V2-V62_1M"
 
-        eval_strategy='steps',
-        save_strategy='steps',
-        save_steps=args.eval_steps,
-        eval_steps=args.eval_steps,
-        logging_steps=args.logging_steps,
-        report_to='comet_ml',
-        metric_for_best_model=args.metric_for_best_model,
-        load_best_model_at_end=True,
-        eval_on_start=True,
-        greater_is_better=True,
-        remove_unused_columns=False,
-        include_num_input_tokens_seen=False,  # input_ids is a dict, so HF Trainer cant get number of tokens
-        include_for_metrics=['inputs'],
-        save_total_limit=1,
-        dataloader_num_workers=4,
-        dataloader_pin_memory=True,
-        seed=args.seed,
-    )
+        all_metrics = {}
+        for stage_idx, n_kv in enumerate(curriculum_levels):
+            dataset_name = dataset_name_template.format(n_kv=n_kv)
+            data_path = data_dir / dataset_name
+            logger.info(f'curriculum stage {stage_idx}/{len(curriculum_levels)-1}: N={n_kv}, data_path={data_path}')
 
-    # Initialize Trainer
-    trainer = CustomTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset['train'],
-        eval_dataset=dataset['valid'],
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
-                   ],
-    )
-    # Train the model
-    trainer.train()
-    logger.info('training done. running final evaluation...')
-    metrics = trainer.evaluate(dataset['valid'])
-    logger.info(f'{metrics}')
-    trainer.save_metrics(split='all', metrics=metrics)
-    trainer.state.save_to_json(output_dir / 'trainer_state.json')
+            stage_dataset = datasets.load_from_disk(str(data_path))
+
+            stage_output_dir = output_dir / f'stage_{stage_idx}_N{n_kv}'
+            stage_output_dir.mkdir(parents=True, exist_ok=True)
+
+            def stage_data_collator(batch):
+                return collate_fn(batch, tokenizer, max_context_length=args.max_context_length)
+
+            training_args = TrainingArguments(
+                output_dir=stage_output_dir,
+                logging_dir=stage_output_dir,
+
+                max_steps=args.max_steps,
+                per_device_train_batch_size=args.per_device_batch_size,
+                per_device_eval_batch_size=args.per_device_batch_size,
+                gradient_accumulation_steps=args.gradient_accumulation_steps,
+                warmup_steps=args.warmup_steps,
+                weight_decay=args.weight_decay,
+                learning_rate=args.learning_rate,
+                lr_scheduler_type=args.lr_scheduler_type,
+                gradient_checkpointing=args.use_gradient_checkpointing,
+
+                eval_strategy='steps',
+                save_strategy='steps',
+                save_steps=args.eval_steps,
+                eval_steps=args.eval_steps,
+                logging_steps=args.logging_steps,
+                report_to='comet_ml',
+                metric_for_best_model=args.metric_for_best_model,
+                load_best_model_at_end=True,
+                eval_on_start=True,
+                greater_is_better=True,
+                remove_unused_columns=False,
+                include_num_input_tokens_seen=False,
+                include_for_metrics=['inputs'],
+                save_total_limit=1,
+                dataloader_num_workers=4,
+                dataloader_pin_memory=True,
+                seed=args.seed,
+            )
+
+            curriculum_cb = CurriculumCallback(
+                metric_name='exact_match',
+                threshold=args.curriculum_threshold,
+            )
+
+            trainer = CustomTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=stage_dataset['train'],
+                eval_dataset=stage_dataset['valid'],
+                data_collator=stage_data_collator,
+                compute_metrics=compute_metrics,
+                preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+                callbacks=[
+                    EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
+                    curriculum_cb,
+                ],
+            )
+
+            trainer.train()
+
+            is_last_stage = (stage_idx == len(curriculum_levels) - 1)
+
+            model = trainer.model
+            best_model_path = stage_output_dir / 'best_model'
+            trainer.save_model(str(best_model_path))
+
+            if curriculum_cb.threshold_reached and not is_last_stage:
+                logger.info(f'curriculum stage {stage_idx} (N={n_kv}): threshold reached, advancing to next stage')
+            elif curriculum_cb.threshold_reached and is_last_stage:
+                logger.info(f'curriculum complete! final stage (N={n_kv}) threshold reached')
+            else:
+                logger.info(f'curriculum stage {stage_idx} (N={n_kv}): threshold NOT reached, stopping curriculum')
+
+            metrics = trainer.evaluate(stage_dataset['valid'])
+            all_metrics[f'stage_{stage_idx}_N{n_kv}'] = metrics
+            logger.info(f'stage {stage_idx} (N={n_kv}) final metrics: {metrics}')
+
+            if not curriculum_cb.threshold_reached:
+                break
+
+        logger.info('curriculum training done. running final evaluation on last completed stage...')
+        final_dataset = datasets.load_from_disk(str(data_dir / dataset_name_template.format(
+            n_kv=curriculum_levels[min(stage_idx, len(curriculum_levels) - 1)]
+        )))
+        final_metrics = trainer.evaluate(final_dataset['valid'])
+        logger.info(f'final metrics: {final_metrics}')
+        trainer.save_metrics(split='all', metrics=final_metrics)
+        trainer.state.save_to_json(output_dir / 'trainer_state.json')
+        with open(output_dir / 'curriculum_metrics.json', 'w') as f:
+            json.dump(all_metrics, f, indent=2)
+    else:
+        # Single-stage training (original behavior)
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            logging_dir=output_dir,
+
+            max_steps=args.max_steps,
+            per_device_train_batch_size=args.per_device_batch_size,
+            per_device_eval_batch_size=args.per_device_batch_size,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            warmup_steps=args.warmup_steps,
+            weight_decay=args.weight_decay,
+            learning_rate=args.learning_rate,
+            lr_scheduler_type=args.lr_scheduler_type,
+            gradient_checkpointing=args.use_gradient_checkpointing,
+
+            eval_strategy='steps',
+            save_strategy='steps',
+            save_steps=args.eval_steps,
+            eval_steps=args.eval_steps,
+            logging_steps=args.logging_steps,
+            report_to='comet_ml',
+            metric_for_best_model=args.metric_for_best_model,
+            load_best_model_at_end=True,
+            eval_on_start=True,
+            greater_is_better=True,
+            remove_unused_columns=False,
+            include_num_input_tokens_seen=False,
+            include_for_metrics=['inputs'],
+            save_total_limit=1,
+            dataloader_num_workers=4,
+            dataloader_pin_memory=True,
+            seed=args.seed,
+        )
+
+        trainer = CustomTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset['train'],
+            eval_dataset=dataset['valid'],
+            data_collator=data_collator,
+            compute_metrics=compute_metrics,
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
+                       StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
+                       ],
+        )
+        trainer.train()
+        logger.info('training done. running final evaluation...')
+        metrics = trainer.evaluate(dataset['valid'])
+        logger.info(f'{metrics}')
+        trainer.save_metrics(split='all', metrics=metrics)
+        trainer.state.save_to_json(output_dir / 'trainer_state.json')
 
 
 if __name__ == '__main__':
