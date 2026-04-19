@@ -134,6 +134,12 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     }
     if 'target_loss' in inner_loop_stats:
         metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
+    if 'rec_loss' in inner_loop_stats:
+        metrics['rec_loss'] = float(inner_loop_stats['rec_loss'].mean())
+    if 'step_delta_mem_norm_mean' in inner_loop_stats:
+        metrics['step_delta_mem_norm_mean'] = float(inner_loop_stats['step_delta_mem_norm_mean'].mean())
+        metrics['step_delta_mem_norm_max'] = float(inner_loop_stats['step_delta_mem_norm_max'].max())
+        metrics['step_delta_mem_norm_min'] = float(inner_loop_stats['step_delta_mem_norm_min'].min())
     return metrics
 
 
@@ -224,6 +230,12 @@ class ExperimentArgs:
     hopfield_beta_init: Optional[float] = field(default=1.0)
     use_separate_hopfield_mem: Optional[bool] = field(default=False)
     hopfield_proj_dim: Optional[int] = field(default=None)
+    hopfield_direct_query: Optional[bool] = field(default=False)
+    hopfield_value_as_key: Optional[bool] = field(default=False)
+    memory_update: Optional[str] = field(default="gradient")
+    use_mem_residual: Optional[bool] = field(default=False)
+    use_reconstruction_loss: Optional[bool] = field(default=False)
+    reconstruction_loss_weight: Optional[float] = field(default=1.0)
 
 
 def main(config_path: Optional[str] = None):
@@ -319,30 +331,38 @@ def main(config_path: Optional[str] = None):
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
-                                      n_mem_tokens=args.n_mem_tokens, K=args.K,
-                                      last_K_second_order=args.last_K_second_order,
-                                      lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
-                                      n_ctrl_tokens=args.n_ctrl_tokens,
-                                      inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
-                                      use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
-                                      use_write_head=args.use_write_head,
-                                      use_write_lora=args.use_write_lora,
-                                      write_lora_r=args.write_lora_r,
-                                      write_lora_alpha=args.write_lora_alpha,
-                                      write_lora_dropout=args.write_lora_dropout,
-                                      write_lora_target_modules=args.write_lora_target_modules,
-                                      freeze_backbone=args.freeze_backbone,
-                                      use_gradient_checkpointing=args.use_gradient_checkpointing,
-                                      attn_implementation=args.attn_implementation,
-                                      add_inner_loss_to_outer=args.add_inner_loss_to_outer,
-                                      inner_loss_weight=args.inner_loss_weight,
-use_hopfield_memory=args.use_hopfield_memory,
-                                       hopfield_n_segments=args.hopfield_n_segments,
-                                       hopfield_retrieval_mode=args.hopfield_retrieval_mode,
-                                       hopfield_beta_init=args.hopfield_beta_init,
-                                       use_separate_hopfield_mem=args.use_separate_hopfield_mem,
-                                       hopfield_proj_dim=args.hopfield_proj_dim)
+    gradmem_config = GradMemGPTConfig(
+        pretrained_model=args.pretrained_model, base_config=config,
+        n_mem_tokens=args.n_mem_tokens, K=args.K,
+        last_K_second_order=args.last_K_second_order,
+        lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
+        n_ctrl_tokens=args.n_ctrl_tokens,
+        inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
+        use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
+        use_write_head=args.use_write_head,
+        use_write_lora=args.use_write_lora,
+        write_lora_r=args.write_lora_r,
+        write_lora_alpha=args.write_lora_alpha,
+        write_lora_dropout=args.write_lora_dropout,
+        write_lora_target_modules=args.write_lora_target_modules,
+        freeze_backbone=args.freeze_backbone,
+        use_gradient_checkpointing=args.use_gradient_checkpointing,
+        attn_implementation=args.attn_implementation,
+        add_inner_loss_to_outer=args.add_inner_loss_to_outer,
+        inner_loss_weight=args.inner_loss_weight,
+        use_hopfield_memory=args.use_hopfield_memory,
+        hopfield_n_segments=args.hopfield_n_segments,
+        hopfield_retrieval_mode=args.hopfield_retrieval_mode,
+        hopfield_beta_init=args.hopfield_beta_init,
+        use_separate_hopfield_mem=args.use_separate_hopfield_mem,
+        hopfield_proj_dim=args.hopfield_proj_dim,
+        hopfield_direct_query=args.hopfield_direct_query,
+        hopfield_value_as_key=args.hopfield_value_as_key,
+        memory_update=args.memory_update,
+        use_mem_residual=args.use_mem_residual,
+        use_reconstruction_loss=args.use_reconstruction_loss,
+        reconstruction_loss_weight=args.reconstruction_loss_weight
+    )
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
