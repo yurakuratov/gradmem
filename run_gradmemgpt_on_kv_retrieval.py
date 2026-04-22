@@ -185,12 +185,27 @@ class CustomTrainer(Trainer):
         return super().create_scheduler(num_training_steps, optimizer)
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
-        # log early stopping patience
         for cb in self.callback_handler.callbacks:
             if isinstance(cb, EarlyStoppingCallback):
                 logs['patience'] = cb.early_stopping_patience_counter
                 break
         return super().log(logs, start_time=start_time)
+
+
+class CurriculumTrainer(CustomTrainer):
+    def __init__(self, *args, step_offset=0, curriculum_stage=0, curriculum_n_kv=0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.step_offset = step_offset
+        self.curriculum_stage = curriculum_stage
+        self.curriculum_n_kv = curriculum_n_kv
+
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        logs['curriculum_stage'] = self.curriculum_stage
+        logs['curriculum_n_kv'] = self.curriculum_n_kv
+        original_step = self.state.global_step
+        self.state.global_step += self.step_offset
+        super().log(logs, start_time=start_time)
+        self.state.global_step = original_step
 
 
 @dataclass
@@ -434,6 +449,7 @@ def main(config_path: Optional[str] = None):
         dataset_name_template = "N{n_kv}-K2V2-V62_1M"
 
         all_metrics = {}
+        cumulative_steps = 0
         for stage_idx, n_kv in enumerate(curriculum_levels):
             dataset_name = dataset_name_template.format(n_kv=n_kv)
             data_path = data_dir / dataset_name
@@ -485,7 +501,7 @@ def main(config_path: Optional[str] = None):
                 threshold=args.curriculum_threshold,
             )
 
-            trainer = CustomTrainer(
+            trainer = CurriculumTrainer(
                 model=model,
                 args=training_args,
                 train_dataset=stage_dataset['train'],
@@ -497,9 +513,13 @@ def main(config_path: Optional[str] = None):
                     EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
                     curriculum_cb,
                 ],
+                step_offset=cumulative_steps,
+                curriculum_stage=stage_idx,
+                curriculum_n_kv=n_kv,
             )
 
             trainer.train()
+            cumulative_steps += trainer.state.global_step
 
             is_last_stage = (stage_idx == len(curriculum_levels) - 1)
 
