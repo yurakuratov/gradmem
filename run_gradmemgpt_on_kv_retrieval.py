@@ -266,6 +266,7 @@ class ExperimentArgs:
     hopfield_proj_dim: Optional[int] = field(default=None)
     hopfield_direct_query: Optional[bool] = field(default=False)
     hopfield_value_as_key: Optional[bool] = field(default=False)
+    hopfield_value_proj_dim: Optional[int] = field(default=None)
     memory_update: Optional[str] = field(default="gradient")
     use_mem_residual: Optional[bool] = field(default=False)
     use_reconstruction_loss: Optional[bool] = field(default=False)
@@ -403,6 +404,7 @@ def main(config_path: Optional[str] = None):
         hopfield_proj_dim=args.hopfield_proj_dim,
         hopfield_direct_query=args.hopfield_direct_query,
         hopfield_value_as_key=args.hopfield_value_as_key,
+        hopfield_value_proj_dim=args.hopfield_value_proj_dim,
         memory_update=args.memory_update,
         use_mem_residual=args.use_mem_residual,
         use_reconstruction_loss=args.use_reconstruction_loss,

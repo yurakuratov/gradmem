@@ -52,3 +52,4 @@ hopfield:
   hopfield_proj_dim: null  # if null use M*d key/query size, otherwise add learnable key/query linear projections
   hopfield_direct_query: false  # use only meta-learned query vector, skip forward pass for query
   hopfield_value_as_key: false  # skip forward pass for key, use value_pattern or its projection as key
+  hopfield_value_proj_dim: null  # value projection dim in Hopfield STORE/RETRIEVE (null = disabled, M*d = identity init)
