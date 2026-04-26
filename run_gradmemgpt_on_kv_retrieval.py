@@ -452,7 +452,9 @@ def main(config_path: Optional[str] = None):
 
         stage_overrides = {}
         if args.curriculum_stage_overrides:
-            stage_overrides = {int(k): v for k, v in json.loads(args.curriculum_stage_overrides).items()}
+            raw = args.curriculum_stage_overrides
+            overrides_dict = json.loads(raw) if isinstance(raw, str) else raw
+            stage_overrides = {int(k): v for k, v in overrides_dict.items()}
             logger.info(f'curriculum stage overrides: {stage_overrides}')
 
         MODEL_PARAM_MAP = {
