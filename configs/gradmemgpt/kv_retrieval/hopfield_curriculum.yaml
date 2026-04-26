@@ -53,7 +53,13 @@ hopfield:
   hopfield_value_as_key: true
 
 curriculum:
-  curriculum_enabled: true
-  curriculum_threshold: 0.95
-  curriculum_levels: "4,8,16,32,64,128"
-  curriculum_data_dir: "./data"
+  enabled: true
+  threshold: 0.95
+  levels: "4,8,16,32,64,128"
+  data_dir: "./data"
+  stage_overrides:
+    1: {inner_lr: 0.02}
+    2: {inner_lr: 0.01}
+    3: {inner_lr: 0.005}
+    4: {inner_lr: 0.002}
+    5: {inner_lr: 0.001}

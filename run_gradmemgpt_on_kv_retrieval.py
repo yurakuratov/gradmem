@@ -275,6 +275,7 @@ class ExperimentArgs:
     curriculum_threshold: Optional[float] = field(default=0.95)
     curriculum_levels: Optional[str] = field(default="4,8,16,32,64,128")
     curriculum_data_dir: Optional[str] = field(default="./data")
+    curriculum_stage_overrides: Optional[str] = field(default=None)
 
 
 def main(config_path: Optional[str] = None):
@@ -292,11 +293,13 @@ def main(config_path: Optional[str] = None):
         with open(args.config) as f:
             cfg = yaml.safe_load(f)
 
-        # Flatten config to args (YAML values override ExperimentArgs defaults)
+# Flatten config to args (YAML values override ExperimentArgs defaults)
         for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield', 'curriculum']:
             if section in cfg:
                 for key, value in cfg[section].items():
-                    if hasattr(args, key):
+                    if key == 'stage_overrides':
+                        args.curriculum_stage_overrides = json.dumps({str(k): v for k, v in value.items()})
+                    elif hasattr(args, key):
                         setattr(args, key, value)
 
         # Set exp_path from config if not explicitly set
@@ -445,12 +448,39 @@ def main(config_path: Optional[str] = None):
         curriculum_levels = [int(x.strip()) for x in args.curriculum_levels.split(',')]
         logger.info(f'curriculum learning enabled: levels={curriculum_levels}, threshold={args.curriculum_threshold}')
 
+        stage_overrides = {}
+        if args.curriculum_stage_overrides:
+            stage_overrides = {int(k): v for k, v in json.loads(args.curriculum_stage_overrides).items()}
+            logger.info(f'curriculum stage overrides: {stage_overrides}')
+
+        MODEL_PARAM_MAP = {
+            'inner_lr': ('lr', 'lr'),
+        }
+        TRAINING_PARAM_MAP = {
+            'learning_rate', 'warmup_steps', 'weight_decay', 'per_device_batch_size',
+            'max_steps', 'eval_steps', 'logging_steps', 'early_stopping_patience',
+        }
+
         data_dir = Path(args.curriculum_data_dir)
         dataset_name_template = "N{n_kv}-K2V2-V62_1M"
 
         all_metrics = {}
         cumulative_steps = 0
         for stage_idx, n_kv in enumerate(curriculum_levels):
+            # Apply stage overrides
+            overrides = stage_overrides.get(stage_idx, {})
+            if overrides:
+                logger.info(f'curriculum stage {stage_idx} overrides: {overrides}')
+                for param, value in overrides.items():
+                    if param in MODEL_PARAM_MAP:
+                        model_attr, config_attr = MODEL_PARAM_MAP[param]
+                        setattr(model, model_attr, value)
+                        setattr(model.config, config_attr, value)
+                        logger.info(f'  override model.{model_attr} = {value}')
+                    elif param in TRAINING_PARAM_MAP:
+                        setattr(args, param, value)
+                        logger.info(f'  override args.{param} = {value}')
+
             dataset_name = dataset_name_template.format(n_kv=n_kv)
             data_path = data_dir / dataset_name
             logger.info(f'curriculum stage {stage_idx}/{len(curriculum_levels)-1}: N={n_kv}, data_path={data_path}')
