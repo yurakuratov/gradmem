@@ -121,6 +121,27 @@ def test_single_batch_train_updates_energy_params():
     assert torch.stack(energy_grads).sum().item() > 0.0
 
 
+def test_energy_loss_uses_masked_average():
+    model = _model(K=1)
+
+    class IdentityEncoder(torch.nn.Module):
+        def forward(self, hidden, state=None):
+            return hidden, state
+
+    model.energy_encoder = IdentityEncoder()
+    model.energy_head = torch.nn.Linear(1, 1, bias=False)
+    with torch.no_grad():
+        model.energy_head.weight.fill_(1.0)
+
+    hidden = torch.tensor([[[1.0], [3.0], [100.0]], [[2.0], [4.0], [6.0]]])
+    mask = torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.bool)
+
+    loss, state = model._energy_loss(hidden, mask, None)
+
+    assert state is None
+    assert torch.allclose(loss, torch.tensor(6.0))  # (1 + 3) / 2 + (2 + 4 + 6) / 3
+
+
 def test_rejects_unknown_inner_objective():
     with pytest.raises(ValueError, match="inner_objective='lstm'"):
         EnergyGradMemConfig(base_config=_base_config(), inner_objective="other")

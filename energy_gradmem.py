@@ -89,12 +89,11 @@ class EnergyGradMem(GradMemGPT):
             encoded, energy_state = self.energy_encoder(hidden, energy_state)
         energy = self.energy_head(encoded).squeeze(-1)
 
-        valid_lengths = mask.long().sum(dim=1)
-        last_idx = valid_lengths.clamp_min(1) - 1
-        batch_idx = torch.arange(hidden.size(0), device=hidden.device)
-        last_energy = energy[batch_idx, last_idx]
-        last_energy = last_energy * (valid_lengths > 0).to(last_energy.dtype)
-        return last_energy.sum(), energy_state
+        mask = mask.to(dtype=energy.dtype)
+        valid_lengths = mask.sum(dim=1)
+        per_sample_energy = (energy * mask).sum(dim=1) / valid_lengths.clamp_min(1.0)
+        per_sample_energy = per_sample_energy * (valid_lengths > 0).to(per_sample_energy.dtype)
+        return per_sample_energy.sum(), energy_state
 
     def _run_write_model(self, write_batch, memory_state):
         write_model_kwargs = write_batch.get("model_kwargs", {})
