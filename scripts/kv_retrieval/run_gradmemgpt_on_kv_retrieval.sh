@@ -17,7 +17,7 @@ GRAD_ACC_STEPS=${GRAD_ACC_STEPS:-$((TBS/(PER_DEVICE_BATCH_SIZE*NP)))}
 MIXED_PRECISION=${MIXED_PRECISION:-no}
 
 # Base model
-MODEL=${MODEL:-energy_gradmem}
+MODEL=${MODEL:-gradmem}
 BASE_MODEL=${BASE_MODEL:-llama}
 L=${L:-4}
 H=${H:-4}
@@ -35,7 +35,7 @@ HF_SUBSET=${HF_SUBSET:-N${N_PAIRS}-K${K_SIZE}V${V_SIZE}-V${VOCAB_SIZE}}
 TOKENIZER_PATH=${TOKENIZER_PATH:-./tokenizers/kv_alphabet_${VOCAB_SIZE}/}
 MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH:-None}
 
-# EnergyGradMem memory / inner loop
+# GradMemGPT memory / inner loop
 MEMORY_BACKEND=${MEMORY_BACKEND:-prefix}
 N_MEM_TOKENS=${N_MEM_TOKENS:-8}
 N_CTRL_TOKENS=${N_CTRL_TOKENS:-0}
@@ -48,7 +48,7 @@ USE_ADAM=${USE_ADAM:-false}
 GRAD_MODE=${GRAD_MODE:-second}
 USE_MEM_PROJ=${USE_MEM_PROJ:-false}
 MEM_PROJ_MODE=${MEM_PROJ_MODE:-none}
-USE_WRITE_HEAD=${USE_WRITE_HEAD:-false}
+USE_WRITE_HEAD=${USE_WRITE_HEAD:-true}
 USE_WRITE_LORA=${USE_WRITE_LORA:-false}
 WRITE_LORA_R=${WRITE_LORA_R:-8}
 WRITE_LORA_ALPHA=${WRITE_LORA_ALPHA:-16}
@@ -69,13 +69,6 @@ LORA_MEM_LAYERS=${LORA_MEM_LAYERS:-all}
 LORA_MEM_TARGET_MODULES=${LORA_MEM_TARGET_MODULES:-None}
 KV_MEM_LAYERS=${KV_MEM_LAYERS:-all}
 
-# Energy objective. Parameter names intentionally use energy_* rather than lstm_*.
-INNER_OBJECTIVE=${INNER_OBJECTIVE:-lstm}
-ENERGY_HIDDEN_SIZE=${ENERGY_HIDDEN_SIZE:-$D}
-ENERGY_NUM_LAYERS=${ENERGY_NUM_LAYERS:-2}
-ENERGY_DROPOUT=${ENERGY_DROPOUT:-0.0}
-ENERGY_FUTURE_MODE=${ENERGY_FUTURE_MODE:-next_token}
-
 # Training control
 MAX_STEPS=${MAX_STEPS:-50000}
 EVAL_STEPS=${EVAL_STEPS:-100}
@@ -87,7 +80,7 @@ LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-constant_with_warmup}
 METRIC_FOR_BEST_MODEL=${METRIC_FOR_BEST_MODEL:-token_accuracy}
 INIT_CHECKPOINT=${INIT_CHECKPOINT:-}
 
-RUN_NAME=${RUN_NAME:-energy_gradmem_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}}
+RUN_NAME=${RUN_NAME:-gradmem_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}}
 RUN_NAME_SUFFIX=${RUN_NAME_SUFFIX:-}
 if [ -n "$RUN_NAME_SUFFIX" ]; then
   RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
@@ -96,15 +89,15 @@ export WANDB_NAME=${WANDB_NAME:-${MODEL}_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_
 
 N_VALUES=${N_VALUES:-1}
 for N in $N_VALUES; do
-  EXP_PATH=${EXP_PATH:-./runs/energy_gradmem_kv/${HF_SUBSET}/${RUN_NAME}/run_${N}}
-  PORT=$((29500 + TBS + N + 17))
+  EXP_PATH=${EXP_PATH:-./runs/gradmem_kv/${HF_SUBSET}/${RUN_NAME}/run_${N}}
+  PORT=$((29500 + TBS + N + 37))
 
   $PYTHON_BIN -m accelerate.commands.launch \
     --main_process_port $PORT \
     --num_processes $NP \
     --mixed_precision "$MIXED_PRECISION" \
     --config_file accelerate.yaml \
-    run_energy_gradmem_on_kv_retrieval.py \
+    run_gradmemgpt_on_kv_retrieval_hf.py \
     --exp_path "$EXP_PATH" \
     --per_device_batch_size "$PER_DEVICE_BATCH_SIZE" \
     --gradient_accumulation_steps "$GRAD_ACC_STEPS" \
@@ -152,11 +145,6 @@ for N in $N_VALUES; do
     --attn_implementation "$ATTN_IMPLEMENTATION" \
     --add_inner_loss_to_outer "$ADD_INNER_LOSS_TO_OUTER" \
     $( [ "$INNER_LOSS_WEIGHT" != "None" ] && echo "--inner_loss_weight $INNER_LOSS_WEIGHT" ) \
-    --inner_objective "$INNER_OBJECTIVE" \
-    --energy_hidden_size "$ENERGY_HIDDEN_SIZE" \
-    --energy_num_layers "$ENERGY_NUM_LAYERS" \
-    --energy_dropout "$ENERGY_DROPOUT" \
-    --energy_future_mode "$ENERGY_FUTURE_MODE" \
     --max_steps "$MAX_STEPS" \
     --eval_steps "$EVAL_STEPS" \
     --logging_steps "$LOGGING_STEPS" \

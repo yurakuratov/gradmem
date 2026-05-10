@@ -13,16 +13,22 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         energy_hidden_size=None,
         energy_num_layers=2,
         energy_dropout=0.0,
+        energy_future_mode="next_token",
         return_energy_state=False,
         **kwargs,
     ):
+        if kwargs.get("use_write_head", False):
+            raise ValueError("EnergyGradMem does not support use_write_head; the energy objective does not use LM logits")
         super().__init__(**kwargs)
         if inner_objective != "lstm":
             raise ValueError("EnergyGradMem currently supports inner_objective='lstm' only")
+        if energy_future_mode not in ("none", "next_token"):
+            raise ValueError("energy_future_mode must be one of: 'none', 'next_token'")
         self.inner_objective = inner_objective
         self.energy_hidden_size = energy_hidden_size
         self.energy_num_layers = energy_num_layers
         self.energy_dropout = energy_dropout
+        self.energy_future_mode = energy_future_mode
         self.return_energy_state = return_energy_state
 
 
@@ -44,11 +50,13 @@ class EnergyGradMem(GradMemGPT):
         self.inner_objective = config.inner_objective
         self.energy_hidden_size = int(energy_hidden_size)
         self.energy_num_layers = energy_num_layers
+        self.energy_future_mode = config.energy_future_mode
         self.return_energy_state = bool(getattr(config, "return_energy_state", False))
         dropout = float(config.energy_dropout) if energy_num_layers > 1 else 0.0
+        energy_input_size = model_hidden_size * 2 if self.energy_future_mode == "next_token" else model_hidden_size
 
         self.energy_encoder = nn.LSTM(
-            input_size=model_hidden_size,
+            input_size=energy_input_size,
             hidden_size=self.energy_hidden_size,
             num_layers=energy_num_layers,
             dropout=dropout,
@@ -136,8 +144,40 @@ class EnergyGradMem(GradMemGPT):
             )
         return ctx_hidden
 
-    def _inner_grad_options(self, k, global_step, total_steps):
-        is_second_order_step = self.grad_mode == "second" and k >= (self.K - self.last_K_second_order)
+    def _future_embeddings(self, segment, mask):
+        if self.energy_future_mode == "none":
+            return None
+        if self.energy_future_mode != "next_token":
+            raise ValueError(f"Unsupported energy_future_mode={self.energy_future_mode}")
+
+        emb_layer = self.model.get_input_embeddings()
+        target_len = mask.size(1)
+        emb_dim = emb_layer.embedding_dim
+        future = emb_layer.weight.new_zeros(segment.size(0), target_len, emb_dim)
+        if segment.size(1) <= 1:
+            return future
+
+        segment_len = min(segment.size(1), target_len)
+        next_len = max(0, segment_len - 1)
+        if next_len == 0:
+            return future
+
+        next_valid = mask[:, 1:segment_len].bool()
+        next_emb = emb_layer(segment[:, 1:segment_len])
+        future[:, :next_len, :] = next_emb * next_valid.unsqueeze(-1).to(next_emb.dtype)
+        return future
+
+    def _energy_input(self, ctx_hidden, segment, mask):
+        future = self._future_embeddings(segment, mask)
+        if future is None:
+            return ctx_hidden
+        return torch.cat([ctx_hidden, future.to(dtype=ctx_hidden.dtype)], dim=-1)
+
+    def _inner_grad_options(self, global_step, total_steps):
+        is_second_order_step = (
+            self.grad_mode == "second"
+            and global_step >= (total_steps - self.last_K_second_order)
+        )
         create_graph = is_second_order_step
         has_future_energy_use = global_step < (total_steps - 1)
         retain_graph = (
@@ -198,10 +238,11 @@ class EnergyGradMem(GradMemGPT):
                     write_batch = backend.build_write_inputs(memory_state, batch_ctx)
                     hidden = self._run_write_model(write_batch, memory_state)
                     ctx_hidden = self._extract_context_hidden(hidden, write_batch, batch_ctx)
-                    inner_loss, energy_state = self._energy_loss(ctx_hidden, write_batch["mask"], energy_state)
+                    energy_input = self._energy_input(ctx_hidden, segment, write_batch["mask"])
+                    inner_loss, energy_state = self._energy_loss(energy_input, write_batch["mask"], energy_state)
                     del hidden
 
-                    create_graph, retain_graph = self._inner_grad_options(k, global_step, total_steps)
+                    create_graph, retain_graph = self._inner_grad_options(global_step, total_steps)
                     inner_params = backend.inner_params(memory_state)
                     grads = torch.autograd.grad(
                         inner_loss,

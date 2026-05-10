@@ -6,13 +6,13 @@ from pathlib import Path
 from typing import Optional
 
 import accelerate
-import datasets
 import torch
 import transformers
 from safetensors.torch import load_file
-from transformers import AutoConfig, AutoTokenizer, EarlyStoppingCallback, HfArgumentParser, Trainer, TrainingArguments
+from transformers import AutoConfig, AutoTokenizer, EarlyStoppingCallback, HfArgumentParser, TrainingArguments
 
-from energy_gradmem import EnergyGradMem, EnergyGradMemConfig
+from grad_memgpt import GradMemGPT, GradMemGPTConfig
+from run_energy_gradmem_on_kv_retrieval import load_kv_dataset, split_dataset
 from run_gradmemgpt_on_kv_retrieval import (
     CustomTrainer,
     StopOnMetricValue,
@@ -25,10 +25,9 @@ from run_gradmemgpt_on_kv_retrieval import (
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ.setdefault("WANDB_PROJECT", "gradmem")
 
-logger_fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-log_lvl = logging.INFO
-logging.basicConfig(format=logger_fmt, level=log_lvl)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger("")
+log_lvl = logging.INFO
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
@@ -54,7 +53,7 @@ class ExperimentArgs:
     weight_decay: Optional[float] = field(default=0.0)
     learning_rate: Optional[float] = field(default=1e-4)
     lr_scheduler_type: Optional[str] = field(default="constant_with_warmup")
-    early_stopping_patience: Optional[int] = field(default=50)
+    early_stopping_patience: Optional[int] = field(default=500)
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
@@ -68,7 +67,7 @@ class ExperimentArgs:
     n_mem_tokens: Optional[int] = field(default=8)
     K: Optional[int] = field(default=2)
     last_K_second_order: Optional[int] = field(default=None)
-    inner_lr: Optional[float] = field(default=0.01)
+    inner_lr: Optional[float] = field(default=0.04)
     use_adam: Optional[bool] = field(default=False)
     grad_mode: Optional[str] = field(default="second")
     n_ctrl_tokens: Optional[int] = field(default=0)
@@ -76,7 +75,7 @@ class ExperimentArgs:
     inner_clip_norm: Optional[float] = field(default=None)
     use_mem_proj: Optional[bool] = field(default=False)
     mem_proj_mode: Optional[str] = field(default="none")
-    use_write_head: Optional[bool] = field(default=False)
+    use_write_head: Optional[bool] = field(default=True)
     use_write_lora: Optional[bool] = field(default=False)
     write_lora_r: Optional[int] = field(default=8)
     write_lora_alpha: Optional[int] = field(default=16)
@@ -92,14 +91,8 @@ class ExperimentArgs:
     freeze_backbone: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
-    add_inner_loss_to_outer: Optional[bool] = field(default=False)
-    inner_loss_weight: Optional[float] = field(default=None)
-
-    inner_objective: Optional[str] = field(default="lstm")
-    energy_hidden_size: Optional[int] = field(default=None)
-    energy_num_layers: Optional[int] = field(default=2)
-    energy_dropout: Optional[float] = field(default=0.0)
-    energy_future_mode: Optional[str] = field(default="next_token")
+    add_inner_loss_to_outer: Optional[bool] = field(default=True)
+    inner_loss_weight: Optional[float] = field(default=0.5)
 
 
 def build_base_config(args, tokenizer):
@@ -126,7 +119,6 @@ def build_base_config(args, tokenizer):
         config.intermediate_size = config.hidden_size * 4
     else:
         raise ValueError(f"Unsupported base model: {args.base_model}")
-
     config.torch_dtype = "float32"
     config.vocab_size = tokenizer.vocab_size
     config.pad_token_id = tokenizer.pad_token_id
@@ -137,7 +129,7 @@ def build_base_config(args, tokenizer):
 
 
 def build_model_config(args, base_config):
-    return EnergyGradMemConfig(
+    return GradMemGPTConfig(
         pretrained_model=args.pretrained_model,
         base_config=base_config,
         memory_backend=args.memory_backend,
@@ -170,35 +162,7 @@ def build_model_config(args, base_config):
         attn_implementation=args.attn_implementation,
         add_inner_loss_to_outer=args.add_inner_loss_to_outer,
         inner_loss_weight=args.inner_loss_weight,
-        inner_objective=args.inner_objective,
-        energy_hidden_size=args.energy_hidden_size,
-        energy_num_layers=args.energy_num_layers,
-        energy_dropout=args.energy_dropout,
-        energy_future_mode=args.energy_future_mode,
     )
-
-
-def load_kv_dataset(args):
-    if args.data_path is not None:
-        return datasets.load_from_disk(args.data_path)
-
-    subset = args.hf_subset
-    if subset is None:
-        subset = f"N{args.n_pairs}-K{args.key_size}V{args.value_size}-V{args.vocab_size}"
-    return datasets.load_dataset(args.hf_dataset, subset)
-
-
-def split_dataset(dataset):
-    train = dataset["train"]
-    if "valid" in dataset:
-        valid = dataset["valid"]
-    elif "validation" in dataset:
-        valid = dataset["validation"]
-    elif "test" in dataset:
-        valid = dataset["test"]
-    else:
-        raise ValueError(f"Dataset has no valid/validation/test split. Available splits: {list(dataset.keys())}")
-    return train, valid
 
 
 if __name__ == "__main__":
@@ -208,10 +172,6 @@ if __name__ == "__main__":
 
     logger = get_logger("")
     transformers.utils.logging.set_verbosity(log_lvl)
-    logger.info(f"num processes: {accel.num_processes}")
-    logger.info(f"mixed precision: {accel.mixed_precision}")
-    logger.info(f"accelerator state: {accel.state}")
-
     assert not (args.pretrained_model is not None and args.base_model is not None), "only one of these args must be set"
 
     if accel.is_main_process:
@@ -222,18 +182,13 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model or args.tokenizer_path)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
-    base_config = build_base_config(args, tokenizer)
-
-    model = EnergyGradMem(build_model_config(args, base_config))
+    model = GradMemGPT(build_model_config(args, build_base_config(args, tokenizer)))
     if args.init_checkpoint is not None:
         missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
         logger.info(f"missing keys from checkpoint: {missing_k}")
         logger.info(f"unexpected keys from checkpoint: {unexpected_k}")
     if accel.mixed_precision == "bf16":
         model.to(torch.bfloat16)
-
-    logger.info(f"model config: {model.config}")
-    logger.info(f"model.dtype: {model.dtype}")
 
     dataset = load_kv_dataset(args)
     train_dataset, valid_dataset = split_dataset(dataset)
@@ -299,7 +254,6 @@ if __name__ == "__main__":
         ],
     )
     trainer.train()
-    logger.info("training done. running final evaluation...")
     metrics = trainer.evaluate(valid_dataset)
     logger.info(f"{metrics}")
     trainer.save_metrics(split="all", metrics=metrics)
