@@ -329,7 +329,23 @@ if __name__ == '__main__':
     model = GradMemGPT(gradmem_config)
 
     if args.init_checkpoint is not None:
-        missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
+        state_dict = load_file(args.init_checkpoint)
+        if args.memory_backend == 'prefix' and 'mem' in state_dict and getattr(model, 'mem', None) is not None:
+            ckpt_mem = state_dict['mem']
+            model_mem = model.mem
+            # if n_mem_tokens is different, slice the checkpoint mem to the model mem shape
+            if ckpt_mem.shape[0] != model_mem.shape[0]:
+                if ckpt_mem.shape[0] > model_mem.shape[0]:
+                    logger.info(
+                        f'Slicing checkpoint mem from {tuple(ckpt_mem.shape)} to {tuple(model_mem.shape)}.'
+                    )
+                    state_dict['mem'] = ckpt_mem[:model_mem.shape[0]]
+                else:
+                    raise ValueError(
+                        f'Checkpoint has fewer memory tokens than model expects: '
+                        f'ckpt mem shape={tuple(ckpt_mem.shape)}, model mem shape={tuple(model_mem.shape)}.'
+                    )
+        missing_k, unexpected_k = model.load_state_dict(state_dict, strict=False)
         if len(missing_k) != 0:
             logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
         if len(unexpected_k) != 0:
