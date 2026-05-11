@@ -1,90 +1,144 @@
-# Test Time Gradient Descend for Memory Update
+# GradMem: Learning to Write Context into Memory with Test-Time Gradient Descent
 
-This repository contains small experiments around "test time" gradient updates for key--value retrieval tasks. The main goal is to train compact GPT style models (both vanilla and models with an adaptive memory) to recover values that appear in the context.
+This repository contains code for **GradMem**, a memory mechanism where the model compresses a context into a small writable memory state using **test-time gradient descent**.
 
+The key idea is not just to optimize memory at inference, but to **meta-learn the model so that a few (<=5) test-time updates are effective**.
 
-## Intro
-Large-context transformers pay a **quadratic cost** every time they reread long prompts.
+arXiv: https://arxiv.org/abs/2603.13875
 
-Our goal is to compress those prompts into a **small, writable parameter block `[mem]`** that we update with a few gradient steps at test time, then drop the original text entirely.
+<p align="center">
+  <img src="./imgs/GradMem_overview_short.png" width="80%" />
+</p>
 
-### How it works
+## Concept
 
-| Phase | What happens | N_iters | Input size |
-|-------|--------------|--------------|------------|
-| **Write (inner loop, *K* steps)** | Show the context, compute an LM loss **L<sub>inner</sub>**, update **`[mem]` only** | *K* | `[mem]` + `context` |
-| **Read (outer loop)** | Discard the context; answer the query with the **updated `[mem]`** and compute **L<sub>outer</sub>** | 1 |  `query` |
+Each example is split into:
+- `context C` (information to store),
+- `query Q` (what to ask),
+- `target Y` (expected output).
 
-*Back-propagating L<sub>outer</sub> meta-trains both the Transformer weights θ and the **initial memory `[mem]_0`**, so the model learns how to “write quickly.”*
+GradMem runs in two phases:
 
-### Gradient-flow modes
+1. **WRITE (inner loop, K steps)**
+   - Start from learned memory initialization `M0`.
+   - Optimize memory tokens `M` on a self-supervised reconstruction loss `L_write(M, C)`.
+   - Update only memory state; model weights stay fixed during this phase.
 
-| Flag | What gradients reach `[mem]_0`? | Extra VRAM cost | Typical use-case |
-|------|---------------------------------|-----------------|------------------|
-| `none` (“Frozen”) | **None** (detach) | None | Baseline sanity check |
-| `first` (“1st-order”) | Straight-through, no Hessian term | None | Fast runs, XX% of full accuracy |
-| `second` (“2nd-order”) | Full MAML (keeps full graph through the *K* inner steps) | **≈ K × activation-memory** (parameters are shared; what multiplies is the *activations* for each inner forward/backward) | Highest accuracy when GPU RAM is sufficient |
+2. **READ (outer objective)**
+   - Predict `Y` from `[M; Q]` after WRITE.
+   - Train model parameters and `M0` by backpropagating task loss through the WRITE updates (meta-learning).
 
+In short: GradMem learns to use gradient descent itself as a writing operation.
 
-## Prerequisites
+## Repository layout
 
-* Python 3.11
-* [conda](https://docs.conda.io/en/latest/) for environment management
+- `grad_memgpt.py` - GradMem model and inner-loop memory optimization logic.
+- `rmt.py` - recurrent memory transformer baseline with forward-only memory updates.
+- `run_gradmemgpt_on_*.py` - GradMem training/eval entry points.
+- `run_rmt_on_*.py` - RMT baseline entry points.
+- `run_gpt2_on_*.py` - non-compressive causal LM baselines.
+- `kv_dataset_utils.py` - synthetic key-value retrieval data generation and tokenizer helpers.
+- `squad_utils.py`, `phonebook_utils.py` - NLP dataset preprocessing.
+- `prepare_pg19_chunks.py` - PG19 chunking for language modeling/compression experiments.
+- `attn_double_bwd/` - custom attention double-backward implementations for higher-order GradMem training.
+- `scripts/` - runnable experiment presets and dataset download scripts.
 
-Create an environment using the provided YAML file:
+## Setup
+
+Requirements:
+- Python 3.11
+- [conda](https://docs.conda.io/en/latest/)
+
+Create environment:
 
 ```bash
 conda env create -f conda_env.yaml
-conda activate /home/jovyan/kuratov/envs/py311_pt2.6_cu12.4  # or the path printed by conda
+conda activate /home/jovyan/kuratov/envs/py311_pt2.6_cu12.4
 ```
 
-Accelerate is configured via `accelerate.yaml`. The default configuration uses BF16 precision and a single process.
+`accelerate.yaml` contains a default single-process setup.
 
-## Datasets
+## Data
 
-### KV-retrieval
-Datasets consist of sequences containing random text segments with embedded `!key:value!` pairs. The last segment queries one of the previous keys (e.g. `?!K:`) and the model must output the corresponding value.
+### KV retrieval
 
-To generate a dataset run the notebook `notebooks/dump_dataset.ipynb`. It relies on `kv_dataset_utils.generate_sequence` to create individual samples and dumps them using Hugging Face `datasets`. The resulting directory will be saved under `./data/<DATASET_NAME>` where `DATASET_NAME` encodes generation parameters, for example `N8_K2V2_1M`.
+Synthetic samples contain `!key:value!` pairs in context and a query like `?!K:`; target is the corresponding value.
 
-Download KV-retrieval datasets from HF:
+Download prepared datasets from Hugging Face:
+
 ```bash
 ./scripts/download_kv_retrieval.sh
 ```
 
+You can also generate data with `notebooks/dump_dataset.ipynb` (uses `kv_dataset_utils.generate_sequence`).
+
 ### bAbI
-Download bAbI datasets from HF:
+
 ```bash
 ./scripts/download_babi.sh
 ```
 
+### PG19 chunks (for text compression / LM experiments)
 
-## Training
+```bash
+./scripts/prepare_pg19_chunks.sh
+```
 
-Two entry points are provided:
+## How to run
 
-* `run_gpt2_on_kv_retrieval.py` &ndash; trains a standard causal LM.
-* `run_gradmemgpt_on_kv_retrieval.py` &ndash; trains a small LM with writable memory (see `grad_memgpt.py`).
-
-Both scripts accept the same arguments (batch size, number of layers, dataset path, etc.). They should be launched through `accelerate`:
+### 1) Baseline causal LM (no writable memory)
 
 ```bash
 accelerate launch --config_file accelerate.yaml \
   run_gpt2_on_kv_retrieval.py \
   --exp_path ./runs/gpt2_example \
   --per_device_batch_size 64 \
-  --data_path ./data/N10-K4V4-S4(32-64)_1M
+  --data_path ./data/N16-K2V2-V62_1M \
+  --tokenizer_path ./tokenizers/kv_alphabet_62/ \
+  --base_model llama
 ```
+
+### 2) GradMem on KV retrieval
 
 ```bash
 accelerate launch --config_file accelerate.yaml \
   run_gradmemgpt_on_kv_retrieval.py \
   --exp_path ./runs/gradmem_example \
   --per_device_batch_size 64 \
-  --data_path ./data/N10-K4V4-S4(32-64)_1M
+  --data_path ./data/N16-K2V2-V62_1M \
+  --tokenizer_path ./tokenizers/kv_alphabet_62/ \
+  --base_model llama \
+  --n_mem_tokens 8 \
+  --K 2 \
+  --inner_lr 0.04 \
+  --grad_mode second
 ```
 
-The scripts log metrics and save checkpoints to the directory specified via `--exp_path`.
+For full experiment configurations, use scripts in `scripts/`:
+- `scripts/run_gradmemgpt_on_kv_retrieval.sh`
+- `scripts/run_rmt_on_kv_retrieval.sh`
+- `scripts/run_gpt_on_kv_retrieval.sh`
+- `scripts/run_gradmemgpt_on_babi.sh`
+- `scripts/run_gradmemgpt_on_squad.sh`
+
+
+For text-compression experiments, prepare PG19 chunks with
+`scripts/prepare_pg19_chunks.sh` and run `run_gradmemgpt_on_text_compression.py` directly with `accelerate`.
+
+## GradMem options
+
+`grad_mode` controls gradient flow through WRITE updates:
+
+- `none` - no meta-gradient through inner updates.
+- `first` - first-order approximation.
+- `second` - full second-order differentiation through inner loop (default for strongest results).
+
+Second-order mode is more expensive in memory/compute, but it is what we found that actually makes GradMem to learn; `attn_double_bwd/` includes optimized double-backward implementations for attention for second-order optimization.
+
+## Outputs
+
+All runs write checkpoints, metrics, and trainer state under `--exp_path` (typically in `./runs/...`).
+
 
 ## Tests
 
@@ -121,4 +175,17 @@ python -m pytest -q -m all --model-family gpt2,gpt_neox
 
 # Combine backend + model-family filters
 python -m pytest -q -m all --backend prefix --model-family llama
+```
+
+## Citation
+```
+@misc{kuratov2026gradmem,
+      title={GradMem: Learning to Write Context into Memory with Test-Time Gradient Descent}, 
+      author={Yuri Kuratov and Matvey Kairov and Aydar Bulatov and Ivan Rodkin and Mikhail Burtsev},
+      year={2026},
+      eprint={2603.13875},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2603.13875}, 
+}
 ```
