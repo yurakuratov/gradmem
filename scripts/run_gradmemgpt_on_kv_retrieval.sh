@@ -65,6 +65,7 @@ LORA_MEM_LAYERS="all"
 
 # KV-cache memory params (active only when MEMORY_BACKEND="kv_cache")
 KV_MEM_LAYERS="all"
+# INNER_LR=10.0 for kv_cache backend
 
 # Prefix backend notes (active only when MEMORY_BACKEND="prefix"):
 # - Uses N_MEM_TOKENS (+ optional N_CTRL_TOKENS).
