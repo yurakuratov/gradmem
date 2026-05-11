@@ -86,6 +86,12 @@ class GradMemGPTConfig(PretrainedConfig):
                  freeze_backbone=False,
                  use_gradient_checkpointing=False,
                  attn_implementation="eager",
+                 write_objective="reconstruction",
+                 energy_head_hidden_dim=None,
+                 energy_rank_weight=0.0,
+                 energy_traj_weight=0.0,
+                 energy_margin=0.1,
+                 energy_traj_margin=0.0,
                  add_inner_loss_to_outer=False,
                  inner_loss_weight=None,
                  **kwargs):
@@ -127,6 +133,12 @@ class GradMemGPTConfig(PretrainedConfig):
                 "none"/"auto"/"" (treated as all layers)
             freeze_backbone: bool, freeze backbone weights (READ+WRITE), except LoRA/write head/mem proj
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
+            write_objective: str, inner WRITE objective ("reconstruction" or "energy")
+            energy_head_hidden_dim: int|None, hidden dim for energy MLP; defaults to backbone hidden size
+            energy_rank_weight: float, optional ranking loss weight for final memory vs initial memory
+            energy_traj_weight: float, optional monotonic trajectory loss weight
+            energy_margin: float, margin for ranking loss
+            energy_traj_margin: float, margin for trajectory monotonicity loss
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
         """
@@ -171,6 +183,12 @@ class GradMemGPTConfig(PretrainedConfig):
         self.last_K_second_order = max(0, min(self.last_K_second_order, K))
         self.use_gradient_checkpointing = use_gradient_checkpointing
         self.attn_implementation = attn_implementation
+        self.write_objective = write_objective
+        self.energy_head_hidden_dim = energy_head_hidden_dim
+        self.energy_rank_weight = energy_rank_weight
+        self.energy_traj_weight = energy_traj_weight
+        self.energy_margin = energy_margin
+        self.energy_traj_margin = energy_traj_margin
         self.add_inner_loss_to_outer = add_inner_loss_to_outer
         self.inner_loss_weight = inner_loss_weight
 
@@ -180,6 +198,11 @@ class GradMemGPTConfig(PretrainedConfig):
         assert self.memory_backend in ["prefix", "lora", "kv_cache"], (
             "memory_backend must be one of: prefix, lora, kv_cache"
         )
+        assert self.write_objective in ["reconstruction", "energy"], (
+            "write_objective must be one of: reconstruction, energy"
+        )
+        if self.write_objective == "energy" and self.memory_backend != "prefix":
+            raise ValueError("write_objective='energy' is currently supported only for memory_backend='prefix'")
         if self.memory_backend == "lora":
             assert self.lora_mem_placement in ["between_layers", "target_modules"], (
                 "lora_mem_placement currently supports: 'between_layers', 'target_modules'"
@@ -280,6 +303,7 @@ class InputPrefixMemoryBackend(MemoryBackend):
             "mask": batch_ctx["mask"],
             "logits_start": batch_ctx["mem_offset"] - 1,
             "label_shift": 0,
+            "context_start": batch_ctx["mem_offset"],
         }
 
     def build_read_inputs(self, memory_state, batch_ctx):
@@ -704,6 +728,14 @@ class GradMemGPT(PreTrainedModel):
                 "use mem_proj_mode='none' or 'proj'"
             )
         self.use_write_head = config.use_write_head
+        self.write_objective = getattr(config, "write_objective", "reconstruction")
+        self.energy_head_hidden_dim = getattr(config, "energy_head_hidden_dim", None)
+        self.energy_rank_weight = float(getattr(config, "energy_rank_weight", 0.0) or 0.0)
+        self.energy_traj_weight = float(getattr(config, "energy_traj_weight", 0.0) or 0.0)
+        self.energy_margin = float(getattr(config, "energy_margin", 0.1))
+        self.energy_traj_margin = float(getattr(config, "energy_traj_margin", 0.0))
+        if self.write_objective == "energy" and self.memory_backend != "prefix":
+            raise ValueError("write_objective='energy' is currently supported only for memory_backend='prefix'")
         self.add_inner_loss_to_outer = config.add_inner_loss_to_outer
         self.inner_loss_weight = config.inner_loss_weight
         if self.add_inner_loss_to_outer:
@@ -749,6 +781,18 @@ class GradMemGPT(PreTrainedModel):
                 head_params = self.model.get_input_embeddings().weight
             with torch.no_grad():
                 self.write_head.weight.copy_(head_params.detach())
+
+        if self.write_objective == "energy":
+            energy_hidden = self.energy_head_hidden_dim or n_embd
+            self.energy_ln = nn.LayerNorm(n_embd)
+            self.energy_head = nn.Sequential(
+                nn.Linear(n_embd, energy_hidden),
+                nn.SiLU(),
+                nn.Linear(energy_hidden, 1),
+            )
+        else:
+            self.energy_ln = None
+            self.energy_head = None
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -956,6 +1000,31 @@ class GradMemGPT(PreTrainedModel):
         if W is None:
             return mem
         return torch.baddbmm(b.unsqueeze(1), mem, W.transpose(1, 2))
+
+    def _compute_write_energy(self, hidden_states, write_batch):
+        if self.energy_head is None:
+            raise RuntimeError("energy_head is not initialized")
+        context_hidden = hidden_states[:, write_batch["context_start"]:, :]
+        context_mask = write_batch["mask"].to(device=context_hidden.device, dtype=context_hidden.dtype)
+        if context_hidden.size(1) != context_mask.size(1):
+            raise ValueError(
+                "Invalid energy context span: "
+                f"context_hidden_len={context_hidden.size(1)}, mask_len={context_mask.size(1)}, "
+                f"context_start={write_batch['context_start']}"
+            )
+        token_energy = self.energy_head(self.energy_ln(context_hidden)).squeeze(-1)
+        return (token_energy * context_mask).sum(dim=1) / context_mask.sum(dim=1).clamp_min(1)
+
+    def _run_energy_write_forward(self, write_batch):
+        model_kwargs = dict(write_batch.get("model_kwargs", {}))
+        if "attention_mask" in write_batch:
+            model_kwargs["attention_mask"] = write_batch["attention_mask"]
+        outs = get_backbone(self.model)(
+            inputs_embeds=write_batch["inputs_embeds"],
+            return_dict=True,
+            **model_kwargs,
+        )
+        return outs, self._compute_write_energy(outs.last_hidden_state, write_batch)
 
     def _get_transformer_blocks(self):
         backbone = get_backbone(self.model)
@@ -1315,6 +1384,7 @@ class GradMemGPT(PreTrainedModel):
         memory_state, memory_state_initial = backend.init_memory_state(B)
         batch_ctx = backend.prepare_batch(context_input_ids, query_input_ids, pad_id)
         opt_state = {}
+        inner_loss_history = []
 
         inner_loop_stats = {
             'inner_grad_norm_mean': torch.tensor(0.0, device=device),
@@ -1326,48 +1396,57 @@ class GradMemGPT(PreTrainedModel):
             with torch.enable_grad():
                 for k in range(self.K):
                     write_batch = backend.build_write_inputs(memory_state, batch_ctx)
-                    write_model_kwargs = write_batch.get('model_kwargs', {})
-                    with backend.activation_context(memory_state):
-                        if self.use_write_head:
-                            outs = get_backbone(self.model)(inputs_embeds=write_batch['inputs_embeds'],
-                                                            return_dict=True,
-                                                            **write_model_kwargs)
-                            hidden = outs.last_hidden_state[:, write_batch['logits_start']:, :]
-                            logits = self.write_head(hidden)
-                        else:
-                            outs = self.model(inputs_embeds=write_batch['inputs_embeds'],
-                                              return_dict=True,
-                                              **write_model_kwargs)
-                            logits = outs.logits[:, write_batch['logits_start']:, :]
+                    if self.write_objective == "energy":
+                        with backend.activation_context(memory_state):
+                            outs, energy = self._run_energy_write_forward(write_batch)
+                        inner_loss_history.append(energy)
+                        inner_loss = energy.sum()
+                        del outs
+                    else:
+                        write_model_kwargs = dict(write_batch.get('model_kwargs', {}))
+                        if 'attention_mask' in write_batch:
+                            write_model_kwargs['attention_mask'] = write_batch['attention_mask']
+                        with backend.activation_context(memory_state):
+                            if self.use_write_head:
+                                outs = get_backbone(self.model)(inputs_embeds=write_batch['inputs_embeds'],
+                                                                return_dict=True,
+                                                                **write_model_kwargs)
+                                hidden = outs.last_hidden_state[:, write_batch['logits_start']:, :]
+                                logits = self.write_head(hidden)
+                            else:
+                                outs = self.model(inputs_embeds=write_batch['inputs_embeds'],
+                                                  return_dict=True,
+                                                  **write_model_kwargs)
+                                logits = outs.logits[:, write_batch['logits_start']:, :]
 
-                    logits_loss = logits[:, :-1]
-                    label_shift = write_batch.get('label_shift', 0)
-                    labels_loss = write_batch['lm_labels'][:, label_shift:]
-                    mask_loss = write_batch['mask'][:, label_shift:]
-                    logits_len = logits_loss.size(1)
-                    labels_len = labels_loss.size(1)
-                    mask_len = mask_loss.size(1)
-                    if (logits_len != labels_len) or (labels_len != mask_len) or (labels_len == 0):
-                        raise ValueError(
-                            "Invalid inner-loop alignment: "
-                            f"backend={self.memory_backend}, "
-                            f"logits_len={logits_len}, labels_len={labels_len}, mask_len={mask_len}, "
-                            f"logits_start={write_batch['logits_start']}, label_shift={label_shift}, "
-                            f"mismatch_logits_labels={logits_len != labels_len}, "
-                            f"mismatch_labels_mask={labels_len != mask_len}, "
-                            f"empty_training_tokens={labels_len == 0}"
-                        )
+                        logits_loss = logits[:, :-1]
+                        label_shift = write_batch.get('label_shift', 0)
+                        labels_loss = write_batch['lm_labels'][:, label_shift:]
+                        mask_loss = write_batch['mask'][:, label_shift:]
+                        logits_len = logits_loss.size(1)
+                        labels_len = labels_loss.size(1)
+                        mask_len = mask_loss.size(1)
+                        if (logits_len != labels_len) or (labels_len != mask_len) or (labels_len == 0):
+                            raise ValueError(
+                                "Invalid inner-loop alignment: "
+                                f"backend={self.memory_backend}, "
+                                f"logits_len={logits_len}, labels_len={labels_len}, mask_len={mask_len}, "
+                                f"logits_start={write_batch['logits_start']}, label_shift={label_shift}, "
+                                f"mismatch_logits_labels={logits_len != labels_len}, "
+                                f"mismatch_labels_mask={labels_len != mask_len}, "
+                                f"empty_training_tokens={labels_len == 0}"
+                            )
 
-                    inner_loss = nn.functional.cross_entropy(
-                        logits_loss.reshape(-1, logits.size(-1)),
-                        labels_loss.reshape(-1),
-                        ignore_index=-100,
-                        reduction='none',
-                    ).view(B, -1)
-                    seq_len = mask_loss.sum(dim=1).clamp_min(1)
-                    inner_loss = (inner_loss * mask_loss).sum(1) / seq_len
-                    inner_loss = inner_loss.sum()
-                    del outs, logits
+                        inner_loss = nn.functional.cross_entropy(
+                            logits_loss.reshape(-1, logits.size(-1)),
+                            labels_loss.reshape(-1),
+                            ignore_index=-100,
+                            reduction='none',
+                        ).view(B, -1)
+                        seq_len = mask_loss.sum(dim=1).clamp_min(1)
+                        inner_loss = (inner_loss * mask_loss).sum(1) / seq_len
+                        inner_loss = inner_loss.sum()
+                        del outs, logits
 
                     is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
                     create_graph = is_second_order_step
@@ -1400,6 +1479,20 @@ class GradMemGPT(PreTrainedModel):
         if self.K:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
             inner_loop_stats['inner_loss'] = inner_loss.detach() / B
+
+        inner_loss_final = None
+        if self.write_objective == "energy":
+            final_write_batch = backend.build_write_inputs(memory_state, batch_ctx)
+            with backend.activation_context(memory_state):
+                final_outs, energy = self._run_energy_write_forward(final_write_batch)
+                inner_loss_final = energy
+            del final_outs
+        else:
+            # todo: we should actually call model one more time here
+            inner_loss_final = inner_loss
+        inner_loop_stats['final_inner_loss_mean'] = inner_loss_final.detach().mean()
+        inner_loop_stats['final_inner_loss_max'] = inner_loss_final.detach().max()
+        inner_loop_stats['final_inner_loss_min'] = inner_loss_final.detach().min()
 
         mem_norm, delta_mem_norm = backend.compute_memory_stats(memory_state, memory_state_initial)
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
@@ -1473,10 +1566,31 @@ class GradMemGPT(PreTrainedModel):
         )
 
         output['inner_loop_stats']['target_loss'] = target_loss.detach()
+        energy_aux_loss = target_loss.new_tensor(0.0)
+        if self.write_objective == "energy":
+            if self.energy_rank_weight > 0.0:
+                neg_memory_state = dict(memory_state)
+                neg_memory_state["mem_batch"] = memory_state_initial["mem_batch"].to(device=target_loss.device)
+                neg_write_batch = backend.build_write_inputs(neg_memory_state, batch_ctx)
+                with backend.activation_context(neg_memory_state):
+                    neg_outs, energy_neg = self._run_energy_write_forward(neg_write_batch)
+                rank_loss = F.relu(self.energy_margin + inner_loss_final - energy_neg).mean()
+                energy_aux_loss = energy_aux_loss + self.energy_rank_weight * rank_loss
+                output['inner_loop_stats']['energy_rank_loss'] = rank_loss.detach()
+                del neg_outs
+            if self.energy_traj_weight > 0.0 and len(inner_loss_history) > 0:
+                energy_next = inner_loss_history[1:] + [inner_loss_final]
+                traj_terms = [
+                    F.relu(e_next - e_prev + self.energy_traj_margin).mean()
+                    for e_prev, e_next in zip(inner_loss_history, energy_next)
+                ]
+                traj_loss = torch.stack(traj_terms).mean()
+                energy_aux_loss = energy_aux_loss + self.energy_traj_weight * traj_loss
+                output['inner_loop_stats']['energy_traj_loss'] = traj_loss.detach()
         if self.add_inner_loss_to_outer:
             inner_loss_mean = inner_loss / B
-            combined_loss = target_loss + self.inner_loss_weight * inner_loss_mean
+            combined_loss = target_loss + self.inner_loss_weight * inner_loss_mean + energy_aux_loss
         else:
-            combined_loss = target_loss
+            combined_loss = target_loss + energy_aux_loss
         output['loss'] = combined_loss
         return output
