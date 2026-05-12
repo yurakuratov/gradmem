@@ -89,6 +89,8 @@ class GradRMTConfig(PretrainedConfig):
                  add_inner_loss_to_outer=False,
                  inner_loss_weight=None,
                  chunk_size=None,
+                 concat_chunk_memory=False,
+                 parallel_chunks=False,
                  **kwargs):
         """
         Args:
@@ -131,6 +133,9 @@ class GradRMTConfig(PretrainedConfig):
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
             chunk_size: int, length of recurrent segments
+            concat_chunk_memory: bool, concatenate memory from WRITE chunks on READ
+            parallel_chunks: bool, if True aggregate WRITE updates across all context chunks
+                at each inner step (batch-wise); if False use consecutive chunk updates
         """
         super().__init__(**kwargs)
 
@@ -176,6 +181,8 @@ class GradRMTConfig(PretrainedConfig):
         self.add_inner_loss_to_outer = add_inner_loss_to_outer
         self.inner_loss_weight = inner_loss_weight
         self.chunk_size = chunk_size
+        self.concat_chunk_memory = concat_chunk_memory
+        self.parallel_chunks = parallel_chunks
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -187,6 +194,7 @@ class GradRMTConfig(PretrainedConfig):
             assert self.lora_mem_placement in ["between_layers", "target_modules"], (
                 "lora_mem_placement currently supports: 'between_layers', 'target_modules'"
             )
+        assert not (concat_chunk_memory and parallel_chunks), "memory retrieval not supported for chunk parallelism"
 
 
 class MemoryBackend:
@@ -200,10 +208,13 @@ class MemoryBackend:
         
     def split_tensor(self, tensor, chunk_size):
         if chunk_size is None:
-            return [segments]
+            return [tensor]
         split_inds = list(range(0, tensor.shape[1], chunk_size)) + [tensor.shape[1]]
         segments = [tensor[:, start:end] for (start, end) in zip(split_inds, split_inds[1:])]
         return segments
+
+    def clone_memory_state(self, memory_state):
+        raise NotImplementedError
 
 
 class InputPrefixMemoryBackend(MemoryBackend):
@@ -316,10 +327,12 @@ class InputPrefixMemoryBackend(MemoryBackend):
 
         if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
             x_qry = F.pad(x_qry, [0, 0, 0, -x_qry.size(1) % 32], "constant", 0)
+            
+        mem_offset = memory_state["mem_batch"].size(1) + o.n_ctrl_tokens * 2
 
         return {
             "inputs_embeds": x_qry,
-            "logits_start": batch_ctx["mem_offset"] - 1,
+            "logits_start": mem_offset - 1,
             "pred_len": batch_ctx["qry_emb"].size(1) + 1,
             "label_shift": 0,
         }
@@ -356,6 +369,28 @@ class InputPrefixMemoryBackend(MemoryBackend):
         if self.owner.mem_proj_mode == "per_sample":
             output["W"] = memory_state["W_batch"]
             output["b"] = memory_state["b_batch"]
+
+    def clone_memory_state(self, memory_state):
+        cloned = {"mem_batch": memory_state["mem_batch"].clone()}
+        if self.owner.mem_proj_mode == "per_sample":
+            cloned["W_batch"] = memory_state["W_batch"].clone()
+            cloned["b_batch"] = memory_state["b_batch"].clone()
+        return cloned
+    
+    def maybe_merge_memory_states(self, memory_states):
+        if not self.owner.concat_chunk_memory:
+            return memory_states[-1]
+        
+        mem_list = [ms["mem_batch"] for ms in memory_states]
+        mem_batch = torch.cat(mem_list, dim=1)
+        merged = {"mem_batch": mem_batch}
+
+        if self.owner.mem_proj_mode == "per_sample":
+            # these should NOT be concatenated — just take last (or first)
+            merged["W_batch"] = memory_states[-1]["W_batch"]
+            merged["b_batch"] = memory_states[-1]["b_batch"]
+
+        return merged
 
 
 class LoraMemoryBackend(MemoryBackend):
@@ -476,6 +511,34 @@ class LoraMemoryBackend(MemoryBackend):
     def attach_return_memory(self, output, memory_state):
         output["lora_mem"] = memory_state["lora_mem"]
 
+    def clone_memory_state(self, memory_state):
+        cloned = {"lora_mem": {}}
+        for slot_id in self.owner.lora_mem_slot_ids:
+            A, B = memory_state["lora_mem"][slot_id]
+            cloned["lora_mem"][slot_id] = (A.clone(), B.clone())
+        return cloned
+        
+    def maybe_merge_memory_states(self, memory_states):
+        if not self.owner.concat_chunk_memory:
+            return memory_states[-1]
+        
+        merged = {"lora_mem": {}}
+        for slot_id in self.owner.lora_mem_slot_ids:
+            A_list = []
+            B_list = []
+
+            for ms in memory_states:
+                A, B = ms["lora_mem"][slot_id]
+                A_list.append(A)
+                B_list.append(B)
+
+            A_cat = torch.cat(A_list, dim=-1)  # (B, d, r_total)
+            B_cat = torch.cat(B_list, dim=1)   # (B, r_total, d)
+
+            merged["lora_mem"][slot_id] = (A_cat, B_cat)
+
+        return merged
+
 
 class KVCacheMemoryBackend(MemoryBackend):
     def init_memory_state(self, batch_size):
@@ -594,6 +657,35 @@ class KVCacheMemoryBackend(MemoryBackend):
 
     def attach_return_memory(self, output, memory_state):
         output["kv_mem"] = memory_state["kv_mem"]
+
+    def clone_memory_state(self, memory_state):
+        cloned = {"kv_mem": {}}
+        for layer_idx in self.owner.kv_mem_layer_ids:
+            K, V = memory_state["kv_mem"][layer_idx]
+            cloned["kv_mem"][layer_idx] = (K.clone(), V.clone())
+        return cloned
+    
+    def maybe_merge_memory_states(self, memory_states):
+        if not self.owner.concat_chunk_memory:
+            return memory_states[-1]
+        
+        merged = {"kv_mem": {}}
+        for layer_idx in self.owner.kv_mem_layer_ids:
+            K_list = []
+            V_list = []
+
+            for ms in memory_states:
+                K, V = ms["kv_mem"][layer_idx]
+                K_list.append(K)
+                V_list.append(V)
+
+            # concat along sequence (memory tokens dim)
+            K_cat = torch.cat(K_list, dim=2)  # (B, H, M_total, d)
+            V_cat = torch.cat(V_list, dim=2)
+
+            merged["kv_mem"][layer_idx] = (K_cat, V_cat)
+
+        return merged
 
 
 class GradRMT(PreTrainedModel):
@@ -773,6 +865,8 @@ class GradRMT(PreTrainedModel):
                 self.write_head.weight.copy_(head_params.detach())
                 
         self.chunk_size = config.chunk_size
+        self.concat_chunk_memory = getattr(config, "concat_chunk_memory", False)
+        self.parallel_chunks = getattr(config, "parallel_chunks", False)
 
         self.tie_weights()
         self.main_input_name = "input_ids"
@@ -1327,13 +1421,12 @@ class GradRMT(PreTrainedModel):
             self._active_lora_memory = old
             
     @torch.enable_grad()
-    def _inner_loop(self, batch_ctx):
+    def _inner_loop(self, batch_ctx, memory_state, memory_state_initial):
         device = batch_ctx['x_ctx'].device
         B = batch_ctx['x_ctx'].size(0)
         inner_loss = torch.tensor(0.0, device=device)
 
         backend = self.memory_backend_impl
-        memory_state, memory_state_initial = backend.init_memory_state(B)
         opt_state = {}
         
         inner_loop_stats = {
@@ -1437,6 +1530,182 @@ class GradRMT(PreTrainedModel):
         for values in zip(*(batch_ctx[k] for k in list_keys)):
             yield {**scalar, **dict(zip(list_keys, values))}
 
+    @staticmethod
+    def _pad_chunk_tensor(tensor, target_len, pad_value):
+        cur_len = tensor.size(1)
+        pad_len = target_len - cur_len
+        if pad_len <= 0:
+            return tensor
+        if tensor.ndim == 3:
+            return F.pad(tensor, [0, 0, 0, pad_len], "constant", pad_value)
+        if tensor.ndim == 2:
+            return F.pad(tensor, [0, pad_len], "constant", pad_value)
+        raise ValueError(f"Unsupported chunk tensor ndim={tensor.ndim}")
+
+    def _build_parallel_chunk_ctx(self, chunk_batch_ctx_list):
+        if len(chunk_batch_ctx_list) == 0:
+            raise ValueError("chunk_batch_ctx_list must be non-empty")
+
+        n_chunks = len(chunk_batch_ctx_list)
+        B = chunk_batch_ctx_list[0]["x_ctx"].size(0)
+        max_len = max(ctx["x_ctx"].size(1) for ctx in chunk_batch_ctx_list)
+
+        combined = {}
+        combined["x_ctx"] = torch.cat(
+            [self._pad_chunk_tensor(ctx["x_ctx"], max_len, 0.0) for ctx in chunk_batch_ctx_list],
+            dim=0,
+        )
+        combined["lm_labels"] = torch.cat(
+            [self._pad_chunk_tensor(ctx["lm_labels"], max_len, -100) for ctx in chunk_batch_ctx_list],
+            dim=0,
+        )
+        combined["mask"] = torch.cat(
+            [self._pad_chunk_tensor(ctx["mask"], max_len, 0) for ctx in chunk_batch_ctx_list],
+            dim=0,
+        )
+
+        first = chunk_batch_ctx_list[0]
+        for key, value in first.items():
+            if key in ("x_ctx", "lm_labels", "mask"):
+                continue
+            if isinstance(value, torch.Tensor) and value.ndim >= 1 and value.size(0) == B:
+                combined[key] = torch.cat([ctx[key] for ctx in chunk_batch_ctx_list], dim=0)
+            else:
+                combined[key] = value
+
+        return combined, n_chunks, B
+
+    @staticmethod
+    def _expand_inner_params_for_chunks(inner_params, n_chunks):
+        return [p.repeat((n_chunks,) + (1,) * (p.ndim - 1)) for p in inner_params]
+
+    @staticmethod
+    def _reduce_chunk_grads(grads, n_chunks, batch_size):
+        reduced = []
+        for g in grads:
+            g_red = g.reshape(n_chunks, batch_size, *g.shape[1:]).mean(dim=0)
+            reduced.append(g_red)
+        return reduced
+
+    @torch.enable_grad()
+    def _inner_loop_parallel_chunks(self, chunk_batch_ctx_list, memory_state, memory_state_initial):
+        if len(chunk_batch_ctx_list) == 0:
+            device = self.model.get_input_embeddings().weight.device
+            return memory_state, {
+                'inner_grad_norm_mean': torch.tensor(0.0, device=device),
+                'inner_grad_norm_max': torch.tensor(-1.0, device=device),
+                'inner_grad_norm_min': torch.tensor(1e06, device=device),
+                'inner_loss': torch.tensor(0.0, device=device),
+            }
+
+        combined_batch_ctx, n_chunks, B = self._build_parallel_chunk_ctx(chunk_batch_ctx_list)
+        device = combined_batch_ctx['x_ctx'].device
+        backend = self.memory_backend_impl
+        opt_state = {}
+
+        inner_loop_stats = {
+            'inner_grad_norm_mean': torch.tensor(0.0, device=device),
+            'inner_grad_norm_max': torch.tensor(-1.0, device=device),
+            'inner_grad_norm_min': torch.tensor(1e06, device=device),
+        }
+        inner_loss = torch.tensor(0.0, device=device)
+
+        for k in range(self.K):
+            is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
+            create_graph = is_second_order_step
+
+            inner_params = backend.inner_params(memory_state)
+            expanded_params = self._expand_inner_params_for_chunks(inner_params, n_chunks)
+            expanded_memory_state = backend.clone_memory_state(memory_state)
+            backend.assign_inner_params(expanded_memory_state, expanded_params)
+
+            write_batch = backend.build_write_inputs(expanded_memory_state, combined_batch_ctx)
+            write_model_kwargs = write_batch.get('model_kwargs', {})
+            with backend.activation_context(expanded_memory_state):
+                if self.use_write_head:
+                    outs = get_backbone(self.model)(inputs_embeds=write_batch['inputs_embeds'],
+                                                    return_dict=True,
+                                                    **write_model_kwargs)
+                    hidden = outs.last_hidden_state[:, write_batch['logits_start']:, :]
+                    logits = self.write_head(hidden)
+                else:
+                    outs = self.model(inputs_embeds=write_batch['inputs_embeds'],
+                                      return_dict=True,
+                                      **write_model_kwargs)
+                    logits = outs.logits[:, write_batch['logits_start']:, :]
+
+            logits_loss = logits[:, :-1]
+            label_shift = write_batch.get('label_shift', 0)
+            labels_loss = write_batch['lm_labels'][:, label_shift:]
+            mask_loss = write_batch['mask'][:, label_shift:]
+            logits_len = logits_loss.size(1)
+            labels_len = labels_loss.size(1)
+            mask_len = mask_loss.size(1)
+            if (logits_len != labels_len) or (labels_len != mask_len) or (labels_len == 0):
+                raise ValueError(
+                    "Invalid inner-loop alignment: "
+                    f"backend={self.memory_backend}, "
+                    f"logits_len={logits_len}, labels_len={labels_len}, mask_len={mask_len}, "
+                    f"logits_start={write_batch['logits_start']}, label_shift={label_shift}, "
+                    f"mismatch_logits_labels={logits_len != labels_len}, "
+                    f"mismatch_labels_mask={labels_len != mask_len}, "
+                    f"empty_training_tokens={labels_len == 0}"
+                )
+
+            per_sample_loss = nn.functional.cross_entropy(
+                logits_loss.reshape(-1, logits.size(-1)),
+                labels_loss.reshape(-1),
+                ignore_index=-100,
+                reduction='none',
+            ).view(B * n_chunks, -1)
+            seq_len = mask_loss.sum(dim=1).clamp_min(1)
+            per_sample_loss = (per_sample_loss * mask_loss).sum(1) / seq_len
+            inner_loss = per_sample_loss.sum() / n_chunks
+            del outs, logits
+
+            retain_graph = create_graph or (self.add_inner_loss_to_outer and (k == self.K - 1))
+            expanded_grads = torch.autograd.grad(
+                inner_loss,
+                expanded_params,
+                create_graph=create_graph,
+                retain_graph=retain_graph,
+            )
+            grads = self._reduce_chunk_grads(expanded_grads, n_chunks, B)
+
+            g_sq = torch.zeros(B, device=device)
+            for g in grads:
+                g_sq = g_sq + g.reshape(B, -1).pow(2).sum(dim=1)
+            g_norm = g_sq.sqrt().detach()
+            inner_loop_stats['inner_grad_norm_mean'] += g_norm.mean()
+            inner_loop_stats['inner_grad_norm_max'] = max(inner_loop_stats['inner_grad_norm_max'], g_norm.max())
+            inner_loop_stats['inner_grad_norm_min'] = min(inner_loop_stats['inner_grad_norm_min'], g_norm.min())
+
+            inner_params = backend.inner_params(memory_state)
+            new_params = []
+            for p, g, i in zip(inner_params, grads, range(len(inner_params))):
+                if self.use_adam:
+                    p_new = self._adam_step(p, g, opt_state.setdefault(str(i), {}), k + 1, self.lr)
+                else:
+                    p_new = self._sgd_step(p, g,
+                                           clip_value=self.inner_clip_value,
+                                           clip_norm=self.inner_clip_norm)
+                new_params.append(p_new)
+            backend.assign_inner_params(memory_state, new_params)
+            backend.maybe_detach_after_step(memory_state)
+
+        if self.K:
+            inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
+            inner_loop_stats['inner_loss'] = inner_loss.detach() / B
+
+        mem_norm, delta_mem_norm = backend.compute_memory_stats(memory_state, memory_state_initial)
+        inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
+        inner_loop_stats['mem_norm_max'] = mem_norm.max()
+        inner_loop_stats['mem_norm_min'] = mem_norm.min()
+        inner_loop_stats['delta_mem_norm_mean'] = delta_mem_norm.mean()
+        inner_loop_stats['delta_mem_norm_max'] = delta_mem_norm.max()
+        inner_loop_stats['delta_mem_norm_min'] = delta_mem_norm.min()
+        return memory_state, inner_loop_stats
+
     def forward(self, input_ids, labels=None, return_mem=False):
         context_input_ids = input_ids['context_input_ids']
         query_input_ids = input_ids['query_input_ids']
@@ -1448,10 +1717,33 @@ class GradRMT(PreTrainedModel):
 
         backend = self.memory_backend_impl
         batch_ctx = backend.prepare_batch(context_input_ids, query_input_ids, pad_id, self.chunk_size)
+        memory_state, memory_state_initial = backend.init_memory_state(B)
 
+        inner_loop_stats = {
+            'inner_grad_norm_mean': torch.tensor(0.0, device=device),
+            'inner_grad_norm_max': torch.tensor(-1.0, device=device),
+            'inner_grad_norm_min': torch.tensor(1e06, device=device),
+            'inner_loss': torch.tensor(0.0, device=device),
+        }
+
+        memory_states = []
         if self.K and context_input_ids.ne(pad_id).any():
-            for cur_batch_ctx in self.expand_batch_ctx(batch_ctx):
-                memory_state, inner_loop_stats = self._inner_loop(cur_batch_ctx)
+            chunk_batch_ctx_list = [
+                cur_batch_ctx for cur_batch_ctx in self.expand_batch_ctx(batch_ctx)
+                if cur_batch_ctx["x_ctx"].size(1) > 1
+            ]
+            if self.parallel_chunks:
+                memory_state, inner_loop_stats = self._inner_loop_parallel_chunks(
+                    chunk_batch_ctx_list,
+                    memory_state,
+                    memory_state_initial,
+                )
+            else:
+                for cur_batch_ctx in chunk_batch_ctx_list:
+                    memory_state, inner_loop_stats = self._inner_loop(cur_batch_ctx, memory_state, memory_state_initial)
+                    memory_states.append(backend.clone_memory_state(memory_state))
+        if (not self.parallel_chunks) and len(memory_states) > 0:
+            memory_state = backend.maybe_merge_memory_states(memory_states)
 
         read_batch = backend.build_read_inputs(memory_state, batch_ctx)
         read_model_kwargs = read_batch.get('model_kwargs', {})
@@ -1469,10 +1761,14 @@ class GradRMT(PreTrainedModel):
         if log_mem_attn_read and read_out.attentions is not None:
             if self.memory_backend == "prefix":
                 mem_start = self.n_ctrl_tokens
-                mem_end = self.n_ctrl_tokens + self.n_mem_tokens
+                mem_end = self.n_ctrl_tokens + memory_state["mem_batch"].size(1)
             else:
                 mem_start = 0
-                mem_end = self.n_mem_tokens
+                if self.memory_backend == "kv_cache" and len(memory_state["kv_mem"]) > 0:
+                    first_layer = next(iter(memory_state["kv_mem"].keys()))
+                    mem_end = memory_state["kv_mem"][first_layer][0].size(2)
+                else:
+                    mem_end = self.n_mem_tokens
 
             layer_ratios = []
             for att in read_out.attentions:

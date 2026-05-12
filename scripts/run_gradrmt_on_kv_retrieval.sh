@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/collect_env_state.sh"
 NP=${NP:-1}
 LR=1e-04
 TBS=64
-PER_DEVICE_BATCH_SIZE=64
+PER_DEVICE_BATCH_SIZE=32
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 
 L=4
@@ -18,13 +18,15 @@ D=128
 BASE_MODEL=llama
 
 V=62
-DATA_NAME="N8-K2V2-V${V}_1M"
+DATA_NAME="N64-K2V2-V${V}_1M"
 DATA_PATH="./data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
 CHUNK_SIZE=7
+CONCAT_CHUNK_MEMORY=false
+PARALLEL_CHUNKS=false
 
-MEMORY_BACKEND="prefix"
+MEMORY_BACKEND="lora"
 
 # Shared memory params
 # - n_mem_tokens is used by prefix and kv_cache backends.
@@ -39,21 +41,22 @@ INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 USE_ADAM=false
 GRAD_MODE="second"
-USE_MEM_PROJ=true
-MEM_PROJ_MODE="proj"
-USE_WRITE_HEAD=false
-USE_WRITE_LORA=true
+USE_MEM_PROJ=false
+MEM_PROJ_MODE="none"
+USE_WRITE_HEAD=true
+USE_WRITE_LORA=false
 WRITE_LORA_R=8
 WRITE_LORA_ALPHA=16
 WRITE_LORA_DROPOUT=0.0
 WRITE_LORA_TARGETS=""
-FREEZE_BACKBONE=true
+FREEZE_BACKBONE=false
 
 # LoRA memory params (active only when MEMORY_BACKEND="lora")
+# LORA_MEM_PLACEMENT="between_layers"
 LORA_MEM_PLACEMENT="target_modules"
 LORA_MEM_TARGET_MODULES="gate_proj,up_proj,down_proj"
-LORA_MEM_R=1
-LORA_MEM_ALPHA=2
+LORA_MEM_R=8
+LORA_MEM_ALPHA=16
 LORA_MEM_DROPOUT=0.0
 LORA_MEM_LAYERS="all"
 
@@ -63,6 +66,10 @@ KV_MEM_LAYERS="all"
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=None
 
+# INIT_CHECKPOINT="./runs/N16-K2V2-V62_1M/gradrmt_llama_L4H4D128_chunk7_lora_target_modules_r8a16_gate_proj_up_proj_down_proj_layers_all_K1_ilr0.04_whead_grad_second_bs_64_lr_1e-04/run_1_bf16/checkpoint-13000/model.safetensors"
+# RUN_NAME_SUFFIX="init_N16"
+INIT_CHECKPOINT="./runs/N32-K2V2-V62_1M/gradrmt_llama_L4H4D128_chunk7_lora_target_modules_r8a16_gate_proj_up_proj_down_proj_layers_all_K1_ilr0.04_whead_grad_second_bs_64_lr_1e-04_init_N16/run_1_bf16/checkpoint-29500/model.safetensors"
+RUN_NAME_SUFFIX="init_N32"
 
 ATTN_IMPL="eager"
 MIXED_PRECISION='bf16'
@@ -77,7 +84,7 @@ if [ "$MEMORY_BACKEND" = "lora" ]; then
   if [ "$LORA_MEM_DROPOUT" != "0.0" ]; then
     RUN_NAME=${RUN_NAME}d${LORA_MEM_DROPOUT}
   fi
-  if [ -n "$LORA_MEM_TARGET_MODULES" ]; then
+  if [ -n "${LORA_MEM_TARGET_MODULES:-}" ]; then
     # replace commas with underscores
     LORA_MEM_TARGET_MODULES_STR=$(echo $LORA_MEM_TARGET_MODULES | tr ',' '_')
     RUN_NAME=${RUN_NAME}_${LORA_MEM_TARGET_MODULES_STR}
@@ -90,7 +97,12 @@ if [ "$MEMORY_BACKEND" = "kv_cache" ]; then
     RUN_NAME=${RUN_NAME}_layers_${KV_MEM_LAYERS}
   fi
 fi
-
+if [ "$CONCAT_CHUNK_MEMORY" = true ]; then
+  RUN_NAME=${RUN_NAME}_cat
+fi
+if [ "$PARALLEL_CHUNKS" = true ]; then
+  RUN_NAME=${RUN_NAME}_prl
+fi
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
 fi
@@ -122,7 +134,7 @@ if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
 fi
 
 # Run ID
-N_VALUES=(1)
+N_VALUES=(1 2 3)
 for N in "${N_VALUES[@]}"; do
   RND=$(date +%Y%m%d%H%M%S)
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_${N}"
@@ -205,7 +217,9 @@ for N in "${N_VALUES[@]}"; do
 
   if [ "$MEMORY_BACKEND" = "lora" ]; then
     CMD+=( --lora_mem_placement "$LORA_MEM_PLACEMENT" )
-    CMD+=( --lora_mem_target_modules "$LORA_MEM_TARGET_MODULES" )
+    if [ -n "${LORA_MEM_TARGET_MODULES:-}" ]; then
+      CMD+=( --lora_mem_target_modules "$LORA_MEM_TARGET_MODULES" )
+    fi
     CMD+=( --lora_mem_r "$LORA_MEM_R" )
     CMD+=( --lora_mem_alpha "$LORA_MEM_ALPHA" )
     CMD+=( --lora_mem_dropout "$LORA_MEM_DROPOUT" )
@@ -214,6 +228,13 @@ for N in "${N_VALUES[@]}"; do
 
   if [ "$MEMORY_BACKEND" = "kv_cache" ]; then
     CMD+=( --kv_mem_layers "$KV_MEM_LAYERS" )
+  fi
+
+  if [ "$CONCAT_CHUNK_MEMORY" = true ]; then
+    CMD+=( --concat_chunk_memory )
+  fi
+  if [ "$PARALLEL_CHUNKS" = true ]; then
+    CMD+=( --parallel_chunks )
   fi
 
   if [ "$ADD_INNER_LOSS_TO_OUTER" = true ]; then
