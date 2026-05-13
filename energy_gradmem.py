@@ -14,6 +14,8 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         energy_num_layers=2,
         energy_dropout=0.0,
         energy_future_mode="next_token",
+        energy_ce_guidance=False,
+        energy_ce_guidance_alpha=0.01,
         return_energy_state=False,
         **kwargs,
     ):
@@ -29,6 +31,8 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         self.energy_num_layers = energy_num_layers
         self.energy_dropout = energy_dropout
         self.energy_future_mode = energy_future_mode
+        self.energy_ce_guidance = energy_ce_guidance
+        self.energy_ce_guidance_alpha = energy_ce_guidance_alpha
         self.return_energy_state = return_energy_state
 
 
@@ -51,6 +55,8 @@ class EnergyGradMem(GradMemGPT):
         self.energy_hidden_size = int(energy_hidden_size)
         self.energy_num_layers = energy_num_layers
         self.energy_future_mode = config.energy_future_mode
+        self.energy_ce_guidance = bool(getattr(config, "energy_ce_guidance", False))
+        self.energy_ce_guidance_alpha = float(getattr(config, "energy_ce_guidance_alpha", 0.01))
         self.return_energy_state = bool(getattr(config, "return_energy_state", False))
         dropout = float(config.energy_dropout) if energy_num_layers > 1 else 0.0
         energy_input_size = model_hidden_size * 2 if self.energy_future_mode == "next_token" else model_hidden_size
@@ -101,7 +107,7 @@ class EnergyGradMem(GradMemGPT):
         valid_lengths = mask.sum(dim=1)
         per_sample_energy = (energy * mask).sum(dim=1) / valid_lengths.clamp_min(1.0)
         per_sample_energy = per_sample_energy * (valid_lengths > 0).to(per_sample_energy.dtype)
-        return per_sample_energy.sum(), energy_state
+        return per_sample_energy.sum(), energy_state, energy
 
     def _run_write_model(self, write_batch, memory_state):
         write_model_kwargs = write_batch.get("model_kwargs", {})
@@ -114,7 +120,38 @@ class EnergyGradMem(GradMemGPT):
             )
         if outs.hidden_states is None:
             raise ValueError("Base model did not return hidden states for energy objective")
-        return outs.hidden_states[-1]
+        return outs
+
+    def _write_token_ce(self, write_out, write_batch):
+        logits = write_out.logits[:, write_batch["logits_start"]:, :]
+        logits_loss = logits[:, :-1]
+        label_shift = write_batch.get("label_shift", 0)
+        labels_loss = write_batch["lm_labels"][:, label_shift:]
+        mask_loss = write_batch["mask"][:, label_shift:]
+        if logits_loss.size(1) != labels_loss.size(1) or labels_loss.size(1) != mask_loss.size(1):
+            raise ValueError(
+                "Invalid CE-guidance alignment: "
+                f"logits_len={logits_loss.size(1)}, labels_len={labels_loss.size(1)}, mask_len={mask_loss.size(1)}"
+            )
+        token_ce = nn.functional.cross_entropy(
+            logits_loss.reshape(-1, logits.size(-1)),
+            labels_loss.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).view(labels_loss.size())
+        if label_shift == 0:
+            # Prefix write logits include the pre-context position. Energy at context
+            # token t is conditioned on token t+1, so skip CE for token 0.
+            token_ce = token_ce[:, 1:]
+            mask_loss = mask_loss[:, 1:]
+        return token_ce, mask_loss
+
+    @staticmethod
+    def _energy_ce_guidance_loss(energy, token_ce, mask):
+        energy = energy[:, :token_ce.size(1)]
+        mask = mask.to(dtype=energy.dtype)
+        per_token = (energy - token_ce.detach().to(dtype=energy.dtype)).pow(2) * mask
+        return per_token.sum() / mask.sum().clamp_min(1.0)
 
     def _validate_context_segments(self, context_segments, batch_size):
         for i, segment in enumerate(context_segments):
@@ -173,7 +210,7 @@ class EnergyGradMem(GradMemGPT):
             return ctx_hidden
         return torch.cat([ctx_hidden, future.to(dtype=ctx_hidden.dtype)], dim=-1)
 
-    def _inner_grad_options(self, global_step, total_steps):
+    def _inner_grad_options(self, global_step, total_steps, keep_energy_graph=False):
         is_second_order_step = (
             self.grad_mode == "second"
             and global_step >= (total_steps - self.last_K_second_order)
@@ -183,6 +220,7 @@ class EnergyGradMem(GradMemGPT):
         retain_graph = (
             create_graph
             or has_future_energy_use
+            or keep_energy_graph
             or (self.add_inner_loss_to_outer and global_step == total_steps - 1)
         )
         return create_graph, retain_graph
@@ -219,11 +257,12 @@ class EnergyGradMem(GradMemGPT):
         batch_size = query_input_ids.size(0)
         opt_state = {}
         inner_loss = torch.tensor(0.0, device=device)
+        guidance_loss = torch.tensor(0.0, device=device)
         write_steps = 0
         stats = self._init_inner_loop_stats(device)
 
         if not self.K:
-            return memory_state, energy_state, inner_loss, write_steps, stats
+            return memory_state, energy_state, inner_loss, guidance_loss, write_steps, stats
 
         with torch.enable_grad():
             total_steps = self.K * len(context_segments)
@@ -236,13 +275,24 @@ class EnergyGradMem(GradMemGPT):
 
                 for k in range(self.K):
                     write_batch = backend.build_write_inputs(memory_state, batch_ctx)
-                    hidden = self._run_write_model(write_batch, memory_state)
-                    ctx_hidden = self._extract_context_hidden(hidden, write_batch, batch_ctx)
+                    write_out = self._run_write_model(write_batch, memory_state)
+                    ctx_hidden = self._extract_context_hidden(write_out.hidden_states[-1], write_batch, batch_ctx)
                     energy_input = self._energy_input(ctx_hidden, segment, write_batch["mask"])
-                    inner_loss, energy_state = self._energy_loss(energy_input, write_batch["mask"], energy_state)
-                    del hidden
+                    inner_loss, energy_state, energy = self._energy_loss(energy_input, write_batch["mask"], energy_state)
+                    if self.energy_ce_guidance:
+                        token_ce, token_ce_mask = self._write_token_ce(write_out, write_batch)
+                        guidance_loss = guidance_loss + self._energy_ce_guidance_loss(
+                            energy,
+                            token_ce,
+                            token_ce_mask,
+                        )
+                    del write_out
 
-                    create_graph, retain_graph = self._inner_grad_options(global_step, total_steps)
+                    create_graph, retain_graph = self._inner_grad_options(
+                        global_step,
+                        total_steps,
+                        keep_energy_graph=self.energy_ce_guidance,
+                    )
                     inner_params = backend.inner_params(memory_state)
                     grads = torch.autograd.grad(
                         inner_loss,
@@ -258,7 +308,9 @@ class EnergyGradMem(GradMemGPT):
                     write_steps += 1
                     global_step += 1
 
-        return memory_state, energy_state, inner_loss, write_steps, stats
+        if write_steps and self.energy_ce_guidance:
+            guidance_loss = guidance_loss / write_steps
+        return memory_state, energy_state, inner_loss, guidance_loss, write_steps, stats
 
     @staticmethod
     def _finalize_inner_stats(stats, inner_loss, write_steps, batch_size):
@@ -352,7 +404,7 @@ class EnergyGradMem(GradMemGPT):
         backend = self.memory_backend_impl
         memory_state, memory_state_initial = backend.init_memory_state(B)
 
-        memory_state, energy_state, inner_loss, write_steps, inner_loop_stats = self._write_segments(
+        memory_state, energy_state, inner_loss, guidance_loss, write_steps, inner_loop_stats = self._write_segments(
             context_segments,
             query_input_ids,
             memory_state,
@@ -375,9 +427,13 @@ class EnergyGradMem(GradMemGPT):
 
         target_loss = self._target_loss(output["predictions"], labels, read_batch)
         output["inner_loop_stats"]["target_loss"] = target_loss.detach()
+        if self.energy_ce_guidance:
+            output["inner_loop_stats"]["energy_ce_guidance_loss"] = guidance_loss.detach()
         if self.add_inner_loss_to_outer:
             combined_loss = target_loss + self.inner_loss_weight * (inner_loss / B)
         else:
             combined_loss = target_loss
+        if self.energy_ce_guidance:
+            combined_loss = combined_loss + self.energy_ce_guidance_alpha * guidance_loss
         output["loss"] = combined_loss
         return output

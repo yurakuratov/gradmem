@@ -1,5 +1,6 @@
 import pytest
 import torch
+from types import SimpleNamespace
 from transformers import GPT2Config
 
 from energy_gradmem import EnergyGradMem, EnergyGradMemConfig
@@ -137,10 +138,93 @@ def test_energy_loss_uses_masked_average():
     hidden = torch.tensor([[[1.0], [3.0], [100.0]], [[2.0], [4.0], [6.0]]])
     mask = torch.tensor([[1, 1, 0], [1, 1, 1]], dtype=torch.bool)
 
-    loss, state = model._energy_loss(hidden, mask, None)
+    loss, state, energy = model._energy_loss(hidden, mask, None)
 
     assert state is None
+    assert torch.equal(energy, hidden.squeeze(-1))
     assert torch.allclose(loss, torch.tensor(6.0))  # (1 + 3) / 2 + (2 + 4 + 6) / 3
+
+
+def test_energy_ce_guidance_loss_uses_detached_ce_and_mask():
+    energy = torch.tensor([[1.0, 2.0, 100.0]], requires_grad=True)
+    ce = torch.tensor([[3.0, 4.0, 1000.0]], requires_grad=True)
+    mask = torch.tensor([[1, 1, 0]], dtype=torch.bool)
+
+    loss = EnergyGradMem._energy_ce_guidance_loss(energy, ce, mask)
+
+    assert torch.allclose(loss, torch.tensor(4.0))
+    loss.backward()
+    assert energy.grad is not None
+    assert ce.grad is None
+
+
+@pytest.mark.parametrize("label_shift", [0, 1])
+def test_write_token_ce_aligns_to_energy_positions(label_shift):
+    model = _model(K=1, energy_future_mode="next_token")
+    B, S, V = 1, 4, 7
+    labels = torch.tensor([[1, 2, 3, -100]])
+    mask = labels.ne(-100)
+
+    logits_len = S + 1 if label_shift == 0 else S
+    logits = torch.zeros(B, logits_len, V)
+    write_out = SimpleNamespace(logits=logits)
+    write_batch = {
+        "logits_start": 0,
+        "label_shift": label_shift,
+        "lm_labels": labels,
+        "mask": mask,
+    }
+
+    token_ce, token_ce_mask = model._write_token_ce(write_out, write_batch)
+
+    if label_shift == 0:
+        original_ce = torch.nn.functional.cross_entropy(
+            logits[:, :-1, :].reshape(-1, V),
+            labels.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).view(B, S)
+        assert token_ce.shape == (B, S - 1)
+        assert torch.equal(token_ce_mask, mask[:, 1:])
+        assert torch.allclose(token_ce, original_ce[:, 1:])
+    else:
+        assert token_ce.shape == (B, S - 1)
+        assert torch.equal(token_ce_mask, mask[:, 1:])
+
+
+def test_forward_with_ce_guidance_reports_aux_loss():
+    torch.manual_seed(0)
+    model = EnergyGradMem(
+        EnergyGradMemConfig(
+            base_config=_base_config(),
+            memory_backend="prefix",
+            n_mem_tokens=4,
+            K=1,
+            lr=0.01,
+            use_adam=False,
+            grad_mode="second",
+            use_mem_proj=False,
+            mem_proj_mode="none",
+            attn_implementation="eager",
+            inner_objective="lstm",
+            energy_hidden_size=32,
+            energy_num_layers=2,
+            energy_ce_guidance=True,
+            energy_ce_guidance_alpha=0.01,
+        )
+    )
+    model.train()
+
+    B, S, Q = 2, 5, 4
+    context = torch.randint(1, 101, (B, S))
+    query = torch.randint(1, 101, (B, Q))
+    labels = torch.randint(1, 101, (B, Q))
+
+    output = model({"context_input_ids": context, "query_input_ids": query}, labels=labels)
+
+    assert torch.isfinite(output["loss"]).item()
+    assert "energy_ce_guidance_loss" in output["inner_loop_stats"]
+    assert output["inner_loop_stats"]["energy_ce_guidance_loss"].item() >= 0.0
 
 
 def test_next_token_future_embeddings_are_appended():

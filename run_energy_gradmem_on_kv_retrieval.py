@@ -100,6 +100,8 @@ class ExperimentArgs:
     energy_num_layers: Optional[int] = field(default=2)
     energy_dropout: Optional[float] = field(default=0.0)
     energy_future_mode: Optional[str] = field(default="next_token")
+    energy_ce_guidance: Optional[bool] = field(default=False)
+    energy_ce_guidance_alpha: Optional[float] = field(default=0.01)
 
 
 def build_base_config(args, tokenizer):
@@ -175,6 +177,8 @@ def build_model_config(args, base_config):
         energy_num_layers=args.energy_num_layers,
         energy_dropout=args.energy_dropout,
         energy_future_mode=args.energy_future_mode,
+        energy_ce_guidance=args.energy_ce_guidance,
+        energy_ce_guidance_alpha=args.energy_ce_guidance_alpha,
     )
 
 
@@ -271,7 +275,7 @@ if __name__ == "__main__":
         eval_steps=args.eval_steps,
         logging_steps=args.logging_steps,
         report_to="wandb",
-        run_name=output_dir.name,
+        run_name=os.environ.get("WANDB_NAME", output_dir.name),
         metric_for_best_model=args.metric_for_best_model,
         load_best_model_at_end=True,
         eval_on_start=True,

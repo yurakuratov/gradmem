@@ -226,7 +226,7 @@ if __name__ == "__main__":
         eval_steps=args.eval_steps,
         logging_steps=args.logging_steps,
         report_to="wandb",
-        run_name=output_dir.name,
+        run_name=os.environ.get("WANDB_NAME", output_dir.name),
         metric_for_best_model=args.metric_for_best_model,
         load_best_model_at_end=True,
         eval_on_start=True,
