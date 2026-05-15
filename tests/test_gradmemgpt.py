@@ -596,10 +596,13 @@ def test_forward_prefix_energy_objective():
     assert torch.isfinite(output["loss"]).item()
     assert output["predictions"].shape == (batch_size, qry_len + 1, vocab_size)
     stats = output["inner_loop_stats"]
-    assert "final_inner_loss_mean" in stats
+    assert "inner_loss_after_write" in stats
+    assert "inner_loss_initial" in stats
+    assert "inner_loss_write_delta" in stats
     assert "energy_rank_loss" in stats
     assert "energy_traj_loss" in stats
-    assert torch.isfinite(stats["final_inner_loss_mean"]).item()
+    assert torch.isfinite(stats["inner_loss_after_write"]).item()
+    assert torch.isfinite(stats["inner_loss_write_delta"]).item()
     assert "mem" in output
 
 
@@ -700,7 +703,7 @@ def test_prefix_energy_write_handles_padded_contexts():
     )
 
     assert torch.isfinite(output["loss"]).item()
-    assert torch.isfinite(output["inner_loop_stats"]["final_inner_loss_mean"]).item()
+    assert torch.isfinite(output["inner_loop_stats"]["inner_loss_after_write"]).item()
 
 
 @pytest.mark.forward

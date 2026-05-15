@@ -141,6 +141,18 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     }
     if 'target_loss' in inner_loop_stats:
         metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
+    for key in [
+        'inner_loss_after_write',
+        'inner_loss_after_write_max',
+        'inner_loss_after_write_min',
+        'inner_loss_initial',
+        'inner_loss_write_delta',
+        'inner_loss_write_delta_max',
+        'inner_loss_write_delta_min',
+    ]:
+        if key in inner_loop_stats:
+            value = inner_loop_stats[key]
+            metrics[key] = float(value.mean() if hasattr(value, 'mean') else value)
     if 'mem_attn_read' in inner_loop_stats:
         metrics['mem_attn_read'] = float(inner_loop_stats['mem_attn_read'].mean())
     return metrics

@@ -1480,19 +1480,28 @@ class GradMemGPT(PreTrainedModel):
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
             inner_loop_stats['inner_loss'] = inner_loss.detach() / B
 
-        inner_loss_final = None
+        # after we write to memory, we should call the model one more time to estimate how actually good write was
+        # this should be mostly used for training/logging/debugging, not really needed for inference
+        inner_loss_after_write = None
         if self.write_objective == "energy":
             final_write_batch = backend.build_write_inputs(memory_state, batch_ctx)
             with backend.activation_context(memory_state):
                 final_outs, energy = self._run_energy_write_forward(final_write_batch)
-                inner_loss_final = energy
+                inner_loss_after_write = energy
             del final_outs
         else:
             # todo: we should actually call model one more time here
-            inner_loss_final = inner_loss
-        inner_loop_stats['final_inner_loss_mean'] = inner_loss_final.detach().mean()
-        inner_loop_stats['final_inner_loss_max'] = inner_loss_final.detach().max()
-        inner_loop_stats['final_inner_loss_min'] = inner_loss_final.detach().min()
+            inner_loss_after_write = inner_loss
+        inner_loop_stats['inner_loss_after_write'] = inner_loss_after_write.detach().mean()
+        inner_loop_stats['inner_loss_after_write_max'] = inner_loss_after_write.detach().max()
+        inner_loop_stats['inner_loss_after_write_min'] = inner_loss_after_write.detach().min()
+        if self.write_objective == "energy" and len(inner_loss_history) > 0:
+            inner_loss_initial = inner_loss_history[0]
+            inner_loss_write_delta = inner_loss_after_write - inner_loss_initial
+            inner_loop_stats['inner_loss_initial'] = inner_loss_initial.detach().mean()
+            inner_loop_stats['inner_loss_write_delta'] = inner_loss_write_delta.detach().mean()
+            inner_loop_stats['inner_loss_write_delta_max'] = inner_loss_write_delta.detach().max()
+            inner_loop_stats['inner_loss_write_delta_min'] = inner_loss_write_delta.detach().min()
 
         mem_norm, delta_mem_norm = backend.compute_memory_stats(memory_state, memory_state_initial)
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
@@ -1574,12 +1583,12 @@ class GradMemGPT(PreTrainedModel):
                 neg_write_batch = backend.build_write_inputs(neg_memory_state, batch_ctx)
                 with backend.activation_context(neg_memory_state):
                     neg_outs, energy_neg = self._run_energy_write_forward(neg_write_batch)
-                rank_loss = F.relu(self.energy_margin + inner_loss_final - energy_neg).mean()
+                rank_loss = F.relu(self.energy_margin + inner_loss_after_write - energy_neg).mean()
                 energy_aux_loss = energy_aux_loss + self.energy_rank_weight * rank_loss
                 output['inner_loop_stats']['energy_rank_loss'] = rank_loss.detach()
                 del neg_outs
             if self.energy_traj_weight > 0.0 and len(inner_loss_history) > 0:
-                energy_next = inner_loss_history[1:] + [inner_loss_final]
+                energy_next = inner_loss_history[1:] + [inner_loss_after_write]
                 traj_terms = [
                     F.relu(e_next - e_prev + self.energy_traj_margin).mean()
                     for e_prev, e_next in zip(inner_loss_history, energy_next)
