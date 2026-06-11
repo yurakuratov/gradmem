@@ -246,6 +246,8 @@ class ExperimentArgs:
     attn_implementation: Optional[str] = field(default="eager")
     write_objective: Optional[str] = field(default="reconstruction")
     energy_head_hidden_dim: Optional[int] = field(default=None)
+    energy_head_checkpoint: Optional[str] = field(default=None)
+    energy_condition_on_label: Optional[bool] = field(default=False)
     energy_rank_weight: Optional[float] = field(default=0.0)
     energy_traj_weight: Optional[float] = field(default=0.0)
     energy_margin: Optional[float] = field(default=0.1)
@@ -294,7 +296,7 @@ if __name__ == '__main__':
             config.hidden_size = args.n_embd
             config.intermediate_size = config.hidden_size * 4
         elif args.base_model == 'llama':
-            config = AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B')
+            config = AutoConfig.from_pretrained('unsloth/Llama-3.2-1B')
             config.num_hidden_layers = args.n_layer
             config.num_attention_heads = args.n_head
             config.num_key_value_heads = args.n_head
@@ -342,6 +344,8 @@ if __name__ == '__main__':
                                       attn_implementation=args.attn_implementation,
                                       write_objective=args.write_objective,
                                       energy_head_hidden_dim=args.energy_head_hidden_dim,
+                                      energy_head_checkpoint=args.energy_head_checkpoint,
+                                      energy_condition_on_label=args.energy_condition_on_label,
                                       energy_rank_weight=args.energy_rank_weight,
                                       energy_traj_weight=args.energy_traj_weight,
                                       energy_margin=args.energy_margin,

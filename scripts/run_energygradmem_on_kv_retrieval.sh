@@ -18,7 +18,7 @@ D=128
 BASE_MODEL=llama
 
 V=62
-DATA_NAME="N8-K2V2-V${V}_1M"
+DATA_NAME="N4-K2V2-V${V}_1M"
 DATA_PATH="./data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
@@ -46,6 +46,8 @@ ENERGY_RANK_WEIGHT=0.0
 ENERGY_TRAJ_WEIGHT=0.0
 ENERGY_MARGIN=0.1
 ENERGY_TRAJ_MARGIN=0.0
+ENERGY_CONDITION_ON_LABEL=true
+ENERGY_HEAD_CPT=distilled_energy_mlp_random.pt
 
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
@@ -80,6 +82,12 @@ fi
 if [ "$ENERGY_TRAJ_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_traj${ENERGY_TRAJ_WEIGHT}_m${ENERGY_TRAJ_MARGIN}
 fi
+if [ "$ENERGY_CONDITION_ON_LABEL" = true ]; then
+  RUN_NAME=${RUN_NAME}_cond_label
+fi
+if [ "$ENERGY_HEAD_CPT" != "None" ]; then
+  RUN_NAME=${RUN_NAME}_cpt
+fi
 RUN_NAME=${RUN_NAME}_grad_${GRAD_MODE}
 if [ "$ADD_INNER_LOSS_TO_OUTER" = true ]; then
   RUN_NAME=${RUN_NAME}_add_inner
@@ -100,7 +108,7 @@ if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
   RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
 fi
 
-N_VALUES=(1 2 3)
+N_VALUES=(2)
 for N in "${N_VALUES[@]}"; do
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_${N}"
 
@@ -180,6 +188,12 @@ for N in "${N_VALUES[@]}"; do
     if [ "$INNER_LOSS_WEIGHT" != "None" ]; then
       CMD+=( --inner_loss_weight "$INNER_LOSS_WEIGHT" )
     fi
+  fi
+  if [ "$ENERGY_CONDITION_ON_LABEL" = true ]; then
+    CMD+=( --energy_condition_on_label )
+  fi
+  if [ "$ENERGY_HEAD_CPT" != "None" ]; then
+    CMD+=( --energy_head_checkpoint "$ENERGY_HEAD_CPT" )
   fi
 
   print_run_header "$EXP_PATH" "$PORT" "$NP" "$MIXED_PRECISION" "${CMD[@]}"

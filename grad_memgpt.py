@@ -88,6 +88,8 @@ class GradMemGPTConfig(PretrainedConfig):
                  attn_implementation="eager",
                  write_objective="reconstruction",
                  energy_head_hidden_dim=None,
+                 energy_head_checkpoint=None,
+                 energy_condition_on_label=False,
                  energy_rank_weight=0.0,
                  energy_traj_weight=0.0,
                  energy_margin=0.1,
@@ -135,6 +137,8 @@ class GradMemGPTConfig(PretrainedConfig):
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
             write_objective: str, inner WRITE objective ("reconstruction" or "energy")
             energy_head_hidden_dim: int|None, hidden dim for energy MLP; defaults to backbone hidden size
+            energy_head_checkpoint: str|None, optional checkpoint for initializing energy MLP
+            energy_condition_on_label: bool, feed concat(hidden, label_embedding) to energy MLP
             energy_rank_weight: float, optional ranking loss weight for final memory vs initial memory
             energy_traj_weight: float, optional monotonic trajectory loss weight
             energy_margin: float, margin for ranking loss
@@ -185,6 +189,8 @@ class GradMemGPTConfig(PretrainedConfig):
         self.attn_implementation = attn_implementation
         self.write_objective = write_objective
         self.energy_head_hidden_dim = energy_head_hidden_dim
+        self.energy_head_checkpoint = energy_head_checkpoint
+        self.energy_condition_on_label = energy_condition_on_label
         self.energy_rank_weight = energy_rank_weight
         self.energy_traj_weight = energy_traj_weight
         self.energy_margin = energy_margin
@@ -730,6 +736,10 @@ class GradMemGPT(PreTrainedModel):
         self.use_write_head = config.use_write_head
         self.write_objective = getattr(config, "write_objective", "reconstruction")
         self.energy_head_hidden_dim = getattr(config, "energy_head_hidden_dim", None)
+        self.energy_head_checkpoint = getattr(config, "energy_head_checkpoint", None)
+        self.energy_condition_on_label = bool(getattr(config, "energy_condition_on_label", False))
+        if self.energy_head_checkpoint is not None:
+            self.energy_condition_on_label = True
         self.energy_rank_weight = float(getattr(config, "energy_rank_weight", 0.0) or 0.0)
         self.energy_traj_weight = float(getattr(config, "energy_traj_weight", 0.0) or 0.0)
         self.energy_margin = float(getattr(config, "energy_margin", 0.1))
@@ -784,12 +794,15 @@ class GradMemGPT(PreTrainedModel):
 
         if self.write_objective == "energy":
             energy_hidden = self.energy_head_hidden_dim or n_embd
-            self.energy_ln = nn.LayerNorm(n_embd)
+            energy_input_dim = n_embd * (2 if self.energy_condition_on_label else 1)
+            self.energy_ln = nn.LayerNorm(energy_input_dim)
             self.energy_head = nn.Sequential(
-                nn.Linear(n_embd, energy_hidden),
+                nn.Linear(energy_input_dim, energy_hidden),
                 nn.SiLU(),
                 nn.Linear(energy_hidden, 1),
             )
+            if self.energy_head_checkpoint is not None:
+                self._load_energy_head_checkpoint(self.energy_head_checkpoint, n_embd)
         else:
             self.energy_ln = None
             self.energy_head = None
@@ -1001,9 +1014,84 @@ class GradMemGPT(PreTrainedModel):
             return mem
         return torch.baddbmm(b.unsqueeze(1), mem, W.transpose(1, 2))
 
+    def _load_energy_head_checkpoint(self, checkpoint_path, n_embd):
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        state = checkpoint.get("energy_mlp", checkpoint)
+        if "ln.weight" not in state:
+            raise ValueError(
+                f"Energy checkpoint {checkpoint_path} does not contain an EnergyMLP state dict"
+            )
+
+        input_dim = state["ln.weight"].numel()
+        expected_input_dim = 2 * n_embd
+        if input_dim != expected_input_dim:
+            raise ValueError(
+                "Energy checkpoint input dim does not match label-conditioned GradMem energy input: "
+                f"checkpoint={input_dim}, expected={expected_input_dim}"
+            )
+
+        linear_keys = sorted(
+            [k for k in state if k.startswith("net.") and k.endswith(".weight")],
+            key=lambda k: int(k.split(".")[1]),
+        )
+        if len(linear_keys) == 0:
+            raise ValueError(f"Energy checkpoint {checkpoint_path} has no net.*.weight layers")
+
+        modules = []
+        for i, key in enumerate(linear_keys):
+            layer_idx = int(key.split(".")[1])
+            out_dim, in_dim = state[key].shape
+            modules.append(nn.Linear(in_dim, out_dim))
+            if i != len(linear_keys) - 1:
+                next_idx = int(linear_keys[i + 1].split(".")[1])
+                activation_modules = [idx for idx in range(layer_idx + 1, next_idx)]
+                if len(activation_modules) != 1:
+                    raise ValueError(
+                        "Unsupported EnergyMLP checkpoint architecture; expected one activation "
+                        "between linear layers"
+                    )
+                modules.append(nn.SiLU())
+
+        self.energy_ln = nn.LayerNorm(input_dim)
+        self.energy_head = nn.Sequential(*modules)
+
+        ln_state = {
+            "weight": state["ln.weight"],
+            "bias": state["ln.bias"],
+        }
+        head_state = {
+            re.sub(r"^net\.", "", key): value
+            for key, value in state.items()
+            if key.startswith("net.")
+        }
+        self.energy_ln.load_state_dict(ln_state)
+        self.energy_head.load_state_dict(head_state)
+        if _is_main_process():
+            logger.info(f"Loaded energy head checkpoint from {checkpoint_path}")
+
     def _compute_write_energy(self, hidden_states, write_batch):
         if self.energy_head is None:
             raise RuntimeError("energy_head is not initialized")
+        if self.energy_condition_on_label:
+            energy_hidden = hidden_states[:, write_batch["logits_start"]:, :][:, :-1, :]
+            label_shift = write_batch.get("label_shift", 0)
+            labels = write_batch["lm_labels"][:, label_shift:]
+            context_mask = write_batch["mask"][:, label_shift:].to(
+                device=energy_hidden.device,
+                dtype=energy_hidden.dtype,
+            )
+            if energy_hidden.size(1) != labels.size(1):
+                raise ValueError(
+                    "Invalid label-conditioned energy alignment: "
+                    f"hidden_len={energy_hidden.size(1)}, labels_len={labels.size(1)}, "
+                    f"logits_start={write_batch['logits_start']}, label_shift={label_shift}"
+                )
+            labels_for_emb = labels.clamp_min(0).to(device=energy_hidden.device)
+            label_emb = self.model.get_input_embeddings()(labels_for_emb)
+            energy_input = torch.cat([energy_hidden, label_emb], dim=-1)
+            token_energy = self.energy_head(self.energy_ln(energy_input)).squeeze(-1)
+            return (token_energy * context_mask).sum(dim=1) / context_mask.sum(dim=1).clamp_min(1)
+
         context_hidden = hidden_states[:, write_batch["context_start"]:, :]
         context_mask = write_batch["mask"].to(device=context_hidden.device, dtype=context_hidden.dtype)
         if context_hidden.size(1) != context_mask.size(1):
