@@ -16,7 +16,9 @@ training:
   logging_steps: 500
   warmup_steps: 10000
   early_stopping_patience: 500
-  seed: 143
+  # seed: 31234
+  # seed: 231414
+  seed: 76893
 
 dataset:
   data_path: "./data/N4-K2V2-V62_1M"
@@ -44,22 +46,25 @@ gradmem:
 
 hopfield:
   use_hopfield_memory: true
-  hopfield_n_segments: 2
-  hopfield_retrieval_mode: raw
+  hopfield_n_segments: 1
+  hopfield_segment_size: 32
+  hopfield_retrieval_mode: raw  # raw | softmax | beta_softmax | mean
   hopfield_beta_init: 1.0
-  use_separate_hopfield_mem: true
-  hopfield_proj_dim: null
-  hopfield_direct_query: false
-  hopfield_value_as_key: true
+  use_separate_hopfield_mem: true  # use separate M_0 values for value, key and query memory tokens
+  hopfield_proj_dim: 512  # if null use M*d key/query size, otherwise add learnable key/query linear projections
+  hopfield_direct_query: false  # use only meta-learned query vector, skip forward pass for query
+  hopfield_value_as_key: false  # skip forward pass for key, use value_pattern or its projection as key
+  hopfield_value_proj_dim: null  # value projection dim in Hopfield STORE/RETRIEVE (null = disabled, M*d = identity init)
 
 curriculum:
-  enabled: true
-  threshold: 0.95
-  levels: "4,8,16,32,64,128"
-  data_dir: "./data"
-  stage_overrides:
-    1: {inner_lr: 0.02}
-    2: {inner_lr: 0.01}
-    3: {inner_lr: 0.005}
-    4: {inner_lr: 0.002}
-    5: {inner_lr: 0.001}
+  curriculum_enabled: true
+  curriculum_threshold: 0.9
+  curriculum_levels: "8,16,32,64,96,128"
+  curriculum_data_dir: "./data"
+  # curriculum_stage_overrides:
+  #   1: {inner_lr: 0.02}
+  #   2: {inner_lr: 0.01}
+  #   3: {inner_lr: 0.005}
+  #   4: {inner_lr: 0.002}
+  #   5: {inner_lr: 0.001}
+
