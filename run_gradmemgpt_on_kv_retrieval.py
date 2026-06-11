@@ -140,6 +140,14 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         metrics['step_delta_mem_norm_mean'] = float(inner_loop_stats['step_delta_mem_norm_mean'].mean())
         metrics['step_delta_mem_norm_max'] = float(inner_loop_stats['step_delta_mem_norm_max'].max())
         metrics['step_delta_mem_norm_min'] = float(inner_loop_stats['step_delta_mem_norm_min'].min())
+    if 'seg_nonempty_count_mean' in inner_loop_stats:
+        metrics['seg_nonempty_count_mean'] = float(inner_loop_stats['seg_nonempty_count_mean'].mean())
+        metrics['seg_nonempty_count_max'] = float(inner_loop_stats['seg_nonempty_count_max'].max())
+        metrics['seg_nonempty_count_min'] = float(inner_loop_stats['seg_nonempty_count_min'].min())
+    if 'seg_nonempty_size_mean' in inner_loop_stats:
+        metrics['seg_nonempty_size_mean'] = float(inner_loop_stats['seg_nonempty_size_mean'].mean())
+        metrics['seg_nonempty_size_max'] = float(inner_loop_stats['seg_nonempty_size_max'].max())
+        metrics['seg_nonempty_size_min'] = float(inner_loop_stats['seg_nonempty_size_min'].min())
     return metrics
 
 

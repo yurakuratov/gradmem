@@ -612,6 +612,9 @@ class GradMemGPT(PreTrainedModel):
                             'inner_grad_norm_max': torch.tensor(-1.0, device=device),
                             'inner_grad_norm_min': torch.tensor(1e06, device=device)}
 
+        seg_nonempty_counts = torch.zeros(B, dtype=torch.long, device=device)
+        seg_nonempty_sizes = torch.zeros(B, dtype=torch.long, device=device)
+
         rec_losses = []
 
         # Track last segment's mem_batch for stats and as fallback for READ phase
@@ -656,6 +659,9 @@ class GradMemGPT(PreTrainedModel):
 
                     # Per-sample: does this segment have any real tokens?
                     seg_has_tokens = seg_mask.any(dim=1)  # [B]
+
+                    seg_nonempty_counts += seg_has_tokens.long()
+                    seg_nonempty_sizes += (seg_mask.sum(dim=1) * seg_has_tokens.long())
 
                     if not seg_has_tokens.any():
                         continue
@@ -945,6 +951,20 @@ class GradMemGPT(PreTrainedModel):
         inner_loop_stats['delta_mem_norm_mean'] = detla_mem_norm.mean()
         inner_loop_stats['delta_mem_norm_max'] = detla_mem_norm.max()
         inner_loop_stats['delta_mem_norm_min'] = detla_mem_norm.min()
+
+        inner_loop_stats['seg_nonempty_count_mean'] = seg_nonempty_counts.float().mean().detach()
+        inner_loop_stats['seg_nonempty_count_max'] = seg_nonempty_counts.max().detach()
+        inner_loop_stats['seg_nonempty_count_min'] = seg_nonempty_counts.min().detach()
+        has_any_seg = seg_nonempty_counts > 0
+        if has_any_seg.any():
+            per_sample_avg_seg_size = seg_nonempty_sizes[has_any_seg].float() / seg_nonempty_counts[has_any_seg].float()
+            inner_loop_stats['seg_nonempty_size_mean'] = per_sample_avg_seg_size.mean().detach()
+            inner_loop_stats['seg_nonempty_size_max'] = per_sample_avg_seg_size.max().detach()
+            inner_loop_stats['seg_nonempty_size_min'] = per_sample_avg_seg_size.min().detach()
+        else:
+            inner_loop_stats['seg_nonempty_size_mean'] = torch.tensor(0.0, device=device)
+            inner_loop_stats['seg_nonempty_size_max'] = torch.tensor(0.0, device=device)
+            inner_loop_stats['seg_nonempty_size_min'] = torch.tensor(0.0, device=device)
 
         qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
         # ---------------------------------------------------------------- #
