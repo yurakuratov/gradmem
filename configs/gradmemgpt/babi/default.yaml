@@ -4,8 +4,8 @@ model:
   pretrained_model: gpt2
 
 training:
-  per_device_batch_size: 16
-  total_batch_size: 64
+  per_device_batch_size: 1
+  total_batch_size: 1
   learning_rate: 1.0e-4
   max_steps: 200000
   eval_steps: 500
@@ -15,8 +15,8 @@ training:
   seed: 142
 
 dataset:
-  data_name: "babilong_qa2_0k"
-  data_path: "/home/jovyan/.cache/test-time-gd-cache/data/babilong_qa2_0k"
+  data_name: "babilong_qa1_0k"
+  data_path: "./data/babilong_qa1_0k"
   tokenizer_path: "./tokenizers/kv_alphabet_62/"
 
 gradmem:
