@@ -892,15 +892,20 @@ class GradMemGPT(PreTrainedModel):
                                 mem_key_prefix = mem_batch_initial
 
                             hopf_mem_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
+                            seg_mask_for_attn = seg_mask.long()
+                            if not seg_has_tokens.all():
+                                seg_mask_for_attn = seg_mask_for_attn.clone()
+                                seg_mask_for_attn[~seg_has_tokens] = 1
                             if self.n_ctrl_tokens > 0:
                                 hopf_ctrl_mask = torch.ones(B, self.n_ctrl_tokens, dtype=torch.long, device=device)
                                 x_seg_comp = torch.cat([write_st_batch, seg_emb, write_end_batch, mem_key_prefix], dim=1)
-                                seg_attn_mask = torch.cat([hopf_ctrl_mask, seg_mask.long(), hopf_ctrl_mask, hopf_mem_mask], dim=1)
+                                seg_attn_mask = torch.cat([hopf_ctrl_mask, seg_mask_for_attn, hopf_ctrl_mask, hopf_mem_mask], dim=1)
                             else:
                                 x_seg_comp = torch.cat([seg_emb, mem_key_prefix], dim=1)
-                                seg_attn_mask = torch.cat([seg_mask.long(), hopf_mem_mask], dim=1)
+                                seg_attn_mask = torch.cat([seg_mask_for_attn, hopf_mem_mask], dim=1)
 
                             position_ids = seg_attn_mask.cumsum(-1) - 1
+                            position_ids = position_ids.clamp(min=0)
                             outs_seg = get_backbone(self.model)(inputs_embeds=x_seg_comp, attention_mask=seg_attn_mask,
                                                                 position_ids=position_ids, return_dict=True)
                             seg_key = outs_seg.last_hidden_state[:, -self.n_mem_tokens:, :].view(B, -1)  # [B, M*d]
