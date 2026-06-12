@@ -2,21 +2,15 @@ container:
   image: "cr.ai.cloud.ru/0be50883-779e-4f89-a2c2-6befd3879c6f/test-time-gd:latest"
 
   # CMD to run
-  command: scripts/run_gradmemgpt_on_kv_retrieval.sh
+  command: "python run_from_config.py --config configs/gradmemgpt/babi/hopfield.yaml --debug"
   # ENV vars
   environment:
     "HF_HOME": "$HF_HOME"
-    "WANDB_API_KEY": "$WANDB_API_KEY"
-    "WANDB_DIR": "$WANDB_DIR"
-    "WANDB_DATA_DIR": "$WANDB_DATA_DIR"
-    "WANDB_ARTIFACT_DIR": "$WANDB_ARTIFACT_DIR"
-    "WANDB_CACHE_DIR": "$WANDB_CACHE_DIR"
-    "WANDB_HTTPS_PROXY": "$WANDB_HTTPS_PROXY"
     "TRITON_CACHE_DIR": "$TRITON_CACHE_DIR"
     "COMET_API_KEY": "$COMET_API_KEY"
-    "COMET_PROJECT_NAME": "gradmem"
-    "COMET_EXPERIMENT_NAME": "test"
-    # "COMET_WORKSPACE": "$COMET_WORKSPACE"
+    "COMET_PROJECT_NAME": "babilong"
+    "COMET_EXPERIMENT_NAME": "base_64tk_q3"
+    "COMET_WORKSPACE": "$COMET_WORKSPACE"
     "COMET_MODE": "online"
     # Added to job description
     "TEAM_NAME": "gradmem/$ME"
@@ -31,6 +25,9 @@ container:
   # Local path for creating working directory copies
   cry_copy_dir: "$MY_HOME/.cryri"
   exclude_from_copy:
+    - ".venv"
+    - "uv.lock"
+    - "pyproject.toml"
     - ".git/"
     - "notebooks/"
     - "build/"
@@ -46,4 +43,4 @@ cloud:
   n_workers: 1
   
   # Job description 
-  description: "test"
+  description: "hopfield_babi_64tk_q3"
