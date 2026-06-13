@@ -201,15 +201,15 @@ class CustomTrainer(Trainer):
 
 
 class CurriculumTrainer(CustomTrainer):
-    def __init__(self, *args, step_offset=0, curriculum_stage=0, curriculum_n_kv=0, **kwargs):
+    def __init__(self, *args, step_offset=0, curriculum_stage=0, curriculum_stage_label="", **kwargs):
         super().__init__(*args, **kwargs)
         self.step_offset = step_offset
         self.curriculum_stage = curriculum_stage
-        self.curriculum_n_kv = curriculum_n_kv
+        self.curriculum_stage_label = curriculum_stage_label
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         logs['curriculum_stage'] = self.curriculum_stage
-        logs['curriculum_n_kv'] = self.curriculum_n_kv
+        logs['curriculum_stage_label'] = self.curriculum_stage_label
         original_step = self.state.global_step
         self.state.global_step += self.step_offset
         super().log(logs, start_time=start_time)
@@ -284,6 +284,7 @@ class ExperimentArgs:
     curriculum_threshold: Optional[float] = field(default=0.95)
     curriculum_levels: Optional[str] = field(default="4,8,16,32,64,128")
     curriculum_data_dir: Optional[str] = field(default="./data")
+    curriculum_dataset_template: Optional[str] = field(default="N{n_kv}-K2V2-V62_1M")
     curriculum_stage_overrides: Optional[str] = field(default=None)
 
 
@@ -455,7 +456,13 @@ def main(config_path: Optional[str] = None):
         assert args.total_batch_size == args_total_bs
 
     if args.curriculum_enabled:
-        curriculum_levels = [int(x.strip()) for x in args.curriculum_levels.split(',')]
+        raw_levels = [x.strip() for x in args.curriculum_levels.split(',')]
+        curriculum_levels = []
+        for level in raw_levels:
+            try:
+                curriculum_levels.append(int(level))
+            except ValueError:
+                curriculum_levels.append(level)
         logger.info(f'curriculum learning enabled: levels={curriculum_levels}, threshold={args.curriculum_threshold}')
 
         stage_overrides = {}
@@ -474,11 +481,10 @@ def main(config_path: Optional[str] = None):
         }
 
         data_dir = Path(args.curriculum_data_dir)
-        dataset_name_template = "N{n_kv}-K2V2-V62_1M"
 
         all_metrics = {}
         cumulative_steps = 0
-        for stage_idx, n_kv in enumerate(curriculum_levels):
+        for stage_idx, level in enumerate(curriculum_levels):
             # Apply stage overrides
             overrides = stage_overrides.get(stage_idx, {})
             if overrides:
@@ -493,13 +499,18 @@ def main(config_path: Optional[str] = None):
                         setattr(args, param, value)
                         logger.info(f'  override args.{param} = {value}')
 
-            dataset_name = dataset_name_template.format(n_kv=n_kv)
+            if isinstance(level, int):
+                dataset_name = args.curriculum_dataset_template.format(n_kv=level)
+                label = f"N{level}"
+            else:
+                dataset_name = level
+                label = level
             data_path = data_dir / dataset_name
-            logger.info(f'curriculum stage {stage_idx}/{len(curriculum_levels)-1}: N={n_kv}, data_path={data_path}')
+            logger.info(f'curriculum stage {stage_idx}/{len(curriculum_levels)-1}: label={label}, data_path={data_path}')
 
             stage_dataset = datasets.load_from_disk(str(data_path))
 
-            stage_output_dir = output_dir / f'stage_{stage_idx}_N{n_kv}'
+            stage_output_dir = output_dir / f'stage_{stage_idx}_{label}'
             stage_output_dir.mkdir(parents=True, exist_ok=True)
 
             def stage_data_collator(batch):
@@ -557,7 +568,7 @@ def main(config_path: Optional[str] = None):
                 ],
                 step_offset=cumulative_steps,
                 curriculum_stage=stage_idx,
-                curriculum_n_kv=n_kv,
+                curriculum_stage_label=label,
             )
 
             trainer.train()
@@ -570,23 +581,26 @@ def main(config_path: Optional[str] = None):
             trainer.save_model(str(best_model_path))
 
             if curriculum_cb.threshold_reached and not is_last_stage:
-                logger.info(f'curriculum stage {stage_idx} (N={n_kv}): threshold reached, advancing to next stage')
+                logger.info(f'curriculum stage {stage_idx} ({label}): threshold reached, advancing to next stage')
             elif curriculum_cb.threshold_reached and is_last_stage:
-                logger.info(f'curriculum complete! final stage (N={n_kv}) threshold reached')
+                logger.info(f'curriculum complete! final stage ({label}) threshold reached')
             else:
-                logger.info(f'curriculum stage {stage_idx} (N={n_kv}): threshold NOT reached, stopping curriculum')
+                logger.info(f'curriculum stage {stage_idx} ({label}): threshold NOT reached, stopping curriculum')
 
             metrics = trainer.evaluate(stage_dataset['valid'])
-            all_metrics[f'stage_{stage_idx}_N{n_kv}'] = metrics
-            logger.info(f'stage {stage_idx} (N={n_kv}) final metrics: {metrics}')
+            all_metrics[f'stage_{stage_idx}_{label}'] = metrics
+            logger.info(f'stage {stage_idx} ({label}) final metrics: {metrics}')
 
             if not curriculum_cb.threshold_reached:
                 break
 
         logger.info('curriculum training done. running final evaluation on last completed stage...')
-        final_dataset = datasets.load_from_disk(str(data_dir / dataset_name_template.format(
-            n_kv=curriculum_levels[min(stage_idx, len(curriculum_levels) - 1)]
-        )))
+        final_level = curriculum_levels[min(stage_idx, len(curriculum_levels) - 1)]
+        if isinstance(final_level, int):
+            final_dataset_name = args.curriculum_dataset_template.format(n_kv=final_level)
+        else:
+            final_dataset_name = final_level
+        final_dataset = datasets.load_from_disk(str(data_dir / final_dataset_name))
         final_metrics = trainer.evaluate(final_dataset['valid'])
         logger.info(f'final metrics: {final_metrics}')
         trainer.save_metrics(split='all', metrics=final_metrics)

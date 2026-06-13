@@ -213,6 +213,8 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
             args.append(f'--curriculum_levels={curriculum["levels"]}')
         if 'data_dir' in curriculum:
             args.append(f'--curriculum_data_dir={curriculum["data_dir"]}')
+        if 'curriculum_dataset_template' in curriculum:
+            args.append(f'--curriculum_dataset_template={curriculum["curriculum_dataset_template"]}')
         if 'stage_overrides' in curriculum:
             import json as _json
             overrides_str = _json.dumps({str(k): v for k, v in curriculum['stage_overrides'].items()})
