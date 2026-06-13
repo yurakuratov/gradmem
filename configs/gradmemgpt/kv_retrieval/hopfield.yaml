@@ -53,3 +53,4 @@ hopfield:
   hopfield_direct_query: false  # use only meta-learned query vector, skip forward pass for query
   hopfield_value_as_key: false  # skip forward pass for key, use value_pattern or its projection as key
   hopfield_value_proj_dim: null  # value projection dim in Hopfield STORE/RETRIEVE (null = disabled, M*d = identity init)
+  hopfield_bptt_segments: null  # number of last segments to keep in BPTT graph (null = all segments)

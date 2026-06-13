@@ -75,6 +75,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  hopfield_direct_query=False,
                  hopfield_value_as_key=False,
                  hopfield_value_proj_dim=None,
+                 hopfield_bptt_segments=None,
                  memory_update="gradient",
                  use_mem_residual=False,
                  use_reconstruction_loss=False,
@@ -114,8 +115,9 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
              hopfield_proj_dim: int|None, dimension for key/query projection layers (None = no projection)
              hopfield_direct_query: bool, skip forward pass for query key, use self.mem_query directly (requires use_separate_hopfield_mem)
              hopfield_value_as_key: bool, use value pattern as key in Hopfield STORE instead of forward pass
-             hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield STORE/RETRIEVE (None = no projection)
-             memory_update: str, how to update memory in inner loop ("gradient" for SGD/Adam, "forward" for RMT-style forward pass)
+hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield STORE/RETRIEVE (None = no projection)
+              hopfield_bptt_segments: int|None, number of last segments to keep in backprop graph for Hopfield (None = all segments)
+              memory_update: str, how to update memory in inner loop ("gradient" for SGD/Adam, "forward" for RMT-style forward pass)
              use_mem_residual: bool, use residual connection in forward memory update: mem = mem + LN(mem_out) (requires memory_update="forward")
              use_reconstruction_loss: bool, add reconstruction loss (context LM loss) to outer loss during forward inner loop
              reconstruction_loss_weight: float, weight of reconstruction loss in combined loss
@@ -165,6 +167,7 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
         self.hopfield_direct_query = hopfield_direct_query
         self.hopfield_value_as_key = hopfield_value_as_key
         self.hopfield_value_proj_dim = hopfield_value_proj_dim
+        self.hopfield_bptt_segments = hopfield_bptt_segments
         self.memory_update = memory_update
         self.use_mem_residual = use_mem_residual
         self.use_reconstruction_loss = use_reconstruction_loss
@@ -191,6 +194,9 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
                 f"hopfield_segment_size must be >= 1, got {hopfield_segment_size}"
         if hopfield_proj_dim is not None:
             assert hopfield_proj_dim > 0, f"hopfield_proj_dim must be positive, got {hopfield_proj_dim}"
+        if hopfield_bptt_segments is not None:
+            assert hopfield_bptt_segments >= 1, f"hopfield_bptt_segments must be >= 1 or None, got {hopfield_bptt_segments}"
+            assert use_hopfield_memory, "hopfield_bptt_segments requires use_hopfield_memory=True"
         assert memory_update in ("gradient", "forward"), \
             f"memory_update must be 'gradient' or 'forward', got '{memory_update}'"
         assert not (use_mem_residual and memory_update != "forward"), \
@@ -346,6 +352,7 @@ class GradMemGPT(PreTrainedModel):
         self.hopfield_direct_query = getattr(config, "hopfield_direct_query", False)
         self.hopfield_value_as_key = getattr(config, "hopfield_value_as_key", False)
         self.hopfield_value_proj_dim = getattr(config, "hopfield_value_proj_dim", None)
+        self.hopfield_bptt_segments = getattr(config, "hopfield_bptt_segments", None)
 
         if self.use_hopfield_memory:
             if self.hopfield_n_segments < 1:
@@ -923,6 +930,12 @@ class GradMemGPT(PreTrainedModel):
 
                         # L2-normalize keys only (values keep their magnitude)
                         seg_key = F.normalize(seg_key, dim=-1)
+
+                        # Detach keys/values for segments outside the BPTT window
+                        # to reduce peak memory by cutting the computation graph
+                        if self.hopfield_bptt_segments is not None and (n_segments - seg_idx - 1) >= self.hopfield_bptt_segments:
+                            seg_key = seg_key.detach()
+                            value_pattern = value_pattern.detach()
 
                         # Store for attention-based retrieval
                         stored_keys.append(seg_key)
