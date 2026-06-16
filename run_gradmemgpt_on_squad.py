@@ -38,8 +38,11 @@ def collate_fn(batch, tokenizer):
     context = [item['context'].strip() for item in batch]
     query = [item['query'] + item['target'] for item in batch]
 
+    orig_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
     context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
                                   padding=True, pad_to_multiple_of=8).input_ids
+    tokenizer.padding_side = orig_padding_side
     query_encoded = tokenizer(query, return_tensors="pt", add_special_tokens=True,
                               padding=True, pad_to_multiple_of=8, return_offsets_mapping=True)
     query_input_ids = query_encoded['input_ids']
