@@ -34,15 +34,19 @@ logger = logging.getLogger('')
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
-def collate_fn(batch, tokenizer, max_context_length=None):
+def collate_fn(batch, tokenizer, max_context_length=None, hopfield=False):
     context = [item['context'] for item in batch]
     query = [item['query'] + item['target'] for item in batch]
 
     orig_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "left"
-    context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
-                                  padding=True, pad_to_multiple_of=8, max_length=max_context_length,
-                                  truncation=True).input_ids
+    if hopfield:
+        context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
+                                      padding=True, pad_to_multiple_of=8).input_ids
+    else:
+        context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
+                                      padding=True, pad_to_multiple_of=8, max_length=max_context_length,
+                                      truncation=True).input_ids
     tokenizer.padding_side = orig_padding_side
     query_encoded = tokenizer(query, return_tensors="pt", add_special_tokens=True,
                               padding=True, pad_to_multiple_of=8, return_offsets_mapping=True)
@@ -446,7 +450,8 @@ def main(config_path: Optional[str] = None):
     dataset = datasets.load_from_disk(args.data_path)
 
     def data_collator(batch):
-        return collate_fn(batch, tokenizer, max_context_length=args.max_context_length)
+        return collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
+                          hopfield=args.use_hopfield_memory)
 
     ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']]
 
@@ -534,7 +539,8 @@ def main(config_path: Optional[str] = None):
             stage_output_dir.mkdir(parents=True, exist_ok=True)
 
             def stage_data_collator(batch):
-                return collate_fn(batch, tokenizer, max_context_length=args.max_context_length)
+                return collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
+                                  hopfield=args.use_hopfield_memory)
 
             training_args = TrainingArguments(
                 output_dir=stage_output_dir,

@@ -384,6 +384,16 @@ class GradMemGPT(PreTrainedModel):
                         nn.init.eye_(self.hopfield_value_inv_proj.weight)
                         self.hopfield_value_inv_proj.bias.zero_()
 
+        if self.use_hopfield_memory and self.hopfield_segment_size is not None:
+            max_pos = getattr(self.model.config, 'n_positions',
+                              getattr(self.model.config, 'max_position_embeddings', None))
+            max_seq_in_segment = self.hopfield_segment_size + self.n_mem_tokens + self.n_ctrl_tokens * 2
+            if max_pos is not None and max_seq_in_segment > max_pos:
+                raise ValueError(
+                    f"Segment + memory tokens ({max_seq_in_segment}) exceeds model's max position embeddings "
+                    f"({max_pos}). Reduce hopfield_segment_size or increase max_position_embeddings."
+                )
+
         self.tie_weights()
         self.main_input_name = "input_ids"
         self.model.config.use_cache = False
