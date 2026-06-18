@@ -254,6 +254,8 @@ def build_args_from_config(
         args.append(f'--early_stopping_patience={training["early_stopping_patience"]}')
     if training.get('use_gradient_checkpointing'):
         args.append(f'--use_gradient_checkpointing')
+    if training.get('auto_find_batch_size'):
+        args.append('--auto_find_batch_size')
 
     if 'data_path' in dataset:
         args.append(f'--data_path={dataset["data_path"]}')

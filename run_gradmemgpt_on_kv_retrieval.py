@@ -228,6 +228,7 @@ class ExperimentArgs:
     tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
+    auto_find_batch_size: Optional[bool] = field(default=False)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
     warmup_steps: Optional[int] = field(default=1000)
     max_steps: Optional[int] = field(default=50000)
@@ -454,7 +455,11 @@ def main(config_path: Optional[str] = None):
 
     output_dir = Path(args.exp_path)
 
-    if args.total_batch_size is None:
+    if args.auto_find_batch_size:
+        if args.total_batch_size is None:
+            raise ValueError("total_batch_size must be specified when auto_find_batch_size is True")
+        args.gradient_accumulation_steps = max(1, args.total_batch_size // (args.per_device_batch_size * accel.num_processes))
+    elif args.total_batch_size is None:
         args.total_batch_size = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
     else:
         args_total_bs = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
@@ -479,10 +484,18 @@ def main(config_path: Optional[str] = None):
 
         MODEL_PARAM_MAP = {
             'inner_lr': ('lr', 'lr'),
+            'inner_clip_value': ('inner_clip_value', 'inner_clip_value'),
+            'inner_clip_norm': ('inner_clip_norm', 'inner_clip_norm'),
+            'hopfield_bptt_segments': ('hopfield_bptt_segments', 'hopfield_bptt_segments'),
+            'hopfield_n_segments': ('hopfield_n_segments', 'hopfield_n_segments'),
+            'hopfield_segment_size': ('hopfield_segment_size', 'hopfield_segment_size'),
+            'hopfield_beta_init': ('hopfield_beta_init', 'hopfield_beta_init'),
+            'hopfield_retrieval_mode': ('hopfield_retrieval_mode', 'hopfield_retrieval_mode'),
         }
         TRAINING_PARAM_MAP = {
             'learning_rate', 'warmup_steps', 'weight_decay', 'per_device_batch_size',
             'max_steps', 'eval_steps', 'logging_steps', 'early_stopping_patience',
+            'total_batch_size',
         }
 
         data_dir = Path(args.curriculum_data_dir)
@@ -503,6 +516,8 @@ def main(config_path: Optional[str] = None):
                     elif param in TRAINING_PARAM_MAP:
                         setattr(args, param, value)
                         logger.info(f'  override args.{param} = {value}')
+                    else:
+                        logger.warning(f'  override param "{param}" is not in MODEL_PARAM_MAP or TRAINING_PARAM_MAP, skipping')
 
             if isinstance(level, int):
                 dataset_name = args.curriculum_dataset_template.format(n_kv=level)
@@ -529,6 +544,7 @@ def main(config_path: Optional[str] = None):
                 per_device_train_batch_size=args.per_device_batch_size,
                 per_device_eval_batch_size=args.per_device_batch_size,
                 gradient_accumulation_steps=args.gradient_accumulation_steps,
+                auto_find_batch_size=args.auto_find_batch_size,
                 warmup_steps=args.warmup_steps,
                 weight_decay=args.weight_decay,
                 learning_rate=args.learning_rate,
@@ -622,6 +638,7 @@ def main(config_path: Optional[str] = None):
             per_device_train_batch_size=args.per_device_batch_size,
             per_device_eval_batch_size=args.per_device_batch_size,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
+            auto_find_batch_size=args.auto_find_batch_size,
             warmup_steps=args.warmup_steps,
             weight_decay=args.weight_decay,
             learning_rate=args.learning_rate,

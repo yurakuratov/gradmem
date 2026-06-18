@@ -149,6 +149,8 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
         args.append(f'--early_stopping_patience={training["early_stopping_patience"]}')
     if training.get('use_gradient_checkpointing'):
         args.append('--use_gradient_checkpointing')
+    if training.get('auto_find_batch_size'):
+        args.append('--auto_find_batch_size')
 
     if 'data_path' in dataset:
         args.append(f'--data_path={dataset["data_path"]}')
@@ -215,9 +217,10 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
             args.append(f'--curriculum_data_dir={curriculum["data_dir"]}')
         if 'curriculum_dataset_template' in curriculum:
             args.append(f'--curriculum_dataset_template={curriculum["curriculum_dataset_template"]}')
-        if 'stage_overrides' in curriculum:
+        if 'stage_overrides' in curriculum or 'curriculum_stage_overrides' in curriculum:
             import json as _json
-            overrides_str = _json.dumps({str(k): v for k, v in curriculum['stage_overrides'].items()})
+            overrides = curriculum.get('stage_overrides') or curriculum.get('curriculum_stage_overrides')
+            overrides_str = _json.dumps({str(k): v for k, v in overrides.items()})
             args.append(f"--curriculum_stage_overrides={overrides_str}")
 
     return args
@@ -287,7 +290,9 @@ def main():
             else:
                 cmd = f"import {script.replace('.py', '')}; {script.replace('.py', '')}.main('{args.config}')"
         else:
-            cmd = f"accelerate launch --config_file accelerate.yaml {script} --config {args.config}"
+            cfg_path = config_path if config_path else str(args.config)
+            cli_args = build_cli_args(cfg, parse_overrides)
+            cmd = f"accelerate launch --mixed_precision 'no' --config_file accelerate.yaml {script} --config {cfg_path} {' '.join(cli_args)}"
         print(f"\n# Run name: {run_name}")
         print(f"# Exp path: {exp_path}")
         print(f"# Command:\n{cmd}")
@@ -324,7 +329,8 @@ def main():
         logger.info(f"\nRunning in debug mode: {module_name}.main('{actual_config_path}')")
         module.main(actual_config_path)
     else:
-        command = f"accelerate launch --mixed_precision 'no' --config_file accelerate.yaml {script} --config {args.config}"
+        cfg_path = config_path if config_path else str(args.config)
+        command = f"accelerate launch --mixed_precision 'no' --config_file accelerate.yaml {script} --config {cfg_path} {' '.join(cli_args)}"
         logger.info(f"\nRunning:\n{command}")
         result = subprocess.run(command, shell=True)
         sys.exit(result.returncode)

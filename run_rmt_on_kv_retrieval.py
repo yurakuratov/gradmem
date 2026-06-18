@@ -182,6 +182,7 @@ class ExperimentArgs:
     tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
+    auto_find_batch_size: Optional[bool] = field(default=False)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
     warmup_steps: Optional[int] = field(default=1000)
     max_steps: Optional[int] = field(default=50000)
@@ -357,7 +358,11 @@ def main(config_path: Optional[str] = None):
 
     output_dir = Path(args.exp_path)
 
-    if args.total_batch_size is None:
+    if args.auto_find_batch_size:
+        if args.total_batch_size is None:
+            raise ValueError("total_batch_size must be specified when auto_find_batch_size is True")
+        args.gradient_accumulation_steps = max(1, args.total_batch_size // (args.per_device_batch_size * accel.num_processes))
+    elif args.total_batch_size is None:
         args.total_batch_size = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
     else:
         args_total_bs = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
@@ -372,6 +377,7 @@ def main(config_path: Optional[str] = None):
         per_device_train_batch_size=args.per_device_batch_size,
         per_device_eval_batch_size=args.per_device_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
+        auto_find_batch_size=args.auto_find_batch_size,
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
