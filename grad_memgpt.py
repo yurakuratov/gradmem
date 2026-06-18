@@ -1025,6 +1025,8 @@ class GradMemGPT(PreTrainedModel):
                         mem_query_prefix = mem_batch_initial
 
                     qry_mask = (query_input_ids != pad_id).to(dtype=torch.long)
+                    if labels is not None:
+                        qry_mask[labels >= 0] = 0
                     hopf_mem_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
                     if self.n_ctrl_tokens > 0:
                         hopf_ctrl_mask = torch.ones(B, self.n_ctrl_tokens, dtype=torch.long, device=device)
