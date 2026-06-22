@@ -155,6 +155,19 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         metrics['seg_nonempty_size_mean'] = float(inner_loop_stats['seg_nonempty_size_mean'].mean())
         metrics['seg_nonempty_size_max'] = float(inner_loop_stats['seg_nonempty_size_max'].max())
         metrics['seg_nonempty_size_min'] = float(inner_loop_stats['seg_nonempty_size_min'].min())
+    if 'hopfield_entropy_mean' in inner_loop_stats:
+        metrics['hopfield_entropy_mean'] = float(inner_loop_stats['hopfield_entropy_mean'].mean())
+        metrics['hopfield_entropy_max'] = float(inner_loop_stats['hopfield_entropy_max'].max())
+        metrics['hopfield_entropy_min'] = float(inner_loop_stats['hopfield_entropy_min'].min())
+        metrics['hopfield_entropy_norm_mean'] = float(inner_loop_stats['hopfield_entropy_norm_mean'].mean())
+        metrics['hopfield_entropy_norm_max'] = float(inner_loop_stats['hopfield_entropy_norm_max'].max())
+        metrics['hopfield_entropy_norm_min'] = float(inner_loop_stats['hopfield_entropy_norm_min'].min())
+        metrics['hopfield_n_seg_50_mean'] = float(inner_loop_stats['hopfield_n_seg_50_mean'].mean())
+        metrics['hopfield_n_seg_50_max'] = float(inner_loop_stats['hopfield_n_seg_50_max'].max())
+        metrics['hopfield_n_seg_50_min'] = float(inner_loop_stats['hopfield_n_seg_50_min'].min())
+        metrics['hopfield_n_seg_95_mean'] = float(inner_loop_stats['hopfield_n_seg_95_mean'].mean())
+        metrics['hopfield_n_seg_95_max'] = float(inner_loop_stats['hopfield_n_seg_95_max'].max())
+        metrics['hopfield_n_seg_95_min'] = float(inner_loop_stats['hopfield_n_seg_95_min'].min())
     return metrics
 
 

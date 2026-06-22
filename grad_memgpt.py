@@ -1015,6 +1015,7 @@ class GradMemGPT(PreTrainedModel):
                 # Average all stored value patterns with equal weight
                 weights = mask.float() / mask.float().sum(dim=1, keepdim=True).clamp(min=1)
                 retrieved_pattern = (weights.unsqueeze(2) * values).sum(dim=1)  # [B, M*d]
+                probs = weights  # [B, n_stored]
             else:
                 if self.hopfield_direct_query:
                     query_key = self.mem_query.unsqueeze(0).expand(B, -1, -1).reshape(B, -1)  # [B, M*d]
@@ -1050,19 +1051,57 @@ class GradMemGPT(PreTrainedModel):
                 scores = torch.bmm(query_key.unsqueeze(1), keys.transpose(1, 2)).squeeze(1)  # [B, n_stored]
 
                 if self.hopfield_retrieval_mode == "raw":
+                    probs = F.softmax(scores.masked_fill(~mask.bool(), float('-inf')), dim=-1)  # [B, n_stored]
                     scores = scores * mask.float()
                     retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
                 elif self.hopfield_retrieval_mode == "softmax":
                     scores = scores.masked_fill(~mask.bool(), float('-inf'))
                     scores = F.softmax(scores, dim=-1)
+                    probs = scores  # [B, n_stored]
                     retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
                 elif self.hopfield_retrieval_mode == "beta_softmax":
                     scores = scores * self.hopfield_beta
                     scores = scores.masked_fill(~mask.bool(), float('-inf'))
                     scores = F.softmax(scores, dim=-1)
+                    probs = scores  # [B, n_stored]
                     retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
                 else:
                     raise ValueError(f"Unknown hopfield_retrieval_mode: {self.hopfield_retrieval_mode}")
+
+            # Hopfield retrieval score distribution metrics
+            with torch.no_grad():
+                probs_v = probs[hopfield_stored]            # [n_valid, n_stored]
+                mask_v = mask[hopfield_stored]              # [n_valid, n_stored]
+                n_valid_per_sample = mask_v.sum(dim=1)      # [n_valid]
+                n_stored = probs_v.size(1)
+
+                entropy = -(probs_v * torch.log(probs_v.clamp_min(1e-12))).sum(dim=1)  # [n_valid]
+                denom = torch.log(n_valid_per_sample.clamp_min(1))
+                entropy_norm = torch.where(
+                    n_valid_per_sample > 1,
+                    entropy / denom.clamp_min(1e-12),
+                    torch.zeros_like(entropy),
+                )
+
+                sorted_probs, _ = torch.sort(probs_v, dim=1, descending=True)
+                cum_probs = torch.cumsum(sorted_probs, dim=1)
+                n_seg_50 = (cum_probs < 0.5).sum(dim=1) + 1
+                n_seg_95 = (cum_probs < 0.95).sum(dim=1) + 1
+                n_seg_50 = n_seg_50.clamp(max=n_stored)
+                n_seg_95 = n_seg_95.clamp(max=n_stored)
+
+                inner_loop_stats['hopfield_entropy_mean'] = entropy.mean().detach()
+                inner_loop_stats['hopfield_entropy_max'] = entropy.max().detach()
+                inner_loop_stats['hopfield_entropy_min'] = entropy.min().detach()
+                inner_loop_stats['hopfield_entropy_norm_mean'] = entropy_norm.mean().detach()
+                inner_loop_stats['hopfield_entropy_norm_max'] = entropy_norm.max().detach()
+                inner_loop_stats['hopfield_entropy_norm_min'] = entropy_norm.min().detach()
+                inner_loop_stats['hopfield_n_seg_50_mean'] = n_seg_50.float().mean().detach()
+                inner_loop_stats['hopfield_n_seg_50_max'] = n_seg_50.float().max().detach()
+                inner_loop_stats['hopfield_n_seg_50_min'] = n_seg_50.float().min().detach()
+                inner_loop_stats['hopfield_n_seg_95_mean'] = n_seg_95.float().mean().detach()
+                inner_loop_stats['hopfield_n_seg_95_max'] = n_seg_95.float().max().detach()
+                inner_loop_stats['hopfield_n_seg_95_min'] = n_seg_95.float().min().detach()
 
             if self.hopfield_value_proj_dim is not None:
                 retrieved_pattern = self.hopfield_value_inv_proj(retrieved_pattern)

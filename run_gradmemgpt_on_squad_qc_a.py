@@ -125,7 +125,7 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
         print('-' * 50)
 
-    return {
+    metrics = {
         "token_accuracy": float(accuracy),
         "exact_match": float(exact_match),
         "inner_loss": float(inner_loop_stats['inner_loss'].mean()),
@@ -139,6 +139,20 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
         "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
     }
+    if 'hopfield_entropy_mean' in inner_loop_stats:
+        metrics['hopfield_entropy_mean'] = float(inner_loop_stats['hopfield_entropy_mean'].mean())
+        metrics['hopfield_entropy_max'] = float(inner_loop_stats['hopfield_entropy_max'].max())
+        metrics['hopfield_entropy_min'] = float(inner_loop_stats['hopfield_entropy_min'].min())
+        metrics['hopfield_entropy_norm_mean'] = float(inner_loop_stats['hopfield_entropy_norm_mean'].mean())
+        metrics['hopfield_entropy_norm_max'] = float(inner_loop_stats['hopfield_entropy_norm_max'].max())
+        metrics['hopfield_entropy_norm_min'] = float(inner_loop_stats['hopfield_entropy_norm_min'].min())
+        metrics['hopfield_n_seg_50_mean'] = float(inner_loop_stats['hopfield_n_seg_50_mean'].mean())
+        metrics['hopfield_n_seg_50_max'] = float(inner_loop_stats['hopfield_n_seg_50_max'].max())
+        metrics['hopfield_n_seg_50_min'] = float(inner_loop_stats['hopfield_n_seg_50_min'].min())
+        metrics['hopfield_n_seg_95_mean'] = float(inner_loop_stats['hopfield_n_seg_95_mean'].mean())
+        metrics['hopfield_n_seg_95_max'] = float(inner_loop_stats['hopfield_n_seg_95_max'].max())
+        metrics['hopfield_n_seg_95_min'] = float(inner_loop_stats['hopfield_n_seg_95_min'].min())
+    return metrics
 
 
 class StopOnMetricValue(TrainerCallback):
