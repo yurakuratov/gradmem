@@ -1,0 +1,52 @@
+# GradMemGPT with Gated DeltaNet-style external memory
+# Gated Delta rule: S_t = S_{t-1} (alpha_t (I - beta_t k_t k_t^T)) + beta_t v_t k_t^T
+# Alternative to Hopfield memory (use_hopfield_memory). Mutually exclusive.
+
+model:
+  base_model: gpt2
+  n_layer: 4
+  n_head: 4
+  n_embd: 128
+
+training:
+  per_device_batch_size: 64
+  total_batch_size: 64
+  learning_rate: 1.0e-4
+  max_steps: 1000000
+  eval_steps: 500
+  logging_steps: 500
+  warmup_steps: 10000
+  early_stopping_patience: 500
+  seed: 143
+
+dataset:
+  data_path: "./data/N8-K2V2-V62_1M"
+  tokenizer_path: "./tokenizers/kv_alphabet_62/"
+
+gradmem:
+  n_mem_tokens: 8
+  n_ctrl_tokens: 0
+  K: 2
+  last_K_second_order: null
+  inner_lr: 0.04
+  inner_clip_value: null
+  inner_clip_norm: null
+  use_adam: false
+  grad_mode: "second"
+  use_mem_proj: false
+  mem_proj_mode: "none"
+  use_write_head: true
+  add_inner_loss_to_outer: true
+  inner_loss_weight: 0.5
+  memory_update: gradient  # gradient | forward (RMT style)
+
+hopfield:
+  hopfield_segment_size: 32  # shared segmenting logic (also used by gated_delta)
+  hopfield_n_segments: 1
+
+gated_delta:
+  use_gated_delta_memory: true
+  gated_delta_state_dim: 128  # d_k = d_v for state matrix S (B, d, d)
+  gated_delta_alpha_init: 0.9  # initial forget gate (sigmoid bias)
+  gated_delta_beta_init: 0.5  # initial write strength (sigmoid bias)
+  gated_delta_bptt_segments: null  # number of last segments to keep in BPTT graph (null = all)
