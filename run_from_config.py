@@ -97,7 +97,7 @@ def apply_overrides(cfg: dict, overrides: dict) -> dict:
 
     for key, value in overrides.items():
         applied = False
-        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'dataset', 'curriculum']:
+        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'gated_delta', 'dataset', 'curriculum']:
             if section in result and key in result[section]:
                 result[section][key] = value
                 applied = True
@@ -204,6 +204,18 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
 
     hopfield = cfg.get('hopfield', {})
     for key, val in hopfield.items():
+        if val is None:
+            continue
+        cli_key = key.replace('_', '-')
+        if val is True:
+            args.append(f'--{cli_key}')
+        elif val is False:
+            args.append(f'--{cli_key}=False')
+        else:
+            args.append(f'--{cli_key}={val}')
+
+    gated_delta = cfg.get('gated_delta', {})
+    for key, val in gated_delta.items():
         if val is None:
             continue
         cli_key = key.replace('_', '-')

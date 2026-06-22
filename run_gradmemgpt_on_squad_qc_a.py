@@ -152,6 +152,13 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         metrics['hopfield_n_seg_95_mean'] = float(inner_loop_stats['hopfield_n_seg_95_mean'].mean())
         metrics['hopfield_n_seg_95_max'] = float(inner_loop_stats['hopfield_n_seg_95_max'].max())
         metrics['hopfield_n_seg_95_min'] = float(inner_loop_stats['hopfield_n_seg_95_min'].min())
+    if 'gd_alpha_mean' in inner_loop_stats:
+        metrics['gd_alpha_mean'] = float(inner_loop_stats['gd_alpha_mean'].mean())
+        metrics['gd_beta_mean'] = float(inner_loop_stats['gd_beta_mean'].mean())
+        metrics['gd_S_norm_mean'] = float(inner_loop_stats['gd_S_norm_mean'].mean())
+        metrics['gd_S_norm_max'] = float(inner_loop_stats['gd_S_norm_max'].max())
+        metrics['gd_S_norm_min'] = float(inner_loop_stats['gd_S_norm_min'].min())
+        metrics['gd_n_written_mean'] = float(inner_loop_stats['gd_n_written_mean'].mean())
     return metrics
 
 

@@ -85,6 +85,11 @@ class GradMemGPTConfig(PretrainedConfig):
                  use_mem_residual=False,
                  use_reconstruction_loss=False,
                  reconstruction_loss_weight=1.0,
+                 use_gated_delta_memory=False,
+                 gated_delta_state_dim=128,
+                 gated_delta_alpha_init=0.9,
+                 gated_delta_beta_init=0.5,
+                 gated_delta_bptt_segments=None,
                  **kwargs):
         """
         Args:
@@ -132,6 +137,11 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
              use_mem_residual: bool, use residual connection in forward memory update: mem = mem + LN(mem_out) (requires memory_update="forward")
              use_reconstruction_loss: bool, add reconstruction loss (context LM loss) to outer loss during forward inner loop
              reconstruction_loss_weight: float, weight of reconstruction loss in combined loss
+             use_gated_delta_memory: bool, enable Gated DeltaNet-style external memory (alternative to Hopfield)
+             gated_delta_state_dim: int, dimension d_k = d_v of the Gated Delta state matrix S (B, d, d)
+             gated_delta_alpha_init: float, initial value for the alpha (forget gate) head bias (sigmoid output)
+             gated_delta_beta_init: float, initial value for the beta (write strength) head bias (sigmoid output)
+             gated_delta_bptt_segments: int|None, number of last segments to keep in backprop graph for Gated Delta (None = all)
          """
         super().__init__(**kwargs)
 
@@ -189,6 +199,12 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.use_reconstruction_loss = use_reconstruction_loss
         self.reconstruction_loss_weight = reconstruction_loss_weight
 
+        self.use_gated_delta_memory = use_gated_delta_memory
+        self.gated_delta_state_dim = gated_delta_state_dim
+        self.gated_delta_alpha_init = gated_delta_alpha_init
+        self.gated_delta_beta_init = gated_delta_beta_init
+        self.gated_delta_bptt_segments = gated_delta_bptt_segments
+
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample", "proj_rw"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
@@ -219,6 +235,21 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
             "use_mem_residual requires memory_update='forward'"
         assert not (use_reconstruction_loss and memory_update != "forward"), \
             "use_reconstruction_loss requires memory_update='forward'"
+
+        # Validate Gated Delta settings
+        assert not (use_gated_delta_memory and use_hopfield_memory), \
+            "use_gated_delta_memory and use_hopfield_memory are mutually exclusive"
+        if use_gated_delta_memory:
+            assert gated_delta_state_dim > 0, \
+                f"gated_delta_state_dim must be positive, got {gated_delta_state_dim}"
+            assert 0.0 < gated_delta_alpha_init < 1.0, \
+                f"gated_delta_alpha_init must be in (0, 1), got {gated_delta_alpha_init}"
+            assert 0.0 < gated_delta_beta_init < 1.0, \
+                f"gated_delta_beta_init must be in (0, 1), got {gated_delta_beta_init}"
+        if gated_delta_bptt_segments is not None:
+            assert gated_delta_bptt_segments >= 1, \
+                f"gated_delta_bptt_segments must be >= 1 or None, got {gated_delta_bptt_segments}"
+            assert use_gated_delta_memory, "gated_delta_bptt_segments requires use_gated_delta_memory=True"
 
         # Validate LoRA settings
         if use_write_lora:
@@ -425,6 +456,42 @@ class GradMemGPT(PreTrainedModel):
                         self.hopfield_value_inv_proj.bias.zero_()
 
         if self.use_hopfield_memory and self.hopfield_segment_size is not None:
+            max_pos = getattr(self.model.config, 'n_positions',
+                              getattr(self.model.config, 'max_position_embeddings', None))
+            max_seq_in_segment = self.hopfield_segment_size + self.n_mem_tokens + self.n_ctrl_tokens * 2
+            if max_pos is not None and max_seq_in_segment > max_pos:
+                raise ValueError(
+                    f"Segment + memory tokens ({max_seq_in_segment}) exceeds model's max position embeddings "
+                    f"({max_pos}). Reduce hopfield_segment_size or increase max_position_embeddings."
+                )
+
+        # Gated DeltaNet-style external memory (alternative to Hopfield)
+        self.use_gated_delta_memory = getattr(config, "use_gated_delta_memory", False)
+        self.gated_delta_state_dim = getattr(config, "gated_delta_state_dim", 128)
+        self.gated_delta_alpha_init = getattr(config, "gated_delta_alpha_init", 0.9)
+        self.gated_delta_beta_init = getattr(config, "gated_delta_beta_init", 0.5)
+        self.gated_delta_bptt_segments = getattr(config, "gated_delta_bptt_segments", None)
+
+        if self.use_gated_delta_memory:
+            pattern_dim = self.n_mem_tokens * n_embd  # M*d
+            d = self.gated_delta_state_dim
+            # Projections between pattern space (M*d) and state space (d)
+            self.gd_key_proj = nn.Linear(pattern_dim, d, bias=True)
+            self.gd_query_proj = nn.Linear(pattern_dim, d, bias=True)
+            self.gd_value_proj = nn.Linear(pattern_dim, d, bias=True)
+            self.gd_value_inv_proj = nn.Linear(d, pattern_dim, bias=True)
+            # Per-segment alpha/beta heads: features -> scalar in (0, 1)
+            self.gd_alpha_head = nn.Linear(pattern_dim, 1, bias=True)
+            self.gd_beta_head = nn.Linear(pattern_dim, 1, bias=True)
+            # Init biases so initial sigmoid(bias) ~= alpha_init / beta_init
+            with torch.no_grad():
+                a_init = self.gated_delta_alpha_init
+                b_init = self.gated_delta_beta_init
+                self.gd_alpha_head.bias.fill_(math.log(a_init / (1.0 - a_init)))
+                self.gd_beta_head.bias.fill_(math.log(b_init / (1.0 - b_init)))
+
+        # Segment-size check also applies to Gated Delta (reuses the same segmenting logic)
+        if self.use_gated_delta_memory and self.hopfield_segment_size is not None:
             max_pos = getattr(self.model.config, 'n_positions',
                               getattr(self.model.config, 'max_position_embeddings', None))
             max_seq_in_segment = self.hopfield_segment_size + self.n_mem_tokens + self.n_ctrl_tokens * 2
@@ -695,6 +762,62 @@ class GradMemGPT(PreTrainedModel):
             return mem
         return torch.baddbmm(b.unsqueeze(1), mem, W.transpose(1, 2))
 
+    def _compress_segment(self, seg_emb, seg_mask, seg_has_tokens, mem_prefix,
+                          write_st_batch, write_end_batch, B, device):
+        """Causal forward pass compressing a segment into M mem-token features.
+
+        Places mem_prefix at the END so it can attend to all preceding content.
+        Returns last_hidden_state[:, -n_mem_tokens:, :].view(B, -1) -> [B, M*d].
+
+        Shared by Hopfield STORE (key) and Gated Delta WRITE (key + alpha/beta).
+        """
+        hopf_mem_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
+        seg_mask_for_attn = seg_mask.long()
+        if not seg_has_tokens.all():
+            seg_mask_for_attn = seg_mask_for_attn.clone()
+            seg_mask_for_attn[~seg_has_tokens] = 1
+        if self.n_ctrl_tokens > 0:
+            hopf_ctrl_mask = torch.ones(B, self.n_ctrl_tokens, dtype=torch.long, device=device)
+            x_seg_comp = torch.cat([write_st_batch, seg_emb, write_end_batch, mem_prefix], dim=1)
+            seg_attn_mask = torch.cat([hopf_ctrl_mask, seg_mask_for_attn, hopf_ctrl_mask, hopf_mem_mask], dim=1)
+        else:
+            x_seg_comp = torch.cat([seg_emb, mem_prefix], dim=1)
+            seg_attn_mask = torch.cat([seg_mask_for_attn, hopf_mem_mask], dim=1)
+
+        position_ids = seg_attn_mask.cumsum(-1) - 1
+        position_ids = position_ids.clamp(min=0)
+        outs_seg = get_backbone(self.model)(inputs_embeds=x_seg_comp, attention_mask=seg_attn_mask,
+                                            position_ids=position_ids, return_dict=True)
+        features = outs_seg.last_hidden_state[:, -self.n_mem_tokens:, :].view(B, -1)  # [B, M*d]
+        del outs_seg
+        return features
+
+    def _compress_query(self, qry_emb, query_input_ids, labels, pad_id, mem_prefix,
+                        read_st_batch, read_end_batch, B, device):
+        """Causal forward pass compressing the query into M mem-token features.
+
+        Shared by Hopfield RETRIEVE (query key) and Gated Delta RETRIEVE (query).
+        Returns [B, M*d].
+        """
+        qry_mask = (query_input_ids != pad_id).to(dtype=torch.long)
+        if labels is not None:
+            qry_mask[labels >= 0] = 0
+        hopf_mem_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
+        if self.n_ctrl_tokens > 0:
+            hopf_ctrl_mask = torch.ones(B, self.n_ctrl_tokens, dtype=torch.long, device=device)
+            x_qry_comp = torch.cat([read_st_batch, qry_emb, read_end_batch, mem_prefix], dim=1)
+            qry_attn_mask = torch.cat([hopf_ctrl_mask, qry_mask, hopf_ctrl_mask, hopf_mem_mask], dim=1)
+        else:
+            x_qry_comp = torch.cat([qry_emb, mem_prefix], dim=1)
+            qry_attn_mask = torch.cat([qry_mask, hopf_mem_mask], dim=1)
+
+        position_ids = qry_attn_mask.cumsum(-1) - 1
+        outs_q = get_backbone(self.model)(inputs_embeds=x_qry_comp, attention_mask=qry_attn_mask,
+                                          position_ids=position_ids, return_dict=True)
+        features = outs_q.last_hidden_state[:, -self.n_mem_tokens:, :].view(B, -1)  # [B, M*d]
+        del outs_q
+        return features
+
     def forward(self, input_ids, labels=None, return_mem=False):
         # context_input_ids : B × S   (segments only, each ends with `|`)
         # query_input_ids   : B × Q   (e.g.  "?!K:V!|") i.e. the last segment
@@ -719,6 +842,8 @@ class GradMemGPT(PreTrainedModel):
             write_end_batch = self.write_end.unsqueeze(0).expand(B, -1, -1)
             read_st_batch = self.read_st.unsqueeze(0).expand(B, -1, -1)
             read_end_batch = self.read_end.unsqueeze(0).expand(B, -1, -1)
+        else:
+            write_st_batch = write_end_batch = read_st_batch = read_end_batch = None
 
         # mem_batch_initial is always self.mem — used for Hopfield keys and as reset point
         mem_batch_initial = self.mem.unsqueeze(0).expand(B, -1, -1).clone()  # [B,M,d]
@@ -736,6 +861,17 @@ class GradMemGPT(PreTrainedModel):
             stored_values = []
             stored_masks = []
             hopfield_stored = torch.zeros(B, dtype=torch.bool, device=device)
+
+        # Gated Delta state matrix (fresh each forward call, S_0 = 0)
+        if self.use_gated_delta_memory:
+            d = self.gated_delta_state_dim
+            # dtype follows the context embeddings; fall back to float32 if no context
+            S_dtype = torch.float32
+            S = torch.zeros(B, d, d, device=device, dtype=S_dtype)
+            gd_written = torch.zeros(B, dtype=torch.bool, device=device)
+            gd_alpha_sum = torch.tensor(0.0, device=device)
+            gd_beta_sum = torch.tensor(0.0, device=device)
+            gd_n_written = 0
 
         total_inner_loss_detached = torch.tensor(0.0, device=device)
         last_segment_inner_loss = None
@@ -772,14 +908,14 @@ class GradMemGPT(PreTrainedModel):
                 mask = (lm_labels != -100)
 
                 # Split context into segments (ceil-padded to equal size)
-                S = ctx_emb.size(1)
-                if self.use_hopfield_memory and self.hopfield_segment_size is not None:
-                    n_segments = math.ceil(S / self.hopfield_segment_size)
+                seq_len = ctx_emb.size(1)
+                if (self.use_hopfield_memory or self.use_gated_delta_memory) and self.hopfield_segment_size is not None:
+                    n_segments = math.ceil(seq_len / self.hopfield_segment_size)
                     segment_size = self.hopfield_segment_size
                 else:
                     n_segments = self.hopfield_n_segments
-                    segment_size = (S + n_segments - 1) // n_segments  # ceil division
-                pad_len = segment_size * n_segments - S
+                    segment_size = (seq_len + n_segments - 1) // n_segments  # ceil division
+                pad_len = segment_size * n_segments - seq_len
 
                 if pad_len > 0:
                     ctx_emb = F.pad(ctx_emb, [0, 0, pad_len, 0], "constant", 0)
@@ -1044,26 +1180,8 @@ class GradMemGPT(PreTrainedModel):
                                 mem_key_prefix = self.mem_key.unsqueeze(0).expand(B, -1, -1)
                             else:
                                 mem_key_prefix = mem_batch_initial
-
-                            hopf_mem_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
-                            seg_mask_for_attn = seg_mask.long()
-                            if not seg_has_tokens.all():
-                                seg_mask_for_attn = seg_mask_for_attn.clone()
-                                seg_mask_for_attn[~seg_has_tokens] = 1
-                            if self.n_ctrl_tokens > 0:
-                                hopf_ctrl_mask = torch.ones(B, self.n_ctrl_tokens, dtype=torch.long, device=device)
-                                x_seg_comp = torch.cat([write_st_batch, seg_emb, write_end_batch, mem_key_prefix], dim=1)
-                                seg_attn_mask = torch.cat([hopf_ctrl_mask, seg_mask_for_attn, hopf_ctrl_mask, hopf_mem_mask], dim=1)
-                            else:
-                                x_seg_comp = torch.cat([seg_emb, mem_key_prefix], dim=1)
-                                seg_attn_mask = torch.cat([seg_mask_for_attn, hopf_mem_mask], dim=1)
-
-                            position_ids = seg_attn_mask.cumsum(-1) - 1
-                            position_ids = position_ids.clamp(min=0)
-                            outs_seg = get_backbone(self.model)(inputs_embeds=x_seg_comp, attention_mask=seg_attn_mask,
-                                                                position_ids=position_ids, return_dict=True)
-                            seg_key = outs_seg.last_hidden_state[:, -self.n_mem_tokens:, :].view(B, -1)  # [B, M*d]
-                            del outs_seg
+                            seg_key = self._compress_segment(seg_emb, seg_mask, seg_has_tokens, mem_key_prefix,
+                                                              write_st_batch, write_end_batch, B, device)
 
                         # Apply key projection if configured
                         if self.hopfield_proj_dim is not None:
@@ -1083,6 +1201,40 @@ class GradMemGPT(PreTrainedModel):
                         stored_values.append(value_pattern)
                         stored_masks.append(seg_has_tokens)
                         hopfield_stored = hopfield_stored | seg_has_tokens
+
+                    # Per-segment Gated Delta WRITE (state recurrence)
+                    if self.use_gated_delta_memory and seg_has_tokens.any():
+                        # Compress segment into features using mem_batch_initial as prefix
+                        seg_features = self._compress_segment(seg_emb, seg_mask, seg_has_tokens, mem_batch_initial,
+                                                               write_st_batch, write_end_batch, B, device)
+
+                        # Key, alpha, beta from segment features
+                        k_t = F.normalize(self.gd_key_proj(seg_features), dim=-1)            # [B, d]
+                        alpha_t = torch.sigmoid(self.gd_alpha_head(seg_features)).squeeze(-1)  # [B]
+                        beta_t = torch.sigmoid(self.gd_beta_head(seg_features)).squeeze(-1)   # [B]
+
+                        # Value from gradient-updated mem_batch
+                        v_t = self.gd_value_proj(mem_batch.view(B, -1))                     # [B, d]
+
+                        # BPTT detach for segments outside the window
+                        if self.gated_delta_bptt_segments is not None and \
+                                (n_segments - seg_idx - 1) >= self.gated_delta_bptt_segments:
+                            S = S.detach()
+
+                        # Gated delta rule: S = S @ (alpha * (I - beta * k k^T)) + beta * v k^T
+                        d = self.gated_delta_state_dim
+                        I = torch.eye(d, device=device, dtype=S.dtype)
+                        kkt = torch.bmm(k_t.unsqueeze(2), k_t.unsqueeze(1))               # [B, d, d]
+                        a = alpha_t.view(B, 1, 1)
+                        b = beta_t.view(B, 1, 1)
+                        transition = a * (I - b * kkt)                                     # [B, d, d]
+                        vk = torch.bmm(v_t.unsqueeze(2), k_t.unsqueeze(1))                # [B, d, d]
+                        S = torch.bmm(S, transition) + b * vk
+
+                        gd_written = gd_written | seg_has_tokens
+                        gd_alpha_sum = gd_alpha_sum + alpha_t[seg_has_tokens].sum().detach()
+                        gd_beta_sum = gd_beta_sum + beta_t[seg_has_tokens].sum().detach()
+                        gd_n_written += seg_has_tokens.sum().item()
 
                     # Keep last segment's mem_batch for stats and READ phase fallback
                     last_mem_batch = mem_batch
@@ -1143,24 +1295,9 @@ class GradMemGPT(PreTrainedModel):
                         mem_query_prefix = self.mem_query.unsqueeze(0).expand(B, -1, -1)
                     else:
                         mem_query_prefix = mem_batch_initial
-
-                    qry_mask = (query_input_ids != pad_id).to(dtype=torch.long)
-                    if labels is not None:
-                        qry_mask[labels >= 0] = 0
-                    hopf_mem_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
-                    if self.n_ctrl_tokens > 0:
-                        hopf_ctrl_mask = torch.ones(B, self.n_ctrl_tokens, dtype=torch.long, device=device)
-                        x_qry_comp = torch.cat([read_st_batch, qry_emb, read_end_batch, mem_query_prefix], dim=1)
-                        qry_attn_mask = torch.cat([hopf_ctrl_mask, qry_mask, hopf_ctrl_mask, hopf_mem_mask], dim=1)
-                    else:
-                        x_qry_comp = torch.cat([qry_emb, mem_query_prefix], dim=1)
-                        qry_attn_mask = torch.cat([qry_mask, hopf_mem_mask], dim=1)
-
-                    position_ids = qry_attn_mask.cumsum(-1) - 1
-                    outs_q = get_backbone(self.model)(inputs_embeds=x_qry_comp, attention_mask=qry_attn_mask,
-                                                      position_ids=position_ids, return_dict=True)
-                    query_key = outs_q.last_hidden_state[:, -self.n_mem_tokens:, :].view(B, -1)  # [B, M*d]
-                    del outs_q
+                    query_key = self._compress_query(qry_emb, query_input_ids, labels, pad_id,
+                                                     mem_query_prefix, read_st_batch, read_end_batch,
+                                                     B, device)
 
                 if self.hopfield_proj_dim is not None:
                     query_key = self.hopfield_query_proj(query_key)
@@ -1236,6 +1373,43 @@ class GradMemGPT(PreTrainedModel):
             # Reshape back to individual memory tokens: [B, M, d]
             assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)
             last_mem_batch = assoc_memory
+
+        # ---------------------------------------------------------------- #
+        # Gated Delta RETRIEVE phase (if enabled)
+        # ---------------------------------------------------------------- #
+        if self.use_gated_delta_memory and self.K and gd_written.any():
+            # Cast S to query embedding dtype for the read matmul
+            S = S.to(dtype=qry_emb.dtype)
+            # Compress query into features using mem_batch_initial as prefix
+            query_features = self._compress_query(qry_emb, query_input_ids, labels, pad_id,
+                                                   mem_batch_initial, read_st_batch, read_end_batch,
+                                                   B, device)
+            q_t = F.normalize(self.gd_query_proj(query_features), dim=-1)  # [B, d]
+
+            # Linear read: o = S @ q
+            retrieved = torch.bmm(S, q_t.unsqueeze(2)).squeeze(2)          # [B, d]
+            retrieved_pattern = self.gd_value_inv_proj(retrieved)           # [B, M*d]
+
+            # Handle samples with no writes: fall back to initial memory
+            if not gd_written.all():
+                retrieved_pattern = torch.where(
+                    gd_written.unsqueeze(1),
+                    retrieved_pattern,
+                    mem_batch_initial.view(B, -1),
+                )
+
+            assoc_memory = retrieved_pattern.view(B, self.n_mem_tokens, -1)  # [B, M, d]
+            last_mem_batch = assoc_memory
+
+            # Gated Delta stats
+            with torch.no_grad():
+                inner_loop_stats['gd_alpha_mean'] = (gd_alpha_sum / max(gd_n_written, 1)).detach()
+                inner_loop_stats['gd_beta_mean'] = (gd_beta_sum / max(gd_n_written, 1)).detach()
+                S_norm = S.flatten(1).norm(dim=1)
+                inner_loop_stats['gd_S_norm_mean'] = S_norm.mean().detach()
+                inner_loop_stats['gd_S_norm_max'] = S_norm.max().detach()
+                inner_loop_stats['gd_S_norm_min'] = S_norm.min().detach()
+                inner_loop_stats['gd_n_written_mean'] = gd_written.float().mean().detach()
 
         if ctx_emb is not None:
             del lm_labels

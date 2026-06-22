@@ -106,6 +106,11 @@ def generate_run_name_gradmemgpt(cfg: Dict[str, Any]) -> str:
 
     run_name += f"_bs_{tbs}_lr_{lr}"
 
+    gated_delta = cfg.get('gated_delta', {})
+    if gated_delta.get('use_gated_delta_memory'):
+        d = gated_delta.get('gated_delta_state_dim', 128)
+        run_name += f"_gd{d}"
+
     curriculum = cfg.get('curriculum', {})
     if curriculum.get('enabled'):
         threshold = curriculum.get('threshold', 0.95)

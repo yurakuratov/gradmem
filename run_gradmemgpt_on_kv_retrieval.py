@@ -168,6 +168,13 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         metrics['hopfield_n_seg_95_mean'] = float(inner_loop_stats['hopfield_n_seg_95_mean'].mean())
         metrics['hopfield_n_seg_95_max'] = float(inner_loop_stats['hopfield_n_seg_95_max'].max())
         metrics['hopfield_n_seg_95_min'] = float(inner_loop_stats['hopfield_n_seg_95_min'].min())
+    if 'gd_alpha_mean' in inner_loop_stats:
+        metrics['gd_alpha_mean'] = float(inner_loop_stats['gd_alpha_mean'].mean())
+        metrics['gd_beta_mean'] = float(inner_loop_stats['gd_beta_mean'].mean())
+        metrics['gd_S_norm_mean'] = float(inner_loop_stats['gd_S_norm_mean'].mean())
+        metrics['gd_S_norm_max'] = float(inner_loop_stats['gd_S_norm_max'].max())
+        metrics['gd_S_norm_min'] = float(inner_loop_stats['gd_S_norm_min'].min())
+        metrics['gd_n_written_mean'] = float(inner_loop_stats['gd_n_written_mean'].mean())
     return metrics
 
 
@@ -302,6 +309,11 @@ class ExperimentArgs:
     hopfield_value_as_key: Optional[bool] = field(default=False)
     hopfield_value_proj_dim: Optional[int] = field(default=None)
     hopfield_bptt_segments: Optional[int] = field(default=None)
+    use_gated_delta_memory: Optional[bool] = field(default=False)
+    gated_delta_state_dim: Optional[int] = field(default=128)
+    gated_delta_alpha_init: Optional[float] = field(default=0.9)
+    gated_delta_beta_init: Optional[float] = field(default=0.5)
+    gated_delta_bptt_segments: Optional[int] = field(default=None)
     memory_update: Optional[str] = field(default="gradient")
     use_mem_residual: Optional[bool] = field(default=False)
     use_reconstruction_loss: Optional[bool] = field(default=False)
@@ -331,7 +343,7 @@ def main(config_path: Optional[str] = None):
             cfg = yaml.safe_load(f)
 
 # Flatten config to args (YAML values override ExperimentArgs defaults)
-        for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield', 'curriculum']:
+        for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield', 'gated_delta', 'curriculum']:
             if section in cfg:
                 for key, value in cfg[section].items():
                     if key == 'stage_overrides':
@@ -447,6 +459,11 @@ def main(config_path: Optional[str] = None):
         hopfield_value_as_key=args.hopfield_value_as_key,
         hopfield_value_proj_dim=args.hopfield_value_proj_dim,
         hopfield_bptt_segments=args.hopfield_bptt_segments,
+        use_gated_delta_memory=args.use_gated_delta_memory,
+        gated_delta_state_dim=args.gated_delta_state_dim,
+        gated_delta_alpha_init=args.gated_delta_alpha_init,
+        gated_delta_beta_init=args.gated_delta_beta_init,
+        gated_delta_bptt_segments=args.gated_delta_bptt_segments,
         memory_update=args.memory_update,
         use_mem_residual=args.use_mem_residual,
         use_reconstruction_loss=args.use_reconstruction_loss,
@@ -474,7 +491,7 @@ def main(config_path: Optional[str] = None):
 
     def data_collator(batch):
         return collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
-                          hopfield=args.use_hopfield_memory)
+                          hopfield=args.use_hopfield_memory or args.use_gated_delta_memory)
 
     ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']]
 
@@ -519,6 +536,10 @@ def main(config_path: Optional[str] = None):
             'hopfield_segment_size': ('hopfield_segment_size', 'hopfield_segment_size'),
             'hopfield_beta_init': ('hopfield_beta_init', 'hopfield_beta_init'),
             'hopfield_retrieval_mode': ('hopfield_retrieval_mode', 'hopfield_retrieval_mode'),
+            'gated_delta_state_dim': ('gated_delta_state_dim', 'gated_delta_state_dim'),
+            'gated_delta_alpha_init': ('gated_delta_alpha_init', 'gated_delta_alpha_init'),
+            'gated_delta_beta_init': ('gated_delta_beta_init', 'gated_delta_beta_init'),
+            'gated_delta_bptt_segments': ('gated_delta_bptt_segments', 'gated_delta_bptt_segments'),
         }
         TRAINING_PARAM_MAP = {
             'learning_rate', 'warmup_steps', 'weight_decay', 'per_device_batch_size',
@@ -563,7 +584,7 @@ def main(config_path: Optional[str] = None):
 
             def stage_data_collator(batch):
                 return collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
-                                  hopfield=args.use_hopfield_memory)
+                                  hopfield=args.use_hopfield_memory or args.use_gated_delta_memory)
 
             training_args = TrainingArguments(
                 output_dir=stage_output_dir,
