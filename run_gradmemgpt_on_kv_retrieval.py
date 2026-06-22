@@ -281,7 +281,12 @@ class ExperimentArgs:
     write_lora_alpha: Optional[int] = field(default=16)
     write_lora_dropout: Optional[float] = field(default=0.0)
     write_lora_target_modules: Optional[str] = field(default=None)
-    freeze_backbone: Optional[bool] = field(default=False)
+    use_read_lora: Optional[bool] = field(default=False)
+    read_lora_r: Optional[int] = field(default=8)
+    read_lora_alpha: Optional[int] = field(default=16)
+    read_lora_dropout: Optional[float] = field(default=0.0)
+    read_lora_target_modules: Optional[str] = field(default=None)
+    freeze_backbone: Optional[bool] = field(default=None)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
@@ -421,6 +426,11 @@ def main(config_path: Optional[str] = None):
         write_lora_alpha=args.write_lora_alpha,
         write_lora_dropout=args.write_lora_dropout,
         write_lora_target_modules=args.write_lora_target_modules,
+        use_read_lora=args.use_read_lora,
+        read_lora_r=args.read_lora_r,
+        read_lora_alpha=args.read_lora_alpha,
+        read_lora_dropout=args.read_lora_dropout,
+        read_lora_target_modules=args.read_lora_target_modules,
         freeze_backbone=args.freeze_backbone,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         attn_implementation=args.attn_implementation,

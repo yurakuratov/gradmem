@@ -4,19 +4,19 @@ model:
   pretrained_model: gpt2
 
 training:
-  per_device_batch_size: 1
-  total_batch_size: 1
+  per_device_batch_size: 16
+  total_batch_size: 16
   learning_rate: 1.0e-4
   max_steps: 1000000
   eval_steps: 250
   logging_steps: 250
   warmup_steps: 10000
-  early_stopping_patience: 50
-  seed: 143
+  early_stopping_patience: 500
+  seed: 145
 
 dataset:
-  data_name: "babilong_qa3_0k"
-  data_path: "./data/babilong_qa3_0k"
+  data_name: "babilong_qa3_4k"
+  data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/babilong_qa3_4k"
   tokenizer_path: "./tokenizers/kv_alphabet_62/"
 
 gradmem:
@@ -43,7 +43,7 @@ gradmem:
 hopfield:
   use_hopfield_memory: true
   hopfield_n_segments: 1
-  hopfield_segment_size: 64
+  hopfield_segment_size: 32
   hopfield_retrieval_mode: raw  # raw | softmax | beta_softmax | mean
   hopfield_beta_init: 1.0
   use_separate_hopfield_mem: true  # use separate M_0 values for value, key and query memory tokens
@@ -51,14 +51,14 @@ hopfield:
   hopfield_direct_query: false  # use only meta-learned query vector, skip forward pass for query
   hopfield_value_as_key: false  # skip forward pass for key, use value_pattern or its projection as key
   hopfield_value_proj_dim: null  # value projection dim in Hopfield STORE/RETRIEVE (null = disabled, M*d = identity init)
-  hopfield_bptt_segments: null  # number of last segments to keep in BPTT graph (null = all segments)
+  hopfield_bptt_segments: 10  # number of last segments to keep in BPTT graph (null = all segments)
 
 curriculum:
   curriculum_enabled: true
-  curriculum_threshold: 0.01
-  curriculum_levels: "babilong_qa1_0k,babilong_qa2_0k,babilong_qa3_0k"
-  curriculum_data_dir: "./data"
+  curriculum_threshold: 0.95
+  curriculum_levels: "babilong_qa3_0k,babilong_qa3_1k,babilong_qa3_2k,babilong_qa3_4k"
+  curriculum_data_dir: "/home/jovyan/dzhivelikian/test_time_gd/data"
   curriculum_stage_overrides:
-    1: {hopfield_bptt_segments: }
-    2: {hopfield_bptt_segments: }
-    3: {hopfield_bptt_segments: }
+    1: {hopfield_bptt_segments: 10, per_device_batch_size: 16, total_batch_size: 16}
+    2: {hopfield_bptt_segments: 10, per_device_batch_size: 16, total_batch_size: 16}
+    3: {hopfield_bptt_segments: 10, per_device_batch_size: 16, total_batch_size: 16}

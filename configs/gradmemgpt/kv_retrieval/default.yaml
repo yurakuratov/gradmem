@@ -9,6 +9,7 @@ model:
 training:
   per_device_batch_size: 64
   total_batch_size: 64
+  # auto_find_batch_size: true  # automatically find max batch size that fits in GPU memory
   learning_rate: 1.0e-4
   max_steps: 1000000
   eval_steps: 500

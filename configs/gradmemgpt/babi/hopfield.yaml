@@ -4,6 +4,7 @@ model:
   pretrained_model: gpt2
 
 training:
+  auto_find_batch_size: false
   per_device_batch_size: 2
   total_batch_size: 2
   learning_rate: 1.0e-4
@@ -15,8 +16,8 @@ training:
   seed: 143
 
 dataset:
-  data_name: "babilong_qa3_0k"
-  data_path: "./data/babilong_qa3_0k"
+  data_name: "babilong_qa3_4k"
+  data_path: "./data/babilong_qa3_4k"
   tokenizer_path: "./tokenizers/kv_alphabet_62/"
 
 gradmem:
@@ -43,7 +44,7 @@ gradmem:
 hopfield:
   use_hopfield_memory: true
   hopfield_n_segments: 1
-  hopfield_segment_size: 64
+  hopfield_segment_size: 32
   hopfield_retrieval_mode: raw  # raw | softmax | beta_softmax | mean
   hopfield_beta_init: 1.0
   use_separate_hopfield_mem: true  # use separate M_0 values for value, key and query memory tokens
@@ -51,4 +52,4 @@ hopfield:
   hopfield_direct_query: false  # use only meta-learned query vector, skip forward pass for query
   hopfield_value_as_key: false  # skip forward pass for key, use value_pattern or its projection as key
   hopfield_value_proj_dim: null  # value projection dim in Hopfield STORE/RETRIEVE (null = disabled, M*d = identity init)
-  hopfield_bptt_segments: null  # number of last segments to keep in BPTT graph (null = all segments)
+  hopfield_bptt_segments: 1  # number of last segments to keep in BPTT graph (null = all segments)

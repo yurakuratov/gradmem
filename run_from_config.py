@@ -179,30 +179,38 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
         args.append(f'--run_name_suffix={cfg["run_name_suffix"]}')
 
     for key, val in gradmem.items():
-        if val is None or val is False:
+        if val is None:
             continue
         cli_key = key.replace('_', '-')
         if val is True:
             args.append(f'--{cli_key}')
+        elif val is False:
+            # emit explicit False so configs can override auto-derived defaults
+            # (e.g. freeze_backbone: false to opt out of auto-freeze when LoRA is on)
+            args.append(f'--{cli_key}=False')
         else:
             args.append(f'--{cli_key}={val}')
 
     for key, val in rmt.items():
-        if val is None or val is False:
+        if val is None:
             continue
         cli_key = key.replace('_', '-')
         if val is True:
             args.append(f'--{cli_key}')
+        elif val is False:
+            args.append(f'--{cli_key}=False')
         else:
             args.append(f'--{cli_key}={val}')
 
     hopfield = cfg.get('hopfield', {})
     for key, val in hopfield.items():
-        if val is None or val is False:
+        if val is None:
             continue
         cli_key = key.replace('_', '-')
         if val is True:
             args.append(f'--{cli_key}')
+        elif val is False:
+            args.append(f'--{cli_key}=False')
         else:
             args.append(f'--{cli_key}={val}')
 

@@ -60,7 +60,12 @@ class GradMemGPTConfig(PretrainedConfig):
                  write_lora_alpha=16,
                  write_lora_dropout=0.0,
                  write_lora_target_modules=None,
-                 freeze_backbone=False,
+                 use_read_lora=False,
+                 read_lora_r=8,
+                 read_lora_alpha=16,
+                 read_lora_dropout=0.0,
+                 read_lora_target_modules=None,
+                 freeze_backbone=None,
                  use_gradient_checkpointing=False,
                  attn_implementation="eager",
                  add_inner_loss_to_outer=False,
@@ -102,7 +107,13 @@ class GradMemGPTConfig(PretrainedConfig):
             write_lora_alpha: int, LoRA alpha for WRITE adapters
             write_lora_dropout: float, LoRA dropout for WRITE adapters
             write_lora_target_modules: list[str]|str|None, target module names (None/"auto" for defaults)
-            freeze_backbone: bool, freeze backbone weights (READ+WRITE), except LoRA/write head/mem proj
+            use_read_lora: bool, enable LoRA adapters during READ phase only
+            read_lora_r: int, LoRA rank for READ adapters
+            read_lora_alpha: int, LoRA alpha for READ adapters
+            read_lora_dropout: float, LoRA dropout for READ adapters
+            read_lora_target_modules: list[str]|str|None, target module names (None/"auto" for defaults)
+            freeze_backbone: bool|None, freeze backbone weights (READ+WRITE), except LoRA/write head/mem proj.
+                None (default) auto-freezes when either write_lora or read_lora is enabled; True/False overrides.
             use_gradient_checkpointing: bool, turn on gradient checkpointing supported by HF models
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
@@ -148,6 +159,11 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.write_lora_alpha = write_lora_alpha
         self.write_lora_dropout = write_lora_dropout
         self.write_lora_target_modules = write_lora_target_modules
+        self.use_read_lora = use_read_lora
+        self.read_lora_r = read_lora_r
+        self.read_lora_alpha = read_lora_alpha
+        self.read_lora_dropout = read_lora_dropout
+        self.read_lora_target_modules = read_lora_target_modules
         self.freeze_backbone = freeze_backbone
         self.last_K_second_order = K if last_K_second_order is None else last_K_second_order
         if grad_mode != "second":
@@ -203,6 +219,16 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
             "use_mem_residual requires memory_update='forward'"
         assert not (use_reconstruction_loss and memory_update != "forward"), \
             "use_reconstruction_loss requires memory_update='forward'"
+
+        # Validate LoRA settings
+        if use_write_lora:
+            assert write_lora_r > 0, f"write_lora_r must be positive, got {write_lora_r}"
+            assert write_lora_alpha > 0, f"write_lora_alpha must be positive, got {write_lora_alpha}"
+        if use_read_lora:
+            assert read_lora_r > 0, f"read_lora_r must be positive, got {read_lora_r}"
+            assert read_lora_alpha > 0, f"read_lora_alpha must be positive, got {read_lora_alpha}"
+        assert freeze_backbone in (None, True, False), \
+            f"freeze_backbone must be None/True/False, got {freeze_backbone}"
 
 
 class GradMemGPT(PreTrainedModel):
@@ -267,9 +293,23 @@ class GradMemGPT(PreTrainedModel):
         self.write_lora_alpha = getattr(config, "write_lora_alpha", 16)
         self.write_lora_dropout = getattr(config, "write_lora_dropout", 0.0)
         self.write_lora_target_modules = getattr(config, "write_lora_target_modules", None)
-        self.freeze_backbone = getattr(config, "freeze_backbone", False)
-        if self.use_write_lora:
-            self._init_write_lora()
+        # read-phase LoRA (applies only during READ phase), decouples READ from WRITE backbone updates
+        self.use_read_lora = getattr(config, "use_read_lora", False)
+        self.read_lora_r = getattr(config, "read_lora_r", 8)
+        self.read_lora_alpha = getattr(config, "read_lora_alpha", 16)
+        self.read_lora_dropout = getattr(config, "read_lora_dropout", 0.0)
+        self.read_lora_target_modules = getattr(config, "read_lora_target_modules", None)
+        # freeze_backbone: None => auto-freeze when either LoRA is enabled
+        freeze_backbone_cfg = getattr(config, "freeze_backbone", None)
+        if freeze_backbone_cfg is None:
+            self.freeze_backbone = bool(self.use_write_lora or self.use_read_lora)
+        else:
+            self.freeze_backbone = bool(freeze_backbone_cfg)
+        # adapter name bookkeeping (filled in by _init_phase_lora)
+        self.write_adapter_name = None
+        self.read_adapter_name = None
+        if self.use_write_lora or self.use_read_lora:
+            self._init_phase_lora()
         if self.freeze_backbone:
             self._freeze_backbone_params()
 
@@ -438,8 +478,8 @@ class GradMemGPT(PreTrainedModel):
             return targets or None
         return None
 
-    def _resolve_write_lora_targets(self):
-        parsed = self._parse_lora_targets(self.write_lora_target_modules)
+    def _resolve_lora_targets(self, value, adapter_name):
+        parsed = self._parse_lora_targets(value)
         if parsed:
             return parsed
 
@@ -453,40 +493,117 @@ class GradMemGPT(PreTrainedModel):
             return targets_by_type[model_type]
 
         raise ValueError(
-            "write_lora_target_modules is not set and model_type is unknown. "
+            f"{adapter_name}_lora_target_modules is not set and model_type is unknown. "
             "Please provide explicit target modules."
         )
 
-    def _init_write_lora(self):
+    def _init_phase_lora(self):
+        """Set up phase-specific LoRA adapters on the backbone.
+
+        WRITE adapter is registered as PEFT's "default" adapter; READ adapter
+        (if enabled) is added as a second adapter named "read". The two adapter
+        sets are disjoint and toggled via set_adapter / enable/disable_adapter_layers.
+        """
         if get_peft_model is None or LoraConfig is None or TaskType is None:
-            raise ImportError("peft is required for write_lora. Please install the peft package.")
+            raise ImportError("peft is required for write_lora/read_lora. Please install the peft package.")
 
-        target_modules = self._resolve_write_lora_targets()
-        lora_config = LoraConfig(
-            r=self.write_lora_r,
-            lora_alpha=self.write_lora_alpha,
-            lora_dropout=self.write_lora_dropout,
-            target_modules=target_modules,
-            task_type=TaskType.CAUSAL_LM,
-        )
-        self.model = get_peft_model(self.model, lora_config)
+        write_config = None
+        read_config = None
+        if self.use_write_lora:
+            write_config = LoraConfig(
+                r=self.write_lora_r,
+                lora_alpha=self.write_lora_alpha,
+                lora_dropout=self.write_lora_dropout,
+                target_modules=self._resolve_lora_targets(self.write_lora_target_modules, "write"),
+                task_type=TaskType.CAUSAL_LM,
+            )
+        if self.use_read_lora:
+            read_config = LoraConfig(
+                r=self.read_lora_r,
+                lora_alpha=self.read_lora_alpha,
+                lora_dropout=self.read_lora_dropout,
+                target_modules=self._resolve_lora_targets(self.read_lora_target_modules, "read"),
+                task_type=TaskType.CAUSAL_LM,
+            )
+
+        # The first adapter registered via get_peft_model becomes "default".
+        # Register the WRITE adapter first when both are enabled so that
+        # "default" = write (matches the legacy write-only naming convention).
+        if write_config is not None:
+            self.model = get_peft_model(self.model, write_config)
+            self.write_adapter_name = "default"
+            if read_config is not None:
+                self.model.add_adapter("read", read_config)
+                self.read_adapter_name = "read"
+        else:
+            # read-only: the single adapter is "default"
+            self.model = get_peft_model(self.model, read_config)
+            self.read_adapter_name = "default"
+            self.write_adapter_name = None
+
         if not (hasattr(self.model, "disable_adapter_layers") and hasattr(self.model, "enable_adapter_layers")):
-            raise RuntimeError("PEFT model does not support adapter toggling; cannot enforce write-only LoRA.")
+            raise RuntimeError("PEFT model does not support adapter toggling; cannot enforce phase-only LoRA.")
+        if self.use_write_lora and self.use_read_lora and not hasattr(self.model, "set_adapter"):
+            raise RuntimeError("PEFT model does not support set_adapter; cannot toggle write/read adapters.")
 
-        # keep base model trainable to preserve previous behavior
-        for param in self.model.parameters():
-            param.requires_grad = True
+        # Default active adapter = WRITE (forward()'s inner loop runs WRITE first);
+        # for read-only, the single adapter is left active and disabled during WRITE.
+        if self.write_adapter_name is not None:
+            self.model.set_adapter(self.write_adapter_name)
+        else:
+            self.model.set_adapter(self.read_adapter_name)
+
+        # Legacy escape hatch: keep base model trainable when not auto-freezing.
+        # When self.freeze_backbone is True, _freeze_backbone_params() handles it next.
+        if not self.freeze_backbone:
+            for param in self.model.parameters():
+                param.requires_grad = True
 
     def _freeze_backbone_params(self):
         for _, param in self.model.named_parameters():
             param.requires_grad = False
-        if self.use_write_lora:
+        if self.use_write_lora or self.use_read_lora:
             for name, param in self.model.named_parameters():
                 if "lora_" in name:
                     param.requires_grad = True
 
+    def _set_phase_adapter(self, phase):
+        """Activate the LoRA adapter for the given phase ('write' or 'read').
+
+        Uses set_adapter (both-adapters) or enable/disable_adapter_layers
+        (single-adapter) to select which LoRA set is applied in the forward pass.
+        Afterwards, re-enables requires_grad on ALL LoRA params: set_adapter and
+        disable_adapter_layers set non-active adapters' params to requires_grad=False,
+        which would block second-order MAML gradients during backward (the WRITE
+        adapter receives grad through the inner-loop graph, the READ adapter through
+        the READ-forward graph — both must stay trainable at backward time).
+        """
+        if not (self.use_write_lora or self.use_read_lora):
+            return
+        both = self.use_write_lora and self.use_read_lora
+        if both:
+            name = self.write_adapter_name if phase == "write" else self.read_adapter_name
+            self.model.set_adapter(name)
+        elif self.use_write_lora:
+            if phase == "write":
+                self.model.enable_adapter_layers()
+            else:
+                self.model.disable_adapter_layers()
+        else:  # read-only
+            if phase == "read":
+                self.model.enable_adapter_layers()
+            else:
+                self.model.disable_adapter_layers()
+        # Restore requires_grad on every LoRA param so backward can populate .grad
+        # for both adapter sets through their respective computation graphs.
+        for name, param in self.model.named_parameters():
+            if "lora_" in name:
+                param.requires_grad = True
+
     @contextmanager
     def _disable_write_lora(self):
+        """Legacy context manager: disable WRITE LoRA during the READ phase.
+        Kept for backwards compatibility; new code uses _set_phase_adapter('read')."""
         if not self.use_write_lora:
             yield
             return
@@ -644,6 +761,8 @@ class GradMemGPT(PreTrainedModel):
         if self.K and context_input_ids.ne(pad_id).any():
             # re‑enable autograd even if outer context is `no_grad`
             with torch.enable_grad():
+                # activate WRITE-phase LoRA (or disable READ adapter for read-only configs)
+                self._set_phase_adapter("write")
                 # build ctx embedding once
                 ctx_emb = self.model.get_input_embeddings()(context_input_ids)      # [B,S,d]
                 # lm labels: reconstructing the context, last mem/ctrl token predicts the first token of the context
@@ -1149,8 +1268,8 @@ class GradMemGPT(PreTrainedModel):
             pad_list = [0, 0, 0, -x_qry.size(1) % 32]
             x_qry = F.pad(x_qry, pad_list, "constant", 0)
 
-        with self._disable_write_lora():
-            logits_q = self.model(inputs_embeds=x_qry).logits                 # [B,M+Q,V]
+        self._set_phase_adapter("read")
+        logits_q = self.model(inputs_embeds=x_qry).logits                 # [B,M+Q,V]
         logits_q = logits_q[:, read_mem_offset-1:read_mem_offset+qry_emb.size(1), :]    # [B,Q+1,V]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
