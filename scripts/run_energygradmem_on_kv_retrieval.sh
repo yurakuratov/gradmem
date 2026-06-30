@@ -24,7 +24,7 @@ TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
 # Energy-GradMem currently supports prefix memory only.
 MEMORY_BACKEND="prefix"
-WRITE_OBJECTIVE="energy"
+WRITE_OBJECTIVE="ce_energy"
 
 # Memory/write params. Start from known-good GradMem N8 setup.
 N_MEM_TOKENS=8
@@ -41,13 +41,19 @@ MEM_PROJ_MODE="none"
 FREEZE_BACKBONE=false
 
 # Energy head and optional shaping losses. Ranking/trajectory are off by default.
-ENERGY_HEAD_HIDDEN_DIM=None
+ENERGY_INPUT_MODE="logits"
+ENERGY_HEAD_HIDDEN_DIM=128
+ENERGY_HEAD_NUM_LAYERS=2
 ENERGY_RANK_WEIGHT=0.0
 ENERGY_TRAJ_WEIGHT=0.0
 ENERGY_MARGIN=0.1
 ENERGY_TRAJ_MARGIN=0.0
-ENERGY_CONDITION_ON_LABEL=true
-ENERGY_HEAD_CPT=distilled_energy_mlp_random.pt
+INNER_LOSS_LAMBDA=1.0
+INNER_LOSS_ANNEAL_STEPS=10000
+ENERGY_CONDITION_ON_LABEL=false
+# ENERGY_HEAD_CPT=distilled_energy_mlp_logits_random.pt
+ENERGY_HEAD_CPT=None
+
 
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
@@ -72,15 +78,25 @@ if [ "$USE_MEM_PROJ" = true ]; then
     RUN_NAME=${RUN_NAME}_ps
   fi
 fi
-RUN_NAME=${RUN_NAME}_energy
+RUN_NAME=${RUN_NAME}_${WRITE_OBJECTIVE}
+RUN_NAME=${RUN_NAME}_${ENERGY_INPUT_MODE}
 if [ "$ENERGY_HEAD_HIDDEN_DIM" != "None" ]; then
   RUN_NAME=${RUN_NAME}_eh${ENERGY_HEAD_HIDDEN_DIM}
+fi
+if [ "$ENERGY_HEAD_NUM_LAYERS" != "1" ]; then
+  RUN_NAME=${RUN_NAME}_el${ENERGY_HEAD_NUM_LAYERS}
 fi
 if [ "$ENERGY_RANK_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_rank${ENERGY_RANK_WEIGHT}_m${ENERGY_MARGIN}
 fi
 if [ "$ENERGY_TRAJ_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_traj${ENERGY_TRAJ_WEIGHT}_m${ENERGY_TRAJ_MARGIN}
+fi
+if [ "$WRITE_OBJECTIVE" == "ce_energy" ]; then
+  RUN_NAME=${RUN_NAME}_lambda${INNER_LOSS_LAMBDA}
+  if [ "$INNER_LOSS_ANNEAL_STEPS" != "None" ]; then
+    RUN_NAME=${RUN_NAME}_anneal${INNER_LOSS_ANNEAL_STEPS}steps
+  fi
 fi
 if [ "$ENERGY_CONDITION_ON_LABEL" = true ]; then
   RUN_NAME=${RUN_NAME}_cond_label
@@ -104,11 +120,15 @@ if [ "$MIXED_PRECISION" == "no" ]; then
   RUN_NAME=${RUN_NAME}_fp32
 fi
 
+# INIT_CHECKPOINT=${INIT_CHECKPOINT:-}
+# RUN_NAME_SUFFIX=${RUN_NAME_SUFFIX:-}
+RUN_NAME_SUFFIX=test
+
 if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
   RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
 fi
 
-N_VALUES=(2)
+N_VALUES=(1 2)
 for N in "${N_VALUES[@]}"; do
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_${N}"
 
@@ -150,10 +170,13 @@ for N in "${N_VALUES[@]}"; do
     --use_adam "$USE_ADAM"
     --grad_mode "$GRAD_MODE"
     --freeze_backbone "$FREEZE_BACKBONE"
+    --energy_input_mode "$ENERGY_INPUT_MODE"
+    --energy_head_num_layers "$ENERGY_HEAD_NUM_LAYERS"
     --energy_rank_weight "$ENERGY_RANK_WEIGHT"
     --energy_traj_weight "$ENERGY_TRAJ_WEIGHT"
     --energy_margin "$ENERGY_MARGIN"
     --energy_traj_margin "$ENERGY_TRAJ_MARGIN"
+    --inner_loss_lambda "$INNER_LOSS_LAMBDA"
     --max_steps 1000000
     --eval_steps 500
     --logging_steps 500
@@ -194,6 +217,9 @@ for N in "${N_VALUES[@]}"; do
   fi
   if [ "$ENERGY_HEAD_CPT" != "None" ]; then
     CMD+=( --energy_head_checkpoint "$ENERGY_HEAD_CPT" )
+  fi
+  if [ "$INNER_LOSS_ANNEAL_STEPS" != "None" ]; then
+    CMD+=( --inner_loss_anneal_steps "$INNER_LOSS_ANNEAL_STEPS" )
   fi
 
   print_run_header "$EXP_PATH" "$PORT" "$NP" "$MIXED_PRECISION" "${CMD[@]}"

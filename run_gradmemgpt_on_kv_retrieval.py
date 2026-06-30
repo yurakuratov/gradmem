@@ -149,6 +149,7 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         'inner_loss_write_delta',
         'inner_loss_write_delta_max',
         'inner_loss_write_delta_min',
+        'inner_loss_lambda',
     ]:
         if key in inner_loop_stats:
             value = inner_loop_stats[key]
@@ -176,6 +177,32 @@ class StopOnMetricValue(TrainerCallback):
             logger.info(f'metric {self.metric_name}={metric_value:.4f} >= {self.value:.4f}, stopping training..')
 
 
+class InnerLossAnnealingCallback(TrainerCallback):
+    def __init__(self, anneal_steps: Optional[int]):
+        self.anneal_steps = anneal_steps
+
+    def _update_lambda(self, state, model):
+        if self.anneal_steps is None or self.anneal_steps <= 0:
+            return
+        if model is None:
+            return
+        step = int(state.global_step or 0)
+        lam = max(0.0, min(1.0, 1.0 - step / float(self.anneal_steps)))
+        target = model.module if hasattr(model, 'module') else model
+        target.inner_loss_lambda = lam
+        if hasattr(target, 'config'):
+            target.config.inner_loss_lambda = lam
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        self._update_lambda(state, model)
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        self._update_lambda(state, model)
+
+    def on_evaluate(self, args, state, control, model=None, **kwargs):
+        self._update_lambda(state, model)
+
+
 class CustomTrainer(Trainer):
     def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
         num_training_steps = int(num_training_steps / 0.9)  # to make final lr not zero, for linear it is lr/10.
@@ -187,6 +214,9 @@ class CustomTrainer(Trainer):
             if isinstance(cb, EarlyStoppingCallback):
                 logs['patience'] = cb.early_stopping_patience_counter
                 break
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(model, 'inner_loss_lambda'):
+            logs['inner_loss_lambda'] = float(model.inner_loss_lambda)
         return super().log(logs, start_time=start_time)
 
 
@@ -245,13 +275,17 @@ class ExperimentArgs:
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
     write_objective: Optional[str] = field(default="reconstruction")
+    energy_input_mode: Optional[str] = field(default=None)
     energy_head_hidden_dim: Optional[int] = field(default=None)
+    energy_head_num_layers: Optional[int] = field(default=1)
     energy_head_checkpoint: Optional[str] = field(default=None)
     energy_condition_on_label: Optional[bool] = field(default=False)
     energy_rank_weight: Optional[float] = field(default=0.0)
     energy_traj_weight: Optional[float] = field(default=0.0)
     energy_margin: Optional[float] = field(default=0.1)
     energy_traj_margin: Optional[float] = field(default=0.0)
+    inner_loss_lambda: Optional[float] = field(default=1.0)
+    inner_loss_anneal_steps: Optional[int] = field(default=None)
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
     inner_loss_weight: Optional[float] = field(default=None)
 
@@ -343,13 +377,17 @@ if __name__ == '__main__':
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
                                       attn_implementation=args.attn_implementation,
                                       write_objective=args.write_objective,
+                                      energy_input_mode=args.energy_input_mode,
                                       energy_head_hidden_dim=args.energy_head_hidden_dim,
+                                      energy_head_num_layers=args.energy_head_num_layers,
                                       energy_head_checkpoint=args.energy_head_checkpoint,
                                       energy_condition_on_label=args.energy_condition_on_label,
                                       energy_rank_weight=args.energy_rank_weight,
                                       energy_traj_weight=args.energy_traj_weight,
                                       energy_margin=args.energy_margin,
                                       energy_traj_margin=args.energy_traj_margin,
+                                      inner_loss_lambda=args.inner_loss_lambda,
+                                      inner_loss_anneal_steps=args.inner_loss_anneal_steps,
                                       add_inner_loss_to_outer=args.add_inner_loss_to_outer,
                                       inner_loss_weight=args.inner_loss_weight)
 
@@ -441,6 +479,13 @@ if __name__ == '__main__':
         seed=args.seed,
     )
 
+    callbacks = [
+        EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
+        StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
+    ]
+    if args.inner_loss_anneal_steps is not None:
+        callbacks.append(InnerLossAnnealingCallback(args.inner_loss_anneal_steps))
+
     # Initialize Trainer
     trainer = CustomTrainer(
         model=model,
@@ -450,9 +495,7 @@ if __name__ == '__main__':
         data_collator=data_collator,
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
-                   ],
+        callbacks=callbacks,
     )
     # Train the model
     trainer.train()
