@@ -1493,15 +1493,11 @@ class GradMemGPT(PreTrainedModel):
             # todo: we should actually call model one more time here
             inner_loss_after_write = inner_loss
         inner_loop_stats['inner_loss_after_write'] = inner_loss_after_write.detach().mean()
-        inner_loop_stats['inner_loss_after_write_max'] = inner_loss_after_write.detach().max()
-        inner_loop_stats['inner_loss_after_write_min'] = inner_loss_after_write.detach().min()
         if self.write_objective == "energy" and len(inner_loss_history) > 0:
             inner_loss_initial = inner_loss_history[0]
             inner_loss_write_delta = inner_loss_after_write - inner_loss_initial
             inner_loop_stats['inner_loss_initial'] = inner_loss_initial.detach().mean()
             inner_loop_stats['inner_loss_write_delta'] = inner_loss_write_delta.detach().mean()
-            inner_loop_stats['inner_loss_write_delta_max'] = inner_loss_write_delta.detach().max()
-            inner_loop_stats['inner_loss_write_delta_min'] = inner_loss_write_delta.detach().min()
 
         mem_norm, delta_mem_norm = backend.compute_memory_stats(memory_state, memory_state_initial)
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
