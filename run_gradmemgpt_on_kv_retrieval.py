@@ -318,6 +318,10 @@ class ExperimentArgs:
     use_mem_residual: Optional[bool] = field(default=False)
     use_reconstruction_loss: Optional[bool] = field(default=False)
     reconstruction_loss_weight: Optional[float] = field(default=1.0)
+    use_energy_inner_loss: Optional[bool] = field(default=False)
+    n_energy_tokens: Optional[int] = field(default=4)
+    energy_mlp_hidden_dim: Optional[int] = field(default=None)
+    energy_mlp_n_layers: Optional[int] = field(default=2)
     # Curriculum learning parameters
     curriculum_enabled: Optional[bool] = field(default=False)
     curriculum_threshold: Optional[float] = field(default=0.95)
@@ -467,7 +471,11 @@ def main(config_path: Optional[str] = None):
         memory_update=args.memory_update,
         use_mem_residual=args.use_mem_residual,
         use_reconstruction_loss=args.use_reconstruction_loss,
-        reconstruction_loss_weight=args.reconstruction_loss_weight
+        reconstruction_loss_weight=args.reconstruction_loss_weight,
+        use_energy_inner_loss=args.use_energy_inner_loss,
+        n_energy_tokens=args.n_energy_tokens,
+        energy_mlp_hidden_dim=args.energy_mlp_hidden_dim,
+        energy_mlp_n_layers=args.energy_mlp_n_layers
     )
 
     # Create gradmemgpt model

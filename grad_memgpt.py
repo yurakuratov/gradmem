@@ -85,6 +85,10 @@ class GradMemGPTConfig(PretrainedConfig):
                  use_mem_residual=False,
                  use_reconstruction_loss=False,
                  reconstruction_loss_weight=1.0,
+                 use_energy_inner_loss=False,
+                 n_energy_tokens=4,
+                 energy_mlp_hidden_dim=None,
+                 energy_mlp_n_layers=2,
                  use_gated_delta_memory=False,
                  gated_delta_state_dim=128,
                  gated_delta_alpha_init=0.9,
@@ -135,8 +139,14 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
               hopfield_bptt_segments: int|None, number of last segments to keep in backprop graph for Hopfield (None = all segments)
               memory_update: str, how to update memory in inner loop ("gradient" for SGD/Adam, "forward" for RMT-style forward pass)
              use_mem_residual: bool, use residual connection in forward memory update: mem = mem + LN(mem_out) (requires memory_update="forward")
-             use_reconstruction_loss: bool, add reconstruction loss (context LM loss) to outer loss during forward inner loop
-             reconstruction_loss_weight: float, weight of reconstruction loss in combined loss
+              use_reconstruction_loss: bool, add reconstruction loss (context LM loss) to outer loss during forward inner loop
+              reconstruction_loss_weight: float, weight of reconstruction loss in combined loss
+             use_energy_inner_loss: bool, replace reconstruction CE in the gradient inner loop with a learned scalar
+                 "energy" read out from dedicated energy tokens at the end of the context (meta-learned via the
+                 outer/second-order path). Requires memory_update="gradient", grad_mode="second".
+             n_energy_tokens: int, number of learnable energy tokens appended at the end of the WRITE context
+             energy_mlp_hidden_dim: int|None, hidden width of the energy MLP (None = n_embd)
+             energy_mlp_n_layers: int, number of Linear layers in the energy MLP (incl. output layer; min 1)
              use_gated_delta_memory: bool, enable Gated DeltaNet-style external memory (alternative to Hopfield)
              gated_delta_state_dim: int, dimension d_k = d_v of the Gated Delta state matrix S (B, d, d)
              gated_delta_alpha_init: float, initial value for the alpha (forget gate) head bias (sigmoid output)
@@ -199,6 +209,11 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.use_reconstruction_loss = use_reconstruction_loss
         self.reconstruction_loss_weight = reconstruction_loss_weight
 
+        self.use_energy_inner_loss = use_energy_inner_loss
+        self.n_energy_tokens = n_energy_tokens
+        self.energy_mlp_hidden_dim = energy_mlp_hidden_dim
+        self.energy_mlp_n_layers = energy_mlp_n_layers
+
         self.use_gated_delta_memory = use_gated_delta_memory
         self.gated_delta_state_dim = gated_delta_state_dim
         self.gated_delta_alpha_init = gated_delta_alpha_init
@@ -235,6 +250,21 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
             "use_mem_residual requires memory_update='forward'"
         assert not (use_reconstruction_loss and memory_update != "forward"), \
             "use_reconstruction_loss requires memory_update='forward'"
+
+        # Validate energy-based inner loss settings
+        if use_energy_inner_loss:
+            assert memory_update == "gradient", \
+                "use_energy_inner_loss requires memory_update='gradient'"
+            assert grad_mode == "second", \
+                "use_energy_inner_loss requires grad_mode='second' (energy head is meta-learned via the second-order path)"
+            assert not add_inner_loss_to_outer, \
+                "use_energy_inner_loss is incompatible with add_inner_loss_to_outer"
+            assert not use_reconstruction_loss, \
+                "use_energy_inner_loss is mutually exclusive with use_reconstruction_loss"
+            assert n_energy_tokens >= 1, \
+                f"n_energy_tokens must be >= 1, got {n_energy_tokens}"
+            assert energy_mlp_n_layers >= 1, \
+                f"energy_mlp_n_layers must be >= 1, got {energy_mlp_n_layers}"
 
         # Validate Gated Delta settings
         assert not (use_gated_delta_memory and use_hopfield_memory), \
@@ -370,6 +400,11 @@ class GradMemGPT(PreTrainedModel):
         self.use_reconstruction_loss = config.use_reconstruction_loss
         self.reconstruction_loss_weight = config.reconstruction_loss_weight
 
+        self.use_energy_inner_loss = config.use_energy_inner_loss
+        self.n_energy_tokens = config.n_energy_tokens
+        self.energy_mlp_hidden_dim = config.energy_mlp_hidden_dim
+        self.energy_mlp_n_layers = config.energy_mlp_n_layers
+
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
         # self.mem are inner loop per-sample params, intial states of mem (self.mem) are meta-learned
@@ -411,6 +446,24 @@ class GradMemGPT(PreTrainedModel):
 
         if self.use_mem_residual:
             self.mem_residual_ln = nn.LayerNorm(n_embd)
+
+        # Learnable energy-based inner-loop objective (replaces reconstruction CE).
+        # energy_tokens are appended at the END of the WRITE context (causal => they
+        # read out mem's effect on the segment); their last-layer hidden states feed
+        # the energy MLP -> scalar, minimised over mem_batch in the inner loop.
+        # Both are meta-learned by the outer loop only (second-order path).
+        if self.use_energy_inner_loss:
+            self.energy_tokens = nn.Parameter(torch.randn(self.n_energy_tokens, n_embd) * 0.02)
+            in_dim = self.n_energy_tokens * n_embd
+            hid = self.energy_mlp_hidden_dim if self.energy_mlp_hidden_dim is not None else n_embd
+            energy_layers = []
+            for i in range(self.energy_mlp_n_layers):
+                layer_in = in_dim if i == 0 else hid
+                layer_out = 1 if i == self.energy_mlp_n_layers - 1 else hid
+                energy_layers.append(nn.Linear(layer_in, layer_out))
+                if i < self.energy_mlp_n_layers - 1:
+                    energy_layers.append(nn.GELU())
+            self.energy_mlp = nn.Sequential(*energy_layers)
 
         # Hopfield-like external memory
         self.use_hopfield_memory = getattr(config, "use_hopfield_memory", False)
@@ -944,7 +997,8 @@ class GradMemGPT(PreTrainedModel):
                         # ---- GRADIENT mode inner loop (existing) ----
                         # Pad segment for JVP Flash Attention compatibility
                         if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
-                            seg_pad_len = -(seg_emb.size(1) + mem_offset) % 32
+                            _fixed_len = mem_offset + (self.n_energy_tokens if self.use_energy_inner_loss else 0)
+                            seg_pad_len = -(seg_emb.size(1) + _fixed_len) % 32
                             seg_pad_list = [0, seg_pad_len, 0, 0]
                             cur_seg_mask = F.pad(seg_mask, seg_pad_list, "constant", 0)
                             cur_seg_labels = F.pad(seg_labels, seg_pad_list, "constant", -100)
@@ -962,6 +1016,9 @@ class GradMemGPT(PreTrainedModel):
                                                         cur_ctrl_attn_mask, cur_seg_mask.long()], dim=1)
                         else:
                             cur_attn_mask = torch.cat([cur_mem_attn_mask, cur_seg_mask.long()], dim=1)
+                        if self.use_energy_inner_loss:
+                            cur_energy_attn_mask = torch.ones(B, self.n_energy_tokens, dtype=torch.long, device=device)
+                            cur_attn_mask = torch.cat([cur_attn_mask, cur_energy_attn_mask], dim=1)
                         cur_position_ids = cur_attn_mask.cumsum(-1) - 1
 
                         # Reset mem_batch to initial for each segment
@@ -995,33 +1052,49 @@ class GradMemGPT(PreTrainedModel):
                             else:  # per-sample
                                 mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
 
-                            if self.n_ctrl_tokens > 0:
-                                x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch, cur_seg_emb], dim=1)
-                            else:
-                                x_ctx = torch.cat([mem_inp, cur_seg_emb], dim=1)    # [B,M+seg_size,d]
-
-                            if self.use_write_head:
+                            if self.use_energy_inner_loss:
+                                # Energy tokens at the END read out mem's effect on the segment (causal);
+                                # the energy MLP maps their last-layer hidden states to a scalar minimised
+                                # over mem_batch. Backbone only — no vocab projection needed here.
+                                energy_tok = self.energy_tokens.unsqueeze(0).expand(B, -1, -1)
+                                if self.n_ctrl_tokens > 0:
+                                    x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch,
+                                                       cur_seg_emb, energy_tok], dim=1)
+                                else:
+                                    x_ctx = torch.cat([mem_inp, cur_seg_emb, energy_tok], dim=1)
                                 outs = get_backbone(self.model)(inputs_embeds=x_ctx, attention_mask=cur_attn_mask,
                                                                 position_ids=cur_position_ids, return_dict=True)
-                                h = outs.last_hidden_state                     # [B,M+seg_size,V]
-                                h = h[:, mem_offset-1:, :]                     # [B,seg_size,V]
-                                logits = self.write_head(h)
-                                del h
+                                energy_h = outs.last_hidden_state[:, -self.n_energy_tokens:, :].reshape(B, -1)
+                                inner_loss = self.energy_mlp(energy_h).squeeze(-1).sum()
+                                del outs
                             else:
-                                outs = self.model(inputs_embeds=x_ctx, attention_mask=cur_attn_mask,
-                                                  position_ids=cur_position_ids, return_dict=True)
-                                logits = outs.logits                           # [B,M+seg_size,V]
-                                logits = logits[:, mem_offset-1:, :]           # [B,seg_size,V]
+                                if self.n_ctrl_tokens > 0:
+                                    x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch, cur_seg_emb], dim=1)
+                                else:
+                                    x_ctx = torch.cat([mem_inp, cur_seg_emb], dim=1)    # [B,M+seg_size,d]
 
-                            inner_loss = nn.functional.cross_entropy(
-                                logits[:, :-1].reshape(-1, logits.size(-1)),
-                                cur_seg_labels.reshape(-1),
-                                ignore_index=-100,
-                                reduction='none',
-                            ).view(B, -1)
-                            inner_loss = (inner_loss * cur_seg_mask).sum(1) / seg_seq_len
-                            inner_loss = inner_loss.sum()
-                            del outs, logits
+                                if self.use_write_head:
+                                    outs = get_backbone(self.model)(inputs_embeds=x_ctx, attention_mask=cur_attn_mask,
+                                                                    position_ids=cur_position_ids, return_dict=True)
+                                    h = outs.last_hidden_state                     # [B,M+seg_size,V]
+                                    h = h[:, mem_offset-1:, :]                     # [B,seg_size,V]
+                                    logits = self.write_head(h)
+                                    del h
+                                else:
+                                    outs = self.model(inputs_embeds=x_ctx, attention_mask=cur_attn_mask,
+                                                      position_ids=cur_position_ids, return_dict=True)
+                                    logits = outs.logits                           # [B,M+seg_size,V]
+                                    logits = logits[:, mem_offset-1:, :]           # [B,seg_size,V]
+
+                                inner_loss = nn.functional.cross_entropy(
+                                    logits[:, :-1].reshape(-1, logits.size(-1)),
+                                    cur_seg_labels.reshape(-1),
+                                    ignore_index=-100,
+                                    reduction='none',
+                                ).view(B, -1)
+                                inner_loss = (inner_loss * cur_seg_mask).sum(1) / seg_seq_len
+                                inner_loss = inner_loss.sum()
+                                del outs, logits
 
                             total_inner_steps += 1
 
@@ -1243,6 +1316,8 @@ class GradMemGPT(PreTrainedModel):
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / total_inner_steps
             if n_segments_with_context > 0:
                 inner_loop_stats['inner_loss'] = (total_inner_loss_detached / n_segments_with_context) / B
+                if self.use_energy_inner_loss:
+                    inner_loop_stats['energy'] = inner_loop_stats['inner_loss']
         if '_n_forward_steps' in inner_loop_stats and inner_loop_stats['_n_forward_steps'] > 0:
             inner_loop_stats['step_delta_mem_norm_mean'] /= inner_loop_stats['_n_forward_steps']
             del inner_loop_stats['_n_forward_steps']
