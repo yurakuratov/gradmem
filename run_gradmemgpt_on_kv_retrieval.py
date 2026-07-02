@@ -322,6 +322,7 @@ class ExperimentArgs:
     n_energy_tokens: Optional[int] = field(default=4)
     energy_mlp_hidden_dim: Optional[int] = field(default=None)
     energy_mlp_n_layers: Optional[int] = field(default=2)
+    energy_readout: Optional[str] = field(default="energy_tokens")
     # Curriculum learning parameters
     curriculum_enabled: Optional[bool] = field(default=False)
     curriculum_threshold: Optional[float] = field(default=0.95)
@@ -475,7 +476,8 @@ def main(config_path: Optional[str] = None):
         use_energy_inner_loss=args.use_energy_inner_loss,
         n_energy_tokens=args.n_energy_tokens,
         energy_mlp_hidden_dim=args.energy_mlp_hidden_dim,
-        energy_mlp_n_layers=args.energy_mlp_n_layers
+        energy_mlp_n_layers=args.energy_mlp_n_layers,
+        energy_readout=args.energy_readout
     )
 
     # Create gradmemgpt model
