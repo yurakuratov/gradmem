@@ -143,6 +143,12 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
     if 'rec_loss' in inner_loop_stats:
         metrics['rec_loss'] = float(inner_loop_stats['rec_loss'].mean())
+    if 'energy' in inner_loop_stats:
+        metrics['energy'] = float(inner_loop_stats['energy'].mean())
+    if 'energy_input_delta_mem_norm_mean' in inner_loop_stats:
+        metrics['energy_input_delta_mem_norm_mean'] = float(inner_loop_stats['energy_input_delta_mem_norm_mean'].mean())
+        metrics['energy_input_delta_mem_norm_max'] = float(inner_loop_stats['energy_input_delta_mem_norm_max'].max())
+        metrics['energy_input_delta_mem_norm_min'] = float(inner_loop_stats['energy_input_delta_mem_norm_min'].min())
     if 'step_delta_mem_norm_mean' in inner_loop_stats:
         metrics['step_delta_mem_norm_mean'] = float(inner_loop_stats['step_delta_mem_norm_mean'].mean())
         metrics['step_delta_mem_norm_max'] = float(inner_loop_stats['step_delta_mem_norm_max'].max())
