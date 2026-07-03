@@ -346,6 +346,8 @@ class ExperimentArgs:
     energy_recon_weight: Optional[float] = field(default=0.0)
     energy_recon_weight_end: Optional[float] = field(default=None)
     energy_recon_anneal_steps: Optional[int] = field(default=0)
+    stabilize_energy_head: Optional[bool] = field(default=True)
+    energy_out_scale: Optional[float] = field(default=1.0)
     # Curriculum learning parameters
     curriculum_enabled: Optional[bool] = field(default=False)
     curriculum_threshold: Optional[float] = field(default=0.95)
@@ -503,7 +505,9 @@ def main(config_path: Optional[str] = None):
         energy_readout=args.energy_readout,
         energy_recon_weight=args.energy_recon_weight,
         energy_recon_weight_end=args.energy_recon_weight_end,
-        energy_recon_anneal_steps=args.energy_recon_anneal_steps
+        energy_recon_anneal_steps=args.energy_recon_anneal_steps,
+        stabilize_energy_head=args.stabilize_energy_head,
+        energy_out_scale=args.energy_out_scale
     )
 
     # Create gradmemgpt model

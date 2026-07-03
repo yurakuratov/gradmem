@@ -47,6 +47,10 @@ gradmem:
   n_energy_tokens: 4
   energy_mlp_hidden_dim: null  # null -> n_embd (128)
   energy_mlp_n_layers: 2
+  # Stabilized (collapse-proof) energy head: LayerNorm + fixed-norm linear read-out.
+  # Prevents the energy gradient from vanishing after recon anneals out.
+  stabilize_energy_head: true
+  energy_out_scale: 1.0
   # Annealed reconstruction auxiliary: 1.0 -> 0.0 over 50k outer steps
   energy_recon_weight: 1.0
   energy_recon_weight_end: 0.0

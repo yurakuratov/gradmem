@@ -93,6 +93,8 @@ class GradMemGPTConfig(PretrainedConfig):
                  energy_recon_weight=0.0,
                  energy_recon_weight_end=None,
                  energy_recon_anneal_steps=0,
+                 stabilize_energy_head=True,
+                 energy_out_scale=1.0,
                  use_gated_delta_memory=False,
                  gated_delta_state_dim=128,
                  gated_delta_alpha_init=0.9,
@@ -160,6 +162,11 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
                  (no schedule, uses energy_recon_weight throughout)
              energy_recon_anneal_steps: int, outer steps to linearly anneal energy_recon_weight ->
                  energy_recon_weight_end; 0 = no schedule
+            stabilize_energy_head: bool, build a collapse-proof energy head (LayerNorm on energy_h +
+                a fixed-norm linear read-out) instead of a plain MLP. Prevents the energy gradient from
+                vanishing (the outer loop can only learn the read-out direction, not shrink its scale).
+            energy_out_scale: float, fixed scale of the stabilized energy read-out (controls the energy's
+                effective magnitude vs recon); only used when stabilize_energy_head=True
              use_gated_delta_memory: bool, enable Gated DeltaNet-style external memory (alternative to Hopfield)
              gated_delta_state_dim: int, dimension d_k = d_v of the Gated Delta state matrix S (B, d, d)
              gated_delta_alpha_init: float, initial value for the alpha (forget gate) head bias (sigmoid output)
@@ -230,6 +237,8 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.energy_recon_weight = energy_recon_weight
         self.energy_recon_weight_end = energy_recon_weight_end
         self.energy_recon_anneal_steps = energy_recon_anneal_steps
+        self.stabilize_energy_head = stabilize_energy_head
+        self.energy_out_scale = energy_out_scale
 
         self.use_gated_delta_memory = use_gated_delta_memory
         self.gated_delta_state_dim = gated_delta_state_dim
@@ -297,6 +306,13 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
                 "energy_recon_weight requires energy_readout='energy_tokens' (Option A)"
             assert energy_recon_anneal_steps >= 0, \
                 f"energy_recon_anneal_steps must be >= 0, got {energy_recon_anneal_steps}"
+
+        # Validate stabilized energy head settings
+        if stabilize_energy_head:
+            assert use_energy_inner_loss, \
+                "stabilize_energy_head requires use_energy_inner_loss=True"
+            assert energy_out_scale > 0, \
+                f"energy_out_scale must be > 0, got {energy_out_scale}"
 
         # Validate Gated Delta settings
         assert not (use_gated_delta_memory and use_hopfield_memory), \
@@ -440,6 +456,8 @@ class GradMemGPT(PreTrainedModel):
         self.energy_recon_weight = config.energy_recon_weight
         self.energy_recon_weight_end = config.energy_recon_weight_end
         self.energy_recon_anneal_steps = config.energy_recon_anneal_steps
+        self.stabilize_energy_head = config.stabilize_energy_head
+        self.energy_out_scale = config.energy_out_scale
 
         # current outer-loop step, stamped by the trainer before forward (for the recon schedule)
         self.current_train_step = 0
@@ -504,15 +522,25 @@ class GradMemGPT(PreTrainedModel):
                 in_dim = self.n_energy_tokens * n_embd
             else:  # "mem_tokens"
                 in_dim = self.n_mem_tokens * n_embd
-            hid = self.energy_mlp_hidden_dim if self.energy_mlp_hidden_dim is not None else n_embd
-            energy_layers = []
-            for i in range(self.energy_mlp_n_layers):
-                layer_in = in_dim if i == 0 else hid
-                layer_out = 1 if i == self.energy_mlp_n_layers - 1 else hid
-                energy_layers.append(nn.Linear(layer_in, layer_out))
-                if i < self.energy_mlp_n_layers - 1:
-                    energy_layers.append(nn.GELU())
-            self.energy_mlp = nn.Sequential(*energy_layers)
+            self.energy_in_dim = in_dim
+            if self.stabilize_energy_head:
+                # Collapse-proof energy head: LayerNorm on energy_h + a fixed-norm linear read-out.
+                # No hidden weights -> the outer loop can only learn the read-out direction, not shrink
+                # the energy's scale, so the inner-loop gradient cannot vanish.
+                self.energy_norm = nn.LayerNorm(in_dim)
+                self.energy_dir = nn.Parameter(torch.randn(in_dim) * 0.02)
+                self.energy_bias = nn.Parameter(torch.zeros(1))
+                self.energy_mlp = None
+            else:
+                hid = self.energy_mlp_hidden_dim if self.energy_mlp_hidden_dim is not None else n_embd
+                energy_layers = []
+                for i in range(self.energy_mlp_n_layers):
+                    layer_in = in_dim if i == 0 else hid
+                    layer_out = 1 if i == self.energy_mlp_n_layers - 1 else hid
+                    energy_layers.append(nn.Linear(layer_in, layer_out))
+                    if i < self.energy_mlp_n_layers - 1:
+                        energy_layers.append(nn.GELU())
+                self.energy_mlp = nn.Sequential(*energy_layers)
 
         # Hopfield-like external memory
         self.use_hopfield_memory = getattr(config, "use_hopfield_memory", False)
@@ -631,6 +659,14 @@ class GradMemGPT(PreTrainedModel):
             return start
         frac = min(self.current_train_step / self.energy_recon_anneal_steps, 1.0)
         return start + (self.energy_recon_weight_end - start) * frac
+
+    def _energy_forward(self, energy_h):
+        # energy_h: [B, in_dim] -> energy per sample [B]
+        if self.stabilize_energy_head:
+            h = self.energy_norm(energy_h)
+            dir_n = self.energy_dir / (self.energy_dir.norm() + 1e-8)   # unit-norm read-out direction
+            return (h * dir_n).sum(-1) * self.energy_out_scale + self.energy_bias.squeeze(0)
+        return self.energy_mlp(energy_h).squeeze(-1)
 
     def tie_weights(self):
         self.model.tie_weights()
@@ -1148,7 +1184,7 @@ class GradMemGPT(PreTrainedModel):
                                     outs = get_backbone(self.model)(inputs_embeds=x_ctx, attention_mask=cur_attn_mask,
                                                                     position_ids=cur_position_ids, return_dict=True)
                                     energy_h = outs.last_hidden_state[:, -self.n_mem_tokens:, :].reshape(B, -1)
-                                    inner_loss = self.energy_mlp(energy_h).squeeze(-1).sum()
+                                    inner_loss = self._energy_forward(energy_h).sum()
                                     del outs
                                 else:
                                     # Option A: energy tokens at the END read out mem's effect on the segment.
@@ -1162,7 +1198,7 @@ class GradMemGPT(PreTrainedModel):
                                                                     position_ids=cur_position_ids, return_dict=True)
                                     h = outs.last_hidden_state
                                     energy_h = h[:, -self.n_energy_tokens:, :].reshape(B, -1)
-                                    energy = self.energy_mlp(energy_h).squeeze(-1).sum()
+                                    energy = self._energy_forward(energy_h).sum()
                                     recon_w = self._energy_recon_weight_now()
                                     energy_recon_weight_now = recon_w
                                     if recon_w > 0:
@@ -1324,7 +1360,7 @@ class GradMemGPT(PreTrainedModel):
                                                             position_ids=fe_position_ids, return_dict=True)
                             mem_out = outs.last_hidden_state[:, -self.n_mem_tokens:, :]
                             energy_h = mem_out.reshape(B, -1)
-                            inner_loss = self.energy_mlp(energy_h).squeeze(-1).sum()
+                            inner_loss = self._energy_forward(energy_h).sum()
                             del outs
 
                             total_inner_steps += 1
