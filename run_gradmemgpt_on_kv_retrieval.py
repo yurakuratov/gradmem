@@ -145,6 +145,10 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         metrics['rec_loss'] = float(inner_loop_stats['rec_loss'].mean())
     if 'energy' in inner_loop_stats:
         metrics['energy'] = float(inner_loop_stats['energy'].mean())
+    if 'energy_recon' in inner_loop_stats:
+        metrics['energy_recon'] = float(inner_loop_stats['energy_recon'].mean())
+    if 'energy_recon_weight' in inner_loop_stats:
+        metrics['energy_recon_weight'] = float(inner_loop_stats['energy_recon_weight'].mean())
     if 'energy_input_delta_mem_norm_mean' in inner_loop_stats:
         metrics['energy_input_delta_mem_norm_mean'] = float(inner_loop_stats['energy_input_delta_mem_norm_mean'].mean())
         metrics['energy_input_delta_mem_norm_max'] = float(inner_loop_stats['energy_input_delta_mem_norm_max'].max())
@@ -224,6 +228,16 @@ class CustomTrainer(Trainer):
     def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
         num_training_steps = int(num_training_steps / 0.9)  # to make final lr not zero, for linear it is lr/10.
         return super().create_scheduler(num_training_steps, optimizer)
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # stamp the current outer step onto the (unwrapped) model so the energy-recon
+        # schedule knows where in training it is; covers train + eval (both call compute_loss)
+        m = model
+        while hasattr(m, "module"):
+            m = m.module
+        if hasattr(m, "set_train_step"):
+            m.set_train_step(self.state.global_step)
+        return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         for cb in self.callback_handler.callbacks:
@@ -329,6 +343,9 @@ class ExperimentArgs:
     energy_mlp_hidden_dim: Optional[int] = field(default=None)
     energy_mlp_n_layers: Optional[int] = field(default=2)
     energy_readout: Optional[str] = field(default="energy_tokens")
+    energy_recon_weight: Optional[float] = field(default=0.0)
+    energy_recon_weight_end: Optional[float] = field(default=None)
+    energy_recon_anneal_steps: Optional[int] = field(default=0)
     # Curriculum learning parameters
     curriculum_enabled: Optional[bool] = field(default=False)
     curriculum_threshold: Optional[float] = field(default=0.95)
@@ -483,7 +500,10 @@ def main(config_path: Optional[str] = None):
         n_energy_tokens=args.n_energy_tokens,
         energy_mlp_hidden_dim=args.energy_mlp_hidden_dim,
         energy_mlp_n_layers=args.energy_mlp_n_layers,
-        energy_readout=args.energy_readout
+        energy_readout=args.energy_readout,
+        energy_recon_weight=args.energy_recon_weight,
+        energy_recon_weight_end=args.energy_recon_weight_end,
+        energy_recon_anneal_steps=args.energy_recon_anneal_steps
     )
 
     # Create gradmemgpt model

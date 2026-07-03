@@ -90,6 +90,9 @@ class GradMemGPTConfig(PretrainedConfig):
                  energy_mlp_hidden_dim=None,
                  energy_mlp_n_layers=2,
                  energy_readout="energy_tokens",
+                 energy_recon_weight=0.0,
+                 energy_recon_weight_end=None,
+                 energy_recon_anneal_steps=0,
                  use_gated_delta_memory=False,
                  gated_delta_state_dim=128,
                  gated_delta_alpha_init=0.9,
@@ -151,6 +154,12 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
              energy_readout: str, source of the energy MLP input - "energy_tokens" (dedicated tokens at the
                  end of the WRITE context; mem stays prefix) or "mem_tokens" (memory tokens themselves placed
                  at the end; no separate energy-token param, MLP input dim = n_mem_tokens*d)
+             energy_recon_weight: float, reconstruction-CE weight added to the energy inner loss at step 0
+                 (Option A only: gradient + energy_tokens). 0.0 = pure energy.
+             energy_recon_weight_end: float|None, final recon weight after linear annealing; None = constant
+                 (no schedule, uses energy_recon_weight throughout)
+             energy_recon_anneal_steps: int, outer steps to linearly anneal energy_recon_weight ->
+                 energy_recon_weight_end; 0 = no schedule
              use_gated_delta_memory: bool, enable Gated DeltaNet-style external memory (alternative to Hopfield)
              gated_delta_state_dim: int, dimension d_k = d_v of the Gated Delta state matrix S (B, d, d)
              gated_delta_alpha_init: float, initial value for the alpha (forget gate) head bias (sigmoid output)
@@ -218,6 +227,9 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.energy_mlp_hidden_dim = energy_mlp_hidden_dim
         self.energy_mlp_n_layers = energy_mlp_n_layers
         self.energy_readout = energy_readout
+        self.energy_recon_weight = energy_recon_weight
+        self.energy_recon_weight_end = energy_recon_weight_end
+        self.energy_recon_anneal_steps = energy_recon_anneal_steps
 
         self.use_gated_delta_memory = use_gated_delta_memory
         self.gated_delta_state_dim = gated_delta_state_dim
@@ -273,6 +285,18 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
             if energy_readout == "energy_tokens":
                 assert n_energy_tokens >= 1, \
                     f"n_energy_tokens must be >= 1, got {n_energy_tokens}"
+
+        # Validate energy+reconstruction (Option A) settings
+        energy_recon_enabled = (energy_recon_weight > 0) or (energy_recon_weight_end not in (None, 0))
+        if energy_recon_enabled:
+            assert use_energy_inner_loss, \
+                "energy_recon_weight requires use_energy_inner_loss=True"
+            assert memory_update == "gradient", \
+                "energy_recon_weight requires memory_update='gradient' (recon needs mem as a prefix)"
+            assert energy_readout == "energy_tokens", \
+                "energy_recon_weight requires energy_readout='energy_tokens' (Option A)"
+            assert energy_recon_anneal_steps >= 0, \
+                f"energy_recon_anneal_steps must be >= 0, got {energy_recon_anneal_steps}"
 
         # Validate Gated Delta settings
         assert not (use_gated_delta_memory and use_hopfield_memory), \
@@ -413,6 +437,12 @@ class GradMemGPT(PreTrainedModel):
         self.energy_mlp_hidden_dim = config.energy_mlp_hidden_dim
         self.energy_mlp_n_layers = config.energy_mlp_n_layers
         self.energy_readout = config.energy_readout
+        self.energy_recon_weight = config.energy_recon_weight
+        self.energy_recon_weight_end = config.energy_recon_weight_end
+        self.energy_recon_anneal_steps = config.energy_recon_anneal_steps
+
+        # current outer-loop step, stamped by the trainer before forward (for the recon schedule)
+        self.current_train_step = 0
 
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
@@ -589,6 +619,18 @@ class GradMemGPT(PreTrainedModel):
         # dummy method to satisfy base class and it's invocation by trainer:
         # Trainer supposes that `inputs`` is a tensor, not dict.
         return 0
+
+    def set_train_step(self, step):
+        # Called by the trainer (compute_loss) so the recon-weight schedule knows the outer step.
+        self.current_train_step = int(step)
+
+    def _energy_recon_weight_now(self):
+        # Linear schedule: energy_recon_weight -> energy_recon_weight_end over energy_recon_anneal_steps.
+        start = self.energy_recon_weight
+        if self.energy_recon_weight_end is None or self.energy_recon_anneal_steps <= 0:
+            return start
+        frac = min(self.current_train_step / self.energy_recon_anneal_steps, 1.0)
+        return start + (self.energy_recon_weight_end - start) * frac
 
     def tie_weights(self):
         self.model.tie_weights()
@@ -959,6 +1001,11 @@ class GradMemGPT(PreTrainedModel):
 
         rec_losses = []
 
+        # energy+recon (Option A) accumulators
+        energy_recon_detached = torch.tensor(0.0, device=device)
+        n_energy_recon_steps = 0
+        energy_recon_weight_now = None
+
         # Track last segment's mem_batch for stats and as fallback for READ phase
         last_mem_batch = mem_batch_initial
 
@@ -1113,8 +1160,33 @@ class GradMemGPT(PreTrainedModel):
                                         x_ctx = torch.cat([mem_inp, cur_seg_emb, energy_tok], dim=1)
                                     outs = get_backbone(self.model)(inputs_embeds=x_ctx, attention_mask=cur_attn_mask,
                                                                     position_ids=cur_position_ids, return_dict=True)
-                                    energy_h = outs.last_hidden_state[:, -self.n_energy_tokens:, :].reshape(B, -1)
-                                    inner_loss = self.energy_mlp(energy_h).squeeze(-1).sum()
+                                    h = outs.last_hidden_state
+                                    energy_h = h[:, -self.n_energy_tokens:, :].reshape(B, -1)
+                                    energy = self.energy_mlp(energy_h).squeeze(-1).sum()
+                                    recon_w = self._energy_recon_weight_now()
+                                    energy_recon_weight_now = recon_w
+                                    if recon_w > 0:
+                                        # Reconstruction CE on the segment positions (mem is a prefix, so the
+                                        # segment attends to mem -> recon has a gradient w.r.t. mem_batch).
+                                        # Slice excludes the energy tokens appended at the end.
+                                        h_seg = h[:, mem_offset - 1:-self.n_energy_tokens, :]
+                                        if self.use_write_head:
+                                            rec_logits = self.write_head(h_seg)
+                                        else:
+                                            rec_logits = self.model.get_output_embeddings()(h_seg)
+                                        recon = nn.functional.cross_entropy(
+                                            rec_logits[:, :-1].reshape(-1, rec_logits.size(-1)),
+                                            cur_seg_labels.reshape(-1),
+                                            ignore_index=-100,
+                                            reduction='none',
+                                        ).view(B, -1)
+                                        recon = (recon * cur_seg_mask).sum(1) / seg_seq_len
+                                        recon = recon.sum()
+                                        inner_loss = energy + recon_w * recon
+                                        energy_recon_detached = energy_recon_detached + recon.detach()
+                                        n_energy_recon_steps += 1
+                                    else:
+                                        inner_loss = energy
                                     del outs
                             else:
                                 if self.n_ctrl_tokens > 0:
@@ -1501,6 +1573,10 @@ class GradMemGPT(PreTrainedModel):
                 inner_loop_stats['inner_loss'] = (total_inner_loss_detached / n_segments_with_context) / B
                 if self.use_energy_inner_loss:
                     inner_loop_stats['energy'] = inner_loop_stats['inner_loss']
+        if n_energy_recon_steps > 0:
+            inner_loop_stats['energy_recon'] = (energy_recon_detached / n_energy_recon_steps) / B
+        if energy_recon_weight_now is not None:
+            inner_loop_stats['energy_recon_weight'] = torch.tensor(float(energy_recon_weight_now), device=device)
         if '_n_forward_steps' in inner_loop_stats and inner_loop_stats['_n_forward_steps'] > 0:
             inner_loop_stats['step_delta_mem_norm_mean'] /= inner_loop_stats['_n_forward_steps']
             del inner_loop_stats['_n_forward_steps']

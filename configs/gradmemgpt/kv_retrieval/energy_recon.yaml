@@ -1,0 +1,53 @@
+# GradMemGPT on KV-retrieval - energy inner loss + annealed reconstruction auxiliary (Option A).
+# inner_loss = energy + w(t)*recon, where w(t) linearly anneals energy_recon_weight -> energy_recon_weight_end
+# over energy_recon_anneal_steps. Recon grounds mem in the context (breaks the pure-energy deadlock /
+# bootstraps the READ<->mem channel); as it anneals out, the learned energy takes over.
+# Option A only: memory_update="gradient" + energy_readout="energy_tokens" + grad_mode="second".
+
+model:
+  base_model: gpt2
+  n_layer: 4
+  n_head: 4
+  n_embd: 128
+
+training:
+  per_device_batch_size: 64
+  total_batch_size: 64
+  learning_rate: 1.0e-4
+  max_steps: 1000000
+  eval_steps: 500
+  logging_steps: 500
+  warmup_steps: 10000
+  early_stopping_patience: 500
+  seed: 143
+
+dataset:
+  data_path: "./data/N4-K2V2-V62_1M"
+  tokenizer_path: "./tokenizers/kv_alphabet_62/"
+
+gradmem:
+  n_mem_tokens: 8
+  n_ctrl_tokens: 0
+  K: 2
+  last_K_second_order: 2  # full second-order (== K); energy head trained via this path
+  inner_lr: 0.04
+  inner_clip_value: null
+  inner_clip_norm: null
+  use_adam: false
+  grad_mode: "second"      # required for use_energy_inner_loss
+  use_mem_proj: false
+  mem_proj_mode: "none"
+  use_write_head: false    # recon uses the model's tied output embeddings when false
+  add_inner_loss_to_outer: false  # incompatible with use_energy_inner_loss
+  inner_loss_weight: 0.0
+  memory_update: gradient  # required for energy_recon (recon needs mem as a prefix)
+  # Learnable energy inner objective (Option A)
+  use_energy_inner_loss: true
+  energy_readout: energy_tokens  # required for energy_recon
+  n_energy_tokens: 4
+  energy_mlp_hidden_dim: null  # null -> n_embd (128)
+  energy_mlp_n_layers: 2
+  # Annealed reconstruction auxiliary: 1.0 -> 0.0 over 50k outer steps
+  energy_recon_weight: 1.0
+  energy_recon_weight_end: 0.0
+  energy_recon_anneal_steps: 50000
