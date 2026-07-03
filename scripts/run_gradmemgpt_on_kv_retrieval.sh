@@ -72,6 +72,7 @@ KV_MEM_LAYERS="all"
 # - Does not use LoRA/KV-cache layer settings.
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
+STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
 
 ATTN_IMPL="eager"
 MIXED_PRECISION='bf16'
@@ -200,6 +201,7 @@ for N in "${N_VALUES[@]}"; do
     --logging_steps 500
     --warmup_steps 10000
     --early_stopping_patience 500
+    --stop_on_metric_value "$STOP_ON_METRIC_VALUE"
     --seed "$((142+$N))"
   )
   # Optional args

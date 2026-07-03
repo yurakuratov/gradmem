@@ -599,6 +599,8 @@ def test_forward_prefix_energy_objective():
     assert "inner_loss_after_write" in stats
     assert "inner_loss_initial" in stats
     assert "inner_loss_write_delta" in stats
+    assert "inner_energy_loss" in stats
+    assert "inner_energy_loss_after_write" in stats
     assert "energy_rank_loss" in stats
     assert "energy_traj_loss" in stats
     assert torch.isfinite(stats["inner_loss_after_write"]).item()
@@ -655,10 +657,129 @@ def test_single_batch_train_prefix_energy_objective():
     assert model.mem.grad is not None
     assert torch.isfinite(model.mem.grad).all().item()
     energy_grads = [p.grad for p in model.energy_head.parameters()]
-    assert all(g is not None for g in energy_grads)
+    energy_grads = [g for g in energy_grads if g is not None]
+    assert len(energy_grads) > 0
     assert all(torch.isfinite(g).all().item() for g in energy_grads)
     assert model.energy_ln.weight.grad is not None
     assert torch.isfinite(model.energy_ln.weight.grad).all().item()
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_forward_prefix_energy_with_reconstruction_objective():
+    torch.manual_seed(0)
+
+    base_config = _build_base_config("gpt2")
+    model_config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        n_mem_tokens=4,
+        K=2,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="second",
+        use_mem_proj=False,
+        mem_proj_mode="none",
+        use_write_head=False,
+        attn_implementation="eager",
+        write_objective="energy_with_reconstruction",
+        write_reconstruction_weight=1.0,
+        write_energy_weight=0.1,
+        energy_rank_weight=0.1,
+        energy_traj_weight=0.01,
+    )
+
+    model = GradMemGPT(model_config)
+    model.eval()
+
+    batch_size = 2
+    ctx_len = 6
+    qry_len = 4
+    vocab_size = base_config.vocab_size
+
+    context_input_ids = torch.randint(0, vocab_size, (batch_size, ctx_len))
+    query_input_ids = torch.randint(0, vocab_size, (batch_size, qry_len))
+    labels = torch.randint(0, vocab_size, (batch_size, qry_len))
+
+    output = model(
+        {
+            "context_input_ids": context_input_ids,
+            "query_input_ids": query_input_ids,
+        },
+        labels=labels,
+    )
+
+    assert torch.isfinite(output["loss"]).item()
+    stats = output["inner_loop_stats"]
+    for key in [
+        "inner_reconstruction_loss",
+        "inner_energy_loss",
+        "inner_reconstruction_loss_after_write",
+        "inner_energy_loss_after_write",
+        "inner_loss_after_write",
+        "inner_loss_initial",
+        "inner_loss_write_delta",
+        "write_reconstruction_weight",
+        "write_energy_weight",
+        "energy_rank_loss",
+        "energy_traj_loss",
+    ]:
+        assert key in stats
+        assert torch.isfinite(stats[key]).item()
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_single_batch_train_prefix_energy_with_reconstruction_objective():
+    torch.manual_seed(0)
+
+    base_config = _build_base_config("gpt2")
+    model_config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        n_mem_tokens=4,
+        K=2,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="second",
+        use_mem_proj=False,
+        mem_proj_mode="none",
+        use_write_head=False,
+        attn_implementation="eager",
+        write_objective="energy_with_reconstruction",
+        write_reconstruction_weight=1.0,
+        write_energy_weight=0.1,
+    )
+
+    model = GradMemGPT(model_config)
+    model.train()
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+
+    batch_size = 2
+    ctx_len = 6
+    qry_len = 4
+    vocab_size = base_config.vocab_size
+
+    context_input_ids = torch.randint(0, vocab_size, (batch_size, ctx_len))
+    query_input_ids = torch.randint(0, vocab_size, (batch_size, qry_len))
+    labels = torch.randint(0, vocab_size, (batch_size, qry_len))
+
+    optimizer.zero_grad(set_to_none=True)
+    output = model(
+        {
+            "context_input_ids": context_input_ids,
+            "query_input_ids": query_input_ids,
+        },
+        labels=labels,
+    )
+    output["loss"].backward()
+
+    assert model.mem.grad is not None
+    assert torch.isfinite(model.mem.grad).all().item()
+    energy_grads = [p.grad for p in model.energy_head.parameters()]
+    energy_grads = [g for g in energy_grads if g is not None]
+    assert len(energy_grads) > 0
+    assert all(torch.isfinite(g).all().item() for g in energy_grads)
 
 
 @pytest.mark.forward
@@ -711,10 +832,34 @@ def test_prefix_energy_write_handles_padded_contexts():
 def test_energy_objective_rejects_unsupported_backend():
     base_config = _build_base_config("gpt2")
 
-    with pytest.raises(ValueError, match="supported only for memory_backend='prefix'"):
+    for write_objective in ["energy", "energy_with_reconstruction"]:
+        with pytest.raises(ValueError, match="supported only for memory_backend='prefix'"):
+            _ = GradMemGPTConfig(
+                base_config=base_config,
+                memory_backend="lora",
+                n_mem_tokens=4,
+                K=1,
+                lr=0.01,
+                use_adam=False,
+                grad_mode="none",
+                use_mem_proj=False,
+                mem_proj_mode="none",
+                use_write_head=False,
+                attn_implementation="eager",
+                write_objective=write_objective,
+                **_backend_extra_kwargs("lora"),
+            )
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_unknown_write_objective_rejects():
+    base_config = _build_base_config("gpt2")
+
+    with pytest.raises(AssertionError, match="write_objective must be one of"):
         _ = GradMemGPTConfig(
             base_config=base_config,
-            memory_backend="lora",
+            memory_backend="prefix",
             n_mem_tokens=4,
             K=1,
             lr=0.01,
@@ -724,6 +869,5 @@ def test_energy_objective_rejects_unsupported_backend():
             mem_proj_mode="none",
             use_write_head=False,
             attn_implementation="eager",
-            write_objective="energy",
-            **_backend_extra_kwargs("lora"),
+            write_objective="definitely_not_valid",
         )

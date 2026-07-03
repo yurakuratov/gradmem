@@ -31,7 +31,7 @@ N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
 K=2
 LAST_K_SECOND_ORDER=${K}
-INNER_LR=0.04
+INNER_LR=0.4
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 USE_ADAM=false
@@ -42,10 +42,13 @@ FREEZE_BACKBONE=false
 
 # Energy head and optional shaping losses. Ranking/trajectory are off by default.
 ENERGY_HEAD_HIDDEN_DIM=None
+WRITE_RECONSTRUCTION_WEIGHT=1.0
+WRITE_ENERGY_WEIGHT=1.0
 ENERGY_RANK_WEIGHT=0.0
 ENERGY_TRAJ_WEIGHT=0.0
 ENERGY_MARGIN=0.1
 ENERGY_TRAJ_MARGIN=0.0
+STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
 
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
@@ -71,6 +74,9 @@ if [ "$USE_MEM_PROJ" = true ]; then
   fi
 fi
 RUN_NAME=${RUN_NAME}_energy
+if [ "$WRITE_OBJECTIVE" = "energy_with_reconstruction" ]; then
+  RUN_NAME=${RUN_NAME}_recon${WRITE_RECONSTRUCTION_WEIGHT}_energy${WRITE_ENERGY_WEIGHT}
+fi
 if [ "$ENERGY_HEAD_HIDDEN_DIM" != "None" ]; then
   RUN_NAME=${RUN_NAME}_eh${ENERGY_HEAD_HIDDEN_DIM}
 fi
@@ -144,6 +150,8 @@ for N in "${N_VALUES[@]}"; do
     --freeze_backbone "$FREEZE_BACKBONE"
     --energy_rank_weight "$ENERGY_RANK_WEIGHT"
     --energy_traj_weight "$ENERGY_TRAJ_WEIGHT"
+    --write_reconstruction_weight "$WRITE_RECONSTRUCTION_WEIGHT"
+    --write_energy_weight "$WRITE_ENERGY_WEIGHT"
     --energy_margin "$ENERGY_MARGIN"
     --energy_traj_margin "$ENERGY_TRAJ_MARGIN"
     --max_steps 1000000
@@ -151,6 +159,7 @@ for N in "${N_VALUES[@]}"; do
     --logging_steps 500
     --warmup_steps 10000
     --early_stopping_patience 500
+    --stop_on_metric_value "$STOP_ON_METRIC_VALUE"
     --seed "$((142+$N))"
   )
 

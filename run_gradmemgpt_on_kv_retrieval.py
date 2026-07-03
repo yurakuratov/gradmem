@@ -143,12 +143,14 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
     for key in [
         'inner_loss_after_write',
-        'inner_loss_after_write_max',
-        'inner_loss_after_write_min',
         'inner_loss_initial',
         'inner_loss_write_delta',
-        'inner_loss_write_delta_max',
-        'inner_loss_write_delta_min',
+        'inner_reconstruction_loss',
+        'inner_energy_loss',
+        'inner_reconstruction_loss_after_write',
+        'inner_energy_loss_after_write',
+        'write_reconstruction_weight',
+        'write_energy_weight',
     ]:
         if key in inner_loop_stats:
             value = inner_loop_stats[key]
@@ -207,6 +209,7 @@ class ExperimentArgs:
     learning_rate: Optional[float] = field(default=1e-04)
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
+    stop_on_metric_value: Optional[float] = field(default=1.0)
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
@@ -246,6 +249,8 @@ class ExperimentArgs:
     attn_implementation: Optional[str] = field(default="eager")
     write_objective: Optional[str] = field(default="reconstruction")
     energy_head_hidden_dim: Optional[int] = field(default=None)
+    write_reconstruction_weight: Optional[float] = field(default=1.0)
+    write_energy_weight: Optional[float] = field(default=1.0)
     energy_rank_weight: Optional[float] = field(default=0.0)
     energy_traj_weight: Optional[float] = field(default=0.0)
     energy_margin: Optional[float] = field(default=0.1)
@@ -342,6 +347,8 @@ if __name__ == '__main__':
                                       attn_implementation=args.attn_implementation,
                                       write_objective=args.write_objective,
                                       energy_head_hidden_dim=args.energy_head_hidden_dim,
+                                      write_reconstruction_weight=args.write_reconstruction_weight,
+                                      write_energy_weight=args.write_energy_weight,
                                       energy_rank_weight=args.energy_rank_weight,
                                       energy_traj_weight=args.energy_traj_weight,
                                       energy_margin=args.energy_margin,
@@ -447,7 +454,8 @@ if __name__ == '__main__':
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
+                   StopOnMetricValue(metric_name='exact_match', value=args.stop_on_metric_value,
+                                     higher_is_better=True),
                    ],
     )
     # Train the model
