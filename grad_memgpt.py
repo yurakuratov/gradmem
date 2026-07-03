@@ -307,10 +307,11 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
             assert energy_recon_anneal_steps >= 0, \
                 f"energy_recon_anneal_steps must be >= 0, got {energy_recon_anneal_steps}"
 
-        # Validate stabilized energy head settings
+        # Validate stabilized energy head settings.
+        # NOTE: stabilize_energy_head is ignored when use_energy_inner_loss=False (the energy head is
+        # only built under that flag), so we do NOT assert use_energy_inner_loss here — doing so would
+        # break HF's to_diff_dict()/repr(), which instantiate the config with all defaults.
         if stabilize_energy_head:
-            assert use_energy_inner_loss, \
-                "stabilize_energy_head requires use_energy_inner_loss=True"
             assert energy_out_scale > 0, \
                 f"energy_out_scale must be > 0, got {energy_out_scale}"
 
