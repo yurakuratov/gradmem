@@ -249,8 +249,8 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         if hopfield_bptt_segments is not None:
             assert hopfield_bptt_segments >= 1, f"hopfield_bptt_segments must be >= 1 or None, got {hopfield_bptt_segments}"
             assert use_hopfield_memory, "hopfield_bptt_segments requires use_hopfield_memory=True"
-        assert memory_update in ("gradient", "forward"), \
-            f"memory_update must be 'gradient' or 'forward', got '{memory_update}'"
+        assert memory_update in ("gradient", "forward", "forward_energy"), \
+            f"memory_update must be 'gradient', 'forward', or 'forward_energy', got '{memory_update}'"
         assert not (use_mem_residual and memory_update != "forward"), \
             "use_mem_residual requires memory_update='forward'"
         assert not (use_reconstruction_loss and memory_update != "forward"), \
@@ -260,8 +260,8 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         assert energy_readout in ("energy_tokens", "mem_tokens"), \
             f"energy_readout must be 'energy_tokens' or 'mem_tokens', got '{energy_readout}'"
         if use_energy_inner_loss:
-            assert memory_update == "gradient", \
-                "use_energy_inner_loss requires memory_update='gradient'"
+            assert memory_update in ("gradient", "forward_energy"), \
+                "use_energy_inner_loss requires memory_update='gradient' or 'forward_energy'"
             assert grad_mode == "second", \
                 "use_energy_inner_loss requires grad_mode='second' (energy head is meta-learned via the second-order path)"
             assert not add_inner_loss_to_outer, \
@@ -457,15 +457,19 @@ class GradMemGPT(PreTrainedModel):
             self.mem_residual_ln = nn.LayerNorm(n_embd)
 
         # Learnable energy-based inner-loop objective (replaces reconstruction CE).
-        # energy_readout selects the source of the energy MLP input:
-        #   "energy_tokens": dedicated energy tokens appended at the END of the WRITE context
-        #      (mem stays as prefix); MLP input dim = n_energy_tokens * d.
-        #   "mem_tokens": the memory tokens themselves are placed at the END (they read out the
-        #      segment); no separate energy-token param; MLP input dim = n_mem_tokens * d.
-        # In both cases the energy MLP -> scalar is minimised over mem_batch in the inner loop,
-        # and is meta-learned by the outer loop only (second-order path).
+        # Energy read-out source depends on mode/readout:
+        #   memory_update="forward_energy": energy read from mem_out (RMT forward output);
+        #      no separate energy-token param; MLP input dim = n_mem_tokens * d.
+        #   energy_readout="energy_tokens" (gradient mode): dedicated energy tokens appended at the
+        #      END of the WRITE context (mem stays as prefix); MLP input dim = n_energy_tokens * d.
+        #   energy_readout="mem_tokens" (gradient mode): memory tokens themselves placed at the END;
+        #      no separate energy-token param; MLP input dim = n_mem_tokens * d.
+        # The energy MLP -> scalar is minimised over mem_batch in the inner loop, and is meta-learned
+        # by the outer loop only (second-order path).
         if self.use_energy_inner_loss:
-            if self.energy_readout == "energy_tokens":
+            if self.memory_update == "forward_energy":
+                in_dim = self.n_mem_tokens * n_embd
+            elif self.energy_readout == "energy_tokens":
                 self.energy_tokens = nn.Parameter(torch.randn(self.n_energy_tokens, n_embd) * 0.02)
                 in_dim = self.n_energy_tokens * n_embd
             else:  # "mem_tokens"
@@ -1192,6 +1196,140 @@ class GradMemGPT(PreTrainedModel):
                         last_segment_inner_loss = inner_loss
                         n_segments_with_context += 1
 
+                    elif self.memory_update == "forward_energy":
+                        # RMT forward write + energy-gradient refinement of the INPUT mem_batch.
+                        # The forward pass ([mem,seg,mem]) produces mem_out, which always encodes the
+                        # segment (so READ always has useful input -> no deadlock); the energy head
+                        # refines the input mem_batch via the second-order path. READ uses mem_out.
+                        # Graceful fallback: if the energy refinement is unhelpful the outer loop
+                        # flattens the energy landscape -> input delta -> 0 -> pure RMT write.
+                        mem_batch = self.mem.unsqueeze(0).expand(B, -1, -1).clone()  # [B,M,d]
+                        mem_batch_init_seg = mem_batch.detach()  # snapshot for input-refinement stat
+
+                        # Reset per-sample params for each segment
+                        if self.mem_proj_mode == "per_sample":
+                            W_batch = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1).clone()
+                            b_batch = self.mem_proj.bias.unsqueeze(0).expand(B, -1).clone()
+
+                        # handling gradients for meta-params:
+                        if self.grad_mode == "none":
+                            mem_batch = mem_batch.detach().requires_grad_(True)
+                            if self.mem_proj_mode == "per_sample":
+                                W_batch = W_batch.detach().requires_grad_(True)
+                                b_batch = b_batch.detach().requires_grad_(True)
+                        else:
+                            mem_batch = mem_batch.requires_grad_(True)
+                            if self.mem_proj_mode == "per_sample":
+                                W_batch = W_batch.requires_grad_(True)
+                                b_batch = b_batch.requires_grad_(True)
+
+                        opt_state = {}
+
+                        # RMT layout attention mask (mem at both ends) + position ids, built once
+                        fe_mem_attn_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
+                        if self.n_ctrl_tokens > 0:
+                            fe_ctrl_attn_mask = torch.ones(B, self.n_ctrl_tokens, dtype=torch.long, device=device)
+                            fe_attn_mask = torch.cat([fe_ctrl_attn_mask, fe_mem_attn_mask, fe_ctrl_attn_mask,
+                                                      seg_mask.long(), fe_ctrl_attn_mask, fe_mem_attn_mask], dim=1)
+                        else:
+                            fe_attn_mask = torch.cat([fe_mem_attn_mask, seg_mask.long(), fe_mem_attn_mask], dim=1)
+                        fe_position_ids = (fe_attn_mask.cumsum(-1) - 1).clamp(min=0)
+
+                        for k in range(self.K):
+                            if self.mem_proj_mode == 'none':
+                                mem_inp = mem_batch
+                            elif self.mem_proj_mode in ('proj', 'proj_rw'):
+                                mem_inp = self.mem_proj(mem_batch)
+                            else:  # per_sample
+                                mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
+
+                            if self.n_ctrl_tokens > 0:
+                                x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch,
+                                                   seg_emb, write_st_batch, mem_inp], dim=1)
+                            else:
+                                x_ctx = torch.cat([mem_inp, seg_emb, mem_inp], dim=1)
+                            outs = get_backbone(self.model)(inputs_embeds=x_ctx, attention_mask=fe_attn_mask,
+                                                            position_ids=fe_position_ids, return_dict=True)
+                            mem_out = outs.last_hidden_state[:, -self.n_mem_tokens:, :]
+                            energy_h = mem_out.reshape(B, -1)
+                            inner_loss = self.energy_mlp(energy_h).squeeze(-1).sum()
+                            del outs
+
+                            total_inner_steps += 1
+                            is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
+                            create_graph = is_second_order_step
+                            retain_graph = create_graph
+
+                            if self.mem_proj_mode == 'per_sample':
+                                g_mem, g_W, g_b = torch.autograd.grad(inner_loss, [mem_batch, W_batch, b_batch],
+                                                                      create_graph=create_graph, retain_graph=retain_graph)
+                            else:
+                                g_mem = torch.autograd.grad(inner_loss, mem_batch,
+                                                            create_graph=create_graph, retain_graph=retain_graph)[0]
+
+                            g_norm = g_mem.reshape(B, -1).norm(dim=1).detach()
+                            inner_loop_stats['inner_grad_norm_mean'] += g_norm.mean()
+                            inner_loop_stats['inner_grad_norm_max'] = max(inner_loop_stats['inner_grad_norm_max'], g_norm.max())
+                            inner_loop_stats['inner_grad_norm_min'] = min(inner_loop_stats['inner_grad_norm_min'], g_norm.min())
+
+                            if self.use_adam:
+                                mem_batch = self._adam_step(mem_batch, g_mem, opt_state.setdefault('mem', {}), k + 1, self.lr)
+                                if self.mem_proj_mode == 'per_sample':
+                                    W_batch = self._adam_step(W_batch, g_W, opt_state.setdefault('W', {}), k + 1, self.lr)
+                                    b_batch = self._adam_step(b_batch, g_b, opt_state.setdefault('b', {}), k + 1, self.lr)
+                                    raise NotImplementedError("Adam is not tested, be careful!")
+                            else:
+                                mem_batch = self._sgd_step(mem_batch, g_mem,
+                                                           clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
+                                if self.mem_proj_mode == 'per_sample':
+                                    W_batch = self._sgd_step(W_batch, g_W,
+                                                              clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
+                                    b_batch = self._sgd_step(b_batch, g_b,
+                                                              clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
+
+                            if self.grad_mode == 'none':
+                                mem_batch = mem_batch.detach().requires_grad_(True)
+                                if self.mem_proj_mode == 'per_sample':
+                                    W_batch = W_batch.detach().requires_grad_(True)
+                                    b_batch = b_batch.detach().requires_grad_(True)
+
+                        # Final forward with the refined mem_batch -> mem_out for READ
+                        if self.mem_proj_mode == 'none':
+                            mem_inp = mem_batch
+                        elif self.mem_proj_mode in ('proj', 'proj_rw'):
+                            mem_inp = self.mem_proj(mem_batch)
+                        else:  # per_sample
+                            mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
+                        if self.n_ctrl_tokens > 0:
+                            x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch,
+                                               seg_emb, write_st_batch, mem_inp], dim=1)
+                        else:
+                            x_ctx = torch.cat([mem_inp, seg_emb, mem_inp], dim=1)
+                        outs = get_backbone(self.model)(inputs_embeds=x_ctx, attention_mask=fe_attn_mask,
+                                                        position_ids=fe_position_ids, return_dict=True)
+                        mem_out_read = outs.last_hidden_state[:, -self.n_mem_tokens:, :]
+                        del outs
+
+                        total_inner_loss_detached = total_inner_loss_detached + inner_loss.detach()
+                        last_segment_inner_loss = inner_loss
+
+                        # input-refinement stat: how far the energy head moved the input
+                        # (-> 0 signals "fell back to pure RMT")
+                        input_delta = (mem_batch.detach() - mem_batch_init_seg).norm(dim=(1, 2))
+                        if 'energy_input_delta_mem_norm_mean' not in inner_loop_stats:
+                            inner_loop_stats['energy_input_delta_mem_norm_mean'] = torch.tensor(0.0, device=device)
+                            inner_loop_stats['energy_input_delta_mem_norm_max'] = torch.tensor(-1.0, device=device)
+                            inner_loop_stats['energy_input_delta_mem_norm_min'] = torch.tensor(1e06, device=device)
+                            inner_loop_stats['_n_fe_segs'] = 0
+                        inner_loop_stats['energy_input_delta_mem_norm_mean'] += input_delta.mean()
+                        inner_loop_stats['energy_input_delta_mem_norm_max'] = max(inner_loop_stats['energy_input_delta_mem_norm_max'], input_delta.max())
+                        inner_loop_stats['energy_input_delta_mem_norm_min'] = min(inner_loop_stats['energy_input_delta_mem_norm_min'], input_delta.min())
+                        inner_loop_stats['_n_fe_segs'] += 1
+
+                        n_segments_with_context += 1
+                        # downstream Hopfield STORE / last_mem_batch must use the READ memory
+                        mem_batch = mem_out_read
+
                     else:  # "forward" – RMT-style forward pass memory update
                         # Reset mem_batch to initial for each segment
                         mem_batch = self.mem.unsqueeze(0).expand(B, -1, -1).clone()  # [B,M,d]
@@ -1366,6 +1504,9 @@ class GradMemGPT(PreTrainedModel):
         if '_n_forward_steps' in inner_loop_stats and inner_loop_stats['_n_forward_steps'] > 0:
             inner_loop_stats['step_delta_mem_norm_mean'] /= inner_loop_stats['_n_forward_steps']
             del inner_loop_stats['_n_forward_steps']
+        if '_n_fe_segs' in inner_loop_stats and inner_loop_stats['_n_fe_segs'] > 0:
+            inner_loop_stats['energy_input_delta_mem_norm_mean'] /= inner_loop_stats['_n_fe_segs']
+            del inner_loop_stats['_n_fe_segs']
         if rec_losses:
             inner_loop_stats['rec_loss'] = torch.stack(rec_losses).mean().detach()
         # mem stats from last segment

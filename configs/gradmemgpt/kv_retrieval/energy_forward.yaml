@@ -1,0 +1,49 @@
+# GradMemGPT on KV-retrieval - forward_energy mode (RMT write + energy-gradient refinement).
+# The forward pass ([mem,seg,mem]) produces mem_out which always encodes the segment (so READ
+# always has useful input -> avoids the pure-energy deadlock); the energy head refines the INPUT
+# mem_batch via the second-order path. READ uses mem_out (RMT read).
+# Graceful fallback: if the energy refinement is unhelpful, energy_input_delta_mem_norm -> 0 and
+# the run reduces to pure RMT. Compare against memory_update="forward" (pure RMT) as the baseline.
+# Requires grad_mode="second".
+
+model:
+  base_model: gpt2
+  n_layer: 4
+  n_head: 4
+  n_embd: 128
+
+training:
+  per_device_batch_size: 64
+  total_batch_size: 64
+  learning_rate: 1.0e-4
+  max_steps: 1000000
+  eval_steps: 500
+  logging_steps: 500
+  warmup_steps: 10000
+  early_stopping_patience: 500
+  seed: 143
+
+dataset:
+  data_path: "./data/N4-K2V2-V62_1M"
+  tokenizer_path: "./tokenizers/kv_alphabet_62/"
+
+gradmem:
+  n_mem_tokens: 8
+  n_ctrl_tokens: 0
+  K: 2
+  last_K_second_order: 2  # full second-order (== K); energy head is trained via this path
+  inner_lr: 0.04
+  inner_clip_value: null
+  inner_clip_norm: 10.0    # carry over the stabilization that bounded mem dynamics
+  use_adam: false
+  grad_mode: "second"      # required for use_energy_inner_loss
+  use_mem_proj: false
+  mem_proj_mode: "none"
+  use_write_head: false
+  add_inner_loss_to_outer: false  # incompatible with use_energy_inner_loss
+  inner_loss_weight: 0.0
+  memory_update: forward_energy  # RMT forward write + energy refinement of the input mem_batch
+  # Learnable energy inner objective (read-out is always mem_out; n_energy_tokens unused here)
+  use_energy_inner_loss: true
+  energy_mlp_hidden_dim: null  # null -> n_embd (128)
+  energy_mlp_n_layers: 2
