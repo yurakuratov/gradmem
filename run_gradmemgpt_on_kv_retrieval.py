@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -72,6 +73,18 @@ def collate_fn(batch, tokenizer, max_context_length=None):
         },
         'labels': labels,
     }
+
+
+def tensor_batch_to_numpy(batch):
+    if isinstance(batch, dict):
+        return {key: tensor_batch_to_numpy(value) for key, value in batch.items()}
+    if isinstance(batch, torch.Tensor):
+        return batch.cpu().numpy().copy()
+    return batch
+
+
+def collate_fn_numpy(batch, tokenizer, max_context_length=None):
+    return tensor_batch_to_numpy(collate_fn(batch, tokenizer, max_context_length=max_context_length))
 
 
 def preprocess_logits_for_metrics(eval_pred, labels):
@@ -182,6 +195,11 @@ class CustomTrainer(Trainer):
     def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
         num_training_steps = int(num_training_steps / 0.9)  # to make final lr not zero, for linear it is lr/10.
         return super().create_scheduler(num_training_steps, optimizer)
+
+    def _prepare_input(self, data):
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data)
+        return super()._prepare_input(data)
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         # log early stopping patience
@@ -390,9 +408,9 @@ if __name__ == '__main__':
     logger.info(f'model.dtype: {model.dtype}')
 
     dataset = datasets.load_from_disk(args.data_path)
-
-    def data_collator(batch):
-        return collate_fn(batch, tokenizer, max_context_length=args.max_context_length)
+    # use collate_fn_numpy if no GPU is available, allows running with 'mds' device on Apple M chips
+    collator_fn = collate_fn if torch.cuda.is_available() else collate_fn_numpy
+    data_collator = partial(collator_fn, tokenizer=tokenizer, max_context_length=args.max_context_length)
 
     # Target sequence looks like: "XXXX!|"
     # Let's not count ! and | in the accuracy calculation
@@ -440,7 +458,7 @@ if __name__ == '__main__':
         include_for_metrics=['inputs'],
         save_total_limit=1,
         dataloader_num_workers=4,
-        dataloader_pin_memory=True,
+        dataloader_pin_memory=torch.cuda.is_available(),
         seed=args.seed,
     )
 

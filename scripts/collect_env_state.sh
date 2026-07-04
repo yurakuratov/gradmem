@@ -132,7 +132,7 @@ PY
   fi
 
   {
-    echo "date: $(date -Is)"
+    echo "date: $(date '+%Y-%m-%dT%H:%M:%S%z')"
     echo "host: $(hostname)"
     echo "pwd: $(pwd)"
     echo "user: $(whoami)"
@@ -263,7 +263,7 @@ finalize_locked_run() {
 # Start per-run wall-clock timer.
 start_run_timer() {
   RUN_TIMER_START_EPOCH="$(date +%s)"
-  RUN_TIMER_START_ISO="$(date -Is)"
+  RUN_TIMER_START_ISO="$(date '+%Y-%m-%dT%H:%M:%S%z')"
 }
 
 # Finish timer, write timing artifact, and expose formatted duration.
@@ -282,7 +282,7 @@ finish_run_timer() {
   local duration_dhms
 
   end_epoch="$(date +%s)"
-  end_iso="$(date -Is)"
+  end_iso="$(date '+%Y-%m-%dT%H:%M:%S%z')"
   duration_seconds=$((end_epoch - RUN_TIMER_START_EPOCH))
   duration_days=$((duration_seconds / 86400))
   duration_hours=$(((duration_seconds % 86400) / 3600))
