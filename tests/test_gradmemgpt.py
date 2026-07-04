@@ -728,6 +728,80 @@ def test_forward_prefix_energy_with_reconstruction_objective():
         assert torch.isfinite(stats[key]).item()
 
 
+@pytest.mark.forward
+@pytest.mark.all
+def test_energy_with_reconstruction_uses_shared_write_forward():
+    torch.manual_seed(0)
+
+    base_config = _build_base_config("gpt2")
+    model_config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        n_mem_tokens=4,
+        K=2,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="second",
+        use_mem_proj=False,
+        mem_proj_mode="none",
+        use_write_head=False,
+        attn_implementation="eager",
+        write_objective="energy_with_reconstruction",
+        write_reconstruction_weight=1.0,
+        write_energy_weight=0.1,
+    )
+
+    model = GradMemGPT(model_config)
+    model.eval()
+
+    call_counts = {
+        "combined": 0,
+        "reconstruction": 0,
+        "energy": 0,
+    }
+    original_combined = model._run_energy_reconstruction_write_forward
+    original_reconstruction = model._run_reconstruction_write_forward
+    original_energy = model._run_energy_write_forward
+
+    def _count_combined(write_batch):
+        call_counts["combined"] += 1
+        return original_combined(write_batch)
+
+    def _count_reconstruction(write_batch):
+        call_counts["reconstruction"] += 1
+        return original_reconstruction(write_batch)
+
+    def _count_energy(write_batch):
+        call_counts["energy"] += 1
+        return original_energy(write_batch)
+
+    model._run_energy_reconstruction_write_forward = _count_combined
+    model._run_reconstruction_write_forward = _count_reconstruction
+    model._run_energy_write_forward = _count_energy
+
+    batch_size = 2
+    ctx_len = 6
+    qry_len = 4
+    vocab_size = base_config.vocab_size
+
+    context_input_ids = torch.randint(0, vocab_size, (batch_size, ctx_len))
+    query_input_ids = torch.randint(0, vocab_size, (batch_size, qry_len))
+    labels = torch.randint(0, vocab_size, (batch_size, qry_len))
+
+    output = model(
+        {
+            "context_input_ids": context_input_ids,
+            "query_input_ids": query_input_ids,
+        },
+        labels=labels,
+    )
+
+    assert torch.isfinite(output["loss"]).item()
+    assert call_counts["combined"] == model_config.K + 1
+    assert call_counts["reconstruction"] == 0
+    assert call_counts["energy"] == 0
+
+
 @pytest.mark.one_batch_train
 @pytest.mark.all
 def test_single_batch_train_prefix_energy_with_reconstruction_objective():
