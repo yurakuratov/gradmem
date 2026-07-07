@@ -1173,6 +1173,10 @@ class GradMemGPT(PreTrainedModel):
             inner_loop_stats['learned_update_delta_norm_max'] = torch.tensor(-1.0, device=device)
             inner_loop_stats['learned_update_delta_norm_min'] = torch.tensor(1e06, device=device)
             inner_loop_stats['_n_learned_update_steps'] = 0
+            if self.learned_update_warmup_steps > 0:
+                inner_loop_stats['learned_update_target_grad_norm_mean'] = torch.tensor(0.0, device=device)
+                inner_loop_stats['learned_update_target_grad_norm_max'] = torch.tensor(-1.0, device=device)
+                inner_loop_stats['_n_learned_warmup_steps'] = 0
 
         seg_nonempty_counts = torch.zeros(B, dtype=torch.long, device=device)
         seg_nonempty_sizes = torch.zeros(B, dtype=torch.long, device=device)
@@ -1382,7 +1386,15 @@ class GradMemGPT(PreTrainedModel):
                                                                 create_graph=False, retain_graph=True)[0].detach()
                                     learned_update_imitation_losses.append(
                                         nn.functional.mse_loss(delta, g_real))
-                                    del g_real
+                                    # log the norm of the imitated target gradient, so warmup dynamics
+                                    # are diagnosable: if ‖g_real‖ itself -> 0, the head is anchored to
+                                    # a vanishing target (Story A), not failing to fit one (Story B).
+                                    g_real_norm = g_real.reshape(B, -1).norm(dim=1)
+                                    inner_loop_stats['learned_update_target_grad_norm_mean'] += g_real_norm.mean()
+                                    inner_loop_stats['learned_update_target_grad_norm_max'] = max(
+                                        inner_loop_stats['learned_update_target_grad_norm_max'], g_real_norm.max())
+                                    inner_loop_stats['_n_learned_warmup_steps'] += 1
+                                    del g_real, g_real_norm
 
                                 # apply the learned update (no autograd.grad, forward-connected)
                                 if self.learned_update_treat_as_gradient:
@@ -1865,6 +1877,9 @@ class GradMemGPT(PreTrainedModel):
         if '_n_learned_update_steps' in inner_loop_stats and inner_loop_stats['_n_learned_update_steps'] > 0:
             inner_loop_stats['learned_update_delta_norm_mean'] /= inner_loop_stats['_n_learned_update_steps']
             del inner_loop_stats['_n_learned_update_steps']
+        if '_n_learned_warmup_steps' in inner_loop_stats and inner_loop_stats['_n_learned_warmup_steps'] > 0:
+            inner_loop_stats['learned_update_target_grad_norm_mean'] /= inner_loop_stats['_n_learned_warmup_steps']
+            del inner_loop_stats['_n_learned_warmup_steps']
         if learned_update_imitation_losses:
             inner_loop_stats['learned_update_imitation_loss'] = \
                 torch.stack(learned_update_imitation_losses).mean().detach()

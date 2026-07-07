@@ -192,6 +192,17 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         metrics['gd_S_norm_max'] = float(inner_loop_stats['gd_S_norm_max'].max())
         metrics['gd_S_norm_min'] = float(inner_loop_stats['gd_S_norm_min'].min())
         metrics['gd_n_written_mean'] = float(inner_loop_stats['gd_n_written_mean'].mean())
+    if 'learned_update_delta_norm_mean' in inner_loop_stats:
+        metrics['learned_update_delta_norm_mean'] = float(inner_loop_stats['learned_update_delta_norm_mean'].mean())
+        metrics['learned_update_delta_norm_max'] = float(inner_loop_stats['learned_update_delta_norm_max'].max())
+        metrics['learned_update_delta_norm_min'] = float(inner_loop_stats['learned_update_delta_norm_min'].min())
+    if 'learned_update_target_grad_norm_mean' in inner_loop_stats:
+        # ‖g_real‖ during the imitation warmup window (key only exists while warmup is active).
+        metrics['learned_update_target_grad_norm_mean'] = float(inner_loop_stats['learned_update_target_grad_norm_mean'].mean())
+        metrics['learned_update_target_grad_norm_max'] = float(inner_loop_stats['learned_update_target_grad_norm_max'].max())
+    if 'learned_update_imitation_loss' in inner_loop_stats:
+        # MSE(delta, g_real); only present during the warmup window.
+        metrics['learned_update_imitation_loss'] = float(inner_loop_stats['learned_update_imitation_loss'].mean())
     return metrics
 
 
