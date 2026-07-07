@@ -103,6 +103,13 @@ class GradMemGPTConfig(PretrainedConfig):
                  recon_pretrain_steps=0,
                  recon_pretrain_target_weight=0.0,
                  recon_pretrain_recon_weight=1.0,
+                 use_learned_inner_update=False,
+                 n_learned_update_tokens=4,
+                 learned_update_mlp_hidden_dim=None,
+                 learned_update_mlp_n_layers=2,
+                 learned_update_treat_as_gradient=True,
+                 learned_update_final_tanh=False,
+                 learned_update_warmup_steps=0,
                  **kwargs):
         """
         Args:
@@ -175,6 +182,26 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
              gated_delta_alpha_init: float, initial value for the alpha (forget gate) head bias (sigmoid output)
              gated_delta_beta_init: float, initial value for the beta (write strength) head bias (sigmoid output)
              gated_delta_bptt_segments: int|None, number of last segments to keep in backprop graph for Gated Delta (None = all)
+             use_learned_inner_update: bool, replace the analytic inner-loop gradient (autograd.grad of the
+                 reconstruction CE) with a learned delta predicted by an MLP head from dedicated readout tokens'
+                 last-layer embeddings. The head is trained END-TO-END by the outer target_loss backpropagating
+                 through the K unrolled inner steps (like an RNN unrolled K times), NOT by imitating the real
+                 gradient. The inner step becomes a fully-forward differentiable composition, so the meta-gradient
+                 to self.mem flows at ~FOMAML cost with no backward-over-backward. The head IS the memory
+                 pathway, so it needs the meta-gradient chain -> requires grad_mode='first' or 'second' (not
+                 'none'). Mutually exclusive with use_energy_inner_loss. Requires memory_update="gradient".
+             n_learned_update_tokens: int, number of learnable readout tokens appended at the end of the WRITE
+                 context (feature width = n_learned_update_tokens * n_embd).
+             learned_update_mlp_hidden_dim: int|None, hidden width of the learned-update MLP (None = n_embd).
+             learned_update_mlp_n_layers: int, number of Linear layers in the learned-update MLP (min 1).
+             learned_update_treat_as_gradient: bool, if True the head output is fed to _sgd_step (reuses self.lr
+                 + inner_clip_*, behaves like a learned/preconditioned gradient); if False, mem = mem + delta
+                 (raw delta, maximally expressive, its own scale).
+             learned_update_final_tanh: bool, apply tanh to the head output to bound its magnitude.
+             learned_update_warmup_steps: int, if >0, during the first N outer steps additionally add an MSE
+                 imitation loss (delta vs the real reconstruction-CE gradient, both detached/grad-stopped as
+                 appropriate) to bootstrap the head near the analytic gradient; after N steps this term vanishes
+                 and the head is purely end-to-end. 0 = pure end-to-end from step 0.
          """
         super().__init__(**kwargs)
 
@@ -260,6 +287,19 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.recon_pretrain_target_weight = recon_pretrain_target_weight
         self.recon_pretrain_recon_weight = recon_pretrain_recon_weight
 
+        # Learned inner-update head (default-off). A learned MLP head predicts the
+        # memory delta directly from readout-token last-layer embeddings, replacing
+        # the analytic inner-loop gradient. Trained end-to-end by the outer loss
+        # through the unrolled K steps (no autograd.grad in the inner loop). See
+        # the docstring above for details.
+        self.use_learned_inner_update = use_learned_inner_update
+        self.n_learned_update_tokens = n_learned_update_tokens
+        self.learned_update_mlp_hidden_dim = learned_update_mlp_hidden_dim
+        self.learned_update_mlp_n_layers = learned_update_mlp_n_layers
+        self.learned_update_treat_as_gradient = learned_update_treat_as_gradient
+        self.learned_update_final_tanh = learned_update_final_tanh
+        self.learned_update_warmup_steps = learned_update_warmup_steps
+
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample", "proj_rw"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), "use_mem_proj must be True if mem_proj_mode is set"
@@ -320,6 +360,24 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
                 "energy_recon_weight requires energy_readout='energy_tokens' (Option A)"
             assert energy_recon_anneal_steps >= 0, \
                 f"energy_recon_anneal_steps must be >= 0, got {energy_recon_anneal_steps}"
+
+        # Validate learned inner-update head settings
+        if use_learned_inner_update:
+            assert memory_update == "gradient", \
+                "use_learned_inner_update requires memory_update='gradient'"
+            assert grad_mode in ("first", "second"), \
+                "use_learned_inner_update requires grad_mode='first' or 'second' (the head is the " \
+                "memory pathway, so it needs the meta-gradient chain that grad_mode='none' detaches)"
+            assert not use_energy_inner_loss, \
+                "use_learned_inner_update is mutually exclusive with use_energy_inner_loss"
+            assert not use_reconstruction_loss, \
+                "use_learned_inner_update is mutually exclusive with use_reconstruction_loss"
+            assert n_learned_update_tokens >= 1, \
+                f"n_learned_update_tokens must be >= 1, got {n_learned_update_tokens}"
+            assert learned_update_mlp_n_layers >= 1, \
+                f"learned_update_mlp_n_layers must be >= 1, got {learned_update_mlp_n_layers}"
+            assert learned_update_warmup_steps >= 0, \
+                f"learned_update_warmup_steps must be >= 0, got {learned_update_warmup_steps}"
 
         # Validate stabilized energy head settings.
         # NOTE: stabilize_energy_head is ignored when use_energy_inner_loss=False (the energy head is
@@ -474,6 +532,15 @@ class GradMemGPT(PreTrainedModel):
         self.stabilize_energy_head = config.stabilize_energy_head
         self.energy_out_scale = config.energy_out_scale
 
+        # Learned inner-update head config (see GradMemGPTConfig docstring).
+        self.use_learned_inner_update = config.use_learned_inner_update
+        self.n_learned_update_tokens = config.n_learned_update_tokens
+        self.learned_update_mlp_hidden_dim = config.learned_update_mlp_hidden_dim
+        self.learned_update_mlp_n_layers = config.learned_update_mlp_n_layers
+        self.learned_update_treat_as_gradient = config.learned_update_treat_as_gradient
+        self.learned_update_final_tanh = config.learned_update_final_tanh
+        self.learned_update_warmup_steps = config.learned_update_warmup_steps
+
         # current outer-loop step, stamped by the trainer before forward (for the recon schedule)
         self.current_train_step = 0
 
@@ -556,6 +623,30 @@ class GradMemGPT(PreTrainedModel):
                     if i < self.energy_mlp_n_layers - 1:
                         energy_layers.append(nn.GELU())
                 self.energy_mlp = nn.Sequential(*energy_layers)
+
+        # Learned inner-update head: predicts the memory delta directly from
+        # readout-token last-layer embeddings, replacing the analytic inner-loop
+        # gradient. Layout mirrors energy Option A: [ctrl?, mem, ctrl?, seg, readout].
+        # The head is trained end-to-end by the outer loss through the unrolled K
+        # steps (no autograd.grad in the inner loop), so the meta-gradient to
+        # self.mem flows forward-only at ~FOMAML cost.
+        if self.use_learned_inner_update:
+            self.learned_update_tokens = nn.Parameter(
+                torch.randn(self.n_learned_update_tokens, n_embd) * 0.02)
+            in_dim = self.n_learned_update_tokens * n_embd
+            self.learned_update_in_dim = in_dim
+            out_dim = self.n_mem_tokens * n_embd
+            hid = self.learned_update_mlp_hidden_dim if self.learned_update_mlp_hidden_dim is not None else n_embd
+            update_layers = []
+            for i in range(self.learned_update_mlp_n_layers):
+                layer_in = in_dim if i == 0 else hid
+                layer_out = out_dim if i == self.learned_update_mlp_n_layers - 1 else hid
+                update_layers.append(nn.Linear(layer_in, layer_out))
+                if i < self.learned_update_mlp_n_layers - 1:
+                    update_layers.append(nn.GELU())
+            if self.learned_update_final_tanh:
+                update_layers.append(nn.Tanh())
+            self.learned_update_head = nn.Sequential(*update_layers)
 
         # Hopfield-like external memory
         self.use_hopfield_memory = getattr(config, "use_hopfield_memory", False)
@@ -1077,11 +1168,17 @@ class GradMemGPT(PreTrainedModel):
         inner_loop_stats = {'inner_grad_norm_mean': torch.tensor(0.0, device=device),
                             'inner_grad_norm_max': torch.tensor(-1.0, device=device),
                             'inner_grad_norm_min': torch.tensor(1e06, device=device)}
+        if self.use_learned_inner_update:
+            inner_loop_stats['learned_update_delta_norm_mean'] = torch.tensor(0.0, device=device)
+            inner_loop_stats['learned_update_delta_norm_max'] = torch.tensor(-1.0, device=device)
+            inner_loop_stats['learned_update_delta_norm_min'] = torch.tensor(1e06, device=device)
+            inner_loop_stats['_n_learned_update_steps'] = 0
 
         seg_nonempty_counts = torch.zeros(B, dtype=torch.long, device=device)
         seg_nonempty_sizes = torch.zeros(B, dtype=torch.long, device=device)
 
         rec_losses = []
+        learned_update_imitation_losses = []  # MSE(delta, g_real) terms during learned-update warmup
 
         # energy+recon (Option A) accumulators
         energy_recon_detached = torch.tensor(0.0, device=device)
@@ -1147,6 +1244,8 @@ class GradMemGPT(PreTrainedModel):
                         if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
                             _extra = self.n_energy_tokens if (self.use_energy_inner_loss
                                                               and self.energy_readout == "energy_tokens") else 0
+                            if self.use_learned_inner_update:
+                                _extra += self.n_learned_update_tokens
                             _fixed_len = mem_offset + _extra
                             seg_pad_len = -(seg_emb.size(1) + _fixed_len) % 32
                             seg_pad_list = [0, seg_pad_len, 0, 0]
@@ -1180,6 +1279,10 @@ class GradMemGPT(PreTrainedModel):
                             if self.use_energy_inner_loss:  # Option A: energy tokens at the end
                                 cur_energy_attn_mask = torch.ones(B, self.n_energy_tokens, dtype=torch.long, device=device)
                                 cur_attn_mask = torch.cat([cur_attn_mask, cur_energy_attn_mask], dim=1)
+                            if self.use_learned_inner_update:  # readout tokens at the end
+                                cur_readout_attn_mask = torch.ones(B, self.n_learned_update_tokens,
+                                                                   dtype=torch.long, device=device)
+                                cur_attn_mask = torch.cat([cur_attn_mask, cur_readout_attn_mask], dim=1)
                         # clamp to 0: masked (pad) positions preceding the first real token would
                         # otherwise yield position_id = -1 (cumsum-1), which is out of range for the
                         # position-embedding gather. Real tokens keep their natural positions; clamped
@@ -1216,6 +1319,88 @@ class GradMemGPT(PreTrainedModel):
                                 mem_inp = self.mem_proj(mem_batch)
                             else:  # per-sample
                                 mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
+
+                            if self.use_learned_inner_update:
+                                # Learned inner-update branch: an MLP head predicts the memory delta
+                                # directly from readout-token last-layer embeddings. No autograd.grad
+                                # is used to update mem_batch; the update is a fully-forward
+                                # differentiable composition, so the outer loss backpropagates through
+                                # the K unrolled steps to self.mem and the head at ~FOMAML cost.
+                                # Layout mirrors energy Option A: [ctrl?, mem, ctrl?, seg, readout].
+                                readout_tok = self.learned_update_tokens.unsqueeze(0).expand(B, -1, -1)
+                                if self.n_ctrl_tokens > 0:
+                                    x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch,
+                                                       cur_seg_emb, readout_tok], dim=1)
+                                else:
+                                    x_ctx = torch.cat([mem_inp, cur_seg_emb, readout_tok], dim=1)
+                                outs = get_backbone(self.model)(inputs_embeds=x_ctx, attention_mask=cur_attn_mask,
+                                                                position_ids=cur_position_ids, return_dict=True)
+                                h = outs.last_hidden_state
+                                # Readout features -> predicted delta (carries graph to mem/head).
+                                phi = h[:, -self.n_learned_update_tokens:, :].reshape(B, -1)   # [B, in_dim]
+                                delta = self.learned_update_head(phi)                           # [B, M*d]
+                                delta = delta.reshape(B, self.n_mem_tokens, -1)                 # [B, M, d]
+
+                                # Reconstruction CE on the segment (mem is a prefix, so the segment
+                                # attends to mem -> recon has a graph to mem_batch). Reused for both
+                                # the detached stat inner_loss and the optional imitation warmup.
+                                h_seg = h[:, mem_offset - 1:-self.n_learned_update_tokens, :]
+                                if self.use_write_head:
+                                    rec_logits = self.write_head(h_seg)
+                                else:
+                                    rec_logits = self.model.get_output_embeddings()(h_seg)
+                                recon = nn.functional.cross_entropy(
+                                    rec_logits[:, :-1].reshape(-1, rec_logits.size(-1)),
+                                    cur_seg_labels.reshape(-1),
+                                    ignore_index=-100, reduction='none',
+                                ).view(B, -1)
+                                recon = (recon * cur_seg_mask).sum(1) / seg_seq_len
+                                recon = recon.sum()                  # scalar, graph-connected to mem_batch
+                                inner_loss = recon.detach()          # stat only (no grad used here)
+                                del outs, h, h_seg, rec_logits
+
+                                # track delta norm (analogous to inner_grad_norm)
+                                delta_norm = delta.reshape(B, -1).norm(dim=1).detach()
+                                inner_loop_stats['learned_update_delta_norm_mean'] += delta_norm.mean()
+                                inner_loop_stats['learned_update_delta_norm_max'] = max(
+                                    inner_loop_stats['learned_update_delta_norm_max'], delta_norm.max())
+                                inner_loop_stats['learned_update_delta_norm_min'] = min(
+                                    inner_loop_stats['learned_update_delta_norm_min'], delta_norm.min())
+                                inner_loop_stats['_n_learned_update_steps'] += 1
+
+                                # Optional imitation warmup: regress delta toward the real
+                                # reconstruction-CE gradient (detached target). Only during the first
+                                # learned_update_warmup_steps outer steps; collected into
+                                # learned_update_imitation_losses and added to the outer loss. After
+                                # warmup this term vanishes and the head is purely end-to-end.
+                                # NOTE: retain_graph=True is required because `recon` and `delta` share
+                                # the same backbone forward graph; freeing it here would break the
+                                # later loss.backward() through delta.
+                                if self.learned_update_warmup_steps > 0 and \
+                                        self.current_train_step < self.learned_update_warmup_steps:
+                                    g_real = torch.autograd.grad(recon, mem_batch,
+                                                                create_graph=False, retain_graph=True)[0].detach()
+                                    learned_update_imitation_losses.append(
+                                        nn.functional.mse_loss(delta, g_real))
+                                    del g_real
+
+                                # apply the learned update (no autograd.grad, forward-connected)
+                                if self.learned_update_treat_as_gradient:
+                                    mem_batch = self._sgd_step(mem_batch, delta,
+                                                               clip_value=self.inner_clip_value,
+                                                               clip_norm=self.inner_clip_norm)
+                                else:
+                                    mem_batch = mem_batch + delta
+
+                                # per-step detach in "none" mode preserves semantics (only head trains)
+                                if self.grad_mode in ['none']:
+                                    mem_batch = mem_batch.detach().requires_grad_(True)
+                                    if self.mem_proj_mode == "per_sample":
+                                        W_batch = W_batch.detach().requires_grad_(True)
+                                        b_batch = b_batch.detach().requires_grad_(True)
+
+                                total_inner_steps += 1
+                                continue  # skip the autograd.grad + SGD step below
 
                             if self.use_energy_inner_loss:
                                 if self.energy_readout == "mem_tokens":
@@ -1677,6 +1862,12 @@ class GradMemGPT(PreTrainedModel):
         if '_n_fe_segs' in inner_loop_stats and inner_loop_stats['_n_fe_segs'] > 0:
             inner_loop_stats['energy_input_delta_mem_norm_mean'] /= inner_loop_stats['_n_fe_segs']
             del inner_loop_stats['_n_fe_segs']
+        if '_n_learned_update_steps' in inner_loop_stats and inner_loop_stats['_n_learned_update_steps'] > 0:
+            inner_loop_stats['learned_update_delta_norm_mean'] /= inner_loop_stats['_n_learned_update_steps']
+            del inner_loop_stats['_n_learned_update_steps']
+        if learned_update_imitation_losses:
+            inner_loop_stats['learned_update_imitation_loss'] = \
+                torch.stack(learned_update_imitation_losses).mean().detach()
         if rec_losses:
             inner_loop_stats['rec_loss'] = torch.stack(rec_losses).mean().detach()
         # mem stats from last segment
@@ -1925,5 +2116,11 @@ class GradMemGPT(PreTrainedModel):
             combined_loss = tw * target_loss + pretrain_recon_term
         else:
             combined_loss = tw * target_loss
+        # Learned inner-update imitation warmup (default-off). During the first
+        # learned_update_warmup_steps outer steps, add the MSE(delta, g_real)
+        # bootstrap term collected in the WRITE loop. After warmup the list is
+        # empty and this is a no-op.
+        if learned_update_imitation_losses:
+            combined_loss = combined_loss + torch.stack(learned_update_imitation_losses).mean()
         output['loss'] = combined_loss
         return output

@@ -359,6 +359,14 @@ class ExperimentArgs:
     recon_pretrain_steps: Optional[int] = field(default=0)
     recon_pretrain_target_weight: Optional[float] = field(default=0.0)
     recon_pretrain_recon_weight: Optional[float] = field(default=1.0)
+    # Learned inner-update head (default-off)
+    use_learned_inner_update: Optional[bool] = field(default=False)
+    n_learned_update_tokens: Optional[int] = field(default=4)
+    learned_update_mlp_hidden_dim: Optional[int] = field(default=None)
+    learned_update_mlp_n_layers: Optional[int] = field(default=2)
+    learned_update_treat_as_gradient: Optional[bool] = field(default=True)
+    learned_update_final_tanh: Optional[bool] = field(default=False)
+    learned_update_warmup_steps: Optional[int] = field(default=0)
     # Curriculum learning parameters
     curriculum_enabled: Optional[bool] = field(default=False)
     curriculum_threshold: Optional[float] = field(default=0.95)
@@ -521,7 +529,14 @@ def main(config_path: Optional[str] = None):
         energy_out_scale=args.energy_out_scale,
         recon_pretrain_steps=args.recon_pretrain_steps,
         recon_pretrain_target_weight=args.recon_pretrain_target_weight,
-        recon_pretrain_recon_weight=args.recon_pretrain_recon_weight
+        recon_pretrain_recon_weight=args.recon_pretrain_recon_weight,
+        use_learned_inner_update=args.use_learned_inner_update,
+        n_learned_update_tokens=args.n_learned_update_tokens,
+        learned_update_mlp_hidden_dim=args.learned_update_mlp_hidden_dim,
+        learned_update_mlp_n_layers=args.learned_update_mlp_n_layers,
+        learned_update_treat_as_gradient=args.learned_update_treat_as_gradient,
+        learned_update_final_tanh=args.learned_update_final_tanh,
+        learned_update_warmup_steps=args.learned_update_warmup_steps
     )
 
     # Create gradmemgpt model

@@ -1,0 +1,58 @@
+# GradMemGPT on KV-retrieval - learned inner-update head.
+# Instead of the analytic inner-loop gradient (autograd.grad of reconstruction
+# CE), a learned MLP head predicts the memory delta directly from readout-token
+# last-layer embeddings. The head is trained END-TO-END by the outer target_loss
+# backpropagating through the K unrolled inner steps (no autograd.grad in the
+# inner loop), so the meta-gradient to self.mem flows forward-only at ~FOMAML
+# cost. Mutually exclusive with use_energy_inner_loss. Requires memory_update="gradient".
+#
+# The head IS the memory pathway, so it needs the meta-gradient chain;
+# grad_mode must be "first" or "second" (not "none"). "first" is the cheap
+# default: the inner step is already differentiable forward-only, so the
+# second-order (backward-over-backward) term is unnecessary.
+
+model:
+  base_model: gpt2
+  n_layer: 4
+  n_head: 4
+  n_embd: 128
+
+training:
+  per_device_batch_size: 64
+  total_batch_size: 64
+  learning_rate: 1.0e-4
+  max_steps: 1000000
+  eval_steps: 500
+  logging_steps: 500
+  warmup_steps: 10000
+  early_stopping_patience: 500
+  seed: 143
+
+dataset:
+  data_path: "./data/N4-K2V2-V62_1M"
+  tokenizer_path: "./tokenizers/kv_alphabet_62/"
+
+gradmem:
+  n_mem_tokens: 8
+  n_ctrl_tokens: 0
+  K: 2
+  inner_lr: 0.04
+  inner_clip_value: null
+  inner_clip_norm: null
+  use_adam: false
+  grad_mode: "first"        # forward-only meta-gradient; no backward-over-backward needed
+  last_K_second_order: 0    # inert under grad_mode!="second"
+  use_mem_proj: false
+  mem_proj_mode: "none"
+  use_write_head: true
+  add_inner_loss_to_outer: false  # the head is the inner update, not the CE loss
+  inner_loss_weight: 0.0
+  memory_update: gradient   # required for use_learned_inner_update
+  # Learned inner-update head
+  use_learned_inner_update: true
+  n_learned_update_tokens: 4
+  learned_update_mlp_hidden_dim: null  # null -> n_embd (128)
+  learned_update_mlp_n_layers: 2
+  learned_update_treat_as_gradient: true  # head output feeds _sgd_step (reuses inner_lr + inner_clip_*)
+  learned_update_final_tanh: false
+  learned_update_warmup_steps: 0   # 0 = pure end-to-end from step 0
