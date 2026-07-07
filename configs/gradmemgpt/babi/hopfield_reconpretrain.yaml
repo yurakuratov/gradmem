@@ -1,0 +1,70 @@
+# GradMemGPT with Hopfield memory + reconstruction-only pretrain warmup.
+#
+# Hypothesis: on noisy babilong (qa3_4k), the WRITE pathway (self.mem, write_head,
+# backbone) is undertrained because the inner-loop reconstruction objective is
+# dominated by PG19 noise segments. A recon-only pretrain phase down-weights the
+# READ (target) loss and up-weights the inner reconstruction loss for the first
+# `recon_pretrain_steps` steps, then linearly anneals both to their normal values.
+#
+# Compare exact_match against hopfield.yaml to test whether recon-pretraining
+# helps the model break past the ~0.2 ceiling. Also watch inner_loss_seg_min
+# (Part 1 diagnostic): if it is near the facts-only loss (~0.6), the WRITE
+# pathway is fine and the bottleneck is retrieval/READ, not reconstruction.
+
+model:
+  pretrained_model: gpt2
+
+training:
+  auto_find_batch_size: false
+  per_device_batch_size: 2
+  total_batch_size: 2
+  learning_rate: 1.0e-4
+  max_steps: 1000000
+  eval_steps: 250
+  logging_steps: 250
+  warmup_steps: 10000
+  early_stopping_patience: 50
+  seed: 143
+
+dataset:
+  data_name: "babilong_qa3_4k"
+  data_path: "./data/babilong_qa3_4k"
+  tokenizer_path: "./tokenizers/kv_alphabet_62/"
+
+gradmem:
+  n_mem_tokens: 8
+  n_ctrl_tokens: 0
+  K: 2
+  last_K_second_order: null
+  inner_lr: 0.04
+  inner_clip_value: null
+  inner_clip_norm: null
+  use_adam: false
+  grad_mode: "second"
+  use_mem_proj: false
+  mem_proj_mode: "none"
+  use_write_head: true
+  add_inner_loss_to_outer: true
+  inner_loss_weight: 0.5
+  memory_update: gradient  # gradient | forward (RMT style)
+  # RMT forward
+  use_mem_residual: false  # for RMT
+  use_reconstruction_loss: false  # reconstruction loss for RMT
+  reconstruction_loss_weight: 1.0
+  # Reconstruction-only pretrain warmup
+  recon_pretrain_steps: 5000        # steps of recon-first warmup (then linear ramp to normal)
+  recon_pretrain_target_weight: 0.0 # target-loss weight at step 0 (0 = pure reconstruction)
+  recon_pretrain_recon_weight: 1.0  # extra weight on inner reconstruction loss at step 0
+
+hopfield:
+  use_hopfield_memory: true
+  hopfield_n_segments: 1
+  hopfield_segment_size: 32
+  hopfield_retrieval_mode: raw  # raw | softmax | beta_softmax | mean
+  hopfield_beta_init: 1.0
+  use_separate_hopfield_mem: true  # use separate M_0 values for value, key and query memory tokens
+  hopfield_proj_dim: 128  # if null use M*d key/query size, otherwise add learnable key/query linear projections
+  hopfield_direct_query: false  # use only meta-learned query vector, skip forward pass for query
+  hopfield_value_as_key: false  # skip forward pass for key, use value_pattern or its projection as key
+  hopfield_value_proj_dim: null  # value projection dim in Hopfield STORE/RETRIEVE (null = disabled, M*d = identity init)
+  hopfield_bptt_segments: 1  # number of last segments to keep in BPTT graph (null = all segments)

@@ -149,6 +149,13 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         metrics['energy_recon'] = float(inner_loop_stats['energy_recon'].mean())
     if 'energy_recon_weight' in inner_loop_stats:
         metrics['energy_recon_weight'] = float(inner_loop_stats['energy_recon_weight'].mean())
+    if 'inner_loss_seg_min' in inner_loop_stats:
+        metrics['inner_loss_seg_min'] = float(inner_loop_stats['inner_loss_seg_min'].mean())
+        metrics['inner_loss_seg_max'] = float(inner_loop_stats['inner_loss_seg_max'].mean())
+    if 'recon_pretrain_target_weight' in inner_loop_stats:
+        metrics['recon_pretrain_target_weight'] = float(inner_loop_stats['recon_pretrain_target_weight'].mean())
+    if 'recon_pretrain_recon_weight' in inner_loop_stats:
+        metrics['recon_pretrain_recon_weight'] = float(inner_loop_stats['recon_pretrain_recon_weight'].mean())
     if 'energy_input_delta_mem_norm_mean' in inner_loop_stats:
         metrics['energy_input_delta_mem_norm_mean'] = float(inner_loop_stats['energy_input_delta_mem_norm_mean'].mean())
         metrics['energy_input_delta_mem_norm_max'] = float(inner_loop_stats['energy_input_delta_mem_norm_max'].max())
@@ -348,6 +355,10 @@ class ExperimentArgs:
     energy_recon_anneal_steps: Optional[int] = field(default=0)
     stabilize_energy_head: Optional[bool] = field(default=True)
     energy_out_scale: Optional[float] = field(default=1.0)
+    # Reconstruction-only pretrain warmup (default-off)
+    recon_pretrain_steps: Optional[int] = field(default=0)
+    recon_pretrain_target_weight: Optional[float] = field(default=0.0)
+    recon_pretrain_recon_weight: Optional[float] = field(default=1.0)
     # Curriculum learning parameters
     curriculum_enabled: Optional[bool] = field(default=False)
     curriculum_threshold: Optional[float] = field(default=0.95)
@@ -507,7 +518,10 @@ def main(config_path: Optional[str] = None):
         energy_recon_weight_end=args.energy_recon_weight_end,
         energy_recon_anneal_steps=args.energy_recon_anneal_steps,
         stabilize_energy_head=args.stabilize_energy_head,
-        energy_out_scale=args.energy_out_scale
+        energy_out_scale=args.energy_out_scale,
+        recon_pretrain_steps=args.recon_pretrain_steps,
+        recon_pretrain_target_weight=args.recon_pretrain_target_weight,
+        recon_pretrain_recon_weight=args.recon_pretrain_recon_weight
     )
 
     # Create gradmemgpt model

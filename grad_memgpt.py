@@ -100,6 +100,9 @@ class GradMemGPTConfig(PretrainedConfig):
                  gated_delta_alpha_init=0.9,
                  gated_delta_beta_init=0.5,
                  gated_delta_bptt_segments=None,
+                 recon_pretrain_steps=0,
+                 recon_pretrain_target_weight=0.0,
+                 recon_pretrain_recon_weight=1.0,
                  **kwargs):
         """
         Args:
@@ -245,6 +248,17 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.gated_delta_alpha_init = gated_delta_alpha_init
         self.gated_delta_beta_init = gated_delta_beta_init
         self.gated_delta_bptt_segments = gated_delta_bptt_segments
+
+        # Reconstruction-only pretrain warmup (default-off). During the first
+        # `recon_pretrain_steps` outer steps the target (READ) loss is scaled by
+        # recon_pretrain_target_weight (e.g. 0 -> pure-reconstruction pretrain)
+        # and the inner-loop reconstruction loss is up-weighted by
+        # recon_pretrain_recon_weight. Both weights linearly ramp to their
+        # normal values over recon_pretrain_steps (driven by current_train_step,
+        # stamped via CustomTrainer.compute_loss -> set_train_step).
+        self.recon_pretrain_steps = recon_pretrain_steps
+        self.recon_pretrain_target_weight = recon_pretrain_target_weight
+        self.recon_pretrain_recon_weight = recon_pretrain_recon_weight
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample", "proj_rw"]
@@ -603,6 +617,11 @@ class GradMemGPT(PreTrainedModel):
         self.gated_delta_beta_init = getattr(config, "gated_delta_beta_init", 0.5)
         self.gated_delta_bptt_segments = getattr(config, "gated_delta_bptt_segments", None)
 
+        # Reconstruction-only pretrain warmup (default-off)
+        self.recon_pretrain_steps = getattr(config, "recon_pretrain_steps", 0)
+        self.recon_pretrain_target_weight = getattr(config, "recon_pretrain_target_weight", 0.0)
+        self.recon_pretrain_recon_weight = getattr(config, "recon_pretrain_recon_weight", 1.0)
+
         if self.use_gated_delta_memory:
             pattern_dim = self.n_mem_tokens * n_embd  # M*d
             d = self.gated_delta_state_dim
@@ -668,6 +687,26 @@ class GradMemGPT(PreTrainedModel):
             dir_n = self.energy_dir / (self.energy_dir.norm() + 1e-8)   # unit-norm read-out direction
             return (h * dir_n).sum(-1) * self.energy_out_scale + self.energy_bias.squeeze(0)
         return self.energy_mlp(energy_h).squeeze(-1)
+
+    def _recon_pretrain_target_weight_now(self):
+        # Target-loss weight schedule for the reconstruction-only pretrain warmup.
+        # = recon_pretrain_target_weight at step 0, linearly ramping to 1.0 over
+        # recon_pretrain_steps, then constant at 1.0. When recon_pretrain_steps
+        # <= 0 the schedule is disabled (always returns 1.0).
+        if self.recon_pretrain_steps <= 0:
+            return 1.0
+        frac = min(self.current_train_step / self.recon_pretrain_steps, 1.0)
+        return self.recon_pretrain_target_weight + (1.0 - self.recon_pretrain_target_weight) * frac
+
+    def _recon_pretrain_recon_weight_now(self):
+        # Reconstruction-loss weight during the pretrain warmup:
+        # = recon_pretrain_recon_weight at step 0, linearly ramping to 0.0 over
+        # recon_pretrain_steps, then constant at 0.0 (i.e. after pretrain the
+        # normal inner-loss term, gated by add_inner_loss_to_outer, takes over).
+        if self.recon_pretrain_steps <= 0:
+            return 0.0
+        frac = min(self.current_train_step / self.recon_pretrain_steps, 1.0)
+        return self.recon_pretrain_recon_weight * (1.0 - frac)
 
     def tie_weights(self):
         self.model.tie_weights()
@@ -1029,6 +1068,12 @@ class GradMemGPT(PreTrainedModel):
         total_inner_steps = 0
         n_segments_with_context = 0
 
+        # Per-segment inner-loss diagnostics: track the batch-mean inner loss of
+        # each processed segment to report min/mean/max across segments. A low
+        # min (≈ facts-only loss) under noise means some segments reconstruct
+        # well -> the bottleneck is retrieval/READ, not the WRITE pathway.
+        seg_inner_losses = []  # list of per-segment batch-mean (detached) scalars
+
         inner_loop_stats = {'inner_grad_norm_mean': torch.tensor(0.0, device=device),
                             'inner_grad_norm_max': torch.tensor(-1.0, device=device),
                             'inner_grad_norm_min': torch.tensor(1e06, device=device)}
@@ -1304,6 +1349,8 @@ class GradMemGPT(PreTrainedModel):
                         total_inner_loss_detached = total_inner_loss_detached + inner_loss.detach()
                         last_segment_inner_loss = inner_loss
                         n_segments_with_context += 1
+                        # Per-segment diagnostic: batch-mean inner loss (last K-step).
+                        seg_inner_losses.append((inner_loss.detach() / B))
 
                     elif self.memory_update == "forward_energy":
                         # RMT forward write + energy-gradient refinement of the INPUT mem_batch.
@@ -1421,6 +1468,7 @@ class GradMemGPT(PreTrainedModel):
 
                         total_inner_loss_detached = total_inner_loss_detached + inner_loss.detach()
                         last_segment_inner_loss = inner_loss
+                        seg_inner_losses.append((inner_loss.detach() / B))
 
                         # input-refinement stat: how far the energy head moved the input
                         # (-> 0 signals "fell back to pure RMT")
@@ -1610,6 +1658,15 @@ class GradMemGPT(PreTrainedModel):
                 inner_loop_stats['inner_loss'] = (total_inner_loss_detached / n_segments_with_context) / B
                 if self.use_energy_inner_loss:
                     inner_loop_stats['energy'] = inner_loop_stats['inner_loss']
+        # Per-segment inner-loss diagnostics (batch-mean per segment).
+        # inner_loss_seg_min: the best-reconstructing segment's loss. Under
+        # noise, a value near the facts-only loss (~0.6) means the WRITE pathway
+        # is fine and the bottleneck is downstream (retrieval/READ); a value
+        # near the mean (~4) means even facts fail to reconstruct.
+        if seg_inner_losses:
+            seg_losses_stack = torch.stack(seg_inner_losses)
+            inner_loop_stats['inner_loss_seg_min'] = seg_losses_stack.min().detach()
+            inner_loop_stats['inner_loss_seg_max'] = seg_losses_stack.max().detach()
         if n_energy_recon_steps > 0:
             inner_loop_stats['energy_recon'] = (energy_recon_detached / n_energy_recon_steps) / B
         if energy_recon_weight_now is not None:
@@ -1841,11 +1898,32 @@ class GradMemGPT(PreTrainedModel):
         )
 
         output['inner_loop_stats']['target_loss'] = target_loss.detach()
+
+        # Reconstruction-only pretrain warmup (default-off: both weights are
+        # inert when recon_pretrain_steps <= 0 -> tw=1.0, recon_pre_w=0.0).
+        # During pretrain the READ (target) loss is down-weighted and the
+        # inner-loop reconstruction loss (last-segment, graph-connected) is
+        # up-weighted; both ramp linearly to their normal values over
+        # recon_pretrain_steps. This reuses the existing last-segment inner-loss
+        # graph (see retain_graph logic above) so no extra graphs are retained.
+        tw = self._recon_pretrain_target_weight_now()
+        recon_pre_w = self._recon_pretrain_recon_weight_now()
+        pretrain_recon_term = recon_pre_w * (last_segment_inner_loss / B) \
+            if (recon_pre_w > 0 and last_segment_inner_loss is not None) else 0.0
+        output['inner_loop_stats']['recon_pretrain_target_weight'] = torch.tensor(float(tw), device=device)
+        output['inner_loop_stats']['recon_pretrain_recon_weight'] = torch.tensor(float(recon_pre_w), device=device)
+
         if self.add_inner_loss_to_outer and last_segment_inner_loss is not None:
-            combined_loss = target_loss + self.inner_loss_weight * last_segment_inner_loss / B
+            combined_loss = tw * target_loss + \
+                (self.inner_loss_weight + recon_pre_w) * last_segment_inner_loss / B
         elif self.use_reconstruction_loss and rec_losses:
-            combined_loss = target_loss + self.reconstruction_loss_weight * torch.stack(rec_losses).mean()
+            combined_loss = tw * target_loss + \
+                (self.reconstruction_loss_weight + recon_pre_w) * torch.stack(rec_losses).mean()
+        elif recon_pre_w > 0 and last_segment_inner_loss is not None:
+            # Pretrain active but neither add_inner_loss_to_outer nor
+            # use_reconstruction_loss is on: still apply the pretrain recon term.
+            combined_loss = tw * target_loss + pretrain_recon_term
         else:
-            combined_loss = target_loss
+            combined_loss = tw * target_loss
         output['loss'] = combined_loss
         return output
