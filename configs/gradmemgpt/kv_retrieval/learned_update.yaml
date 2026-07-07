@@ -56,3 +56,10 @@ gradmem:
   learned_update_treat_as_gradient: true  # head output feeds _sgd_step (reuses inner_lr + inner_clip_*)
   learned_update_final_tanh: false
   learned_update_warmup_steps: 0   # 0 = pure end-to-end from step 0
+  # Normalize the head's delta to per-sample unit norm over M*d. Removes the
+  # task-irrelevant magnitude DOF (GPT2 ln_1 normalizes mem-token embeddings
+  # before attention, so magnitude barely affects target_loss and would otherwise
+  # drift unbounded). Per-sample step magnitude then equals inner_lr exactly,
+  # total displacement is bounded by K*inner_lr, and the warmup target is also
+  # normalized so imitation matches directions.
+  learned_update_normalize: true

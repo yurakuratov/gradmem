@@ -110,6 +110,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  learned_update_treat_as_gradient=True,
                  learned_update_final_tanh=False,
                  learned_update_warmup_steps=0,
+                 learned_update_normalize=False,
                  **kwargs):
         """
         Args:
@@ -202,6 +203,13 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
                  imitation loss (delta vs the real reconstruction-CE gradient, both detached/grad-stopped as
                  appropriate) to bootstrap the head near the analytic gradient; after N steps this term vanishes
                  and the head is purely end-to-end. 0 = pure end-to-end from step 0.
+             learned_update_normalize: bool, L2-normalize the head's delta to unit norm per sample over the
+                 full M*d vector before applying the update. Removes the task-irrelevant magnitude degree of
+                 freedom (GPT2's ln_1 normalizes mem-token embeddings before attention, so magnitude barely
+                 affects target_loss and would otherwise drift unbounded). Per-sample step magnitude then
+                 equals self.lr exactly (under learned_update_treat_as_gradient), and total displacement is
+                 bounded by K*lr. When on, the imitation warmup target is also normalized so warmup matches
+                 directions. Same unidentifiable-scale rationale as stabilize_energy_head.
          """
         super().__init__(**kwargs)
 
@@ -299,6 +307,7 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.learned_update_treat_as_gradient = learned_update_treat_as_gradient
         self.learned_update_final_tanh = learned_update_final_tanh
         self.learned_update_warmup_steps = learned_update_warmup_steps
+        self.learned_update_normalize = learned_update_normalize
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample", "proj_rw"]
@@ -540,6 +549,7 @@ class GradMemGPT(PreTrainedModel):
         self.learned_update_treat_as_gradient = config.learned_update_treat_as_gradient
         self.learned_update_final_tanh = config.learned_update_final_tanh
         self.learned_update_warmup_steps = config.learned_update_warmup_steps
+        self.learned_update_normalize = config.learned_update_normalize
 
         # current outer-loop step, stamped by the trainer before forward (for the recon schedule)
         self.current_train_step = 0
@@ -1345,6 +1355,19 @@ class GradMemGPT(PreTrainedModel):
                                 delta = self.learned_update_head(phi)                           # [B, M*d]
                                 delta = delta.reshape(B, self.n_mem_tokens, -1)                 # [B, M, d]
 
+                                # Remove the task-irrelevant magnitude DOF: per-sample unit-norm delta.
+                                # Differentiable: the Jacobian (I - d̂ d̂ᵀ)/‖delta‖ projects the radial
+                                # component out of the head's gradient too, forcing the head to learn only
+                                # the direction that affects the task (GPT2's ln_1 normalizes mem-token
+                                # embeddings before attention, so magnitude barely affects target_loss and
+                                # would otherwise drift unbounded). Applied once here so the stat, the
+                                # warmup MSE, and the update step all see the same normalized delta. Per-
+                                # sample step magnitude then equals self.lr exactly (inner_clip_norm is a
+                                # harmless no-op once ‖delta‖=1).
+                                if self.learned_update_normalize:
+                                    reduce_dims = tuple(range(1, delta.ndim))   # per-sample over M·d
+                                    delta = delta / (delta.norm(dim=reduce_dims, keepdim=True) + 1e-8)
+
                                 # Reconstruction CE on the segment (mem is a prefix, so the segment
                                 # attends to mem -> recon has a graph to mem_batch). Reused for both
                                 # the detached stat inner_loss and the optional imitation warmup.
@@ -1384,11 +1407,16 @@ class GradMemGPT(PreTrainedModel):
                                         self.current_train_step < self.learned_update_warmup_steps:
                                     g_real = torch.autograd.grad(recon, mem_batch,
                                                                 create_graph=False, retain_graph=True)[0].detach()
+                                    if self.learned_update_normalize:
+                                        # Magnitude is declared task-irrelevant: match directions only.
+                                        _rd = tuple(range(1, g_real.ndim))   # per-sample over M·d
+                                        g_real = g_real / (g_real.norm(dim=_rd, keepdim=True) + 1e-8)
                                     learned_update_imitation_losses.append(
                                         nn.functional.mse_loss(delta, g_real))
                                     # log the norm of the imitated target gradient, so warmup dynamics
-                                    # are diagnosable: if ‖g_real‖ itself -> 0, the head is anchored to
-                                    # a vanishing target (Story A), not failing to fit one (Story B).
+                                    # are diagnosable: if ‖g_real‖ itself -> 0 (without normalization),
+                                    # the head is anchored to a vanishing target (Story A), not failing to
+                                    # fit one (Story B). Under normalization this reads ~1.0 by construction.
                                     g_real_norm = g_real.reshape(B, -1).norm(dim=1)
                                     inner_loop_stats['learned_update_target_grad_norm_mean'] += g_real_norm.mean()
                                     inner_loop_stats['learned_update_target_grad_norm_max'] = max(

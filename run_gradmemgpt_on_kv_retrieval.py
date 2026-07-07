@@ -378,6 +378,7 @@ class ExperimentArgs:
     learned_update_treat_as_gradient: Optional[bool] = field(default=True)
     learned_update_final_tanh: Optional[bool] = field(default=False)
     learned_update_warmup_steps: Optional[int] = field(default=0)
+    learned_update_normalize: Optional[bool] = field(default=False)
     # Curriculum learning parameters
     curriculum_enabled: Optional[bool] = field(default=False)
     curriculum_threshold: Optional[float] = field(default=0.95)
@@ -547,7 +548,8 @@ def main(config_path: Optional[str] = None):
         learned_update_mlp_n_layers=args.learned_update_mlp_n_layers,
         learned_update_treat_as_gradient=args.learned_update_treat_as_gradient,
         learned_update_final_tanh=args.learned_update_final_tanh,
-        learned_update_warmup_steps=args.learned_update_warmup_steps
+        learned_update_warmup_steps=args.learned_update_warmup_steps,
+        learned_update_normalize=args.learned_update_normalize
     )
 
     # Create gradmemgpt model
