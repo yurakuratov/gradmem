@@ -47,6 +47,7 @@ class ExperimentArgs:
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default="token_accuracy")
+    stop_exact_match_value: Optional[float] = field(default=1.0)
     warmup_steps: Optional[int] = field(default=1000)
     max_steps: Optional[int] = field(default=50000)
     logging_steps: Optional[int] = field(default=100)
@@ -374,7 +375,7 @@ if __name__ == "__main__":
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-            StopOnMetricValue(metric_name="exact_match", value=1.0, higher_is_better=True),
+            StopOnMetricValue(metric_name="exact_match", value=args.stop_exact_match_value, higher_is_better=True),
             EnergyFreezeCallback(args.energy_freezed_steps),
         ],
     )

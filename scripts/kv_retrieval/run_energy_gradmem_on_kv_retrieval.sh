@@ -104,6 +104,7 @@ EARLY_STOPPING_PATIENCE=${EARLY_STOPPING_PATIENCE:-500}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
 LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-constant_with_warmup}
 METRIC_FOR_BEST_MODEL=${METRIC_FOR_BEST_MODEL:-token_accuracy}
+STOP_EXACT_MATCH_VALUE=${STOP_EXACT_MATCH_VALUE:-1.0}
 INIT_CHECKPOINT=${INIT_CHECKPOINT:-}
 
 RUN_NAME=${RUN_NAME:-energy_gradmem_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}}
@@ -135,6 +136,7 @@ for N in $N_VALUES; do
     --weight_decay "$WEIGHT_DECAY" \
     --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
     --metric_for_best_model "$METRIC_FOR_BEST_MODEL" \
+    --stop_exact_match_value "$STOP_EXACT_MATCH_VALUE" \
     --n_layer "$L" \
     --n_head "$H" \
     --n_embd "$D" \
