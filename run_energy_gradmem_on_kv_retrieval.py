@@ -10,7 +10,7 @@ import datasets
 import torch
 import transformers
 from safetensors.torch import load_file
-from transformers import AutoConfig, AutoTokenizer, EarlyStoppingCallback, HfArgumentParser, Trainer, TrainingArguments
+from transformers import AutoConfig, AutoTokenizer, EarlyStoppingCallback, HfArgumentParser, TrainerCallback, TrainingArguments
 
 from energy_gradmem import EnergyGradMem, EnergyGradMemConfig
 from run_gradmemgpt_on_kv_retrieval import (
@@ -102,6 +102,15 @@ class ExperimentArgs:
     energy_future_mode: Optional[str] = field(default="next_token")
     energy_ce_guidance: Optional[bool] = field(default=False)
     energy_ce_guidance_alpha: Optional[float] = field(default=0.01)
+    energy_inner_ce_weight: Optional[float] = field(default=0.0)
+    energy_pretrain_objective: Optional[str] = field(default="ce")
+    energy_pretrain_steps: Optional[int] = field(default=0)
+    energy_pretrain_batch_size: Optional[int] = field(default=16)
+    energy_pretrain_seq_len: Optional[int] = field(default=32)
+    energy_pretrain_lr: Optional[float] = field(default=1e-3)
+    energy_pretrain_seed: Optional[int] = field(default=0)
+    energy_pretrain_l2_reg: Optional[float] = field(default=0.0)
+    energy_freezed_steps: Optional[int] = field(default=0)
 
 
 def build_base_config(args, tokenizer):
@@ -179,6 +188,14 @@ def build_model_config(args, base_config):
         energy_future_mode=args.energy_future_mode,
         energy_ce_guidance=args.energy_ce_guidance,
         energy_ce_guidance_alpha=args.energy_ce_guidance_alpha,
+        energy_inner_ce_weight=args.energy_inner_ce_weight,
+        energy_pretrain_objective=args.energy_pretrain_objective,
+        energy_pretrain_steps=args.energy_pretrain_steps,
+        energy_pretrain_batch_size=args.energy_pretrain_batch_size,
+        energy_pretrain_seq_len=args.energy_pretrain_seq_len,
+        energy_pretrain_lr=args.energy_pretrain_lr,
+        energy_pretrain_seed=args.energy_pretrain_seed,
+        energy_pretrain_l2_reg=args.energy_pretrain_l2_reg,
     )
 
 
@@ -203,6 +220,50 @@ def split_dataset(dataset):
     else:
         raise ValueError(f"Dataset has no valid/validation/test split. Available splits: {list(dataset.keys())}")
     return train, valid
+
+
+class EnergyFreezeCallback(TrainerCallback):
+    def __init__(self, freezed_steps):
+        self.freezed_steps = int(freezed_steps or 0)
+        self._logged_start = False
+        self._logged_unfreeze = False
+
+    @staticmethod
+    def _unwrap_model(model):
+        return model.module if hasattr(model, "module") else model
+
+    def _energy_parameters(self, model):
+        target = self._unwrap_model(model)
+        if not (hasattr(target, "energy_encoder") and hasattr(target, "energy_head")):
+            return []
+        return list(target.energy_encoder.parameters()) + list(target.energy_head.parameters())
+
+    def _zero_energy_grads(self, model):
+        for param in self._energy_parameters(model):
+            if param.grad is not None:
+                param.grad.zero_()
+
+    def on_train_begin(self, args, state, control, model=None, **kwargs):
+        if self.freezed_steps <= 0 or model is None:
+            return
+        self._logged_start = True
+        logger.info(
+            "Energy model gradients will be zeroed for first %d optimizer steps",
+            self.freezed_steps,
+        )
+
+    def on_step_begin(self, args, state, control, model=None, **kwargs):
+        if self.freezed_steps <= 0 or model is None or self._logged_unfreeze:
+            return
+        if state.global_step >= self.freezed_steps:
+            self._logged_unfreeze = True
+            logger.info("Energy model gradients enabled at optimizer step %d", state.global_step)
+
+    def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
+        if self.freezed_steps <= 0 or model is None:
+            return
+        if state.global_step < self.freezed_steps:
+            self._zero_energy_grads(model)
 
 
 if __name__ == "__main__":
@@ -235,6 +296,15 @@ if __name__ == "__main__":
         logger.info(f"unexpected keys from checkpoint: {unexpected_k}")
     if accel.mixed_precision == "bf16":
         model.to(torch.bfloat16)
+    model.to(accel.device)
+    if args.energy_pretrain_steps > 0:
+        logger.info(
+            f"pretraining energy objective: objective={args.energy_pretrain_objective}, "
+            f"steps={args.energy_pretrain_steps}, "
+            f"batch_size={args.energy_pretrain_batch_size}, seq_len={args.energy_pretrain_seq_len}, "
+            f"lr={args.energy_pretrain_lr}, l2_reg={args.energy_pretrain_l2_reg}, device={accel.device}"
+        )
+        model.pretrain_energy_objective()
 
     logger.info(f"model config: {model.config}")
     logger.info(f"model.dtype: {model.dtype}")
@@ -248,7 +318,12 @@ if __name__ == "__main__":
     ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ["!", "|"]]
 
     def compute_metrics(eval_pred):
-        return compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer)
+        metrics = compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer)
+        _, inner_loop_stats = eval_pred.predictions
+        for key in ("inner_energy_loss", "inner_ce_loss"):
+            if key in inner_loop_stats:
+                metrics[key] = float(inner_loop_stats[key].mean())
+        return metrics
 
     if args.total_batch_size is None:
         args.total_batch_size = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
@@ -300,6 +375,7 @@ if __name__ == "__main__":
         callbacks=[
             EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
             StopOnMetricValue(metric_name="exact_match", value=1.0, higher_is_better=True),
+            EnergyFreezeCallback(args.energy_freezed_steps),
         ],
     )
     trainer.train()

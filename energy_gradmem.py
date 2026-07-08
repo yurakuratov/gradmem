@@ -1,7 +1,13 @@
+import logging
+
 import torch
 from torch import nn
+from tqdm.auto import tqdm
 
-from grad_memgpt import GradMemGPT, GradMemGPTConfig
+from grad_memgpt import GradMemGPT, GradMemGPTConfig, _is_main_process
+
+
+logger = logging.getLogger(__name__)
 
 
 class EnergyGradMemConfig(GradMemGPTConfig):
@@ -16,16 +22,28 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         energy_future_mode="next_token",
         energy_ce_guidance=False,
         energy_ce_guidance_alpha=0.01,
+        energy_inner_ce_weight=0.0,
+        energy_pretrain_objective="ce",
+        energy_pretrain_steps=0,
+        energy_pretrain_batch_size=16,
+        energy_pretrain_seq_len=32,
+        energy_pretrain_lr=1e-3,
+        energy_pretrain_seed=0,
+        energy_pretrain_l2_reg=0.0,
         return_energy_state=False,
         **kwargs,
     ):
         if kwargs.get("use_write_head", False):
             raise ValueError("EnergyGradMem does not support use_write_head; the energy objective does not use LM logits")
         super().__init__(**kwargs)
-        if inner_objective != "lstm":
-            raise ValueError("EnergyGradMem currently supports inner_objective='lstm' only")
+        if inner_objective not in ("lstm", "embedding_l1", "embedding_l2"):
+            raise ValueError("inner_objective must be one of: 'lstm', 'embedding_l1', 'embedding_l2'")
         if energy_future_mode not in ("none", "next_token"):
             raise ValueError("energy_future_mode must be one of: 'none', 'next_token'")
+        if inner_objective in ("embedding_l1", "embedding_l2") and energy_future_mode != "next_token":
+            raise ValueError("embedding_l1/embedding_l2 inner objectives require energy_future_mode='next_token'")
+        if energy_pretrain_objective not in ("ce", "embedding_mean_abs_diff", "embedding_l2"):
+            raise ValueError("energy_pretrain_objective must be one of: 'ce', 'embedding_mean_abs_diff', 'embedding_l2'")
         self.inner_objective = inner_objective
         self.energy_hidden_size = energy_hidden_size
         self.energy_num_layers = energy_num_layers
@@ -33,6 +51,14 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         self.energy_future_mode = energy_future_mode
         self.energy_ce_guidance = energy_ce_guidance
         self.energy_ce_guidance_alpha = energy_ce_guidance_alpha
+        self.energy_inner_ce_weight = energy_inner_ce_weight
+        self.energy_pretrain_objective = energy_pretrain_objective
+        self.energy_pretrain_steps = energy_pretrain_steps
+        self.energy_pretrain_batch_size = energy_pretrain_batch_size
+        self.energy_pretrain_seq_len = energy_pretrain_seq_len
+        self.energy_pretrain_lr = energy_pretrain_lr
+        self.energy_pretrain_seed = energy_pretrain_seed
+        self.energy_pretrain_l2_reg = energy_pretrain_l2_reg
         self.return_energy_state = return_energy_state
 
 
@@ -57,18 +83,39 @@ class EnergyGradMem(GradMemGPT):
         self.energy_future_mode = config.energy_future_mode
         self.energy_ce_guidance = bool(getattr(config, "energy_ce_guidance", False))
         self.energy_ce_guidance_alpha = float(getattr(config, "energy_ce_guidance_alpha", 0.01))
+        self.energy_inner_ce_weight = float(getattr(config, "energy_inner_ce_weight", 0.0))
+        self.energy_pretrain_objective = getattr(config, "energy_pretrain_objective", "ce")
+        self.energy_pretrain_steps = int(getattr(config, "energy_pretrain_steps", 0))
+        self.energy_pretrain_batch_size = int(getattr(config, "energy_pretrain_batch_size", 16))
+        self.energy_pretrain_seq_len = int(getattr(config, "energy_pretrain_seq_len", 32))
+        self.energy_pretrain_lr = float(getattr(config, "energy_pretrain_lr", 1e-3))
+        self.energy_pretrain_seed = int(getattr(config, "energy_pretrain_seed", 0))
+        self.energy_pretrain_l2_reg = float(getattr(config, "energy_pretrain_l2_reg", 0.0))
         self.return_energy_state = bool(getattr(config, "return_energy_state", False))
         dropout = float(config.energy_dropout) if energy_num_layers > 1 else 0.0
         energy_input_size = model_hidden_size * 2 if self.energy_future_mode == "next_token" else model_hidden_size
 
-        self.energy_encoder = nn.LSTM(
-            input_size=energy_input_size,
-            hidden_size=self.energy_hidden_size,
-            num_layers=energy_num_layers,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.energy_head = nn.Linear(self.energy_hidden_size, 1)
+        if self.inner_objective == "lstm":
+            self.energy_encoder = nn.LSTM(
+                input_size=energy_input_size,
+                hidden_size=self.energy_hidden_size,
+                num_layers=energy_num_layers,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.energy_head = nn.Linear(self.energy_hidden_size, 1)
+
+    def _energy_parameters(self):
+        params = []
+        if hasattr(self, "energy_encoder"):
+            params.extend(self.energy_encoder.parameters())
+        if hasattr(self, "energy_head"):
+            params.extend(self.energy_head.parameters())
+        return list(params)
+
+    def set_energy_trainable(self, trainable=True):
+        for param in self._energy_parameters():
+            param.requires_grad = trainable
 
     @staticmethod
     def _context_segments(context_input_ids):
@@ -96,12 +143,24 @@ class EnergyGradMem(GradMemGPT):
             return batch_ctx["mem_offset"]
         return 0
 
-    def _energy_loss(self, hidden, mask, energy_state):
-        # Eval still needs inner-loop gradients. cuDNN RNN backward rejects eval-mode
-        # modules, so use the native autograd path for this small objective model.
+    def _energy_values(self, hidden, energy_state=None):
+        if self.inner_objective in ("embedding_l1", "embedding_l2"):
+            if hidden.size(-1) % 2 != 0:
+                raise ValueError(f"{self.inner_objective} requires an even energy input size")
+            pred, target = hidden.chunk(2, dim=-1)
+            if self.inner_objective == "embedding_l1":
+                return (pred - target).abs().mean(dim=-1), energy_state
+            return (pred - target).pow(2).mean(dim=-1), energy_state
+
         with torch.backends.cudnn.flags(enabled=False):
             encoded, energy_state = self.energy_encoder(hidden, energy_state)
         energy = self.energy_head(encoded).squeeze(-1)
+        return energy, energy_state
+
+    def _energy_loss(self, hidden, mask, energy_state):
+        # Eval still needs inner-loop gradients. cuDNN RNN backward rejects eval-mode
+        # modules, so use the native autograd path for this small objective model.
+        energy, energy_state = self._energy_values(hidden, energy_state)
 
         mask = mask.to(dtype=energy.dtype)
         valid_lengths = mask.sum(dim=1)
@@ -146,12 +205,190 @@ class EnergyGradMem(GradMemGPT):
             mask_loss = mask_loss[:, 1:]
         return token_ce, mask_loss
 
+    def _write_inner_ce_loss(self, write_out, write_batch):
+        logits = write_out.logits[:, write_batch["logits_start"]:, :]
+        logits_loss = logits[:, :-1]
+        label_shift = write_batch.get("label_shift", 0)
+        labels_loss = write_batch["lm_labels"][:, label_shift:]
+        mask_loss = write_batch["mask"][:, label_shift:]
+        if logits_loss.size(1) != labels_loss.size(1) or labels_loss.size(1) != mask_loss.size(1) or labels_loss.size(1) == 0:
+            raise ValueError(
+                "Invalid inner CE alignment: "
+                f"logits_len={logits_loss.size(1)}, labels_len={labels_loss.size(1)}, mask_len={mask_loss.size(1)}"
+            )
+        token_ce = nn.functional.cross_entropy(
+            logits_loss.reshape(-1, logits.size(-1)),
+            labels_loss.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).view(labels_loss.size())
+        return self._masked_token_loss_sum(token_ce, mask_loss)
+
     @staticmethod
     def _energy_ce_guidance_loss(energy, token_ce, mask):
         energy = energy[:, :token_ce.size(1)]
         mask = mask.to(dtype=energy.dtype)
-        per_token = (energy - token_ce.detach().to(dtype=energy.dtype)).pow(2) * mask
+        per_token = (energy - token_ce.detach().to(dtype=energy.dtype)).abs() * mask
         return per_token.sum() / mask.sum().clamp_min(1.0)
+
+    @staticmethod
+    def _masked_token_loss_sum(token_loss, mask):
+        mask = mask.to(dtype=token_loss.dtype)
+        valid_lengths = mask.sum(dim=1)
+        per_sample = (token_loss * mask).sum(dim=1) / valid_lengths.clamp_min(1.0)
+        per_sample = per_sample * (valid_lengths > 0).to(per_sample.dtype)
+        return per_sample.sum()
+
+    def _sample_energy_pretrain_batch(self, batch_size, seq_len, generator, device):
+        vocab_size = int(self.model.config.vocab_size)
+        pad_id = self.model.config.pad_token_id
+        low = 1 if vocab_size > 1 else 0
+        tokens = torch.randint(low, vocab_size, (batch_size, seq_len), generator=generator, device=device)
+        if pad_id is not None:
+            tokens = torch.where(tokens == pad_id, (tokens + 1) % vocab_size, tokens)
+        return tokens
+
+    def _embedding_mean_abs_diff_pretrain_loss(self, batch_size, seq_len, generator, device):
+        if self.inner_objective != "lstm":
+            raise ValueError("embedding_mean_abs_diff pretraining requires trainable inner_objective='lstm'")
+        input_size = self.energy_encoder.input_size
+        if input_size % 2 != 0:
+            raise ValueError("embedding_mean_abs_diff pretraining requires an even energy encoder input size")
+        hidden_size = input_size // 2
+        dtype = self.energy_head.weight.dtype
+        h1 = torch.randn(batch_size, seq_len, hidden_size, generator=generator, device=device, dtype=dtype)
+        h2 = torch.randn(batch_size, seq_len, hidden_size, generator=generator, device=device, dtype=dtype)
+        energy_input = torch.cat([h1, h2], dim=-1)
+        target = (h1 - h2).abs().mean(dim=-1)
+        energy, _ = self._energy_values(energy_input)
+        return (energy - target.detach()).pow(2).mean()
+
+    def _embedding_l2_pretrain_loss(self, batch_size, seq_len, generator, device):
+        if self.inner_objective != "lstm":
+            raise ValueError("embedding_l2 pretraining requires trainable inner_objective='lstm'")
+        input_size = self.energy_encoder.input_size
+        if input_size % 2 != 0:
+            raise ValueError("embedding_l2 pretraining requires an even energy encoder input size")
+        hidden_size = input_size // 2
+        dtype = self.energy_head.weight.dtype
+        h1 = torch.randn(batch_size, seq_len, hidden_size, generator=generator, device=device, dtype=dtype)
+        h2 = torch.randn(batch_size, seq_len, hidden_size, generator=generator, device=device, dtype=dtype)
+        energy_input = torch.cat([h1, h2], dim=-1)
+        target = (h1 - h2).pow(2).mean(dim=-1)
+        energy, _ = self._energy_values(energy_input)
+        return (energy - target.detach()).pow(2).mean()
+
+    def _ce_pretrain_loss(self, backend, pad_id, generator, device):
+        context = self._sample_energy_pretrain_batch(
+            self.energy_pretrain_batch_size,
+            self.energy_pretrain_seq_len,
+            generator,
+            device,
+        )
+        memory_state, _ = backend.init_memory_state(context.size(0))
+        batch_ctx = backend.prepare_batch(context, context, pad_id)
+        write_batch = backend.build_write_inputs(memory_state, batch_ctx)
+
+        with torch.no_grad():
+            write_out = self._run_write_model(write_batch, memory_state)
+            ctx_hidden = self._extract_context_hidden(write_out.hidden_states[-1], write_batch, batch_ctx)
+            energy_input = self._energy_input(ctx_hidden, context, write_batch["mask"]).detach()
+            token_ce, token_ce_mask = self._write_token_ce(write_out, write_batch)
+
+        energy, _ = self._energy_values(energy_input)
+        return self._energy_ce_guidance_loss(energy, token_ce, token_ce_mask)
+
+    def _energy_pretrain_l2_regularization(self):
+        if self.energy_pretrain_l2_reg <= 0.0:
+            ref = next(self.parameters())
+            return ref.new_zeros(())
+        params = self._energy_parameters()
+        if not params:
+            ref = next(self.parameters())
+            return ref.new_zeros(())
+        penalty = params[0].new_zeros(())
+        for param in params:
+            penalty = penalty + param.pow(2).sum()
+        return self.energy_pretrain_l2_reg * penalty
+
+    def pretrain_energy_objective(self):
+        if self.energy_pretrain_batch_size < 1 or self.energy_pretrain_seq_len < 2:
+            raise ValueError("energy_pretrain_batch_size must be >= 1 and energy_pretrain_seq_len must be >= 2")
+        if self.energy_pretrain_steps <= 0:
+            return
+        if self.inner_objective != "lstm":
+            raise ValueError("energy pretraining requires trainable inner_objective='lstm'")
+
+        was_training = self.training
+        device = self.model.get_input_embeddings().weight.device
+        generator = torch.Generator(device=device)
+        generator.manual_seed(self.energy_pretrain_seed)
+        optimizer = torch.optim.AdamW(self._energy_parameters(), lr=self.energy_pretrain_lr, weight_decay=0.0)
+
+        try:
+            self.eval()
+            self.energy_encoder.train()
+            self.energy_head.train()
+            backend = self.memory_backend_impl
+            pad_id = self.model.config.pad_token_id
+            show_progress = _is_main_process()
+            log_every = max(1, self.energy_pretrain_steps // 10)
+            last_loss = None
+
+            if show_progress:
+                logger.info(
+                    "Energy pretraining started: objective=%s, steps=%d, batch_size=%d, seq_len=%d, lr=%g, l2_reg=%g",
+                    self.energy_pretrain_objective,
+                    self.energy_pretrain_steps,
+                    self.energy_pretrain_batch_size,
+                    self.energy_pretrain_seq_len,
+                    self.energy_pretrain_lr,
+                    self.energy_pretrain_l2_reg,
+                )
+
+            progress = tqdm(
+                range(self.energy_pretrain_steps),
+                desc="energy pretrain",
+                disable=not show_progress,
+            )
+            for step in progress:
+                if self.energy_pretrain_objective == "ce":
+                    loss = self._ce_pretrain_loss(backend, pad_id, generator, device)
+                elif self.energy_pretrain_objective == "embedding_mean_abs_diff":
+                    loss = self._embedding_mean_abs_diff_pretrain_loss(
+                        self.energy_pretrain_batch_size,
+                        self.energy_pretrain_seq_len,
+                        generator,
+                        device,
+                    )
+                elif self.energy_pretrain_objective == "embedding_l2":
+                    loss = self._embedding_l2_pretrain_loss(
+                        self.energy_pretrain_batch_size,
+                        self.energy_pretrain_seq_len,
+                        generator,
+                        device,
+                    )
+                else:
+                    raise ValueError(f"Unsupported energy_pretrain_objective={self.energy_pretrain_objective}")
+                loss = loss + self._energy_pretrain_l2_regularization()
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                optimizer.step()
+                last_loss = float(loss.detach().item())
+                if show_progress:
+                    progress.set_postfix(loss=f"{last_loss:.4f}")
+                    if (step + 1) % log_every == 0 or step == 0 or (step + 1) == self.energy_pretrain_steps:
+                        logger.info(
+                            "Energy pretraining step %d/%d: loss=%.6f",
+                            step + 1,
+                            self.energy_pretrain_steps,
+                            last_loss,
+                        )
+
+            if show_progress:
+                logger.info("Energy pretraining finished: final_loss=%.6f", last_loss)
+        finally:
+            self.train(was_training)
 
     def _validate_context_segments(self, context_segments, batch_size):
         for i, segment in enumerate(context_segments):
@@ -257,6 +494,8 @@ class EnergyGradMem(GradMemGPT):
         batch_size = query_input_ids.size(0)
         opt_state = {}
         inner_loss = torch.tensor(0.0, device=device)
+        inner_energy_loss = torch.tensor(0.0, device=device)
+        inner_ce_loss = torch.tensor(0.0, device=device)
         guidance_loss = torch.tensor(0.0, device=device)
         write_steps = 0
         stats = self._init_inner_loop_stats(device)
@@ -278,9 +517,16 @@ class EnergyGradMem(GradMemGPT):
                     write_out = self._run_write_model(write_batch, memory_state)
                     ctx_hidden = self._extract_context_hidden(write_out.hidden_states[-1], write_batch, batch_ctx)
                     energy_input = self._energy_input(ctx_hidden, segment, write_batch["mask"])
-                    inner_loss, energy_state, energy = self._energy_loss(energy_input, write_batch["mask"], energy_state)
+                    energy_loss, energy_state, energy = self._energy_loss(energy_input, write_batch["mask"], energy_state)
+                    step_ce_loss = torch.zeros_like(energy_loss)
                     if self.energy_ce_guidance:
                         token_ce, token_ce_mask = self._write_token_ce(write_out, write_batch)
+                    if self.energy_inner_ce_weight != 0.0:
+                        step_ce_loss = self._write_inner_ce_loss(write_out, write_batch)
+                    inner_loss = energy_loss + self.energy_inner_ce_weight * step_ce_loss
+                    inner_energy_loss = inner_energy_loss + energy_loss.detach()
+                    inner_ce_loss = inner_ce_loss + step_ce_loss.detach()
+                    if self.energy_ce_guidance:
                         guidance_loss = guidance_loss + self._energy_ce_guidance_loss(
                             energy,
                             token_ce,
@@ -310,6 +556,9 @@ class EnergyGradMem(GradMemGPT):
 
         if write_steps and self.energy_ce_guidance:
             guidance_loss = guidance_loss / write_steps
+        if write_steps:
+            stats["inner_energy_loss"] = inner_energy_loss / (write_steps * batch_size)
+            stats["inner_ce_loss"] = inner_ce_loss / (write_steps * batch_size)
         return memory_state, energy_state, inner_loss, guidance_loss, write_steps, stats
 
     @staticmethod
