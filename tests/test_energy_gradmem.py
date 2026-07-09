@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from transformers import GPT2Config
 
 from energy_gradmem import EnergyGradMem, EnergyGradMemConfig
-from run_energy_gradmem_on_kv_retrieval import EnergyFreezeCallback
+from run_energy_gradmem_on_kv_retrieval import EnergyFreezeCallback, strip_trailing_context_separator
 
 
 def _base_config():
@@ -20,7 +20,14 @@ def _base_config():
     )
 
 
-def _model(memory_backend="prefix", K=2, energy_future_mode="next_token", inner_objective="lstm"):
+def _model(
+    memory_backend="prefix",
+    K=2,
+    energy_future_mode="next_token",
+    inner_objective="lstm",
+    segment_write_mode="sequential",
+    segment_size=None,
+):
     return EnergyGradMem(
         EnergyGradMemConfig(
             base_config=_base_config(),
@@ -39,8 +46,23 @@ def _model(memory_backend="prefix", K=2, energy_future_mode="next_token", inner_
             energy_num_layers=2,
             energy_dropout=0.0,
             energy_future_mode=energy_future_mode,
+            segment_write_mode=segment_write_mode,
+            segment_size=segment_size,
         )
     )
+
+
+def test_strip_trailing_context_separator_removes_only_final_pipe():
+    batch = [
+        {"context": "!Tg:ON!!jr:Tk!|", "query": "Tg:", "target": "ON"},
+        {"context": "!Tg:ON!!jr:Tk!", "query": "jr:", "target": "Tk"},
+    ]
+
+    stripped = strip_trailing_context_separator(batch)
+
+    assert stripped[0]["context"] == "!Tg:ON!!jr:Tk!"
+    assert stripped[1]["context"] == "!Tg:ON!!jr:Tk!"
+    assert batch[0]["context"] == "!Tg:ON!!jr:Tk!|"
 
 
 def test_forward_single_segment_prefix():
@@ -93,6 +115,113 @@ def test_forward_multi_segment_prefix_unequal_lengths():
     assert output["predictions"].shape == (B, Q + 1, 101)
     assert "inner_loss" in output["inner_loop_stats"]
     assert output["energy_state"][0].shape == (2, B, 32)
+
+
+def test_forward_parallel_segments_prefix_equal_lengths():
+    torch.manual_seed(0)
+    model = _model(K=2, energy_future_mode="none", segment_write_mode="parallel")
+    model.eval()
+
+    B, Q = 2, 4
+    segments = [torch.randint(1, 101, (B, 5)), torch.randint(1, 101, (B, 5))]
+    query = torch.randint(1, 101, (B, Q))
+    labels = torch.randint(1, 101, (B, Q))
+
+    output = model(
+        {"context_input_ids": segments, "query_input_ids": query},
+        labels=labels,
+        return_mem=True,
+        return_energy_state=True,
+    )
+
+    assert torch.isfinite(output["loss"]).item()
+    assert output["predictions"].shape == (B, Q + 1, 101)
+    assert output["mem"].shape == (B, 4, 48)
+    assert output["energy_state"][0].shape == (2, B, 32)
+    assert "inner_energy_loss" in output["inner_loop_stats"]
+
+
+def test_context_tensor_segment_size_returns_segment_list():
+    model = _model(K=1, segment_size=4)
+    context = torch.arange(24).reshape(2, 12)
+
+    segments = model._context_segments(context)
+
+    assert isinstance(segments, list)
+    assert len(segments) == 3
+    assert all(segment.shape == (2, 4) for segment in segments)
+    assert torch.equal(torch.cat(segments, dim=1), context)
+
+
+def test_context_tensor_segment_size_rejects_uneven_lengths():
+    model = _model(K=1, segment_size=4)
+    context = torch.arange(20).reshape(2, 10)
+
+    with pytest.raises(ValueError, match="divisible by segment_size"):
+        model._context_segments(context)
+
+
+def test_context_segment_list_ignores_segment_size():
+    model = _model(K=1, segment_size=4)
+    segments = [torch.arange(10).reshape(2, 5), torch.arange(12).reshape(2, 6)]
+
+    returned = model._context_segments(segments)
+    assert len(returned) == len(segments)
+    assert all(torch.equal(a, b) for a, b in zip(returned, segments))
+
+
+def test_sequential_tensor_segment_size_matches_segment_list():
+    torch.manual_seed(0)
+    model_tensor = _model(K=1, energy_future_mode="none", segment_size=5)
+    model_list = _model(K=1, energy_future_mode="none")
+    model_list.load_state_dict(model_tensor.state_dict())
+    model_tensor.eval()
+    model_list.eval()
+
+    B, Q = 2, 4
+    segments = [torch.randint(1, 101, (B, 5)), torch.randint(1, 101, (B, 5))]
+    context = torch.cat(segments, dim=1)
+    query = torch.randint(1, 101, (B, Q))
+    labels = torch.randint(1, 101, (B, Q))
+
+    output_tensor = model_tensor({"context_input_ids": context, "query_input_ids": query}, labels=labels)
+    output_list = model_list({"context_input_ids": segments, "query_input_ids": query}, labels=labels)
+
+    assert torch.allclose(output_tensor["predictions"], output_list["predictions"])
+    assert torch.allclose(output_tensor["inner_loop_stats"]["inner_loss"], output_list["inner_loop_stats"]["inner_loss"])
+
+
+def test_forward_parallel_segments_tensor_segment_size():
+    torch.manual_seed(0)
+    model = _model(K=2, energy_future_mode="none", segment_write_mode="parallel", segment_size=5)
+    model.eval()
+
+    B, Q = 2, 4
+    context = torch.randint(1, 101, (B, 10))
+    query = torch.randint(1, 101, (B, Q))
+    labels = torch.randint(1, 101, (B, Q))
+
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        labels=labels,
+        return_mem=True,
+        return_energy_state=True,
+    )
+
+    assert torch.isfinite(output["loss"]).item()
+    assert output["predictions"].shape == (B, Q + 1, 101)
+    assert output["mem"].shape == (B, 4, 48)
+    assert output["energy_state"][0].shape == (2, B, 32)
+
+
+def test_parallel_segments_rejects_unequal_lengths():
+    model = _model(K=1, energy_future_mode="none", segment_write_mode="parallel")
+    B, Q = 2, 4
+    segments = [torch.randint(1, 101, (B, 5)), torch.randint(1, 101, (B, 6))]
+    query = torch.randint(1, 101, (B, Q))
+
+    with pytest.raises(ValueError, match="equal segment lengths"):
+        model({"context_input_ids": segments, "query_input_ids": query})
 
 
 def test_single_batch_train_updates_energy_params():
@@ -579,6 +708,35 @@ def test_rejects_fixed_embedding_objective_without_next_token_target():
             base_config=_base_config(),
             inner_objective="embedding_l1",
             energy_future_mode="none",
+        )
+
+
+def test_rejects_parallel_segments_without_prefix_backend():
+    with pytest.raises(ValueError, match="memory_backend='prefix'"):
+        EnergyGradMemConfig(
+            base_config=_base_config(),
+            memory_backend="lora",
+            segment_write_mode="parallel",
+            energy_future_mode="none",
+        )
+
+
+def test_rejects_parallel_segments_with_future_embeddings():
+    with pytest.raises(ValueError, match="energy_future_mode='none'"):
+        EnergyGradMemConfig(
+            base_config=_base_config(),
+            segment_write_mode="parallel",
+            energy_future_mode="next_token",
+        )
+
+
+def test_rejects_parallel_segments_with_energy_ce_guidance():
+    with pytest.raises(ValueError, match="energy_ce_guidance"):
+        EnergyGradMemConfig(
+            base_config=_base_config(),
+            segment_write_mode="parallel",
+            energy_future_mode="none",
+            energy_ce_guidance=True,
         )
 
 

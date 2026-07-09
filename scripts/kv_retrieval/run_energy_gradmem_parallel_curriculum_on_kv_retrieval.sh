@@ -3,9 +3,9 @@
 set -euo pipefail
 shopt -s nullglob
 
-# Two-stage curriculum for hidden-state-only EnergyGradMem:
+# Curriculum with semi-parallel segment writes.
 # stage 1: inner objective = energy + CE
-# stage 2: inner objective = energy only, initialized from stage 1 checkpoint
+# later stages: inner objective = energy only, initialized from previous stage checkpoint
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BASE_SCRIPT=$SCRIPT_DIR/run_energy_gradmem_on_kv_retrieval.sh
@@ -28,11 +28,9 @@ TBS=64
 LR=1e-04
 N_VALUES=1
 CE_WEIGHTS=(1.0 0.0 0.0 0.0)
+START_ITERATION=1
 INIT_CHECKPOINT=""
 STOP_EXACT_MATCH_VALUE=0.99
-
-
-START_ITERATION=1
 
 if [ ${#CE_WEIGHTS[@]} -eq 0 ]; then
   echo "CE_WEIGHTS must be non-empty" >&2
@@ -51,6 +49,7 @@ if ! [[ "$START_ITERATION" =~ ^[0-9]+$ ]] || [ "$START_ITERATION" -lt 1 ]; then
   echo "START_ITERATION must be a positive 1-based integer, got: $START_ITERATION" >&2
   exit 1
 fi
+
 latest_checkpoint() {
   local stage_path=$1
   local best_step=-1
@@ -82,10 +81,10 @@ for N in $N_VALUES; do
     N_SEGMENTS_IN_CONTEXT=${N_SEGMENTSS_IN_CONTEXT[$STAGE_INDEX]}
     N_PAIRS=$((N_PAIRS_IN_SEGMENT * N_SEGMENTS_IN_CONTEXT))
     HF_SUBSET=N${N_PAIRS}-K${K_SIZE}V${V_SIZE}-V${VOCAB_SIZE}
-    RUN_NAME=energy_gradmem_curriculum_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}
-    EXP_ROOT=./runs/energy_gradmem_kv_curriculum/${HF_SUBSET}/${RUN_NAME}
+    RUN_NAME=energy_gradmem_parallel_curriculum_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}
+    EXP_ROOT=./runs/energy_gradmem_kv_parallel_curriculum/${HF_SUBSET}/${RUN_NAME}
     STAGE_EXP_PATH=${EXP_ROOT}/run_${N}/stage_${STAGE}_ce_${CE_WEIGHT}
-    STAGE_WANDB_NAME=${MODEL}_curriculum_ce${CE_WEIGHT}_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}
+    STAGE_WANDB_NAME=${MODEL}_parallel_curriculum_ce${CE_WEIGHT}_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}
 
     if [ "$STAGE" -lt "$START_ITERATION" ]; then
       echo "Skipping stage $STAGE; reading checkpoint from $STAGE_EXP_PATH"
@@ -98,6 +97,7 @@ for N in $N_VALUES; do
       N_PAIRS="$N_PAIRS" \
       N_PAIRS_IN_SEGMENT="$N_PAIRS_IN_SEGMENT" \
       N_SEGMENTS_IN_CONTEXT="$N_SEGMENTS_IN_CONTEXT" \
+      SEGMENT_WRITE_MODE=parallel \
       INNER_OBJECTIVE=lstm \
       ENERGY_FUTURE_MODE=none \
       ENERGY_INNER_CE_WEIGHT="$CE_WEIGHT" \

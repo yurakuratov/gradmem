@@ -23,6 +23,8 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         energy_ce_guidance=False,
         energy_ce_guidance_alpha=0.01,
         energy_inner_ce_weight=0.0,
+        segment_write_mode="sequential",
+        segment_size=None,
         energy_pretrain_objective="ce",
         energy_pretrain_steps=0,
         energy_pretrain_batch_size=16,
@@ -40,8 +42,19 @@ class EnergyGradMemConfig(GradMemGPTConfig):
             raise ValueError("inner_objective must be one of: 'lstm', 'embedding_l1', 'embedding_l2'")
         if energy_future_mode not in ("none", "next_token"):
             raise ValueError("energy_future_mode must be one of: 'none', 'next_token'")
+        if segment_write_mode not in ("sequential", "parallel"):
+            raise ValueError("segment_write_mode must be one of: 'sequential', 'parallel'")
+        if segment_size is not None and int(segment_size) <= 0:
+            raise ValueError("segment_size must be a positive integer when set")
         if inner_objective in ("embedding_l1", "embedding_l2") and energy_future_mode != "next_token":
             raise ValueError("embedding_l1/embedding_l2 inner objectives require energy_future_mode='next_token'")
+        if segment_write_mode == "parallel":
+            if self.memory_backend != "prefix":
+                raise ValueError("segment_write_mode='parallel' currently supports memory_backend='prefix' only")
+            if energy_future_mode != "none":
+                raise ValueError("segment_write_mode='parallel' requires energy_future_mode='none'")
+            if energy_ce_guidance:
+                raise ValueError("segment_write_mode='parallel' does not support energy_ce_guidance")
         if energy_pretrain_objective not in ("ce", "embedding_mean_abs_diff", "embedding_l2"):
             raise ValueError("energy_pretrain_objective must be one of: 'ce', 'embedding_mean_abs_diff', 'embedding_l2'")
         self.inner_objective = inner_objective
@@ -52,6 +65,8 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         self.energy_ce_guidance = energy_ce_guidance
         self.energy_ce_guidance_alpha = energy_ce_guidance_alpha
         self.energy_inner_ce_weight = energy_inner_ce_weight
+        self.segment_write_mode = segment_write_mode
+        self.segment_size = segment_size
         self.energy_pretrain_objective = energy_pretrain_objective
         self.energy_pretrain_steps = energy_pretrain_steps
         self.energy_pretrain_batch_size = energy_pretrain_batch_size
@@ -84,6 +99,10 @@ class EnergyGradMem(GradMemGPT):
         self.energy_ce_guidance = bool(getattr(config, "energy_ce_guidance", False))
         self.energy_ce_guidance_alpha = float(getattr(config, "energy_ce_guidance_alpha", 0.01))
         self.energy_inner_ce_weight = float(getattr(config, "energy_inner_ce_weight", 0.0))
+        self.segment_write_mode = getattr(config, "segment_write_mode", "sequential")
+        self.segment_size = getattr(config, "segment_size", None)
+        if self.segment_size is not None:
+            self.segment_size = int(self.segment_size)
         self.energy_pretrain_objective = getattr(config, "energy_pretrain_objective", "ce")
         self.energy_pretrain_steps = int(getattr(config, "energy_pretrain_steps", 0))
         self.energy_pretrain_batch_size = int(getattr(config, "energy_pretrain_batch_size", 16))
@@ -117,14 +136,22 @@ class EnergyGradMem(GradMemGPT):
         for param in self._energy_parameters():
             param.requires_grad = trainable
 
-    @staticmethod
-    def _context_segments(context_input_ids):
+    def _context_segments(self, context_input_ids):
         if isinstance(context_input_ids, torch.Tensor):
             if context_input_ids.ndim != 2:
                 raise ValueError(
                     "context_input_ids tensor must have shape [B, S]; "
                     f"got {tuple(context_input_ids.shape)}"
                 )
+            if self.segment_size is not None:
+                if self.segment_size <= 0:
+                    raise ValueError("segment_size must be a positive integer when set")
+                if context_input_ids.size(1) % self.segment_size != 0:
+                    raise ValueError(
+                        "context_input_ids length must be divisible by segment_size; "
+                        f"length={context_input_ids.size(1)}, segment_size={self.segment_size}"
+                    )
+                return list(context_input_ids.split(self.segment_size, dim=1))
             return [context_input_ids]
         if isinstance(context_input_ids, (list, tuple)):
             if len(context_input_ids) == 0:
@@ -206,6 +233,10 @@ class EnergyGradMem(GradMemGPT):
         return token_ce, mask_loss
 
     def _write_inner_ce_loss(self, write_out, write_batch):
+        token_ce, mask_loss = self._write_inner_ce_tokens(write_out, write_batch)
+        return self._masked_token_loss_sum(token_ce, mask_loss)
+
+    def _write_inner_ce_tokens(self, write_out, write_batch):
         logits = write_out.logits[:, write_batch["logits_start"]:, :]
         logits_loss = logits[:, :-1]
         label_shift = write_batch.get("label_shift", 0)
@@ -222,7 +253,14 @@ class EnergyGradMem(GradMemGPT):
             ignore_index=-100,
             reduction="none",
         ).view(labels_loss.size())
-        return self._masked_token_loss_sum(token_ce, mask_loss)
+        return token_ce, mask_loss
+
+    def _write_parallel_inner_ce_loss(self, write_out, write_batch, batch_size, n_segments):
+        token_ce, mask = self._write_inner_ce_tokens(write_out, write_batch)
+        seq_len = token_ce.size(1)
+        token_ce = token_ce.reshape(batch_size, n_segments * seq_len)
+        mask = mask.reshape(batch_size, n_segments * seq_len)
+        return self._masked_token_loss_sum(token_ce, mask)
 
     @staticmethod
     def _energy_ce_guidance_loss(energy, token_ce, mask):
@@ -487,6 +525,86 @@ class EnergyGradMem(GradMemGPT):
             new_params.append(p_new)
         return new_params
 
+    @staticmethod
+    def _validate_parallel_segments(context_segments):
+        segment_len = context_segments[0].size(1)
+        for i, segment in enumerate(context_segments):
+            if segment.size(1) != segment_len:
+                raise ValueError(
+                    "segment_write_mode='parallel' requires equal segment lengths; "
+                    f"segment=0 len={segment_len}, segment={i} len={segment.size(1)}"
+                )
+
+    @staticmethod
+    def _repeat_prefix_memory_state(memory_state, n_segments):
+        repeated = {"mem_batch": memory_state["mem_batch"].repeat_interleave(n_segments, dim=0)}
+        if "W_batch" in memory_state:
+            repeated["W_batch"] = memory_state["W_batch"].repeat_interleave(n_segments, dim=0)
+            repeated["b_batch"] = memory_state["b_batch"].repeat_interleave(n_segments, dim=0)
+        return repeated
+
+    def _write_segments_parallel(self, context_segments, query_input_ids, memory_state, energy_state):
+        self._validate_parallel_segments(context_segments)
+
+        backend = self.memory_backend_impl
+        pad_id = self.model.config.pad_token_id
+        device = query_input_ids.device
+        batch_size = query_input_ids.size(0)
+        n_segments = len(context_segments)
+        segment_len = context_segments[0].size(1)
+        opt_state = {}
+        inner_loss = torch.tensor(0.0, device=device)
+        inner_energy_loss = torch.tensor(0.0, device=device)
+        inner_ce_loss = torch.tensor(0.0, device=device)
+        guidance_loss = torch.tensor(0.0, device=device)
+        write_steps = 0
+        stats = self._init_inner_loop_stats(device)
+
+        if not self.K:
+            return memory_state, energy_state, inner_loss, guidance_loss, write_steps, stats
+
+        flat_segments = torch.stack(context_segments, dim=1).reshape(batch_size * n_segments, segment_len)
+        flat_query_input_ids = query_input_ids.repeat_interleave(n_segments, dim=0)
+        batch_ctx = backend.prepare_batch(flat_segments, flat_query_input_ids, pad_id)
+
+        with torch.enable_grad():
+            for k in range(self.K):
+                write_memory_state = self._repeat_prefix_memory_state(memory_state, n_segments)
+                write_batch = backend.build_write_inputs(write_memory_state, batch_ctx)
+                write_out = self._run_write_model(write_batch, write_memory_state)
+                ctx_hidden = self._extract_context_hidden(write_out.hidden_states[-1], write_batch, batch_ctx)
+                ctx_len = write_batch["mask"].size(1)
+                ctx_hidden = ctx_hidden.reshape(batch_size, n_segments * ctx_len, ctx_hidden.size(-1))
+                energy_mask = write_batch["mask"].reshape(batch_size, n_segments * ctx_len)
+                energy_loss, energy_state, _ = self._energy_loss(ctx_hidden, energy_mask, energy_state)
+                step_ce_loss = torch.zeros_like(energy_loss)
+                if self.energy_inner_ce_weight != 0.0:
+                    step_ce_loss = self._write_parallel_inner_ce_loss(write_out, write_batch, batch_size, n_segments)
+                inner_loss = energy_loss + self.energy_inner_ce_weight * step_ce_loss
+                inner_energy_loss = inner_energy_loss + energy_loss.detach()
+                inner_ce_loss = inner_ce_loss + step_ce_loss.detach()
+                del write_out
+
+                create_graph, retain_graph = self._inner_grad_options(k, self.K)
+                inner_params = backend.inner_params(memory_state)
+                grads = torch.autograd.grad(
+                    inner_loss,
+                    inner_params,
+                    create_graph=create_graph,
+                    retain_graph=retain_graph,
+                )
+
+                self._record_grad_stats(stats, grads, batch_size, device)
+                new_params = self._updated_inner_params(inner_params, grads, opt_state, k)
+                backend.assign_inner_params(memory_state, new_params)
+                backend.maybe_detach_after_step(memory_state)
+                write_steps += 1
+
+        if write_steps:
+            stats["inner_energy_loss"] = inner_energy_loss / (write_steps * batch_size)
+            stats["inner_ce_loss"] = inner_ce_loss / (write_steps * batch_size)
+        return memory_state, energy_state, inner_loss, guidance_loss, write_steps, stats
+
     def _write_segments(self, context_segments, query_input_ids, memory_state, energy_state):
         backend = self.memory_backend_impl
         pad_id = self.model.config.pad_token_id
@@ -653,7 +771,8 @@ class EnergyGradMem(GradMemGPT):
         backend = self.memory_backend_impl
         memory_state, memory_state_initial = backend.init_memory_state(B)
 
-        memory_state, energy_state, inner_loss, guidance_loss, write_steps, inner_loop_stats = self._write_segments(
+        write_fn = self._write_segments_parallel if self.segment_write_mode == "parallel" else self._write_segments
+        memory_state, energy_state, inner_loss, guidance_loss, write_steps, inner_loop_stats = write_fn(
             context_segments,
             query_input_ids,
             memory_state,

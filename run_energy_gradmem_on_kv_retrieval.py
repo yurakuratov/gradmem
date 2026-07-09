@@ -40,6 +40,8 @@ class ExperimentArgs:
     hf_dataset: Optional[str] = field(default="irodkin/kv_retrieval")
     hf_subset: Optional[str] = field(default=None)
     n_pairs: Optional[int] = field(default=8)
+    n_pairs_in_segment: Optional[int] = field(default=None)
+    n_segments_in_context: Optional[int] = field(default=1)
     key_size: Optional[int] = field(default=2)
     value_size: Optional[int] = field(default=2)
     vocab_size: Optional[int] = field(default=62)
@@ -95,6 +97,8 @@ class ExperimentArgs:
     attn_implementation: Optional[str] = field(default="eager")
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
     inner_loss_weight: Optional[float] = field(default=None)
+    segment_write_mode: Optional[str] = field(default="sequential")
+    segment_size: Optional[int] = field(default=None)
 
     inner_objective: Optional[str] = field(default="lstm")
     energy_hidden_size: Optional[int] = field(default=None)
@@ -182,6 +186,8 @@ def build_model_config(args, base_config):
         attn_implementation=args.attn_implementation,
         add_inner_loss_to_outer=args.add_inner_loss_to_outer,
         inner_loss_weight=args.inner_loss_weight,
+        segment_write_mode=args.segment_write_mode,
+        segment_size=args.segment_size,
         inner_objective=args.inner_objective,
         energy_hidden_size=args.energy_hidden_size,
         energy_num_layers=args.energy_num_layers,
@@ -221,6 +227,15 @@ def split_dataset(dataset):
     else:
         raise ValueError(f"Dataset has no valid/validation/test split. Available splits: {list(dataset.keys())}")
     return train, valid
+
+
+def strip_trailing_context_separator(batch):
+    return [
+        {**item, "context": item["context"][:-1]}
+        if item["context"].endswith("|")
+        else item
+        for item in batch
+    ]
 
 
 class EnergyFreezeCallback(TrainerCallback):
@@ -314,7 +329,7 @@ if __name__ == "__main__":
     train_dataset, valid_dataset = split_dataset(dataset)
 
     def data_collator(batch):
-        return collate_fn(batch, tokenizer, max_context_length=args.max_context_length)
+        return collate_fn(strip_trailing_context_separator(batch), tokenizer, max_context_length=args.max_context_length)
 
     ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ["!", "|"]]
 
