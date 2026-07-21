@@ -24,7 +24,7 @@ TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
 # Energy-GradMem currently supports prefix memory only.
 MEMORY_BACKEND="prefix"
-WRITE_OBJECTIVE="energy"
+WRITE_OBJECTIVE=${WRITE_OBJECTIVE:-"energy"}
 
 # Memory/write params. Start from known-good GradMem N8 setup.
 N_MEM_TOKENS=8
@@ -40,21 +40,35 @@ USE_MEM_PROJ=false
 MEM_PROJ_MODE="none"
 FREEZE_BACKBONE=false
 
-# Energy head and optional shaping losses. Ranking/trajectory are off by default.
+# Energy head and optional landscape-shaping losses. Environment overrides let
+# dedicated experiment wrappers reuse this launcher without duplicating it.
 ENERGY_HEAD_HIDDEN_DIM=None
 WRITE_RECONSTRUCTION_WEIGHT=1.0
 WRITE_ENERGY_WEIGHT=1.0
-ENERGY_RANK_WEIGHT=0.0
-ENERGY_TRAJ_WEIGHT=0.0
-ENERGY_MARGIN=0.1
-ENERGY_TRAJ_MARGIN=0.0
-STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
+ENERGY_RANK_WEIGHT=${ENERGY_RANK_WEIGHT:-0.0}
+ENERGY_TRAJ_WEIGHT=${ENERGY_TRAJ_WEIGHT:-0.0}
+ENERGY_MARGIN=${ENERGY_MARGIN:-0.1}
+ENERGY_TRAJ_MARGIN=${ENERGY_TRAJ_MARGIN:-0.0}
+ENERGY_RANK_TEMPERATURE=${ENERGY_RANK_TEMPERATURE:-1.0}
+ENERGY_MIX_ALPHA=${ENERGY_MIX_ALPHA:-0.75}
+ENERGY_ANCHOR_WEIGHT=${ENERGY_ANCHOR_WEIGHT:-0.0}
+
+STOP_ON_METRIC_VALUE=0.99
 
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
 
 ATTN_IMPL="eager"
 MIXED_PRECISION='no'
+
+# INIT_CHECKPOINT=./runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D128_mem8_K2_ilr0.4_energy_recon1.0_energy1.0_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-15000/model.safetensors
+# RUN_NAME_SUFFIX=init_N8_K2_ilr0.4_recon1.0_energy1.0
+
+# INIT_CHECKPOINT=runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D128_mem8_K2_ilr0.4_energy_recon1.0_energy1.0_rank0.01_m0.1_t1.0_mix0.75_anchor0.001_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-15500/model.safetensors
+# RUN_NAME_SUFFIX=init_N8_K2_ilr0.4_recon1.0_energy1.0_shaping
+# INIT_CHECKPOINT=./runs/N8-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.4_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-12500/model.safetensors
+# INIT_CHECKPOINT=./runs/N8-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.4_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-14500/model.safetensors
+# RUN_NAME_SUFFIX=init_gradmem_N8_K2_ilr0.4
 
 RUN_NAME=energygradmem_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
@@ -82,9 +96,13 @@ if [ "$ENERGY_HEAD_HIDDEN_DIM" != "None" ]; then
 fi
 if [ "$ENERGY_RANK_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_rank${ENERGY_RANK_WEIGHT}_m${ENERGY_MARGIN}
+  RUN_NAME=${RUN_NAME}_t${ENERGY_RANK_TEMPERATURE}_mix${ENERGY_MIX_ALPHA}
 fi
 if [ "$ENERGY_TRAJ_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_traj${ENERGY_TRAJ_WEIGHT}_m${ENERGY_TRAJ_MARGIN}
+fi
+if [ "$ENERGY_ANCHOR_WEIGHT" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_anchor${ENERGY_ANCHOR_WEIGHT}
 fi
 RUN_NAME=${RUN_NAME}_grad_${GRAD_MODE}
 if [ "$ADD_INNER_LOSS_TO_OUTER" = true ]; then
@@ -106,7 +124,7 @@ if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
   RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
 fi
 
-N_VALUES=(1 2 3)
+N_VALUES=(2)
 for N in "${N_VALUES[@]}"; do
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_${N}"
 
@@ -154,7 +172,10 @@ for N in "${N_VALUES[@]}"; do
     --write_energy_weight "$WRITE_ENERGY_WEIGHT"
     --energy_margin "$ENERGY_MARGIN"
     --energy_traj_margin "$ENERGY_TRAJ_MARGIN"
-    --max_steps 1000000
+    --energy_rank_temperature "$ENERGY_RANK_TEMPERATURE"
+    --energy_mix_alpha "$ENERGY_MIX_ALPHA"
+    --energy_anchor_weight "$ENERGY_ANCHOR_WEIGHT"
+    --max_steps 200000
     --eval_steps 500
     --logging_steps 500
     --warmup_steps 10000

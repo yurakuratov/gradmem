@@ -94,6 +94,9 @@ class GradMemGPTConfig(PretrainedConfig):
                  energy_traj_weight=0.0,
                  energy_margin=0.1,
                  energy_traj_margin=0.0,
+                 energy_rank_temperature=1.0,
+                 energy_mix_alpha=0.75,
+                 energy_anchor_weight=0.0,
                  add_inner_loss_to_outer=False,
                  inner_loss_weight=None,
                  **kwargs):
@@ -140,10 +143,13 @@ class GradMemGPTConfig(PretrainedConfig):
             energy_head_hidden_dim: int|None, hidden dim for energy MLP; defaults to backbone hidden size
             write_reconstruction_weight: float, reconstruction loss weight for energy_with_reconstruction
             write_energy_weight: float, energy loss weight for energy_with_reconstruction
-            energy_rank_weight: float, optional ranking loss weight for final memory vs initial memory
+            energy_rank_weight: float, optional context-memory contrastive ranking loss weight
             energy_traj_weight: float, optional monotonic trajectory loss weight
             energy_margin: float, margin for ranking loss
             energy_traj_margin: float, margin for trajectory monotonicity loss
+            energy_rank_temperature: float, softplus temperature for contrastive ranking losses
+            energy_mix_alpha: float, positive-memory coefficient for interpolated negatives
+            energy_anchor_weight: float, optional energy-magnitude anchoring loss weight
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
         """
@@ -196,6 +202,9 @@ class GradMemGPTConfig(PretrainedConfig):
         self.energy_traj_weight = energy_traj_weight
         self.energy_margin = energy_margin
         self.energy_traj_margin = energy_traj_margin
+        self.energy_rank_temperature = energy_rank_temperature
+        self.energy_mix_alpha = energy_mix_alpha
+        self.energy_anchor_weight = energy_anchor_weight
         self.add_inner_loss_to_outer = add_inner_loss_to_outer
         self.inner_loss_weight = inner_loss_weight
 
@@ -213,6 +222,10 @@ class GradMemGPTConfig(PretrainedConfig):
                 "write_objective='energy' and 'energy_with_reconstruction' are currently supported only "
                 "for memory_backend='prefix'"
             )
+        if self.energy_rank_temperature <= 0.0:
+            raise ValueError("energy_rank_temperature must be > 0")
+        if not 0.0 <= self.energy_mix_alpha <= 1.0:
+            raise ValueError("energy_mix_alpha must be within [0, 1]")
         if self.memory_backend == "lora":
             assert self.lora_mem_placement in ["between_layers", "target_modules"], (
                 "lora_mem_placement currently supports: 'between_layers', 'target_modules'"
@@ -746,6 +759,13 @@ class GradMemGPT(PreTrainedModel):
         self.energy_traj_weight = float(getattr(config, "energy_traj_weight", 0.0) or 0.0)
         self.energy_margin = float(getattr(config, "energy_margin", 0.1))
         self.energy_traj_margin = float(getattr(config, "energy_traj_margin", 0.0))
+        self.energy_rank_temperature = float(getattr(config, "energy_rank_temperature", 1.0))
+        self.energy_mix_alpha = float(getattr(config, "energy_mix_alpha", 0.75))
+        self.energy_anchor_weight = float(getattr(config, "energy_anchor_weight", 0.0) or 0.0)
+        if self.energy_rank_temperature <= 0.0:
+            raise ValueError("energy_rank_temperature must be > 0")
+        if not 0.0 <= self.energy_mix_alpha <= 1.0:
+            raise ValueError("energy_mix_alpha must be within [0, 1]")
         if self.write_objective in ("energy", "energy_with_reconstruction") and self.memory_backend != "prefix":
             raise ValueError(
                 "write_objective='energy' and 'energy_with_reconstruction' are currently supported only "
@@ -1040,6 +1060,102 @@ class GradMemGPT(PreTrainedModel):
             **model_kwargs,
         )
         return outs, self._compute_write_energy(outs.last_hidden_state, write_batch)
+
+    @staticmethod
+    def _fixed_point_free_permutation(batch_size, device):
+        if batch_size <= 1:
+            return None
+        shift = torch.randint(1, batch_size, (1,), device=device)
+        return (torch.arange(batch_size, device=device) + shift) % batch_size
+
+    @classmethod
+    def _build_energy_negative_memories(cls, positive_mem, initial_mem, mix_alpha):
+        """Build detached context-mismatched, interpolated, and radius-matched memories."""
+        positive_mem = positive_mem.detach()
+        initial_mem = initial_mem.to(device=positive_mem.device, dtype=positive_mem.dtype).detach()
+        batch_size = positive_mem.size(0)
+
+        permutation = cls._fixed_point_free_permutation(batch_size, positive_mem.device)
+        if permutation is None:
+            deranged_mem = None
+            interpolated_mem = None
+        else:
+            deranged_mem = positive_mem.index_select(0, permutation)
+            interpolated_mem = mix_alpha * positive_mem + (1.0 - mix_alpha) * deranged_mem
+
+        random_direction = torch.randn_like(positive_mem)
+        flat_direction = random_direction.reshape(batch_size, -1)
+        direction_norm = flat_direction.norm(dim=1).clamp_min(torch.finfo(positive_mem.dtype).eps)
+        write_radius = (positive_mem - initial_mem).reshape(batch_size, -1).norm(dim=1)
+        scale_shape = (batch_size,) + (1,) * (positive_mem.ndim - 1)
+        random_direction = random_direction / direction_norm.view(scale_shape)
+        random_mem = initial_mem + random_direction * write_radius.view(scale_shape)
+
+        return {
+            "deranged": deranged_mem,
+            "interpolated": interpolated_mem,
+            "random": random_mem,
+        }, permutation
+
+    def _run_energy_memory_candidate(self, backend, memory_template, batch_ctx, mem_batch):
+        candidate_state = {
+            key: value.detach() if isinstance(value, torch.Tensor) else value
+            for key, value in memory_template.items()
+        }
+        candidate_state["mem_batch"] = mem_batch.detach()
+        write_batch = backend.build_write_inputs(candidate_state, batch_ctx)
+        with backend.activation_context(candidate_state):
+            outs, energy = self._run_energy_write_forward(write_batch)
+        del outs
+        return energy
+
+    def _compute_energy_landscape_losses(self, backend, memory_state, memory_state_initial, batch_ctx, *,
+                                         compute_rank, compute_anchor,):
+        if not compute_rank and not compute_anchor:
+            raise ValueError("At least one energy landscape objective must be active")
+
+        positive_mem = memory_state["mem_batch"].detach()
+        energy_positive = self._run_energy_memory_candidate(backend, memory_state, batch_ctx, positive_mem)
+
+        negative_energies = {}
+        negative_losses = {}
+        if compute_rank:
+            negative_memories, _ = self._build_energy_negative_memories(
+                positive_mem,
+                memory_state_initial["mem_batch"],
+                self.energy_mix_alpha,
+            )
+            for name, negative_mem in negative_memories.items():
+                if negative_mem is None:
+                    continue
+                energy_negative = self._run_energy_memory_candidate(
+                    backend, memory_state, batch_ctx, negative_mem
+                )
+                negative_energies[name] = energy_negative
+                negative_losses[name] = F.softplus(
+                    (energy_positive - energy_negative + self.energy_margin)
+                    / self.energy_rank_temperature
+                ).mean()
+
+        rank_loss = None
+        if compute_rank:
+            rank_loss = torch.stack(list(negative_losses.values())).mean()
+
+        anchor_loss = None
+        if compute_anchor:
+            # Negative energies are included only when ranking already needed
+            # those candidates. Anchor-only training regularizes the detached
+            # positive state without constructing unused negative memories.
+            anchor_energies = [energy_positive] + list(negative_energies.values())
+            anchor_loss = torch.stack([energy.pow(2).mean() for energy in anchor_energies]).mean()
+
+        return {
+            "rank_loss": rank_loss,
+            "anchor_loss": anchor_loss,
+            "energy_positive": energy_positive,
+            "negative_energies": negative_energies,
+            "negative_losses": negative_losses,
+        }
 
     def _compute_write_reconstruction_loss(self, logits, write_batch):
         logits_loss = logits[:, :-1]
@@ -1647,32 +1763,92 @@ class GradMemGPT(PreTrainedModel):
             ignore_index=-100,
         )
 
-        output['inner_loop_stats']['target_loss'] = target_loss.detach()
-        energy_aux_loss = target_loss.new_tensor(0.0)
-        if self.write_objective in ("energy", "energy_with_reconstruction"):
-            if self.energy_rank_weight > 0.0:
-                neg_memory_state = dict(memory_state)
-                neg_memory_state["mem_batch"] = memory_state_initial["mem_batch"].to(device=target_loss.device)
-                neg_write_batch = backend.build_write_inputs(neg_memory_state, batch_ctx)
-                with backend.activation_context(neg_memory_state):
-                    neg_outs, energy_neg = self._run_energy_write_forward(neg_write_batch)
-                rank_loss = F.relu(self.energy_margin + energy_loss_after_write - energy_neg).mean()
-                energy_aux_loss = energy_aux_loss + self.energy_rank_weight * rank_loss
-                output['inner_loop_stats']['energy_rank_loss'] = rank_loss.detach()
-                del neg_outs
-            if self.energy_traj_weight > 0.0 and len(energy_loss_history) > 0:
-                energy_next = energy_loss_history[1:] + [energy_loss_after_write]
-                traj_terms = [
-                    F.relu(e_next - e_prev + self.energy_traj_margin).mean()
-                    for e_prev, e_next in zip(energy_loss_history, energy_next)
-                ]
-                traj_loss = torch.stack(traj_terms).mean()
-                energy_aux_loss = energy_aux_loss + self.energy_traj_weight * traj_loss
-                output['inner_loop_stats']['energy_traj_loss'] = traj_loss.detach()
-        if self.add_inner_loss_to_outer:
-            inner_loss_mean = inner_loss / B
-            combined_loss = target_loss + self.inner_loss_weight * inner_loss_mean + energy_aux_loss
-        else:
-            combined_loss = target_loss + energy_aux_loss
-        output['loss'] = combined_loss
+        zero = target_loss.new_tensor(0.0)
+        inner_loss_for_outer = inner_loss / B
+        # energy shaping losses:
+        rank_loss = zero
+        rank_deranged_loss = zero
+        rank_interpolated_loss = zero
+        rank_random_loss = zero
+        traj_loss = zero
+        anchor_loss = zero
+
+        loss_stats = {}
+        landscape_stats = {}
+        energy_objective_active = self.write_objective in ("energy", "energy_with_reconstruction")
+        rank_active = energy_objective_active and self.energy_rank_weight > 0.0
+        anchor_active = energy_objective_active and self.energy_anchor_weight > 0.0
+        trajectory_active = (energy_objective_active and self.energy_traj_weight > 0.0 and len(energy_loss_history) > 0)
+
+        if rank_active or anchor_active:
+            # Candidate memories are detached inside this helper, so these
+            # auxiliary losses shape energy at fixed written states.
+            landscape = self._compute_energy_landscape_losses(
+                backend,
+                memory_state,
+                memory_state_initial,
+                batch_ctx,
+                compute_rank=rank_active,
+                compute_anchor=anchor_active,
+            )
+            energy_positive = landscape["energy_positive"]
+            landscape_stats["energy_positive_mean"] = energy_positive.mean()
+
+        if rank_active:
+            rank_loss = landscape["rank_loss"]
+            loss_names = {
+                "deranged": "energy_rank_deranged_loss",
+                "interpolated": "energy_rank_interpolated_loss",
+                "random": "energy_rank_random_loss",
+            }
+            component_losses = {}
+            for name, energy_negative in landscape["negative_energies"].items():
+                component_loss = landscape["negative_losses"][name]
+                component_losses[loss_names[name]] = component_loss
+                landscape_stats[f"energy_negative_{name}_mean"] = energy_negative.mean()
+                landscape_stats[f"energy_margin_{name}_mean"] = (energy_negative - energy_positive).mean()
+                landscape_stats[f"energy_margin_violation_{name}"] = (
+                    energy_positive + self.energy_margin > energy_negative
+                ).to(dtype=energy_positive.dtype).mean()
+
+            rank_deranged_loss = component_losses.get("energy_rank_deranged_loss", zero)
+            rank_interpolated_loss = component_losses.get("energy_rank_interpolated_loss", zero)
+            rank_random_loss = component_losses.get("energy_rank_random_loss", zero)
+
+            loss_stats.update({
+                "energy_rank_loss": rank_loss,
+                "energy_rank_deranged_loss": rank_deranged_loss,
+                "energy_rank_interpolated_loss": rank_interpolated_loss,
+                "energy_rank_random_loss": rank_random_loss,
+            })
+
+        if anchor_active:
+            anchor_loss = landscape["anchor_loss"]
+            loss_stats["energy_anchor_loss"] = anchor_loss
+
+        if trajectory_active:
+            energy_next = energy_loss_history[1:] + [energy_loss_after_write]
+            traj_terms = [
+                F.relu(e_next - e_prev + self.energy_traj_margin).mean()
+                for e_prev, e_next in zip(energy_loss_history, energy_next)
+            ]
+            traj_loss = torch.stack(traj_terms).mean()
+            loss_stats["energy_traj_loss"] = traj_loss
+
+        weighted_inner_loss = self.inner_loss_weight * inner_loss_for_outer if self.add_inner_loss_to_outer else zero
+        weighted_rank_loss = self.energy_rank_weight * rank_loss if rank_active else zero
+        weighted_traj_loss = self.energy_traj_weight * traj_loss if trajectory_active else zero
+        weighted_anchor_loss = self.energy_anchor_weight * anchor_loss if anchor_active else zero
+        energy_aux_loss = weighted_rank_loss + weighted_traj_loss + weighted_anchor_loss
+        outer_loss = target_loss + weighted_inner_loss + energy_aux_loss
+
+        loss_stats.update({
+            "outer_loss": outer_loss,
+            "target_loss": target_loss,
+        })
+        if rank_active or trajectory_active or anchor_active:
+            loss_stats["energy_aux_loss"] = energy_aux_loss
+        for name, value in {**loss_stats, **landscape_stats}.items():
+            output["inner_loop_stats"][name] = value.detach()
+        output['loss'] = outer_loss
         return output

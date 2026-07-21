@@ -34,6 +34,34 @@ logger = logging.getLogger('')
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
+LOSS_COMPONENT_KEYS = [
+    "outer_loss",
+    "target_loss",
+    "energy_rank_loss",
+    "energy_rank_deranged_loss",
+    "energy_rank_interpolated_loss",
+    "energy_rank_random_loss",
+    "energy_traj_loss",
+    "energy_anchor_loss",
+    "energy_aux_loss",
+]
+
+ENERGY_LANDSCAPE_STAT_KEYS = [
+    "energy_positive_mean",
+    "energy_negative_deranged_mean",
+    "energy_negative_interpolated_mean",
+    "energy_negative_random_mean",
+    "energy_margin_deranged_mean",
+    "energy_margin_interpolated_mean",
+    "energy_margin_random_mean",
+    "energy_margin_violation_deranged",
+    "energy_margin_violation_interpolated",
+    "energy_margin_violation_random",
+]
+
+TRAIN_COMPONENT_KEYS = LOSS_COMPONENT_KEYS + ENERGY_LANDSCAPE_STAT_KEYS
+
+
 def collate_fn(batch, tokenizer, max_context_length=None):
     context = [item['context'] for item in batch]
     query = [item['query'] + item['target'] for item in batch]
@@ -152,8 +180,6 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
         "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
     }
-    if 'target_loss' in inner_loop_stats:
-        metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
     for key in [
         'inner_loss_after_write',
         'inner_loss_initial',
@@ -164,7 +190,7 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         'inner_energy_loss_after_write',
         'write_reconstruction_weight',
         'write_energy_weight',
-    ]:
+    ] + TRAIN_COMPONENT_KEYS:
         if key in inner_loop_stats:
             value = inner_loop_stats[key]
             metrics[key] = float(value.mean() if hasattr(value, 'mean') else value)
@@ -192,6 +218,40 @@ class StopOnMetricValue(TrainerCallback):
 
 
 class CustomTrainer(Trainer):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._train_component_sums = {}
+        self._train_component_count = None
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        labels = inputs.get("labels")
+        batch_size = labels.size(0) if isinstance(labels, torch.Tensor) else 1
+        loss, outputs = super().compute_loss(
+            model,
+            inputs,
+            return_outputs=True,
+            num_items_in_batch=num_items_in_batch,
+        )
+
+        if model.training and isinstance(outputs, dict):
+            stats = outputs.get("inner_loop_stats", {})
+            count = loss.detach().new_tensor(float(batch_size))
+            if self._train_component_count is None:
+                self._train_component_count = count
+            else:
+                self._train_component_count = self._train_component_count + count
+            for key in TRAIN_COMPONENT_KEYS:
+                value = stats.get(key)
+                if value is None:
+                    continue
+                weighted_value = value.detach().float().mean() * count
+                if key in self._train_component_sums:
+                    self._train_component_sums[key] = self._train_component_sums[key] + weighted_value
+                else:
+                    self._train_component_sums[key] = weighted_value
+
+        return (loss, outputs) if return_outputs else loss
+
     def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
         num_training_steps = int(num_training_steps / 0.9)  # to make final lr not zero, for linear it is lr/10.
         return super().create_scheduler(num_training_steps, optimizer)
@@ -202,6 +262,15 @@ class CustomTrainer(Trainer):
         return super()._prepare_input(data)
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        if "loss" in logs and self._train_component_count is not None:
+            total_count = self._nested_gather(self._train_component_count).sum().item()
+            if total_count > 0:
+                for key, value_sum in self._train_component_sums.items():
+                    total_value = self._nested_gather(value_sum).sum().item()
+                    logs[key] = total_value / total_count
+            self._train_component_sums = {}
+            self._train_component_count = None
+
         # log early stopping patience
         for cb in self.callback_handler.callbacks:
             if isinstance(cb, EarlyStoppingCallback):
@@ -273,6 +342,9 @@ class ExperimentArgs:
     energy_traj_weight: Optional[float] = field(default=0.0)
     energy_margin: Optional[float] = field(default=0.1)
     energy_traj_margin: Optional[float] = field(default=0.0)
+    energy_rank_temperature: Optional[float] = field(default=1.0)
+    energy_mix_alpha: Optional[float] = field(default=0.75)
+    energy_anchor_weight: Optional[float] = field(default=0.0)
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
     inner_loss_weight: Optional[float] = field(default=None)
 
@@ -371,6 +443,9 @@ if __name__ == '__main__':
                                       energy_traj_weight=args.energy_traj_weight,
                                       energy_margin=args.energy_margin,
                                       energy_traj_margin=args.energy_traj_margin,
+                                      energy_rank_temperature=args.energy_rank_temperature,
+                                      energy_mix_alpha=args.energy_mix_alpha,
+                                      energy_anchor_weight=args.energy_anchor_weight,
                                       add_inner_loss_to_outer=args.add_inner_loss_to_outer,
                                       inner_loss_weight=args.inner_loss_weight)
 
