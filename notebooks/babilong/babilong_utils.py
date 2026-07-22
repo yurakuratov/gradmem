@@ -210,11 +210,15 @@ class NoiseInjectionDataset(Dataset):
                  task_end_pct=None,                     # right border of facts in sample, between task_start_pct and 1
                  sample_size=1024,
                  mixed_length_ratio=0.0,                # used for mixed length curriculum, prob for shorter samples
+                 noise_ratio=None,                      # if set (and sample_size is None), total length =
+                                                        # facts_len * (1 + noise_ratio); total length tracks the
+                                                        # natural fact count -> 0k-like variable distribution, with noise
                  random_seed=42):
         self.task_dataset = task_dataset
         self.noise_sampler = noise_sampler
         self.sample_size = sample_size
         self.mixed_length_ratio = mixed_length_ratio
+        self.noise_ratio = noise_ratio
         self.tokenizer = tokenizer
         self.task_start_pct = task_start_pct
         self.task_end_pct = task_end_pct
@@ -230,7 +234,14 @@ class NoiseInjectionDataset(Dataset):
 
         sample_size = self.get_sample_size()
         task_len = sum_lengths(facts_tok)
-        background_text_len = sample_size - task_len
+        if self.noise_ratio is not None:
+            # ratio mode: noise budget scales with the fact count of THIS sample,
+            # so total length = task_len * (1 + noise_ratio) and stays variable
+            # across samples (0k-like distribution, but with noise added on top).
+            background_text_len = int(round(task_len * self.noise_ratio))
+            sample_size = task_len + background_text_len   # effective total, for pct-bounds logic
+        else:
+            background_text_len = sample_size - task_len
         background_text = self.noise_sampler.get_sample(background_text_len)
         sample['background_text'] = background_text
 

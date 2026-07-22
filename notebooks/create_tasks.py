@@ -31,16 +31,24 @@ if __name__ == "__main__":
     parser.add_argument('--noise_tag', type=str, default=None,
                         help="tag appended to the output folder/len_name to distinguish noise variants "
                              "(e.g. 'rand'). Defaults to the --noise value.")
+    parser.add_argument('--length_mode', type=str, default='fixed', choices=['fixed', 'ratio'],
+                        help="'fixed': each sample padded to message_length (current behavior; total length "
+                             "is constant across samples). 'ratio': total length = facts_len * (1 + "
+                             "--noise_ratio), so length tracks the natural fact count (0k-like variable "
+                             "distribution) with noise added on top. Default: fixed")
+    parser.add_argument('--noise_ratio', type=float, default=1.0,
+                        help="noise tokens per fact token; only used with --length_mode ratio. "
+                             "E.g. 1.0 -> as much noise as facts, 3.0 -> 3x. Default: 1.0")
     args = parser.parse_args()
 
     tasks = args.tasks.split(' ')
     print(tasks)
 
     # message_lengths = [0, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000, 512000, 1_000_000]
-    message_lengths = [600,]
+    message_lengths = [1000,]
 
     # names = ['0k', '1k', '2k', '4k', '8k', '16k', '32k', '64k', '128k', '256k', '512k', '1M']
-    names = ['600_curriculum']
+    names = ['1k',]
 
     message_lengths = message_lengths
 
@@ -49,6 +57,8 @@ if __name__ == "__main__":
     # tag that identifies the noise variant in output paths
     noise_tag = args.noise_tag if args.noise_tag is not None else args.noise
     print('noise source:', args.noise, '| tag:', noise_tag)
+    print('length mode:', args.length_mode,
+          '| noise_ratio:', args.noise_ratio if args.length_mode == 'ratio' else 'n/a')
 
     os.makedirs('tasks', exist_ok=True)
     tokenizer = AutoTokenizer.from_pretrained('gpt2')
@@ -66,7 +76,11 @@ if __name__ == "__main__":
             for len_name, message_length in zip(names, message_lengths):
                 print('message length', len_name, message_length)
 
-                if message_length > 0:
+                if args.length_mode == 'ratio':
+                    # do not cap facts by the fixed message_length budget: in ratio mode the
+                    # total length grows with the fact count, so we want the natural distribution.
+                    task_dataset_test = TaskDataset(task_path)
+                elif message_length > 0:
                     max_n_facts = message_length // 8
                     task_dataset_test = TaskDataset(task_path, max_n_facts=max_n_facts)
                 else:
@@ -79,12 +93,24 @@ if __name__ == "__main__":
                     # 'random' or 'repeat': no external dataset needed
                     noise_sampler_test = RandomStringSampler(tokenizer=tokenizer, mode=args.noise, random_seed=None)
 
-                dataset_test = NoiseInjectionDataset(task_dataset=task_dataset_test,
-                                                        noise_sampler=noise_sampler_test,
-                                                        tokenizer=tokenizer,
-                                                        sample_size=message_length,
-                                                        mixed_length_ratio=1.0 if curriculum else 0.0
-                                                     )
+                if args.length_mode == 'ratio':
+                    # total length tracks each sample's natural fact count; noise added on top.
+                    # sample_size is unused in this mode (NoiseInjectionDataset derives the budget
+                    # from facts_len * noise_ratio per sample).
+                    dataset_test = NoiseInjectionDataset(task_dataset=task_dataset_test,
+                                                            noise_sampler=noise_sampler_test,
+                                                            tokenizer=tokenizer,
+                                                            sample_size=None,
+                                                            noise_ratio=args.noise_ratio,
+                                                            mixed_length_ratio=0.0,
+                                                         )
+                else:
+                    dataset_test = NoiseInjectionDataset(task_dataset=task_dataset_test,
+                                                            noise_sampler=noise_sampler_test,
+                                                            tokenizer=tokenizer,
+                                                            sample_size=message_length,
+                                                            mixed_length_ratio=1.0 if curriculum else 0.0
+                                                         )
 
                 # get number_of_samples random indices
                 inds = list(range(len(dataset_test)))
@@ -103,8 +129,13 @@ if __name__ == "__main__":
 
                 llm_tasks[len_name] = [{'input': i.strip(), 'question': q, 'target': t} for (i, q, t) in zip(inputs, questions, targets)]
 
-                # include the noise tag in the filename so variants don't overwrite each other
-                out_len_name = len_name if noise_tag == 'pg19' else f"{len_name}_{noise_tag}"
+                # build an output name that distinguishes noise source and length mode so
+                # variants don't overwrite each other
+                out_len_name = len_name
+                if args.length_mode == 'ratio':
+                    out_len_name = f"{out_len_name}_ratio{args.noise_ratio:g}"
+                if noise_tag != 'pg19':
+                    out_len_name = f"{out_len_name}_{noise_tag}"
                 json_path = os.path.join(subfolder, f"{out_len_name}_{split}.json")
                 print(f"Writing", json_path)
                 with open(json_path, 'w') as f:
