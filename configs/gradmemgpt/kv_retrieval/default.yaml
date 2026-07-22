@@ -1,5 +1,14 @@
 # GradMemGPT on KV-retrieval - default configuration
 
+# Output-folder controls (all optional, top-level):
+#   runs_dir: "./runs"      # output root prefix (default: ./runs)
+#   run_name: "my_run"      # override the auto-generated hyperparameter folder component (default: auto)
+# A unique per-run postfix (run_<seed>_<uid8>) is always appended so runs never
+# overwrite each other; when comet_ml is available, <uid8> is the first 8 chars
+# of the comet experiment key, tying the folder to the comet run.
+# runs_dir: "./runs"
+# run_name: null
+
 model:
   base_model: gpt2
   n_layer: 4

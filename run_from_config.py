@@ -12,6 +12,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -19,7 +20,8 @@ from pathlib import Path
 import yaml
 
 from generate_run_name import (
-    generate_run_name, get_exp_path, get_data_path, load_config, get_model_type
+    generate_run_name, get_exp_path, get_data_path, load_config, get_model_type,
+    get_run_uid,
 )
 
 
@@ -177,6 +179,10 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
         args.append(f'--init_checkpoint={cfg["init_checkpoint"]}')
     if 'run_name_suffix' in cfg:
         args.append(f'--run_name_suffix={cfg["run_name_suffix"]}')
+    if cfg.get('runs_dir') is not None:
+        args.append(f'--runs_dir={cfg["runs_dir"]}')
+    if cfg.get('run_name') is not None:
+        args.append(f'--run_name={cfg["run_name"]}')
 
     for key, val in gradmem.items():
         if val is None:
@@ -277,22 +283,28 @@ def main():
     if args.model is not None:
         model_type = args.model
 
-    # Compute run_name and exp_path after applying overrides
+    # Compute run_name and exp_path after applying overrides.
+    # Generate the run uid once (and export it as COMET_EXPERIMENT_KEY) so that:
+    #   (a) the folder postfix and the comet experiment share the same key, and
+    #   (b) the launched subprocess inherits COMET_EXPERIMENT_KEY via the parent
+    #       env, causing HF's CometCallback to bind to this exact experiment.
+    # get_run_uid() is idempotent, so it's safe that get_exp_path() calls it again.
+    run_uid = get_run_uid()
+    merged_cfg = apply_overrides(cfg, parse_overrides) if (args.model is not None or parse_overrides) else cfg
+
     if args.model is not None or parse_overrides:
-        run_name = generate_run_name(apply_overrides(cfg, parse_overrides))
-        exp_path = get_exp_path(apply_overrides(cfg, parse_overrides))
+        run_name = merged_cfg.get('run_name') or generate_run_name(merged_cfg)
+        exp_path = get_exp_path(merged_cfg)
     else:
-        run_name = generate_run_name(cfg)
-        exp_path = get_exp_path(cfg)
+        run_name = merged_cfg.get('run_name') or generate_run_name(merged_cfg)
+        exp_path = get_exp_path(merged_cfg)
 
     logger.info(f"Config: {args.config}")
     logger.info(f"Run name: {run_name}")
     logger.info(f"Exp path: {exp_path}")
+    logger.info(f"Run uid (comet key): {run_uid}")
 
     script = get_script_for_model(model_type, dataset_type)
-
-    if args.model is not None or parse_overrides:
-        run_name = generate_run_name(apply_overrides(cfg, parse_overrides))
 
     # Prepare config path for debug mode
     config_path = None
@@ -315,6 +327,8 @@ def main():
             cmd = f"accelerate launch --mixed_precision 'no' --config_file accelerate.yaml {script} --config {cfg_path} {' '.join(cli_args)}"
         print(f"\n# Run name: {run_name}")
         print(f"# Exp path: {exp_path}")
+        print(f"# Run uid (comet key): {run_uid}")
+        print(f"# COMET_EXPERIMENT_KEY: {os.getenv('COMET_EXPERIMENT_KEY')}")
         print(f"# Command:\n{cmd}")
         return
 

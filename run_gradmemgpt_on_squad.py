@@ -173,6 +173,8 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     config: Optional[str] = field(default=None)
     exp_path: Optional[str] = field(default=None)
+    runs_dir: Optional[str] = field(default=None)
+    run_name: Optional[str] = field(default=None)
     per_device_batch_size: int = field(default=2)
     data_path: str = field(
         default='./data/N2-K4V4-S4(32-64)_1M',

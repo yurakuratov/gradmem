@@ -52,7 +52,18 @@ gradmem:
   inner_lr: 0.04
   grad_mode: "second"
   use_write_head: true
+
+# Optional top-level output-folder controls:
+# runs_dir: "./runs"     # output root prefix (default: ./runs)
+# run_name: "my_run"     # override the auto-generated hyperparameter folder component (default: auto)
 ```
+
+### Output-folder naming & uniqueness
+The output dir layout is `<runs_dir>/<data_name>/<run_name>/run_<seed>_<uid8>`:
+- `runs_dir` (top-level, default `./runs`) is the root prefix.
+- `run_name` (top-level, default auto-generated from hyperparameters) is the middle component. When set, it **fully replaces** the auto name; `run_name_suffix` only appends to the auto name.
+- `run_<seed>` is the training seed (`training.seed`).
+- `<uid8>` is a unique per-run postfix so identical-config runs no longer overwrite each other. When comet_ml is available, `get_run_uid()` (`generate_run_name.py`) generates the id via `comet_ml.generate_guid()` and exports it as `COMET_EXPERIMENT_KEY` — HF's `CometCallback` then binds the comet experiment to that exact key, so `<uid8>` (its first 8 chars) visually pairs the local folder with the comet URL. `run_from_config.py` generates the uid once and the launched subprocess inherits `COMET_EXPERIMENT_KEY` via the parent env.
 
 ## Key Scripts
 - `run_gpt2_on_kv_retrieval.py` - vanilla causal LM baseline

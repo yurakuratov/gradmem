@@ -8,6 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+data
 build/
 develop-eggs/
 dist/
@@ -179,3 +180,6 @@ cython_debug/
 # data
 data/
 runs/
+notebooks/generated_tasks
+notebooks/data
+notebooks/tasks_1-20_v1-2
