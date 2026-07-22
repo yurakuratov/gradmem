@@ -157,6 +157,50 @@ class SentenceSampler:
         return True
 
 
+# sampler of random filler text (control for pg19-noise ablations)
+# mode="random": uniform random printable-ASCII tokens (high-entropy, non-English)
+# mode="repeat": a single token repeated (near-zero reconstruction difficulty)
+# Same get_sample() interface as SentenceSampler, so NoiseInjectionDataset interleaves
+# facts identically regardless of the noise source.
+class RandomStringSampler:
+    def __init__(self, tokenizer, mode="random", min_sentence_len=10, max_sentence_len=50,
+                 fill_token_str=" the", random_seed=None):
+        self.tokenizer = tokenizer
+        self.mode = mode
+        self.min_sentence_len = min_sentence_len
+        self.max_sentence_len = max_sentence_len
+        self.gen = np.random.default_rng(seed=random_seed)
+        self.fill_token = tokenizer.encode(fill_token_str, add_special_tokens=False)[0]
+        # printable-ASCII tokens that decode to clean, round-trippable text
+        self.safe_tokens = [tid for tid in range(tokenizer.vocab_size)
+                            if self._is_printable_ascii(tokenizer.decode([tid]))]
+
+    @staticmethod
+    def _is_printable_ascii(s):
+        return len(s) > 0 and all(32 <= ord(c) < 127 for c in s)
+
+    def _make_chunk(self, length):
+        if self.mode == "repeat":
+            return [self.fill_token] * length
+        return self.gen.choice(self.safe_tokens, size=length).tolist()
+
+    def get_sample(self, sample_size):
+        # return a list of token chunks whose total length equals sample_size
+        if sample_size <= 0:
+            return []
+        sample = []
+        total_len = 0
+        while total_len < sample_size:
+            remaining = sample_size - total_len
+            lo = min(self.min_sentence_len, remaining)
+            hi = min(self.max_sentence_len, remaining)
+            target = int(self.gen.integers(lo, hi + 1))
+            chunk = self._make_chunk(target)
+            sample.append(chunk)
+            total_len += len(chunk)
+        return sample
+
+
 # combined dataset for noisy babi QA
 # it's recommended to use sample_size >= 1024
 # and task_end_pct - task_start_pct >= 0.2 in order to
