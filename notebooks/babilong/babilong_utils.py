@@ -235,6 +235,13 @@ class NoiseInjectionDataset(Dataset):
         question_tok = self.tokenizer(sample['question'], add_special_tokens=False)['input_ids']
         answer_tok = self.tokenizer(sample['answer'], add_special_tokens=False)['input_ids']
 
+        if self.noise_ratio == 0:
+            flat = [i for s in facts_tok for i in s]
+            sample['input_tokens'] = flat
+            sample['question_tokens'] = question_tok
+            sample['target_tokens'] = answer_tok
+            return sample
+
         sample_size = self.get_sample_size()
         task_len = sum_lengths(facts_tok)
         if self.noise_ratio is not None:

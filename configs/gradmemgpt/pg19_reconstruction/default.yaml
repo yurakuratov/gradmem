@@ -1,0 +1,54 @@
+# GradMemGPT on PG19 associative reconstruction.
+#
+# Task: given a PG19 text excerpt as `context` (written to memory via the
+# inner-loop WRITE phase), reconstruct a held-out continuation `target` given
+# its prefix `query`. The target metric is how much writing the context to
+# memory helps: eval_delta_token_accuracy = token_accuracy (with memory) minus
+# token_accuracy without memory (context removed → WRITE skipped → READ runs
+# against the initial unwritten memory).
+#
+# Dataset: build with
+#   ./scripts/prepare_pg19_reconstruction_dataset.sh
+# (consumes the chunks from prepare_pg19_chunks.py and emits a
+# {context, query, target} DatasetDict with train / valid / valid_no_context).
+
+model:
+  pretrained_model: gpt2          # real GPT-2 (vocab 50257); kv_alphabet tokenizer is inert on this branch
+
+training:
+  per_device_batch_size: 4
+  total_batch_size: 32
+  learning_rate: 1.0e-4
+  max_steps: 200000
+  eval_steps: 1000
+  logging_steps: 1000
+  warmup_steps: 5000
+  early_stopping_patience: 50
+  use_gradient_checkpointing: true
+  seed: 142
+  no_context_eval: true           # run the "without memory" eval pass every eval and report the delta
+
+dataset:
+  data_path: "./data/pg19_reconstruction"
+  tokenizer_path: "./tokenizers/kv_alphabet_62/"   # inert for the pretrained branch; gpt2 tokenizer actually loads
+
+gradmem:
+  n_mem_tokens: 8
+  n_ctrl_tokens: 0
+  K: 2
+  last_K_second_order: 2
+  inner_lr: 0.04
+  inner_clip_value: null
+  inner_clip_norm: null
+  use_adam: false
+  grad_mode: "second"
+  use_mem_proj: false
+  mem_proj_mode: "none"
+  use_write_head: true
+  use_write_lora: true
+  write_lora_r: 8
+  write_lora_alpha: 16
+  use_read_lora: false
+  add_inner_loss_to_outer: true
+  inner_loss_weight: 0.5
+  memory_update: gradient

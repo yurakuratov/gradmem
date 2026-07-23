@@ -153,6 +153,11 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
         args.append('--use_gradient_checkpointing')
     if training.get('auto_find_batch_size'):
         args.append('--auto_find_batch_size')
+    # Dual eval: "without memory" no-context pass + token-accuracy delta.
+    if training.get('no_context_eval'):
+        args.append('--no_context_eval')
+        if training.get('no_context_data_path') is not None:
+            args.append(f'--no_context_data_path={training["no_context_data_path"]}')
 
     if 'data_path' in dataset:
         args.append(f'--data_path={dataset["data_path"]}')

@@ -206,6 +206,98 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     return metrics
 
 
+def collate_fn_no_context(batch, tokenizer):
+    """Collate for the "without memory" baseline: context is all-pad.
+
+    Builds the same nested-dict shape as `collate_fn` (`context_input_ids`,
+    `query_input_ids`, `labels`) and reuses the identical query/target
+    tokenization + offset-based target masking, but sets `context_input_ids`
+    to a single pad column per sample. With no non-pad context tokens the
+    GradMemGPT WRITE branch is skipped (grad_memgpt.py line ~1209,
+    `if self.K and context_input_ids.ne(pad_id).any()`) so the READ phase
+    runs against the initial (unwritten) memory — exactly the "without memory"
+    condition.
+    """
+    pad_id = tokenizer.pad_token_id
+    # context_input_ids: [B, 1] all-pad. Size 1 keeps it cheap; the WRITE
+    # guard checks `.ne(pad_id).any()` which is False for all-pad tensors.
+    B = len(batch)
+    context_input_ids = torch.full((B, 1), pad_id, dtype=torch.long)
+
+    # query+target tokenization + target masking is identical to collate_fn.
+    query = [item['query'] + item['target'] for item in batch]
+    query_encoded = tokenizer(query, return_tensors="pt", add_special_tokens=True,
+                              padding=True, pad_to_multiple_of=8, return_offsets_mapping=True)
+    query_input_ids = query_encoded['input_ids']
+    offsets_mapping = query_encoded['offset_mapping']
+
+    labels_mask = torch.zeros_like(query_input_ids)
+    for i, item in enumerate(batch):
+        query_seq_len = len(item['query'])
+        target_seq_len = len(item['target'])
+        target_st, target_end = query_seq_len, query_seq_len + target_seq_len
+        in_target = False
+        for j in range(len(offsets_mapping[i]) - 1, -1, -1):
+            st, end = offsets_mapping[i][j]
+            if st < target_end and end > target_st:
+                labels_mask[i, j] = 1
+                in_target = True
+            elif in_target:
+                break
+
+    labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
+    return {
+        'input_ids': {
+            'context_input_ids': context_input_ids,
+            'query_input_ids': query_input_ids,
+        },
+        'labels': labels,
+    }
+
+
+def compute_metrics_fn_no_context(eval_pred, ignore_token_ids, tokenizer):
+    """Metrics for the "without memory" baseline.
+
+    Identical token-accuracy / exact-match logic to `compute_metrics_fn`, but
+    every `inner_loop_stats` access is guarded: when the WRITE phase is skipped
+    (all-pad context) the stats dict lacks `inner_loss` and the grad/mem norms,
+    so we only surface keys that are actually present.
+    """
+    predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
+    preds, inner_loop_stats = predictions
+    preds = preds[..., :-1]
+    labels = labels[..., :]
+
+    mask = (labels != -100)
+    for t_id in ignore_token_ids:
+        mask &= (labels != t_id)
+
+    masked_predictions = preds[mask]
+    masked_labels = labels[mask]
+    accuracy = (masked_predictions == masked_labels).mean()
+
+    exact_match = np.mean([
+        np.all(pred[mask[i]] == lab[mask[i]])
+        for i, (pred, lab) in enumerate(zip(preds, labels))
+        if np.any(mask[i])
+    ])
+
+    metrics = {
+        "token_accuracy": float(accuracy),
+        "exact_match": float(exact_match),
+    }
+    # inner_loop_stats is sparsely populated when WRITE is skipped; surface
+    # anything that is present (defensively guarded).
+    for k, v in inner_loop_stats.items():
+        if k.startswith('_'):
+            continue
+        if hasattr(v, 'mean'):
+            metrics[k] = v.mean().item()
+        else:
+            metrics[k] = float(v)
+    return metrics
+
+
 class StopOnMetricValue(TrainerCallback):
     def __init__(self, metric_name: str, value: float, higher_is_better: bool = True):
         self.metric_name = metric_name
@@ -279,6 +371,71 @@ class CurriculumTrainer(CustomTrainer):
         self.state.global_step += self.step_offset
         super().log(logs, start_time=start_time)
         self.state.global_step = original_step
+
+
+class DualEvalTrainer(CustomTrainer):
+    """Trainer that also runs a "without memory" (no-context) eval pass.
+
+    After the normal `evaluate()` call (context written to memory), this runs
+    a second pass against `no_context_dataset` with `no_context_data_collator`
+    (which feeds all-pad context → WRITE phase skipped → initial memory used)
+    and `no_context_compute_metrics`. The token-accuracy and exact-match
+    deltas between the two passes are injected as
+    `eval_delta_token_accuracy` / `eval_delta_exact_match`, so the metric the
+    task actually cares about (how much memory helps) flows to comet_ml and is
+    usable as `metric_for_best_model`.
+    """
+
+    def __init__(self, *args, no_context_dataset=None, no_context_data_collator=None,
+                 no_context_compute_metrics=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.no_context_dataset = no_context_dataset
+        self.no_context_data_collator = no_context_data_collator
+        self.no_context_compute_metrics = no_context_compute_metrics
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        # 1. Normal eval (context → memory).
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset, ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix)
+
+        if self.no_context_dataset is None:
+            return metrics
+
+        # 2. "Without memory" eval: temporarily swap collator + compute_metrics
+        # so the no-context pass uses the all-pad collate and its (guarded)
+        # stats handling, then restore them. metric_key_prefix='no_mem' makes
+        # HF auto-prefix the no-context metrics as eval_no_mem_*.
+        saved_collator = self.data_collator
+        saved_compute_metrics = self.compute_metrics
+        try:
+            self.data_collator = self.no_context_data_collator
+            self.compute_metrics = self.no_context_compute_metrics
+            no_ctx_metrics = super().evaluate(
+                eval_dataset=self.no_context_dataset, ignore_keys=ignore_keys,
+                metric_key_prefix="no_mem")
+        finally:
+            self.data_collator = saved_collator
+            self.compute_metrics = saved_compute_metrics
+
+        # 3. Inject deltas into the returned (primary) metrics dict.
+        key_acc = f"{metric_key_prefix}_token_accuracy"
+        key_em = f"{metric_key_prefix}_exact_match"
+        no_ctx_acc = no_ctx_metrics.get("no_mem_token_accuracy")
+        no_ctx_em = no_ctx_metrics.get("no_mem_exact_match")
+        if key_acc in metrics and no_ctx_acc is not None:
+            metrics[f"{metric_key_prefix}_no_mem_token_accuracy"] = no_ctx_acc
+            metrics[f"{metric_key_prefix}_delta_token_accuracy"] = \
+                float(metrics[key_acc]) - float(no_ctx_acc)
+        if key_em in metrics and no_ctx_em is not None:
+            metrics[f"{metric_key_prefix}_no_mem_exact_match"] = no_ctx_em
+            metrics[f"{metric_key_prefix}_delta_exact_match"] = \
+                float(metrics[key_em]) - float(no_ctx_em)
+
+        # Carry the no-context stats through so they're logged too.
+        for k, v in no_ctx_metrics.items():
+            metrics.setdefault(k, v)
+        return metrics
 
 
 @dataclass
@@ -388,6 +545,13 @@ class ExperimentArgs:
     curriculum_data_dir: Optional[str] = field(default="./data")
     curriculum_dataset_template: Optional[str] = field(default="N{n_kv}-K2V2-V62_1M")
     curriculum_stage_overrides: Optional[str] = field(default=None)
+    # Dual eval: also evaluate a "without memory" (no-context) pass and report
+    # the token-accuracy delta (how much writing context to memory helps).
+    no_context_eval: Optional[bool] = field(default=False)
+    # Path to a dataset whose 'valid_no_context' (or 'valid') split is used for
+    # the no-context pass. If None, reuses the main dataset's valid_no_context /
+    # valid split.
+    no_context_data_path: Optional[str] = field(default=None)
 
 
 def main(config_path: Optional[str] = None):
@@ -581,6 +745,34 @@ def main(config_path: Optional[str] = None):
 
     def compute_metrics(eval_pred):
         return compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer)
+
+    # No-context ("without memory") eval setup. Prefers a dedicated
+    # valid_no_context split; falls back to the same valid split with the
+    # no-context collator (which ignores the context field and pads).
+    no_context_dataset = None
+    no_context_data_collator = None
+    no_context_compute_metrics = None
+    if args.no_context_eval:
+        if args.no_context_data_path is not None:
+            no_ctx_ds = datasets.load_from_disk(args.no_context_data_path)
+        else:
+            no_ctx_ds = dataset
+        if 'valid_no_context' in no_ctx_ds:
+            no_context_dataset = no_ctx_ds['valid_no_context']
+        elif 'valid' in no_ctx_ds:
+            no_context_dataset = no_ctx_ds['valid']
+        else:
+            logger.warning('no_context_eval enabled but no valid/valid_no_context split found; skipping.')
+            no_context_dataset = None
+
+        def no_context_data_collator_fn(batch):
+            return collate_fn_no_context(batch, tokenizer)
+
+        def no_context_compute_metrics_fn(eval_pred):
+            return compute_metrics_fn_no_context(eval_pred, ignore_token_ids, tokenizer)
+
+        no_context_data_collator = no_context_data_collator_fn
+        no_context_compute_metrics = no_context_compute_metrics_fn
 
     output_dir = Path(args.exp_path)
 
@@ -798,7 +990,8 @@ def main(config_path: Optional[str] = None):
             seed=args.seed,
         )
 
-        trainer = CustomTrainer(
+        trainer_cls = DualEvalTrainer if args.no_context_eval else CustomTrainer
+        trainer_kwargs = dict(
             model=model,
             args=training_args,
             train_dataset=dataset['train'],
@@ -810,6 +1003,13 @@ def main(config_path: Optional[str] = None):
                        StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
                        ],
         )
+        if args.no_context_eval and no_context_dataset is not None:
+            trainer_kwargs.update(
+                no_context_dataset=no_context_dataset,
+                no_context_data_collator=no_context_data_collator,
+                no_context_compute_metrics=no_context_compute_metrics,
+            )
+        trainer = trainer_cls(**trainer_kwargs)
         trainer.train()
         logger.info('training done. running final evaluation...')
         metrics = trainer.evaluate(dataset['valid'])
