@@ -67,6 +67,23 @@ def build_curriculum_schedule(base_names, cmin, cmax, n_stages, schedule):
     return names, max_facts_per_name
 
 
+def compute_dataset_stats(samples):
+    """Summary statistics for a list of generated NoiseInjectionDataset samples.
+
+    Returns a dict with:
+      n_samples            : number of samples
+      tokens  {min,mean,max}: length of input_tokens (facts + noise) per sample
+      facts   {min,mean,max}: number of bAbI facts per sample
+    """
+    n_tokens = np.array([len(s['input_tokens']) for s in samples])
+    n_facts = np.array([len(s['facts']) for s in samples])
+    return {
+        'n_samples': int(len(samples)),
+        'tokens': {'min': int(n_tokens.min()), 'mean': float(n_tokens.mean()), 'max': int(n_tokens.max())},
+        'facts': {'min': int(n_facts.min()), 'mean': float(n_facts.mean()), 'max': int(n_facts.max())},
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate babilong tasks with configurable noise source.")
     parser.add_argument('tasks', type=str, help="space-separated bAbI task names, e.g. 'qa3' or 'qa1 qa3'")
@@ -239,3 +256,13 @@ if __name__ == "__main__":
                 print(f"Writing", json_path)
                 with open(json_path, 'w') as f:
                     json.dump(llm_tasks[len_name], f)
+
+                # write summary statistics (sample count, token-length and fact-count ranges)
+                # to <name>_<split>.stats.json next to the data file
+                stats = compute_dataset_stats(samples)
+                stats_path = os.path.join(subfolder, f"{out_len_name}_{split}.stats.json")
+                with open(stats_path, 'w') as f:
+                    json.dump(stats, f, indent=2)
+                print(f"  stats: n={stats['n_samples']} "
+                      f"tokens[min/mean/max]={stats['tokens']['min']}/{stats['tokens']['mean']:.0f}/{stats['tokens']['max']} "
+                      f"facts[min/mean/max]={stats['facts']['min']}/{stats['facts']['mean']:.1f}/{stats['facts']['max']}")
