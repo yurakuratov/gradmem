@@ -132,7 +132,10 @@ class SentenceSampler:
                 if len(text) == 0:
                     continue
                 text = text[self.gen.choice(len(text)):]  # start from random position in text
-                text = text[:sample_size * 10]            # cut too long texts to speed up tokenization
+                text = text[:max(sample_size * 10, 4000)]  # cut too long texts to speed up tokenization
+                                                          # floor 4000 chars so small sample_size
+                                                          # (few facts / low noise_ratio) still yields
+                                                          # >=3 sentences and the loop terminates
             sentences += self.sentence_tokenizer.tokenize(text)
             if self.shuffle:
                 sentences = sentences[1:-1]
@@ -238,7 +241,12 @@ class NoiseInjectionDataset(Dataset):
             # ratio mode: noise budget scales with the fact count of THIS sample,
             # so total length = task_len * (1 + noise_ratio) and stays variable
             # across samples (0k-like distribution, but with noise added on top).
-            background_text_len = int(round(task_len * self.noise_ratio))
+            # floor the noise budget so the noise sampler always gets a sane request:
+            # with few facts and/or a small noise_ratio, task_len * noise_ratio can be
+            # a handful of tokens, which starves SentenceSampler of prose and spins its
+            # sentence-filling loop indefinitely. 64 tokens is well below any usable
+            # noise budget but large enough to always yield a few sentences.
+            background_text_len = max(int(round(task_len * self.noise_ratio)), 64)
             sample_size = task_len + background_text_len   # effective total, for pct-bounds logic
         else:
             background_text_len = sample_size - task_len
