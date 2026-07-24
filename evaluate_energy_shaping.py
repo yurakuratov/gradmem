@@ -4,6 +4,8 @@
 The evaluator deliberately does not use ``Trainer``: it reconstructs each model
 from the config saved beside the checkpoint, disables auxiliary outer losses,
 and evaluates fixed checkpoints without mutating their parameters.
+
+See ``EVALUATE_ENERGY_SHAPING.md`` for CLI examples and plot interpretation.
 """
 
 from __future__ import annotations
@@ -17,6 +19,7 @@ import json
 import math
 import random
 import re
+import sys
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -39,6 +42,7 @@ SAFE_ALIAS_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 RUN_DIR_RE = re.compile(r"^run_(\d+)$")
 CHECKPOINT_DIR_RE = re.compile(r"^checkpoint-(\d+)$")
 EVALUATOR_SCHEMA_VERSION = 1
+QUALITY_DIAGNOSTICS_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -79,6 +83,7 @@ class FrozenModel:
     device: torch.device
     objective_type: str
     expected_training_exact_match: float | None
+    training_inner_steps: int
 
 
 @dataclass
@@ -495,7 +500,7 @@ def load_frozen_model(
     if not missing_set.issubset(EXPECTED_MISSING_CHECKPOINT_KEYS):
         raise ValueError(f"Unexpected missing checkpoint keys in {model_path}: {sorted(missing_set)}")
     model.tie_weights()
-    resolved_device = resolve_device(str(device)) if not isinstance(device, torch.device) else device
+    resolved_device = resolve_device(str(device))
     model.to(device=resolved_device, dtype=torch.float32)
     model.eval()
     for parameter in model.parameters():
@@ -515,6 +520,7 @@ def load_frozen_model(
             else "learned_energy"
         ),
         expected_training_exact_match=saved_exact_match(run_path),
+        training_inner_steps=int(cli_args.get("K", config.K)),
     )
 
 
@@ -655,6 +661,83 @@ def objective_for_aligned_memories_batched(
 # Compatibility aliases for users of the original two-energy-model evaluator.
 energy_for_aligned_memories = objective_for_aligned_memories
 energy_for_aligned_memories_batched = objective_for_aligned_memories_batched
+
+
+def quality_for_aligned_memories(
+    model: GradMemGPT,
+    context_input_ids: torch.Tensor,
+    query_input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    mem_batch: torch.Tensor,
+    ignore_token_ids: Sequence[int],
+) -> dict[str, np.ndarray]:
+    """Score downstream reads from fixed prefix memories without running a write."""
+    if context_input_ids.size(0) != mem_batch.size(0):
+        raise ValueError("Context and candidate-memory batch sizes must match")
+    if model.memory_backend != "prefix" or model.mem_proj_mode == "per_sample":
+        raise ValueError(
+            "Quality diagnostics currently require prefix memory without per-sample projection"
+        )
+    device = next(model.parameters()).device
+    context_input_ids = context_input_ids.to(device)
+    query_input_ids = query_input_ids.to(device)
+    labels = labels.to(device)
+    mem_batch = mem_batch.to(device)
+    backend = model.memory_backend_impl
+    batch_ctx = backend.prepare_batch(
+        context_input_ids, query_input_ids, model.model.config.pad_token_id
+    )
+    memory_state, _ = backend.init_memory_state(context_input_ids.size(0))
+    memory_state["mem_batch"] = mem_batch.detach()
+    read_batch = backend.build_read_inputs(memory_state, batch_ctx)
+    with torch.no_grad(), backend.activation_context(memory_state), model._disable_write_lora():
+        read_out = model.model(
+            inputs_embeds=read_batch["inputs_embeds"],
+            return_dict=True,
+            **read_batch.get("model_kwargs", {}),
+        )
+    logits = read_out.logits[
+        :, read_batch["logits_start"]:read_batch["logits_start"] + read_batch["pred_len"], :
+    ]
+    if int(read_batch.get("label_shift", 0)) != 0:
+        raise ValueError("Quality diagnostics currently require zero label shift")
+    return per_example_task_metrics(logits, labels, ignore_token_ids)
+
+
+def score_candidate_memories_batched(
+    frozen: FrozenModel,
+    context_input_ids: torch.Tensor,
+    query_input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    mem_batch: torch.Tensor,
+    batch_size: int,
+) -> dict[str, np.ndarray]:
+    ignore_ids = [
+        frozen.tokenizer.convert_tokens_to_ids(token) for token in ("!", "|")
+    ]
+    collected: dict[str, list[np.ndarray]] = defaultdict(list)
+    for start in range(0, context_input_ids.size(0), batch_size):
+        end = min(start + batch_size, context_input_ids.size(0))
+        objective = objective_for_aligned_memories(
+            frozen.model,
+            context_input_ids[start:end],
+            query_input_ids[start:end],
+            mem_batch[start:end],
+        ).cpu().numpy()
+        quality = quality_for_aligned_memories(
+            frozen.model,
+            context_input_ids[start:end],
+            query_input_ids[start:end],
+            labels[start:end],
+            mem_batch[start:end],
+            ignore_ids,
+        )
+        collected["objective"].append(objective)
+        for key, value in quality.items():
+            collected[key].append(value)
+    result = {key: np.concatenate(values) for key, values in collected.items()}
+    result["token_accuracy"] = result["token_correct"] / result["token_count"]
+    return result
 
 
 def per_example_task_metrics(
@@ -1285,8 +1368,408 @@ def contour_probe(
     return rows
 
 
+def _rankdata(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=np.float64)
+    start = 0
+    while start < values.size:
+        end = start + 1
+        while end < values.size and values[order[end]] == values[order[start]]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1) + 1.0
+        start = end
+    return ranks
+
+
+def spearman_correlation(left: Sequence[float], right: Sequence[float]) -> float | None:
+    left_array = np.asarray(left, dtype=np.float64)
+    right_array = np.asarray(right, dtype=np.float64)
+    valid = np.isfinite(left_array) & np.isfinite(right_array)
+    if valid.sum() < 3:
+        return None
+    left_rank = _rankdata(left_array[valid])
+    right_rank = _rankdata(right_array[valid])
+    if np.all(left_rank == left_rank[0]) or np.all(right_rank == right_rank[0]):
+        return None
+    return float(np.corrcoef(left_rank, right_rank)[0, 1])
+
+
+def ordering_concordance(left: Sequence[float], right: Sequence[float]) -> float | None:
+    left_array = np.asarray(left, dtype=np.float64)
+    right_array = np.asarray(right, dtype=np.float64)
+    if left_array.size < 2:
+        return None
+    i, j = np.triu_indices(left_array.size, k=1)
+    left_delta = left_array[i] - left_array[j]
+    right_delta = right_array[i] - right_array[j]
+    comparable = (left_delta != 0.0) & (right_delta != 0.0)
+    if not comparable.any():
+        return None
+    return float(np.mean((left_delta[comparable] * right_delta[comparable]) > 0.0))
+
+
+def quality_alignment_summaries(
+    candidate_rows: Sequence[Mapping[str, Any]],
+    bootstrap_resamples: int,
+    seed: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    grouped: dict[tuple[int, int, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in candidate_rows:
+        grouped[(
+            int(row["N"]),
+            int(row["example_index"]),
+            str(row["candidate_family"]),
+        )].append(row)
+
+    correlation_rows = []
+    quality_metrics = {
+        "target_nll": "target_nll",
+        "token_error": "token_error",
+        "exact_error": "exact_error",
+        "distance_to_oracle": "distance_to_oracle",
+        "distance_to_training_k": "distance_to_training_k",
+    }
+    for (n_value, example_index, family), members in sorted(
+        grouped.items(), key=lambda item: tuple(str(value) for value in item[0])
+    ):
+        objective = [float(row["objective"]) for row in members]
+        result: dict[str, Any] = {
+            "N": n_value,
+            "example_index": example_index,
+            "candidate_family": family,
+            "num_candidates": len(members),
+        }
+        for output_name, field in quality_metrics.items():
+            result[f"spearman_objective_vs_{output_name}"] = spearman_correlation(
+                objective, [float(row[field]) for row in members]
+            )
+        result["objective_target_nll_concordance"] = ordering_concordance(
+            objective, [float(row["target_nll"]) for row in members]
+        )
+        objective_best = min(members, key=lambda row: float(row["objective"]))
+        result["objective_selected_nll_regret"] = (
+            float(objective_best["target_nll"])
+            - min(float(row["target_nll"]) for row in members)
+        )
+        correlation_rows.append(result)
+
+    summary_rows = []
+    summary_groups: dict[tuple[int, str], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in correlation_rows:
+        summary_groups[(int(row["N"]), str(row["candidate_family"]))].append(row)
+    correlation_metrics = [
+        f"spearman_objective_vs_{name}" for name in quality_metrics
+    ] + ["objective_target_nll_concordance", "objective_selected_nll_regret"]
+    for group_index, ((n_value, family), members) in enumerate(sorted(
+        summary_groups.items(), key=lambda item: tuple(str(value) for value in item[0])
+    )):
+        result = {
+            "N": n_value,
+            "candidate_family": family,
+            "num_examples": len(members),
+        }
+        for metric_index, metric in enumerate(correlation_metrics):
+            values = np.asarray([
+                float(row[metric]) for row in members if row.get(metric) is not None
+            ], dtype=np.float64)
+            result[f"{metric}_valid_examples"] = int(values.size)
+            result[f"{metric}_coverage"] = float(values.size / len(members))
+            if values.size == 0:
+                result[f"{metric}_mean"] = None
+                result[f"{metric}_median"] = None
+                result[f"{metric}_std"] = None
+                result[f"{metric}_median_ci_low"] = None
+                result[f"{metric}_median_ci_high"] = None
+                continue
+            low, high = bootstrap_interval(
+                values,
+                n_resamples=bootstrap_resamples,
+                seed=seed + group_index * 1009 + metric_index * 9176,
+                statistic="median",
+            )
+            result[f"{metric}_mean"] = float(values.mean())
+            result[f"{metric}_median"] = float(np.median(values))
+            result[f"{metric}_std"] = sample_std(values.tolist())
+            result[f"{metric}_median_ci_low"] = low
+            result[f"{metric}_median_ci_high"] = high
+        summary_rows.append(result)
+
+    trajectory_rows = [row for row in candidate_rows if row["candidate_family"] == "trajectory"]
+    trajectory_summary = []
+    for group_index, ((n_value, inner_steps), members) in enumerate(sorted(
+        _group_rows(trajectory_rows, ("N", "K")).items()
+    )):
+        result = {
+            "N": int(n_value),
+            "K": int(inner_steps),
+            "num_examples": len(members),
+            "exact_match": float(np.mean([float(row["exact_match"]) for row in members])),
+            "token_accuracy": float(np.mean([float(row["token_accuracy"]) for row in members])),
+        }
+        for metric_index, metric in enumerate(("delta_objective", "delta_target_nll", "target_nll")):
+            values = np.asarray([float(row[metric]) for row in members])
+            low, high = bootstrap_interval(
+                values,
+                n_resamples=bootstrap_resamples,
+                seed=seed + group_index * 104729 + metric_index * 9176,
+                statistic="median",
+            )
+            result[f"median_{metric}"] = float(np.median(values))
+            result[f"median_{metric}_ci_low"] = low
+            result[f"median_{metric}_ci_high"] = high
+        trajectory_summary.append(result)
+
+    return correlation_rows, summary_rows, trajectory_summary
+
+
+def _group_rows(
+    rows: Sequence[Mapping[str, Any]], keys: Sequence[str]
+) -> dict[tuple[Any, ...], list[Mapping[str, Any]]]:
+    grouped: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in rows:
+        grouped[tuple(row.get(key) for key in keys)].append(row)
+    return grouped
+
+
+def collect_quality_diagnostic_candidates(
+    frozen: FrozenModel,
+    dataset: Any,
+    n_value: int,
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    count = min(len(dataset), int(args.quality_examples))
+    indices = deterministic_subset_indices(len(dataset), count, args.seed + 50021 + n_value)
+    examples = [dataset[index] for index in indices]
+    batch = collate_kv_batch(examples, frozen.tokenizer)
+    context = batch["input_ids"]["context_input_ids"]
+    query = batch["input_ids"]["query_input_ids"]
+    labels = batch["labels"]
+    model = frozen.model
+
+    requested_steps = sorted(set(args.quality_inner_steps))
+    training_k = int(frozen.training_inner_steps)
+    state_steps = set(requested_steps) | {training_k}
+    states: dict[int, torch.Tensor] = {}
+    for inner_steps in sorted(state_steps):
+        chunks = []
+        set_inner_steps(model, inner_steps)
+        for start in range(0, count, args.batch_size):
+            end = min(start + args.batch_size, count)
+            if inner_steps == 0:
+                memory = initial_memory(model, end - start)
+            else:
+                inputs = {
+                    "context_input_ids": context[start:end].to(frozen.device),
+                    "query_input_ids": query[start:end].to(frozen.device),
+                }
+                with torch.no_grad():
+                    output = model(inputs, labels=None, return_mem=True)
+                memory = output["mem"].detach()
+            chunks.append(memory.cpu())
+        states[inner_steps] = torch.cat(chunks, dim=0)
+
+    trajectory_scores = {
+        inner_steps: score_candidate_memories_batched(
+            frozen, context, query, labels, states[inner_steps], args.batch_size
+        )
+        for inner_steps in requested_steps
+    }
+    training_scores = (
+        trajectory_scores[training_k]
+        if training_k in trajectory_scores
+        else score_candidate_memories_batched(
+            frozen, context, query, labels, states[training_k], args.batch_size
+        )
+    )
+    nll_matrix = np.stack([
+        trajectory_scores[inner_steps]["target_loss"] for inner_steps in requested_steps
+    ])
+    oracle_positions = np.argmin(nll_matrix, axis=0)
+    trajectory_stack = torch.stack([states[inner_steps] for inner_steps in requested_steps])
+    oracle_mem = trajectory_stack[oracle_positions, torch.arange(count)]
+    training_mem = states[training_k]
+    write_radius = (training_mem - states[0]).reshape(count, -1).norm(dim=1).clamp_min(1e-12)
+
+    rows: list[dict[str, Any]] = []
+
+    def append_candidates(
+        memories: torch.Tensor,
+        sample_positions: np.ndarray,
+        metadata: Sequence[Mapping[str, Any]],
+        scores: Mapping[str, np.ndarray] | None = None,
+    ) -> None:
+        if scores is None:
+            scores = score_candidate_memories_batched(
+                frozen,
+                context[sample_positions],
+                query[sample_positions],
+                labels[sample_positions],
+                memories,
+                args.batch_size,
+            )
+        positions_tensor = torch.from_numpy(sample_positions).long()
+        distance_training = (memories - training_mem[positions_tensor]).reshape(
+            len(metadata), -1
+        ).norm(dim=1).numpy()
+        distance_oracle = (memories - oracle_mem[positions_tensor]).reshape(
+            len(metadata), -1
+        ).norm(dim=1).numpy()
+        radius = write_radius[positions_tensor].numpy()
+        for row_index, (position, extra) in enumerate(zip(sample_positions, metadata)):
+            token_accuracy = float(scores["token_accuracy"][row_index])
+            exact_match = float(scores["exact_match"][row_index])
+            rows.append({
+                "model": frozen.label,
+                "N": int(n_value),
+                "example_index": int(indices[int(position)]),
+                "objective_type": frozen.objective_type,
+                "training_K": training_k,
+                "oracle_K": int(requested_steps[int(oracle_positions[int(position)])]),
+                "objective": float(scores["objective"][row_index]),
+                "target_nll": float(scores["target_loss"][row_index]),
+                "token_accuracy": token_accuracy,
+                "token_error": 1.0 - token_accuracy,
+                "exact_match": exact_match,
+                "exact_error": 1.0 - exact_match,
+                "distance_to_training_k": float(distance_training[row_index]),
+                "distance_to_oracle": float(distance_oracle[row_index]),
+                "distance_to_training_k_normalized": float(distance_training[row_index] / radius[row_index]),
+                "distance_to_oracle_normalized": float(distance_oracle[row_index] / radius[row_index]),
+                "delta_objective": float(
+                    scores["objective"][row_index] - training_scores["objective"][int(position)]
+                ),
+                "delta_target_nll": float(
+                    scores["target_loss"][row_index] - training_scores["target_loss"][int(position)]
+                ),
+                "delta_token_accuracy": float(
+                    token_accuracy - training_scores["token_accuracy"][int(position)]
+                ),
+                "delta_exact_match": float(
+                    exact_match - training_scores["exact_match"][int(position)]
+                ),
+                **extra,
+            })
+
+    sample_positions = np.arange(count, dtype=np.int64)
+    for inner_steps in requested_steps:
+        append_candidates(
+            states[inner_steps],
+            sample_positions,
+            [{"candidate_family": "trajectory", "candidate_kind": "write_state", "K": inner_steps,
+              "t": None, "radius": None, "direction_index": None} for _ in range(count)],
+            scores=trajectory_scores[inner_steps],
+        )
+
+    mismatched = torch.roll(training_mem, shifts=1, dims=0)
+    for t_value in np.linspace(0.0, 1.0, 11):
+        candidate = (1.0 - float(t_value)) * training_mem + float(t_value) * mismatched
+        kind = "positive" if math.isclose(t_value, 0.0) else (
+            "deranged" if math.isclose(t_value, 1.0) else "interpolated"
+        )
+        append_candidates(
+            candidate,
+            sample_positions,
+            [{"candidate_family": "interpolation", "candidate_kind": kind, "K": training_k,
+              "t": float(t_value), "radius": None, "direction_index": None}
+             for _ in range(count)],
+        )
+
+    directions = torch.from_numpy(seeded_orthonormal_directions(
+        count,
+        args.num_radial_directions,
+        training_mem[0].numel(),
+        args.seed + 70001 + n_value,
+    )).reshape(count, args.num_radial_directions, *training_mem.shape[1:])
+    for radius_value in (0.0, 0.125, 0.25, 0.5, 1.0, 1.5):
+        candidate = (
+            training_mem[:, None]
+            + float(radius_value) * write_radius[:, None, None, None] * directions
+        ).reshape(count * args.num_radial_directions, *training_mem.shape[1:])
+        positions = np.repeat(sample_positions, args.num_radial_directions)
+        append_candidates(
+            candidate,
+            positions,
+            [{"candidate_family": "radial", "candidate_kind": "radial", "K": training_k,
+              "t": None, "radius": float(radius_value), "direction_index": direction}
+             for _ in range(count) for direction in range(args.num_radial_directions)],
+        )
+    return rows
+
+
 def _svg_text(value: Any) -> str:
     return html.escape(str(value), quote=True)
+
+
+def nice_axis_ticks(
+    minimum: float,
+    maximum: float,
+    max_intervals: int = 5,
+    include_zero: bool = False,
+    fixed_bounds: tuple[float, float] | None = None,
+) -> tuple[float, float, list[float], float]:
+    """Return readable axis bounds and 1/2/2.5/5×10^n ticks."""
+    minimum = float(minimum)
+    maximum = float(maximum)
+    if not math.isfinite(minimum) or not math.isfinite(maximum):
+        raise ValueError("Axis bounds must be finite")
+    if minimum > maximum:
+        minimum, maximum = maximum, minimum
+    if include_zero:
+        minimum = min(minimum, 0.0)
+        maximum = max(maximum, 0.0)
+    if fixed_bounds is not None:
+        lower, upper = map(float, fixed_bounds)
+        if not lower < upper:
+            raise ValueError("fixed axis bounds must be increasing")
+        minimum, maximum = lower, upper
+    if math.isclose(minimum, maximum):
+        scale = max(abs(minimum), 1.0)
+        minimum -= 0.5 * scale
+        maximum += 0.5 * scale
+
+    rough_step = (maximum - minimum) / max(1, int(max_intervals))
+    exponent = math.floor(math.log10(rough_step))
+    magnitude = 10.0 ** exponent
+    fraction = rough_step / magnitude
+    nice_fraction = next(value for value in (1.0, 2.0, 2.5, 5.0, 10.0) if value >= fraction - 1e-12)
+    step = nice_fraction * magnitude
+
+    if fixed_bounds is None:
+        axis_min = math.floor(minimum / step + 1e-12) * step
+        axis_max = math.ceil(maximum / step - 1e-12) * step
+    else:
+        axis_min, axis_max = minimum, maximum
+        # Prefer a divisor of a fixed range, e.g. 0.2 or 0.25 for [0, 1].
+        span = axis_max - axis_min
+        candidates = [span / intervals for intervals in range(max_intervals, 2, -1)]
+        step = min(
+            candidates,
+            key=lambda value: min(
+                abs(value / (base * 10.0 ** math.floor(math.log10(value))) - 1.0)
+                for base in (1.0, 2.0, 2.5, 5.0, 10.0)
+            ),
+        )
+
+    interval_count = max(1, int(round((axis_max - axis_min) / step)))
+    ticks = [axis_min + index * step for index in range(interval_count + 1)]
+    if ticks[-1] < axis_max - abs(step) * 1e-8:
+        ticks.append(axis_max)
+    ticks[0] = axis_min
+    ticks[-1] = axis_max
+    ticks = [0.0 if math.isclose(value, 0.0, abs_tol=abs(step) * 1e-10) else value for value in ticks]
+    return axis_min, axis_max, ticks, step
+
+
+def format_axis_tick(value: float, step: float) -> str:
+    value = 0.0 if math.isclose(value, 0.0, abs_tol=max(abs(step), 1.0) * 1e-12) else value
+    if value != 0.0 and (abs(value) >= 1e5 or abs(value) < 1e-4):
+        return f"{value:.3g}"
+    decimals = max(0, -math.floor(math.log10(abs(step))))
+    scaled = abs(step) * 10 ** decimals
+    if not math.isclose(scaled, round(scaled), abs_tol=1e-9):
+        decimals += 1
+    return f"{value:.{min(decimals, 8)}f}".rstrip("0").rstrip(".") or "0"
 
 
 def write_line_svg(
@@ -1296,6 +1779,9 @@ def write_line_svg(
     x_label: str,
     y_label: str,
     std_series: Mapping[str, Sequence[tuple[float, float, float | None]]] | None = None,
+    x_ticks: Sequence[float] | None = None,
+    include_y_zero: bool = False,
+    y_bounds: tuple[float, float] | None = None,
 ) -> None:
     width, height = 760, 460
     left, right, top, bottom = 82, 30, 48, 70
@@ -1309,20 +1795,25 @@ def write_line_svg(
         return
     xs = [point[0] for point in all_points]
     ys = [point[1] for point in all_points]
-    x_min, x_max = min(xs), max(xs)
-    y_min, y_max = min(ys), max(ys)
-    if math.isclose(x_min, x_max):
-        x_min, x_max = x_min - 0.5, x_max + 0.5
-    if math.isclose(y_min, y_max):
-        y_min, y_max = y_min - 0.5, y_max + 0.5
-    y_padding = 0.08 * (y_max - y_min)
-    y_min -= y_padding
-    y_max += y_padding
+    raw_x_min, raw_x_max = min(xs), max(xs)
+    if x_ticks is None:
+        x_min, x_max, tick_values, x_step = nice_axis_ticks(raw_x_min, raw_x_max)
+    else:
+        tick_values = sorted({float(value) for value in x_ticks})
+        x_min, x_max = raw_x_min, raw_x_max
+        if math.isclose(x_min, x_max):
+            x_min, x_max = x_min - 0.5, x_max + 0.5
+        x_step = 1.0
+    y_min, y_max, y_ticks, y_step = nice_axis_ticks(
+        min(ys), max(ys), include_zero=include_y_zero, fixed_bounds=y_bounds
+    )
 
     def x_coord(value: float) -> float:
+        value = max(x_min, min(x_max, value))
         return left + (value - x_min) / (x_max - x_min) * (width - left - right)
 
     def y_coord(value: float) -> float:
+        value = max(y_min, min(y_max, value))
         return top + (y_max - value) / (y_max - y_min) * (height - top - bottom)
 
     colors = ["#2166ac", "#b2182b", "#4d9221", "#762a83", "#e08214", "#0571b0"]
@@ -1332,17 +1823,17 @@ def write_line_svg(
         '<rect width="100%" height="100%" fill="#ffffff"/>',
         f'<text x="{width / 2}" y="26" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">{_svg_text(title)}</text>',
     ]
-    for tick_index in range(6):
-        fraction = tick_index / 5
-        y_value = y_min + fraction * (y_max - y_min)
+    for y_value in y_ticks:
         y = y_coord(y_value)
-        elements.append(f'<line x1="{left}" x2="{width - right}" y1="{y:.2f}" y2="{y:.2f}" stroke="#dddddd" stroke-width="1"/>')
-        elements.append(f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" font-family="sans-serif" font-size="11" fill="#444">{y_value:.3g}</text>')
-    for tick_index in range(6):
-        fraction = tick_index / 5
-        x_value = x_min + fraction * (x_max - x_min)
+        is_zero = include_y_zero and math.isclose(y_value, 0.0, abs_tol=1e-12)
+        stroke = "#888888" if is_zero else "#dddddd"
+        width_value = "1.4" if is_zero else "1"
+        elements.append(f'<line x1="{left}" x2="{width - right}" y1="{y:.2f}" y2="{y:.2f}" stroke="{stroke}" stroke-width="{width_value}"/>')
+        elements.append(f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" font-family="sans-serif" font-size="11" fill="#444">{format_axis_tick(y_value, y_step)}</text>')
+    for x_value in tick_values:
         x = x_coord(x_value)
-        elements.append(f'<text x="{x:.2f}" y="{height - bottom + 20}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#444">{x_value:.3g}</text>')
+        tick_label = str(int(round(x_value))) if x_ticks is not None else format_axis_tick(x_value, x_step)
+        elements.append(f'<text x="{x:.2f}" y="{height - bottom + 20}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#444">{tick_label}</text>')
     elements.extend([
         f'<line x1="{left}" x2="{width - right}" y1="{height - bottom}" y2="{height - bottom}" stroke="#333"/>',
         f'<line x1="{left}" x2="{left}" y1="{top}" y2="{height - bottom}" stroke="#333"/>',
@@ -1394,8 +1885,9 @@ def write_heatmap_svg(
     y_values = sorted({float(row["y"]) for row in rows})
     lookup = {(float(row["x"]), float(row["y"])): float(row[value_key]) for row in rows}
     values = np.asarray(list(lookup.values()))
-    limit = color_limit if color_limit is not None else max(abs(float(values.min())), abs(float(values.max())))
-    limit = max(float(limit), 1e-12)
+    raw_limit = color_limit if color_limit is not None else max(abs(float(values.min())), abs(float(values.max())))
+    raw_limit = max(float(raw_limit), 1e-12)
+    _, limit, _, color_step = nice_axis_ticks(0.0, raw_limit, max_intervals=4, include_zero=True)
     width, height = 620, 540
     left, right, top, bottom = 72, 90, 48, 62
     cell_width = (width - left - right) / len(x_values)
@@ -1425,17 +1917,19 @@ def write_heatmap_svg(
             elements.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{cell_width + 0.2:.2f}" height="{cell_height + 0.2:.2f}" fill="{color(value)}"/>')
     for tick_index in range(0, len(x_values), max(1, len(x_values) // 5)):
         x = left + (tick_index + 0.5) * cell_width
-        elements.append(f'<text x="{x:.2f}" y="{height - bottom + 20}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#444">{x_values[tick_index]:.2g}</text>')
+        axis_step = abs(x_values[1] - x_values[0]) if len(x_values) > 1 else 1.0
+        elements.append(f'<text x="{x:.2f}" y="{height - bottom + 20}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="#444">{format_axis_tick(x_values[tick_index], axis_step)}</text>')
     reversed_y = list(reversed(y_values))
     for tick_index in range(0, len(reversed_y), max(1, len(reversed_y) // 5)):
         y = top + (tick_index + 0.5) * cell_height
-        elements.append(f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" font-family="sans-serif" font-size="11" fill="#444">{reversed_y[tick_index]:.2g}</text>')
+        axis_step = abs(y_values[1] - y_values[0]) if len(y_values) > 1 else 1.0
+        elements.append(f'<text x="{left - 8}" y="{y + 4:.2f}" text-anchor="end" font-family="sans-serif" font-size="11" fill="#444">{format_axis_tick(reversed_y[tick_index], axis_step)}</text>')
     elements.extend([
         f'<text x="{(left + width - right) / 2}" y="{height - 20}" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#222">mismatch direction</text>',
         f'<text x="18" y="{(top + height - bottom) / 2}" text-anchor="middle" transform="rotate(-90 18 {(top + height - bottom) / 2})" font-family="sans-serif" font-size="13" fill="#222">orthogonal direction</text>',
-        f'<text x="{width - right + 14}" y="{top + 10}" font-family="sans-serif" font-size="11" fill="#444">+{limit:.3g}</text>',
+        f'<text x="{width - right + 14}" y="{top + 10}" font-family="sans-serif" font-size="11" fill="#444">+{format_axis_tick(limit, color_step)}</text>',
         f'<text x="{width - right + 14}" y="{top + (height - top - bottom) / 2}" font-family="sans-serif" font-size="11" fill="#444">0</text>',
-        f'<text x="{width - right + 14}" y="{height - bottom}" font-family="sans-serif" font-size="11" fill="#444">−{limit:.3g}</text>',
+        f'<text x="{width - right + 14}" y="{height - bottom}" font-family="sans-serif" font-size="11" fill="#444">−{format_axis_tick(limit, color_step)}</text>',
     ])
     for color_index in range(100):
         value = limit * (1 - 2 * color_index / 99)
@@ -1444,6 +1938,556 @@ def write_heatmap_svg(
     elements.append("</svg>")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(elements) + "\n")
+
+
+def ensure_trajectory_quality_deltas(rows: Sequence[Mapping[str, Any]]) -> None:
+    """Backfill quality deltas in saved diagnostics created before these fields existed."""
+    grouped = _group_rows(rows, ("alias", "N", "example_index"))
+    for members in grouped.values():
+        trajectory = [
+            row for row in members if row.get("candidate_family") == "trajectory"
+        ]
+        if not trajectory:
+            continue
+        training_k = int(trajectory[0]["training_K"])
+        baseline = next(
+            (row for row in trajectory if int(row["K"]) == training_k), None
+        )
+        if baseline is None:
+            baseline = next((
+                row for row in members
+                if row.get("candidate_family") == "interpolation"
+                and row.get("t") is not None
+                and math.isclose(float(row["t"]), 0.0)
+            ), None)
+        if baseline is None:
+            continue
+        baseline_token_accuracy = float(baseline["token_accuracy"])
+        baseline_exact_match = float(baseline["exact_match"])
+        for row in trajectory:
+            if isinstance(row, dict):
+                row.setdefault(
+                    "delta_token_accuracy",
+                    float(row["token_accuracy"]) - baseline_token_accuracy,
+                )
+                row.setdefault(
+                    "delta_exact_match",
+                    float(row["exact_match"]) - baseline_exact_match,
+                )
+
+
+def write_alignment_scatter_svg(
+    path: Path,
+    rows: Sequence[Mapping[str, Any]],
+    title: str,
+    *,
+    y_key: str = "delta_target_nll",
+    y_axis_label: str = "Δ target NLL from training K (lower is better)",
+    quality_higher_is_better: bool = False,
+    summary_statistic: str = "median",
+    minimum_y_limit: float = 1e-9,
+    fixed_y_bounds: tuple[float, float] | None = None,
+) -> None:
+    if not rows:
+        return
+    if summary_statistic not in ("mean", "median"):
+        raise ValueError(f"Unsupported scatter summary statistic: {summary_statistic}")
+    width, height = 760, 500
+    left, right, top, bottom = 84, 32, 78, 70
+    x_values = np.asarray([float(row["delta_objective"]) for row in rows])
+    y_values = np.asarray([float(row[y_key]) for row in rows])
+    raw_x_limit = max(float(np.quantile(np.abs(x_values), 0.99)), 1e-9)
+    raw_y_limit = max(float(np.quantile(np.abs(y_values), 0.99)), minimum_y_limit)
+    x_min, x_max, x_ticks, x_step = nice_axis_ticks(
+        -raw_x_limit, raw_x_limit, max_intervals=6, include_zero=True
+    )
+    y_min, y_max, y_ticks, y_step = nice_axis_ticks(
+        -raw_y_limit,
+        raw_y_limit,
+        max_intervals=6,
+        include_zero=True,
+        fixed_bounds=fixed_y_bounds,
+    )
+    steps = sorted({int(row["K"]) for row in rows})
+    colors = ["#2166ac", "#4393c3", "#92c5de", "#4d9221", "#e08214", "#b2182b", "#762a83"]
+    color_by_step = {step: colors[index % len(colors)] for index, step in enumerate(steps)}
+
+    def x_coord(value: float) -> float:
+        value = max(x_min, min(x_max, value))
+        return left + (value - x_min) / (x_max - x_min) * (width - left - right)
+
+    def y_coord(value: float) -> float:
+        value = max(y_min, min(y_max, value))
+        return top + (y_max - value) / (y_max - y_min) * (height - top - bottom)
+
+    conflict_top = y_coord(0) if quality_higher_is_better else top
+    conflict_bottom = height - bottom if quality_higher_is_better else y_coord(0)
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="{_svg_text(title)}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="{width / 2}" y="27" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">{_svg_text(title)}</text>',
+        f'<rect x="{left}" y="{conflict_top:.2f}" width="{x_coord(0)-left:.2f}" height="{conflict_bottom-conflict_top:.2f}" fill="#fddbc7" fill-opacity="0.35"/>',
+    ]
+    for tick in x_ticks:
+        x = x_coord(tick)
+        stroke = "#777777" if math.isclose(tick, 0.0, abs_tol=1e-12) else "#dddddd"
+        elements.extend([
+            f'<line x1="{x:.2f}" x2="{x:.2f}" y1="{top}" y2="{height-bottom}" stroke="{stroke}"/>',
+            f'<text x="{x:.2f}" y="{height-bottom+18}" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#444">{format_axis_tick(tick, x_step)}</text>',
+        ])
+    for tick in y_ticks:
+        y = y_coord(tick)
+        stroke = "#777777" if math.isclose(tick, 0.0, abs_tol=1e-12) else "#dddddd"
+        elements.extend([
+            f'<line x1="{left}" x2="{width-right}" y1="{y:.2f}" y2="{y:.2f}" stroke="{stroke}"/>',
+            f'<text x="{left-7}" y="{y+4:.2f}" text-anchor="end" font-family="sans-serif" font-size="10" fill="#444">{format_axis_tick(tick, y_step)}</text>',
+        ])
+    legend_width = (width - left - right) / max(len(steps), 1)
+    for index, step in enumerate(steps):
+        legend_x = left + (index + 0.5) * legend_width
+        elements.extend([
+            f'<circle cx="{legend_x-13:.2f}" cy="50" r="4" fill="{color_by_step[step]}" stroke="#222"/>',
+            f'<text x="{legend_x-5:.2f}" y="54" font-family="sans-serif" font-size="11" fill="#222">K={step}</text>',
+        ])
+    for row in rows:
+        step = int(row["K"])
+        elements.append(
+            f'<circle cx="{x_coord(float(row["delta_objective"])):.2f}" '
+            f'cy="{y_coord(float(row[y_key])):.2f}" r="1.6" '
+            f'fill="{color_by_step[step]}" fill-opacity="0.24"/>'
+        )
+    summarize = np.mean if summary_statistic == "mean" else np.median
+    medians = []
+    for step in steps:
+        selected = [row for row in rows if int(row["K"]) == step]
+        medians.append((
+            step,
+            float(summarize([float(row["delta_objective"]) for row in selected])),
+            float(summarize([float(row[y_key]) for row in selected])),
+        ))
+    coordinates = " ".join(f"{x_coord(x):.2f},{y_coord(y):.2f}" for _, x, y in medians)
+    elements.append(f'<polyline points="{coordinates}" fill="none" stroke="#222" stroke-width="1.5"/>')
+    for step, x_value, y_value in medians:
+        elements.extend([
+            f'<circle cx="{x_coord(x_value):.2f}" cy="{y_coord(y_value):.2f}" r="4" fill="{color_by_step[step]}" stroke="#222"/>',
+            f'<text x="{x_coord(x_value)+6:.2f}" y="{y_coord(y_value)-5:.2f}" font-family="sans-serif" font-size="10" fill="#222">K={step}</text>',
+        ])
+    elements.extend([
+        f'<line x1="{left}" x2="{width-right}" y1="{height-bottom}" y2="{height-bottom}" stroke="#333"/>',
+        f'<line x1="{left}" x2="{left}" y1="{top}" y2="{height-bottom}" stroke="#333"/>',
+        f'<text x="{(left + width-right)/2}" y="{height-22}" text-anchor="middle" font-family="sans-serif" font-size="13" fill="#222">Δ write objective from training K (lower is better)</text>',
+        f'<text x="18" y="{(top+height-bottom)/2}" text-anchor="middle" transform="rotate(-90 18 {(top+height-bottom)/2})" font-family="sans-serif" font-size="13" fill="#222">{_svg_text(y_axis_label)}</text>',
+        '</svg>',
+    ])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(elements) + "\n")
+
+
+def write_correlation_matrix_svg(
+    path: Path,
+    rows: Sequence[Mapping[str, Any]],
+    title: str,
+) -> None:
+    if not rows:
+        return
+    family_order = {"trajectory": 0, "interpolation": 1, "radial": 2}
+    aliases = list(dict.fromkeys(
+        str(row["alias"]) for row in rows if row.get("alias") is not None
+    ))
+    alias_order = {alias: index for index, alias in enumerate(aliases)}
+    show_alias = len(aliases) > 1
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            alias_order.get(str(row.get("alias")), 0) if show_alias else 0,
+            family_order.get(str(row["candidate_family"]), 99),
+        ),
+    )
+    metrics = [
+        ("spearman_objective_vs_target_nll_median", "target NLL"),
+        ("spearman_objective_vs_token_error_median", "token error"),
+        ("spearman_objective_vs_exact_error_median", "exact error"),
+        ("spearman_objective_vs_distance_to_oracle_median", "distance to oracle"),
+        ("spearman_objective_vs_distance_to_training_k_median", "distance to train K"),
+    ]
+    labels = []
+    for row in rows:
+        family = str(row["candidate_family"])
+        if family == "trajectory":
+            k_values = row.get("trajectory_K_values")
+            if isinstance(k_values, (list, tuple)) and k_values:
+                minimum_k = int(min(k_values))
+                maximum_k = int(max(k_values))
+                family_label = (
+                    f"trajectory K={minimum_k}"
+                    if minimum_k == maximum_k
+                    else f"trajectory K={minimum_k}–{maximum_k}"
+                )
+            else:
+                family_label = "trajectory (K range unavailable)"
+        else:
+            family_label = family.replace("_", " ")
+        labels.append(
+            f'{row.get("alias")} / {family_label}' if show_alias else family_label
+        )
+    width = 980 if show_alias else 820
+    height = 147 + 42 * len(rows)
+    left, right, top, bottom = (315 if show_alias else 190), 25, 105, 42
+    cell_width = (width - left - right) / len(metrics)
+    cell_height = (height - top - bottom) / len(rows)
+
+    def color(value: float | None) -> str:
+        if value is None or not math.isfinite(float(value)):
+            return "#eeeeee"
+        normalized = max(-1.0, min(1.0, float(value)))
+        endpoint = (178, 24, 43) if normalized >= 0 else (33, 102, 172)
+        amount = abs(normalized)
+        channels = [round(255 + amount * (channel - 255)) for channel in endpoint]
+        return "#" + "".join(f"{channel:02x}" for channel in channels)
+
+    elements = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" aria-label="{_svg_text(title)}">',
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        f'<text x="{width/2}" y="26" text-anchor="middle" font-family="sans-serif" font-size="17" fill="#222">{_svg_text(title)}</text>',
+        '<text x="20" y="47" font-family="sans-serif" font-size="10" fill="#444">trajectory: memories after K inner write updates for the same example</text>',
+        '<text x="20" y="62" font-family="sans-serif" font-size="10" fill="#444">interpolation: path from the training-K memory toward a deranged memory</text>',
+        '<text x="20" y="77" font-family="sans-serif" font-size="10" fill="#444">radial: random directions around the training-K memory</text>',
+    ]
+    for column, (_, label) in enumerate(metrics):
+        x = left + (column + 0.5) * cell_width
+        elements.append(f'<text x="{x:.2f}" y="{top-10}" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#333">{_svg_text(label)}</text>')
+    for row_index, (row, label) in enumerate(zip(rows, labels)):
+        y = top + row_index * cell_height
+        elements.append(f'<text x="{left-8}" y="{y+cell_height/2+4:.2f}" text-anchor="end" font-family="sans-serif" font-size="11" fill="#333">{_svg_text(label)}</text>')
+        for column, (metric, _) in enumerate(metrics):
+            value = row.get(metric)
+            x = left + column * cell_width
+            elements.append(f'<rect x="{x:.2f}" y="{y:.2f}" width="{cell_width-1:.2f}" height="{cell_height-1:.2f}" fill="{color(value)}"/>')
+            text_value = "—" if value is None else f"{float(value):+.2f}"
+            text_color = "#ffffff" if value is not None and abs(float(value)) > 0.55 else "#222222"
+            elements.append(f'<text x="{x+cell_width/2:.2f}" y="{y+cell_height/2+4:.2f}" text-anchor="middle" font-family="sans-serif" font-size="11" fill="{text_color}">{text_value}</text>')
+    elements.extend([
+        f'<text x="{left}" y="{height-14}" font-family="sans-serif" font-size="10" fill="#444">−1: lower objective ranks worse quality</text>',
+        f'<text x="{width-right}" y="{height-14}" text-anchor="end" font-family="sans-serif" font-size="10" fill="#444">+1: lower objective ranks better quality</text>',
+        '</svg>',
+    ])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(elements) + "\n")
+
+
+def add_trajectory_k_values(
+    summary_rows: Sequence[Mapping[str, Any]],
+    candidate_rows: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach the actual sampled K grid to trajectory rows used by matrix plots."""
+    k_by_alias: dict[str | None, list[int]] = {}
+    aliases = {
+        None if row.get("alias") is None else str(row["alias"])
+        for row in summary_rows
+        if row.get("candidate_family") == "trajectory"
+    }
+    for alias in aliases:
+        k_by_alias[alias] = sorted({
+            int(row["K"])
+            for row in candidate_rows
+            if row.get("candidate_family") == "trajectory"
+            and row.get("K") is not None
+            and (
+                None if row.get("alias") is None else str(row["alias"])
+            ) == alias
+        })
+    output = []
+    for row in summary_rows:
+        transformed = dict(row)
+        if row.get("candidate_family") == "trajectory":
+            alias = None if row.get("alias") is None else str(row["alias"])
+            transformed["trajectory_K_values"] = k_by_alias.get(alias, [])
+        output.append(transformed)
+    return output
+
+
+def generate_quality_plots(
+    output_dir: Path,
+    candidate_rows: Sequence[Mapping[str, Any]],
+    family_summary: Sequence[Mapping[str, Any]],
+    trajectory_summary: Sequence[Mapping[str, Any]],
+) -> None:
+    plots_dir = output_dir / "plots" / "quality_alignment"
+    ensure_trajectory_quality_deltas(candidate_rows)
+    for n_value in sorted({int(row["N"]) for row in candidate_rows}):
+        trajectory_candidates = [
+            row for row in candidate_rows
+            if int(row["N"]) == n_value and row["candidate_family"] == "trajectory"
+        ]
+        write_alignment_scatter_svg(
+            plots_dir / f"objective-vs-target-nll-n{n_value}.svg",
+            trajectory_candidates,
+            f"Write objective versus target NLL across K (N={n_value})",
+        )
+        write_alignment_scatter_svg(
+            plots_dir / f"objective-vs-token-accuracy-n{n_value}.svg",
+            trajectory_candidates,
+            f"Write objective versus token accuracy across K (N={n_value})",
+            y_key="delta_token_accuracy",
+            y_axis_label="Δ token accuracy from training K (higher is better)",
+            quality_higher_is_better=True,
+            summary_statistic="mean",
+            minimum_y_limit=0.05,
+        )
+        write_alignment_scatter_svg(
+            plots_dir / f"objective-vs-exact-match-n{n_value}.svg",
+            trajectory_candidates,
+            f"Write objective versus exact match across K (N={n_value})",
+            y_key="delta_exact_match",
+            y_axis_label="Δ exact match from training K (higher is better)",
+            quality_higher_is_better=True,
+            summary_statistic="mean",
+            fixed_y_bounds=(-1.0, 1.0),
+        )
+        selected_summary = [
+            row for row in family_summary if int(row["N"]) == n_value
+        ]
+        selected_summary = add_trajectory_k_values(
+            selected_summary, trajectory_candidates
+        )
+        write_correlation_matrix_svg(
+            plots_dir / f"correlation-matrix-n{n_value}.svg",
+            selected_summary,
+            f"Median per-example objective/quality rank correlation (N={n_value})",
+        )
+        trajectory = [row for row in trajectory_summary if int(row["N"]) == n_value]
+        write_line_svg(
+            plots_dir / f"trajectory-deltas-vs-k-n{n_value}.svg",
+            {
+                "median Δ objective": [(float(row["K"]), float(row["median_delta_objective"])) for row in trajectory],
+                "median Δ target NLL": [(float(row["K"]), float(row["median_delta_target_nll"])) for row in trajectory],
+            },
+            f"Objective and read-quality changes across K (N={n_value})",
+            "inner steps K",
+            "change from training K",
+            x_ticks=[float(row["K"]) for row in trajectory],
+            include_y_zero=True,
+        )
+
+
+def generate_aggregate_quality_plots(
+    output_dir: Path,
+    candidate_rows: Sequence[Mapping[str, Any]],
+    family_rows: Sequence[Mapping[str, Any]],
+    trajectory_rows: Sequence[Mapping[str, Any]],
+) -> None:
+    plots_dir = output_dir / "plots" / "quality_alignment"
+    mean_candidates = []
+    for row in candidate_rows:
+        transformed = dict(row)
+        for metric in (
+            "objective", "target_nll", "token_accuracy", "exact_match",
+            "delta_objective", "delta_target_nll",
+            "delta_token_accuracy", "delta_exact_match",
+        ):
+            if f"{metric}_mean" in row:
+                transformed[metric] = row[f"{metric}_mean"]
+        mean_candidates.append(transformed)
+    ensure_trajectory_quality_deltas(mean_candidates)
+    for n_value in sorted({int(row["N"]) for row in family_rows}):
+        trajectory_candidates = [
+            row for row in mean_candidates
+            if int(row["N"]) == n_value and row["candidate_family"] == "trajectory"
+        ]
+        write_alignment_scatter_svg(
+            plots_dir / f"objective-vs-target-nll-n{n_value}.svg",
+            trajectory_candidates,
+            f"Run-mean write objective versus target NLL across K (N={n_value})",
+        )
+        write_alignment_scatter_svg(
+            plots_dir / f"objective-vs-token-accuracy-n{n_value}.svg",
+            trajectory_candidates,
+            f"Run-mean write objective versus token accuracy across K (N={n_value})",
+            y_key="delta_token_accuracy",
+            y_axis_label="Δ token accuracy from training K (higher is better)",
+            quality_higher_is_better=True,
+            summary_statistic="mean",
+            minimum_y_limit=0.05,
+        )
+        write_alignment_scatter_svg(
+            plots_dir / f"objective-vs-exact-match-n{n_value}.svg",
+            trajectory_candidates,
+            f"Run-mean write objective versus exact match across K (N={n_value})",
+            y_key="delta_exact_match",
+            y_axis_label="Δ exact match from training K (higher is better)",
+            quality_higher_is_better=True,
+            summary_statistic="mean",
+            fixed_y_bounds=(-1.0, 1.0),
+        )
+        selected_family = [row for row in family_rows if int(row["N"]) == n_value]
+        matrix_rows = []
+        for row in selected_family:
+            transformed = dict(row)
+            for metric in (
+                "target_nll", "token_error", "exact_error",
+                "distance_to_oracle", "distance_to_training_k",
+            ):
+                transformed[f"spearman_objective_vs_{metric}_median"] = row.get(
+                    f"spearman_objective_vs_{metric}_median_mean"
+                )
+            matrix_rows.append(transformed)
+        matrix_rows = add_trajectory_k_values(matrix_rows, trajectory_candidates)
+        write_correlation_matrix_svg(
+            plots_dir / f"correlation-matrix-n{n_value}.svg",
+            matrix_rows,
+            f"Run-mean median objective/quality rank correlation (N={n_value})",
+        )
+        trajectory = [row for row in trajectory_rows if int(row["N"]) == n_value]
+        write_line_svg(
+            plots_dir / f"trajectory-deltas-vs-k-n{n_value}.svg",
+            {
+                "median Δ objective": [(float(row["K"]), float(row["median_delta_objective_mean"])) for row in trajectory],
+                "median Δ target NLL": [(float(row["K"]), float(row["median_delta_target_nll_mean"])) for row in trajectory],
+            },
+            f"Run-mean objective and read-quality changes across K (N={n_value})",
+            "inner steps K",
+            "mean change from training K",
+            x_ticks=[float(row["K"]) for row in trajectory],
+            include_y_zero=True,
+        )
+
+
+def generate_cross_alias_quality_plots(
+    output_dir: Path,
+    aggregate_by_alias: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]],
+) -> None:
+    trajectory_rows = [
+        row for aggregate in aggregate_by_alias.values()
+        for row in aggregate.get("quality_trajectory", [])
+    ]
+    plots_dir = output_dir / "plots" / "quality_alignment"
+    aliases = list(aggregate_by_alias)
+    candidates_by_alias: dict[str, list[dict[str, Any]]] = {}
+    for alias in aliases:
+        candidate_path = output_dir / "aggregate" / alias / "quality_alignment" / "candidates.jsonl"
+        if not candidate_path.exists():
+            continue
+        transformed_rows = []
+        for row in read_jsonl(candidate_path):
+            transformed = dict(row)
+            for metric in (
+                "objective", "target_nll", "delta_objective", "delta_target_nll",
+                "token_accuracy", "exact_match", "delta_token_accuracy", "delta_exact_match",
+            ):
+                if f"{metric}_mean" in row:
+                    transformed[metric] = row[f"{metric}_mean"]
+            transformed_rows.append(transformed)
+        ensure_trajectory_quality_deltas(transformed_rows)
+        candidates_by_alias[alias] = transformed_rows
+
+    family_rows = [
+        row for aggregate in aggregate_by_alias.values()
+        for row in aggregate.get("quality_family", [])
+    ]
+    for n_value in sorted({int(row["N"]) for row in family_rows}):
+        matrix_rows = []
+        for row in family_rows:
+            if int(row["N"]) != n_value:
+                continue
+            transformed = dict(row)
+            for metric in (
+                "target_nll", "token_error", "exact_error",
+                "distance_to_oracle", "distance_to_training_k",
+            ):
+                transformed[f"spearman_objective_vs_{metric}_median"] = row.get(
+                    f"spearman_objective_vs_{metric}_median_mean"
+                )
+            matrix_rows.append(transformed)
+        matrix_candidates = [
+            row
+            for candidate_rows in candidates_by_alias.values()
+            for row in candidate_rows
+            if int(row["N"]) == n_value
+            and row["candidate_family"] == "trajectory"
+        ]
+        matrix_rows = add_trajectory_k_values(matrix_rows, matrix_candidates)
+        write_correlation_matrix_svg(
+            plots_dir / f"correlation-matrix-n{n_value}.svg",
+            matrix_rows,
+            f"Run-mean objective/quality rank correlation by alias (N={n_value})",
+        )
+
+    for alias, candidate_rows in candidates_by_alias.items():
+        for n_value in sorted({int(row["N"]) for row in candidate_rows}):
+            trajectory_candidates = [
+                row for row in candidate_rows
+                if int(row["N"]) == n_value and row["candidate_family"] == "trajectory"
+            ]
+            write_alignment_scatter_svg(
+                plots_dir / f"objective-vs-target-nll-{alias}-n{n_value}.svg",
+                trajectory_candidates,
+                f"Run-mean objective versus target NLL: {alias} (N={n_value})",
+            )
+            write_alignment_scatter_svg(
+                plots_dir / f"objective-vs-token-accuracy-{alias}-n{n_value}.svg",
+                trajectory_candidates,
+                f"Run-mean objective versus token accuracy: {alias} (N={n_value})",
+                y_key="delta_token_accuracy",
+                y_axis_label="Δ token accuracy from training K (higher is better)",
+                quality_higher_is_better=True,
+                summary_statistic="mean",
+                minimum_y_limit=0.05,
+            )
+            write_alignment_scatter_svg(
+                plots_dir / f"objective-vs-exact-match-{alias}-n{n_value}.svg",
+                trajectory_candidates,
+                f"Run-mean objective versus exact match: {alias} (N={n_value})",
+                y_key="delta_exact_match",
+                y_axis_label="Δ exact match from training K (higher is better)",
+                quality_higher_is_better=True,
+                summary_statistic="mean",
+                fixed_y_bounds=(-1.0, 1.0),
+            )
+            trajectory_groups = _group_rows(trajectory_candidates, ("K",))
+            write_line_svg(
+                plots_dir / f"trajectory-inner-objective-{alias}-n{n_value}.svg",
+                {
+                    alias: [
+                        (float(k_value), float(np.median([
+                            float(row["delta_objective"]) for row in members
+                        ])))
+                        for (k_value,), members in sorted(trajectory_groups.items())
+                    ]
+                },
+                f"Run-mean inner write-objective trajectory: {alias} (N={n_value})",
+                "inner steps K",
+                "median Δ inner write objective from training K",
+                x_ticks=sorted(float(key[0]) for key in trajectory_groups),
+                include_y_zero=True,
+            )
+    for n_value in sorted({int(row["N"]) for row in trajectory_rows}):
+        series = {}
+        bands = {}
+        for alias in aliases:
+            selected = [
+                row for row in trajectory_rows
+                if row["alias"] == alias and int(row["N"]) == n_value
+            ]
+            series[alias] = [
+                (float(row["K"]), float(row["median_delta_target_nll_mean"]))
+                for row in selected
+            ]
+            bands[alias] = [
+                (float(row["K"]), float(row["median_delta_target_nll_mean"]),
+                 row.get("median_delta_target_nll_std"))
+                for row in selected
+            ]
+        write_line_svg(
+            plots_dir / f"target-nll-delta-vs-k-n{n_value}.svg",
+            series,
+            f"Target-NLL change across K by alias (N={n_value})",
+            "inner steps K",
+            "run mean of median Δ target NLL ± run std",
+            std_series=bands,
+            x_ticks=sorted({float(row["K"]) for row in trajectory_rows if int(row["N"]) == n_value}),
+            include_y_zero=True,
+        )
+
 
 
 def generate_plots(
@@ -1471,6 +2515,8 @@ def generate_plots(
             f"Exact match vs. number of facts (K={inner_steps})",
             "N facts",
             "exact match",
+            x_ticks=sorted({float(row["N"]) for row in task_summary}),
+            y_bounds=(0.0, 1.0),
         )
 
     for n_value in n_values:
@@ -1492,6 +2538,8 @@ def generate_plots(
                 f"{y_label.title()} vs. inner steps (N={n_value})",
                 "inner steps K",
                 y_label,
+                x_ticks=sorted({float(row["K"]) for row in task_summary if int(row["N"]) == n_value}),
+                y_bounds=(0.0, 1.0) if metric == "exact_match" else None,
             )
 
     for n_value in sorted({int(row["N"]) for row in interpolation_rows}):
@@ -1568,6 +2616,8 @@ def generate_aggregate_plots(
             "N facts",
             "exact match mean ± run std",
             std_series=bands,
+            x_ticks=sorted({float(row["N"]) for row in task_rows}),
+            y_bounds=(0.0, 1.0),
         )
 
     for n_value in sorted({int(row["N"]) for row in task_rows}):
@@ -1594,6 +2644,8 @@ def generate_aggregate_plots(
                 "inner steps K",
                 f"{label} mean ± run std",
                 std_series=bands,
+                x_ticks=sorted({float(row["K"]) for row in task_rows if int(row["N"]) == n_value}),
+                y_bounds=(0.0, 1.0) if metric == "exact_match" else None,
             )
 
     for n_value in sorted({int(row["N"]) for row in interpolation_rows}):
@@ -1902,6 +2954,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scan-examples", type=int, default=512)
     parser.add_argument("--contour-examples", type=int, default=64)
     parser.add_argument("--num-radial-directions", type=int, default=8)
+    parser.add_argument(
+        "--quality-diagnostics",
+        action="store_true",
+        help="evaluate whether the write objective ranks downstream read quality",
+    )
+    parser.add_argument(
+        "--quality-n-values",
+        nargs="+",
+        default=None,
+        help="N values for quality diagnostics (default: evaluated landscape N values)",
+    )
+    parser.add_argument("--quality-examples", type=int, default=256)
+    parser.add_argument(
+        "--quality-inner-steps",
+        nargs="+",
+        default=[0, 1, 2, 4, 8, 16, 32],
+    )
     return parser
 
 
@@ -1928,6 +2997,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Legacy mode requires both --baseline-run and --shaped-run")
     if args.batch_size <= 0:
         raise ValueError("batch-size must be positive")
+    if args.quality_examples <= 0:
+        raise ValueError("quality-examples must be positive")
+    if any(step < 0 for step in args.quality_inner_steps):
+        raise ValueError("quality-inner-steps must be non-negative")
+    if len(set(args.quality_inner_steps)) != len(args.quality_inner_steps):
+        raise ValueError("quality-inner-steps must be unique")
     if args.matching_bank_size <= 1:
         raise ValueError("matching-bank-size must be greater than one")
     if args.matching_examples < args.matching_bank_size:
@@ -2011,6 +3086,72 @@ def evaluation_config(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def quality_evaluation_config(args: argparse.Namespace) -> dict[str, Any]:
+    """Settings for the additive quality pass, kept out of the base resume signature."""
+    return {
+        "quality_diagnostics_schema_version": QUALITY_DIAGNOSTICS_SCHEMA_VERSION,
+        "n_values": list(args.quality_n_values),
+        "num_examples": int(args.quality_examples),
+        "inner_steps": list(args.quality_inner_steps),
+        "interpolation_values": [float(value) for value in np.linspace(0.0, 1.0, 11)],
+        "radial_radii": [0.0, 0.125, 0.25, 0.5, 1.0, 1.5],
+        "num_radial_directions": int(args.num_radial_directions),
+        "batch_size": int(args.batch_size),
+        "bootstrap_resamples": int(args.bootstrap_resamples),
+        "seed": int(args.seed),
+        "device": str(args.device),
+        "dtype": "float32",
+    }
+
+
+def apply_resume_defaults(
+    args: argparse.Namespace,
+    argv: Sequence[str],
+) -> None:
+    """Recover omitted base-evaluation arguments from an existing root manifest."""
+    if not args.resume:
+        return
+    manifest_path = args.output_dir / "manifest.json"
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text())
+    saved = manifest.get("evaluation")
+    if not isinstance(saved, Mapping):
+        return
+    option_map = {
+        "--data-root": ("data_root", "data_root", Path),
+        "--n-values": ("n_values", "n_values", list),
+        "--inner-steps": ("inner_steps", "inner_steps", list),
+        "--batch-size": ("batch_size", "batch_size", int),
+        "--seed": ("seed", "seed", int),
+        "--bootstrap-resamples": ("bootstrap_resamples", "bootstrap_resamples", int),
+        "--max-eval-examples": ("max_eval_examples", "max_eval_examples", lambda value: value),
+        "--skip-landscape": ("skip_landscape", "skip_landscape", bool),
+        "--landscape-n-values": ("landscape_n_values", "landscape_n_values", list),
+        "--matching-n-values": ("matching_n_values", "matching_n_values", list),
+        "--matching-examples": ("matching_examples", "matching_examples", int),
+        "--matching-bank-size": ("matching_bank_size", "matching_bank_size", int),
+        "--scan-examples": ("scan_examples", "scan_examples", int),
+        "--contour-examples": ("contour_examples", "contour_examples", int),
+        "--num-radial-directions": ("num_radial_directions", "num_radial_directions", int),
+        "--device": ("device", "device", str),
+    }
+    explicit_options = {piece.split("=", 1)[0] for piece in argv if piece.startswith("--")}
+    for option, (attribute, saved_key, converter) in option_map.items():
+        if option not in explicit_options and saved_key in saved:
+            setattr(args, attribute, converter(saved[saved_key]))
+
+    has_input = bool(
+        args.model or args.experiment_paths or args.baseline_run or args.shaped_run
+    )
+    saved_inputs = manifest.get("inputs")
+    if not has_input and isinstance(saved_inputs, list) and saved_inputs:
+        args.model = [
+            [str(item["alias"]), str(item["path"]), str(item["checkpoint_selector"])]
+            for item in saved_inputs
+        ]
+
+
 def tokenizer_signature_digest(tokenizer: Any) -> str:
     def stable(value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
@@ -2049,6 +3190,151 @@ def validate_resume_manifest(
         raise ValueError(f"Resume signature mismatch for checkpoint output: {checkpoint_output}")
 
 
+def quality_diagnostics_signature(
+    checkpoint_digest: str,
+    spec: ResolvedRun,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    return {
+        "checkpoint_sha256": checkpoint_digest,
+        "quality_evaluation": quality_evaluation_config(args),
+        "alias": spec.alias,
+        "run_id": spec.run_id,
+        "seed": spec.seed,
+        "checkpoint": spec.checkpoint_name,
+    }
+
+
+def quality_diagnostics_complete(
+    quality_dir: Path,
+    signature: Mapping[str, Any],
+) -> bool:
+    manifest_path = quality_dir / "manifest.json"
+    if not manifest_path.exists():
+        return False
+    manifest = json.loads(manifest_path.read_text())
+    validate_resume_manifest(manifest, signature, quality_dir)
+    return True
+
+
+def update_checkpoint_report_with_quality(
+    checkpoint_output: Path,
+    family_summary: Sequence[Mapping[str, Any]],
+) -> None:
+    report_path = checkpoint_output / "report.md"
+    text = report_path.read_text() if report_path.exists() else "# Frozen-checkpoint evaluation\n"
+    marker = "\n## Objective–quality diagnostics\n"
+    if marker in text:
+        text = text.split(marker, 1)[0].rstrip() + "\n"
+    alignment_table = format_markdown_table(
+        ["N", "Candidate family", "Examples", "ρ(objective, target NLL)", "Valid coverage", "NLL regret"],
+        [[
+            row["N"],
+            row["candidate_family"],
+            row["num_examples"],
+            "—" if row.get("spearman_objective_vs_target_nll_median") is None else f'{float(row["spearman_objective_vs_target_nll_median"]):+.3f}',
+            f'{float(row["spearman_objective_vs_target_nll_coverage"]):.3f}',
+            "—" if row.get("objective_selected_nll_regret_mean") is None else f'{float(row["objective_selected_nll_regret_mean"]):.5f}',
+        ] for row in family_summary],
+    )
+    text += (
+        marker
+        + "Correlations are computed within each example, so checkpoint-specific objective offsets do not affect them. "
+        + "Positive correlation with NLL/error means lower objective ranks better reads.\n\n"
+        + alignment_table
+        + "\n\nSee [quality candidate data](quality_alignment/candidates.jsonl), "
+        + "[quality summaries](quality_alignment/candidate_family_summary.csv), and "
+        + "[quality plots](plots/quality_alignment/).\n"
+    )
+    report_path.write_text(text)
+
+
+def run_quality_diagnostics(
+    frozen: FrozenModel,
+    spec: ResolvedRun,
+    args: argparse.Namespace,
+    loaded_datasets: Mapping[int, Any],
+    checkpoint_output: Path,
+    checkpoint_digest: str,
+) -> None:
+    quality_dir = checkpoint_output / "quality_alignment"
+    signature = quality_diagnostics_signature(checkpoint_digest, spec, args)
+    if quality_dir.exists():
+        if not args.resume:
+            raise FileExistsError(f"Quality diagnostics already exist: {quality_dir}")
+        if quality_diagnostics_complete(quality_dir, signature):
+            return
+        raise ValueError(f"Cannot resume quality diagnostics without a complete manifest: {quality_dir}")
+    quality_dir.mkdir(parents=True, exist_ok=False)
+    write_json(quality_dir / "manifest.json", {
+        "status": "running",
+        "signature": signature,
+        "device": str(frozen.device),
+        "objective_type": frozen.objective_type,
+    })
+    candidate_rows: list[dict[str, Any]] = []
+    for n_value in args.quality_n_values:
+        print(
+            f"[quality] alias={spec.alias} run={spec.run_id} seed={spec.seed} N={n_value}",
+            flush=True,
+        )
+        candidate_rows.extend(collect_quality_diagnostic_candidates(
+            frozen, loaded_datasets[n_value], n_value, args
+        ))
+    correlation_rows, family_summary, trajectory_summary = quality_alignment_summaries(
+        candidate_rows, args.bootstrap_resamples, args.seed
+    )
+    for rows in (
+        candidate_rows, correlation_rows, family_summary, trajectory_summary
+    ):
+        add_run_metadata(rows, spec)
+    write_jsonl(quality_dir / "candidates.jsonl", candidate_rows)
+    write_csv(quality_dir / "correlations.csv", correlation_rows)
+    write_csv(quality_dir / "candidate_family_summary.csv", family_summary)
+    write_csv(quality_dir / "trajectory_summary.csv", trajectory_summary)
+    write_json(quality_dir / "summary.json", {
+        "candidate_families": family_summary,
+        "trajectory": trajectory_summary,
+    })
+    generate_quality_plots(
+        checkpoint_output, candidate_rows, family_summary, trajectory_summary
+    )
+    update_checkpoint_report_with_quality(checkpoint_output, family_summary)
+    write_json(quality_dir / "manifest.json", {
+        "status": "complete",
+        "signature": signature,
+        "device": str(frozen.device),
+        "objective_type": frozen.objective_type,
+        "num_candidates": len(candidate_rows),
+        "num_correlation_rows": len(correlation_rows),
+    })
+
+
+def regenerate_quality_presentation(checkpoint_output: Path) -> None:
+    """Refresh plots/reports from completed diagnostics without model execution."""
+    quality_dir = checkpoint_output / "quality_alignment"
+    candidate_rows = read_jsonl(quality_dir / "candidates.jsonl")
+    family_summary = read_csv(quality_dir / "candidate_family_summary.csv")
+    trajectory_summary = read_csv(quality_dir / "trajectory_summary.csv")
+    generate_quality_plots(
+        checkpoint_output, candidate_rows, family_summary, trajectory_summary
+    )
+    update_checkpoint_report_with_quality(checkpoint_output, family_summary)
+
+
+def regenerate_checkpoint_plots(checkpoint_output: Path, n_values: Sequence[int]) -> None:
+    """Refresh ordinary task/landscape plots from saved checkpoint tables."""
+    task_summary = json.loads((checkpoint_output / "task_summary.json").read_text())
+    generate_plots(
+        checkpoint_output,
+        task_summary,
+        read_csv(checkpoint_output / "interpolation.csv"),
+        read_csv(checkpoint_output / "radial.csv"),
+        read_csv(checkpoint_output / "contours.csv"),
+        n_values,
+    )
+
+
 def evaluate_resolved_run(
     spec: ResolvedRun,
     args: argparse.Namespace,
@@ -2075,6 +3361,31 @@ def evaluate_resolved_run(
             raise ValueError(f"Cannot resume checkpoint without manifest: {checkpoint_output}")
         existing = json.loads(manifest_path.read_text())
         validate_resume_manifest(existing, signature, checkpoint_output)
+        regenerate_checkpoint_plots(checkpoint_output, args.n_values)
+        if args.quality_diagnostics:
+            quality_signature = quality_diagnostics_signature(checkpoint_digest, spec, args)
+            quality_dir = checkpoint_output / "quality_alignment"
+            if quality_diagnostics_complete(quality_dir, quality_signature):
+                regenerate_quality_presentation(checkpoint_output)
+            else:
+                frozen = load_frozen_model(
+                    spec.alias, spec.run_path, spec.checkpoint_path, device=device
+                )
+                run_quality_diagnostics(
+                    frozen, spec, args, loaded_datasets, checkpoint_output, checkpoint_digest
+                )
+                digest_after = parameter_digest(frozen.model)
+                if digest_after != frozen.digest_before:
+                    raise AssertionError(
+                        f"Frozen model parameters changed during quality evaluation: "
+                        f"{spec.alias}/{spec.run_id}"
+                    )
+                del frozen
+                gc.collect()
+                if device.type == "mps":
+                    torch.mps.empty_cache()
+                elif device.type == "cuda":
+                    torch.cuda.empty_cache()
         return checkpoint_output, str(existing["tokenizer_signature_sha256"])
 
     checkpoint_output.mkdir(parents=True, exist_ok=False)
@@ -2253,6 +3564,10 @@ def evaluate_resolved_run(
         reproduction,
         checkpoint_metadata=manifest,
     )
+    if args.quality_diagnostics:
+        run_quality_diagnostics(
+            frozen, spec, args, loaded_datasets, checkpoint_output, checkpoint_digest
+        )
     manifest.update({
         "status": "complete",
         "parameter_digest_after": digest_after,
@@ -2356,6 +3671,53 @@ def aggregate_alias_outputs(
         "interpolation": interpolation_summary_aggregate,
         "radial": radial_aggregate,
     })
+
+    quality_paths = [path / "quality_alignment" for path in paths]
+    quality_family_aggregate: list[dict[str, Any]] = []
+    quality_trajectory_aggregate: list[dict[str, Any]] = []
+    if quality_paths and all((path / "manifest.json").exists() for path in quality_paths):
+        quality_dir = alias_dir / "quality_alignment"
+        quality_dir.mkdir(parents=True, exist_ok=True)
+        correlation_rows = [
+            row for path in quality_paths for row in read_csv(path / "correlations.csv")
+        ]
+        family_rows = [
+            row for path in quality_paths for row in read_csv(path / "candidate_family_summary.csv")
+        ]
+        trajectory_rows = [
+            row for path in quality_paths for row in read_csv(path / "trajectory_summary.csv")
+        ]
+        correlation_aggregate = aggregate_numeric_rows(
+            correlation_rows, ["alias", "N", "example_index", "candidate_family"]
+        )
+        quality_family_aggregate = aggregate_numeric_rows(
+            family_rows, ["alias", "objective_type", "N", "candidate_family"]
+        )
+        quality_trajectory_aggregate = aggregate_numeric_rows(
+            trajectory_rows, ["alias", "N", "K"]
+        )
+        write_csv(quality_dir / "correlations.csv", correlation_aggregate)
+        write_csv(quality_dir / "candidate_family_summary.csv", quality_family_aggregate)
+        write_csv(quality_dir / "trajectory_summary.csv", quality_trajectory_aggregate)
+        aggregate_aligned_jsonl(
+            [path / "candidates.jsonl" for path in quality_paths],
+            quality_dir / "candidates.jsonl",
+            [
+                "alias", "objective_type", "N", "example_index", "candidate_family",
+                "candidate_kind", "K", "t", "radius", "direction_index", "training_K",
+            ],
+        )
+        quality_candidate_aggregate = read_jsonl(quality_dir / "candidates.jsonl")
+        write_json(quality_dir / "summary.json", {
+            "candidate_families": quality_family_aggregate,
+            "trajectory": quality_trajectory_aggregate,
+        })
+        generate_aggregate_quality_plots(
+            alias_dir,
+            quality_candidate_aggregate,
+            quality_family_aggregate,
+            quality_trajectory_aggregate,
+        )
     generate_aggregate_plots(
         alias_dir,
         task_aggregate,
@@ -2396,6 +3758,12 @@ def aggregate_alias_outputs(
         )
         + f"\n\n## Task metrics\n\n{alias_task_table}\n\n"
         + f"## Context–memory matching\n\n{alias_matching_table}\n\n"
+        + (
+            "## Objective–quality diagnostics\n\n"
+            "See [quality summaries](quality_alignment/candidate_family_summary.csv), "
+            "[quality plots](plots/quality_alignment/).\n\n"
+            if quality_family_aggregate else ""
+        )
         + "See [plots](plots/), [task summary](task_summary.csv), "
         + "[task examples](task_examples.jsonl), and the landscape tables for complete artifacts.\n"
     )
@@ -2406,6 +3774,8 @@ def aggregate_alias_outputs(
         "interpolation_summary": interpolation_summary_aggregate,
         "radial": radial_aggregate,
         "contours": contour_aggregate,
+        "quality_family": quality_family_aggregate,
+        "quality_trajectory": quality_trajectory_aggregate,
     }
 
 
@@ -2637,6 +4007,19 @@ def generate_root_report(
         ] for row in matching_rows],
     ) if matching_rows else "Landscape probes were not evaluated."
 
+    quality_rows = [
+        row for value in aggregate_by_alias.values() for row in value.get("quality_family", [])
+    ]
+    quality_table = format_markdown_table(
+        ["Alias", "N", "Candidate family", "Runs", "ρ(objective, target NLL)", "NLL regret"],
+        [[
+            row["alias"], row["N"], row["candidate_family"],
+            row["run_count"],
+            format_mean_std(row, "spearman_objective_vs_target_nll_median"),
+            format_mean_std(row, "objective_selected_nll_regret_mean", 5),
+        ] for row in quality_rows],
+    ) if quality_rows else "Quality diagnostics were not evaluated."
+
     comparison_rows = []
     unmatched_rows = []
     for (reference_alias, candidate_alias), result in comparison_results.items():
@@ -2660,6 +4043,7 @@ def generate_root_report(
     ) if unmatched_rows else "Only one alias was evaluated."
 
     aliases = list(dict.fromkeys(spec.alias for spec in resolved))
+    quality_enabled = bool(getattr(args, "quality_diagnostics", False))
     text = f"""# Frozen-checkpoint evaluation
 
 ## Evaluation settings
@@ -2677,6 +4061,10 @@ def generate_root_report(
 - Radial radii: `[0, 0.125, 0.25, 0.5, 1, 1.5]` times write radius
 - Contours: `31×31`, x `[-0.5, 1.5]`, y `[-1, 1]`
 - Bootstrap resamples: `{args.bootstrap_resamples}`
+- Quality diagnostics: `{quality_enabled}`
+- Quality N values: `{getattr(args, 'quality_n_values', []) if quality_enabled else []}`
+- Quality examples: `{getattr(args, 'quality_examples', '—') if quality_enabled else '—'}`
+- Quality K values: `{getattr(args, 'quality_inner_steps', []) if quality_enabled else []}`
 
 ## Evaluated checkpoints
 
@@ -2706,25 +4094,40 @@ Values are arithmetic run means ± sample standard deviation. Standard deviation
 
 {matching_table}
 
+## Objective–quality alignment aggregates
+
+Correlations are computed within examples. Positive correlation with target NLL/error means that lower objective ranks better reads.
+
+{quality_table}
+
 ## Artifacts
 
 - [Per-checkpoint data and plots](per_checkpoint/)
 - [Per-alias aggregates](aggregate/)
 - [Seed-paired comparisons](comparisons/)
 - [Cross-alias aggregate plots](plots/)
+- [Quality-alignment plots](plots/quality_alignment/)
 - Evaluated aliases: `{aliases}`
 """
     (output_dir / "report.md").write_text(text)
 
 
 def main() -> int:
-    args = build_parser().parse_args()
+    argv = sys.argv[1:]
+    args = build_parser().parse_args(argv)
+    apply_resume_defaults(args, argv)
     args.n_values = parse_int_list(args.n_values)
     args.inner_steps = parse_int_list(args.inner_steps)
     args.landscape_n_values = parse_int_list(args.landscape_n_values)
     args.matching_n_values = (
         args.n_values if args.matching_n_values is None else parse_int_list(args.matching_n_values)
     )
+    args.quality_n_values = (
+        list(args.landscape_n_values)
+        if args.quality_n_values is None
+        else parse_int_list(args.quality_n_values)
+    )
+    args.quality_inner_steps = parse_int_list(args.quality_inner_steps)
     validate_args(args)
     seed_everything(args.seed)
     inputs = experiment_inputs_from_args(args)
@@ -2740,7 +4143,12 @@ def main() -> int:
             f"Output directory is not empty; use --resume or a new directory: {args.output_dir}"
         )
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    device = resolve_device(args.device)
+    root_manifest_exists = (args.output_dir / "manifest.json").exists()
+    device = (
+        torch.device(args.device)
+        if args.resume and root_manifest_exists and args.device != "auto"
+        else resolve_device(args.device)
+    )
 
     root_manifest: dict[str, Any] = {
         "status": "running",
@@ -2759,6 +4167,8 @@ def main() -> int:
     if not args.skip_landscape:
         required_n_values.update(args.landscape_n_values)
         required_n_values.update(args.matching_n_values)
+    if args.quality_diagnostics:
+        required_n_values.update(args.quality_n_values)
     loaded_datasets: dict[int, Any] = {}
     for n_value in sorted(required_n_values):
         dataset_path = args.data_root / f"N{n_value}-K2V2-V62_1M"
@@ -2815,6 +4225,8 @@ def main() -> int:
         [row for aggregate in aggregate_by_alias.values() for row in aggregate["contours"]],
         list(specs_by_alias),
     )
+    if args.quality_diagnostics:
+        generate_cross_alias_quality_plots(args.output_dir, aggregate_by_alias)
     generate_root_report(
         args.output_dir,
         resolved,
@@ -2836,6 +4248,9 @@ def main() -> int:
             }
             for (reference, candidate), result in comparison_results.items()
         ],
+        "quality_diagnostics": (
+            quality_evaluation_config(args) if args.quality_diagnostics else None
+        ),
     })
     write_json(args.output_dir / "manifest.json", root_manifest)
     print(f"Evaluation complete: {args.output_dir}", flush=True)
