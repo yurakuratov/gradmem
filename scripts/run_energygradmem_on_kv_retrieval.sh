@@ -124,7 +124,7 @@ if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
   RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
 fi
 
-N_VALUES=(2)
+N_VALUES=(1)
 for N in "${N_VALUES[@]}"; do
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_${N}"
 
@@ -186,6 +186,9 @@ for N in "${N_VALUES[@]}"; do
 
   if [ -n "${INIT_CHECKPOINT:-}" ]; then
     CMD+=( --init_checkpoint "$INIT_CHECKPOINT" )
+  fi
+  if [ -n "${INIT_BASE_CHECKPOINT:-}" ]; then
+    CMD+=( --init_base_checkpoint "$INIT_BASE_CHECKPOINT" )
   fi
   if [ "$INNER_CLIP_VALUE" != "None" ]; then
     CMD+=( --inner_clip_value "$INNER_CLIP_VALUE" )
