@@ -300,7 +300,8 @@ class ExperimentArgs:
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
-    init_checkpoint: Optional[str] = field(default=None)
+    init_base_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize base model'})
+    init_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize gradmem model'})
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
@@ -452,7 +453,10 @@ if __name__ == '__main__':
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
 
+    model_to_init_from_ckpt = None
     if args.init_checkpoint is not None:
+        model_to_init_from_ckpt = model
+        init_ckpt_path = args.init_checkpoint
         state_dict = load_file(args.init_checkpoint)
         if args.memory_backend == 'prefix' and 'mem' in state_dict and getattr(model, 'mem', None) is not None:
             ckpt_mem = state_dict['mem']
@@ -469,7 +473,11 @@ if __name__ == '__main__':
                         f'Checkpoint has fewer memory tokens than model expects: '
                         f'ckpt mem shape={tuple(ckpt_mem.shape)}, model mem shape={tuple(model_mem.shape)}.'
                     )
-        missing_k, unexpected_k = model.load_state_dict(state_dict, strict=False)
+    elif args.init_base_checkpoint is not None:
+        model_to_init_from_ckpt = model.model
+        init_ckpt_path = args.init_base_checkpoint
+    if model_to_init_from_ckpt is not None:
+        missing_k, unexpected_k = model_to_init_from_ckpt.load_state_dict(load_file(init_ckpt_path), strict=False)
         if len(missing_k) != 0:
             logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
         if len(unexpected_k) != 0:
@@ -483,7 +491,7 @@ if __name__ == '__main__':
     logger.info(f'model.dtype: {model.dtype}')
 
     dataset = datasets.load_from_disk(args.data_path)
-    # use collate_fn_numpy if no GPU is available, allows running with 'mds' device on Apple M chips
+    # use collate_fn_numpy if no GPU is available, allows running with 'mps' device on Apple M chips
     collator_fn = collate_fn if torch.cuda.is_available() else collate_fn_numpy
     data_collator = partial(collator_fn, tokenizer=tokenizer, max_context_length=args.max_context_length)
 

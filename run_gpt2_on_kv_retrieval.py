@@ -3,6 +3,7 @@ import logging
 import os
 from pathlib import Path
 import math
+from functools import partial
 
 import torch
 import numpy as np
@@ -69,6 +70,18 @@ def collate_fn(batch, tokenizer, max_input_length=None):
         'attention_mask': attn_mask,
         'labels': labels,
     }
+
+
+def tensor_batch_to_numpy(batch):
+    if isinstance(batch, dict):
+        return {key: tensor_batch_to_numpy(value) for key, value in batch.items()}
+    if isinstance(batch, torch.Tensor):
+        return batch.cpu().numpy().copy()
+    return batch
+
+
+def collate_fn_numpy(batch, tokenizer, max_input_length=None):
+    return tensor_batch_to_numpy(collate_fn(batch, tokenizer, max_input_length=max_input_length))
 
 
 def preprocess_logits_for_metrics(logits, labels):
@@ -139,6 +152,18 @@ class CustomTrainer(Trainer):
     def create_scheduler(self, num_training_steps: int, optimizer: torch.optim.Optimizer = None):
         num_training_steps = int(num_training_steps / 0.9)  # to make final lr not zero, for linear it is lr/10.
         return super().create_scheduler(num_training_steps, optimizer)
+
+    def _prepare_input(self, data):
+        if isinstance(data, np.ndarray):
+            data = torch.from_numpy(data)
+        return super()._prepare_input(data)
+
+    def floating_point_ops(self, inputs):
+        main_input_name = getattr(self.model, "main_input_name", "input_ids")
+        if isinstance(inputs.get(main_input_name), np.ndarray):
+            inputs = dict(inputs)
+            inputs[main_input_name] = torch.from_numpy(inputs[main_input_name])
+        return super().floating_point_ops(inputs)
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         # log early stopping patience
@@ -304,8 +329,9 @@ if __name__ == '__main__':
 
     dataset = datasets.load_from_disk(args.data_path)
 
-    def data_collator(batch):
-        return collate_fn(batch, tokenizer, max_input_length=args.max_input_length)
+    # use collate_fn_numpy if no GPU is available, allows running with 'mps' device on Apple M chips
+    collator_fn = collate_fn if torch.cuda.is_available() else collate_fn_numpy
+    data_collator = partial(collator_fn, tokenizer=tokenizer, max_input_length=args.max_input_length)
 
     # Target sequence looks like: "XXXX!|"
     # Let's not count ! and | in the accuracy calculation
@@ -350,11 +376,12 @@ if __name__ == '__main__':
         eval_on_start=True,
         greater_is_better=True,
         remove_unused_columns=False,
-        include_num_input_tokens_seen=True,
+        # NumPy batches are converted to tensors later in CustomTrainer._prepare_input.
+        include_num_input_tokens_seen=False,
         include_for_metrics=['inputs'],
         save_total_limit=1,
         dataloader_num_workers=4,
-        dataloader_pin_memory=True,
+        dataloader_pin_memory=torch.cuda.is_available(),
         seed=args.seed,
     )
 
