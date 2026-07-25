@@ -22,7 +22,7 @@ V_SIZE=2
 VOCAB_SIZE=62
 N_MEM_TOKENS=8
 K=2
-INNER_LR=1.0
+INNER_LRS=(1.0 1.0 1.0 1.0)
 GRAD_MODE=second
 TBS=64
 LR=1e-04
@@ -31,6 +31,8 @@ CE_WEIGHTS=(1.0 0.0 0.0 0.0)
 START_ITERATION=1
 INIT_CHECKPOINT=""
 STOP_EXACT_MATCH_VALUE=0.99
+INNER_OBJECTIVE=neural
+ENERGY_MODEL_TYPE=lstm
 
 if [ ${#CE_WEIGHTS[@]} -eq 0 ]; then
   echo "CE_WEIGHTS must be non-empty" >&2
@@ -42,6 +44,10 @@ if [ ${#N_PAIRSS_IN_SEGMENT[@]} -ne ${#CE_WEIGHTS[@]} ]; then
 fi
 if [ ${#N_SEGMENTSS_IN_CONTEXT[@]} -ne ${#CE_WEIGHTS[@]} ]; then
   echo "N_SEGMENTSS_IN_CONTEXT must have one value per curriculum stage" >&2
+  exit 1
+fi
+if [ ${#INNER_LRS[@]} -ne ${#CE_WEIGHTS[@]} ]; then
+  echo "INNER_LRS must have one value per curriculum stage" >&2
   exit 1
 fi
 
@@ -77,6 +83,7 @@ for N in $N_VALUES; do
   for STAGE_INDEX in "${!CE_WEIGHTS[@]}"; do
     STAGE=$((STAGE + 1))
     CE_WEIGHT=${CE_WEIGHTS[$STAGE_INDEX]}
+    INNER_LR=${INNER_LRS[$STAGE_INDEX]}
     N_PAIRS_IN_SEGMENT=${N_PAIRSS_IN_SEGMENT[$STAGE_INDEX]}
     N_SEGMENTS_IN_CONTEXT=${N_SEGMENTSS_IN_CONTEXT[$STAGE_INDEX]}
     N_PAIRS=$((N_PAIRS_IN_SEGMENT * N_SEGMENTS_IN_CONTEXT))
@@ -97,8 +104,10 @@ for N in $N_VALUES; do
       N_PAIRS="$N_PAIRS" \
       N_PAIRS_IN_SEGMENT="$N_PAIRS_IN_SEGMENT" \
       N_SEGMENTS_IN_CONTEXT="$N_SEGMENTS_IN_CONTEXT" \
+      INNER_LR="$INNER_LR" \
       SEGMENT_WRITE_MODE=parallel \
-      INNER_OBJECTIVE=lstm \
+      INNER_OBJECTIVE="$INNER_OBJECTIVE" \
+      ENERGY_MODEL_TYPE="$ENERGY_MODEL_TYPE" \
       ENERGY_FUTURE_MODE=none \
       ENERGY_INNER_CE_WEIGHT="$CE_WEIGHT" \
       ENERGY_CE_GUIDANCE=false \
