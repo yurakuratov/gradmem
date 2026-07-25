@@ -100,7 +100,7 @@ class ExperimentArgs:
     segment_write_mode: Optional[str] = field(default="sequential")
     segment_size: Optional[int] = field(default=None)
 
-    inner_objective: Optional[str] = field(default="lstm")
+    inner_objective: Optional[str] = field(default="neural")
     energy_hidden_size: Optional[int] = field(default=None)
     energy_num_layers: Optional[int] = field(default=2)
     energy_dropout: Optional[float] = field(default=0.0)
@@ -108,6 +108,13 @@ class ExperimentArgs:
     energy_ce_guidance: Optional[bool] = field(default=False)
     energy_ce_guidance_alpha: Optional[float] = field(default=0.01)
     energy_inner_ce_weight: Optional[float] = field(default=0.0)
+    energy_model_type: Optional[str] = field(default="lstm")
+    energy_mamba_state_size: Optional[int] = field(default=128)
+    energy_mamba_conv_kernel: Optional[int] = field(default=4)
+    energy_mamba_expand: Optional[int] = field(default=2)
+    energy_mamba_head_dim: Optional[int] = field(default=64)
+    energy_mamba_chunk_size: Optional[int] = field(default=256)
+    energy_mamba_backend: Optional[str] = field(default="cuda")
     energy_pretrain_objective: Optional[str] = field(default="ce")
     energy_pretrain_steps: Optional[int] = field(default=0)
     energy_pretrain_batch_size: Optional[int] = field(default=16)
@@ -196,6 +203,13 @@ def build_model_config(args, base_config):
         energy_ce_guidance=args.energy_ce_guidance,
         energy_ce_guidance_alpha=args.energy_ce_guidance_alpha,
         energy_inner_ce_weight=args.energy_inner_ce_weight,
+        energy_model_type=args.energy_model_type,
+        energy_mamba_state_size=args.energy_mamba_state_size,
+        energy_mamba_conv_kernel=args.energy_mamba_conv_kernel,
+        energy_mamba_expand=args.energy_mamba_expand,
+        energy_mamba_head_dim=args.energy_mamba_head_dim,
+        energy_mamba_chunk_size=args.energy_mamba_chunk_size,
+        energy_mamba_backend=args.energy_mamba_backend,
         energy_pretrain_objective=args.energy_pretrain_objective,
         energy_pretrain_steps=args.energy_pretrain_steps,
         energy_pretrain_batch_size=args.energy_pretrain_batch_size,

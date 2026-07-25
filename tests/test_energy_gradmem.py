@@ -3,7 +3,9 @@ import torch
 from types import SimpleNamespace
 from transformers import GPT2Config
 
+import energy_gradmem as energy_gradmem_module
 from energy_gradmem import EnergyGradMem, EnergyGradMemConfig
+from grad_memgpt import GradMemGPT, GradMemGPTConfig
 from run_energy_gradmem_on_kv_retrieval import EnergyFreezeCallback, strip_trailing_context_separator
 
 
@@ -24,9 +26,12 @@ def _model(
     memory_backend="prefix",
     K=2,
     energy_future_mode="next_token",
-    inner_objective="lstm",
+    inner_objective="neural",
+    energy_model_type="lstm",
     segment_write_mode="sequential",
     segment_size=None,
+    use_write_head=False,
+    **kwargs,
 ):
     return EnergyGradMem(
         EnergyGradMemConfig(
@@ -39,15 +44,17 @@ def _model(
             grad_mode="second",
             use_mem_proj=False,
             mem_proj_mode="none",
-            use_write_head=False,
+            use_write_head=use_write_head,
             attn_implementation="eager",
             inner_objective=inner_objective,
             energy_hidden_size=32,
             energy_num_layers=2,
             energy_dropout=0.0,
             energy_future_mode=energy_future_mode,
+            energy_model_type=energy_model_type,
             segment_write_mode=segment_write_mode,
             segment_size=segment_size,
+            **kwargs,
         )
     )
 
@@ -139,6 +146,122 @@ def test_forward_parallel_segments_prefix_equal_lengths():
     assert output["mem"].shape == (B, 4, 48)
     assert output["energy_state"][0].shape == (2, B, 32)
     assert "inner_energy_loss" in output["inner_loop_stats"]
+
+
+def test_identity_energy_model_uses_transformer_hidden_states_directly():
+    model = _model(K=1, energy_future_mode="none", energy_model_type="identity")
+    model.eval()
+
+    hidden = torch.randn(2, 5, 48)
+    encoded, state = model.energy_encoder(hidden, state="kept")
+
+    assert encoded is hidden
+    assert state == "kept"
+    assert model.energy_head[0].in_features == 48
+
+
+def test_forward_identity_energy_model_prefix():
+    torch.manual_seed(0)
+    model = _model(K=1, energy_future_mode="none", energy_model_type="identity")
+    model.eval()
+
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model({"context_input_ids": context, "query_input_ids": query}, labels=labels)
+
+    assert torch.isfinite(output["loss"]).item()
+
+
+def test_mamba2_energy_model_uses_fla_layer(monkeypatch):
+    seen_kwargs = None
+
+    class FakeFlaMamba2(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            nonlocal seen_kwargs
+            seen_kwargs = kwargs
+
+        def forward(self, hidden, **kwargs):
+            return hidden + 1.0, None, None
+
+    monkeypatch.setattr(energy_gradmem_module, "FlaMamba2", FakeFlaMamba2)
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="mamba2",
+        energy_mamba_state_size=32,
+        energy_mamba_conv_kernel=3,
+        energy_mamba_expand=1,
+        energy_mamba_head_dim=16,
+        energy_mamba_chunk_size=64,
+        energy_mamba_backend="triton",
+    )
+
+    hidden = torch.zeros(2, 5, 48)
+    encoded, state = model.energy_encoder(hidden, state="ignored")
+
+    assert torch.equal(encoded, torch.ones_like(hidden))
+    assert state == "ignored"
+    assert seen_kwargs == {
+        "hidden_size": 48,
+        "state_size": 32,
+        "conv_kernel": 3,
+        "expand": 1,
+        "head_dim": 16,
+        "chunk_size": 64,
+        "backend": "triton",
+    }
+    assert model.energy_head[0].in_features == 48
+
+
+def test_mamba2_energy_model_rejects_invalid_head_dim_default():
+    with pytest.raises(ValueError, match=r"energy_mamba_expand \* energy_input_size"):
+        _model(K=1, energy_future_mode="none", energy_model_type="mamba2")
+
+
+def test_mamba2_energy_model_requires_fla(monkeypatch):
+    monkeypatch.setattr(energy_gradmem_module, "FlaMamba2", None)
+
+    with pytest.raises(ImportError, match="flash-linear-attention"):
+        _model(
+            K=1,
+            energy_future_mode="none",
+            energy_model_type="mamba2",
+            energy_mamba_head_dim=16,
+        )
+
+
+def test_forward_mamba2_energy_model_prefix(monkeypatch):
+    class FakeFlaMamba2(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.proj = torch.nn.Linear(kwargs["hidden_size"], kwargs["hidden_size"])
+
+        def forward(self, hidden, **kwargs):
+            return self.proj(hidden), None, None
+
+    monkeypatch.setattr(energy_gradmem_module, "FlaMamba2", FakeFlaMamba2)
+    torch.manual_seed(0)
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="mamba2",
+        energy_mamba_expand=1,
+        energy_mamba_head_dim=16,
+    )
+    model.eval()
+
+    B, Q = 2, 4
+    context = torch.randint(1, 101, (B, 5))
+    query = torch.randint(1, 101, (B, Q))
+    labels = torch.randint(1, 101, (B, Q))
+
+    output = model({"context_input_ids": context, "query_input_ids": query}, labels=labels)
+
+    assert torch.isfinite(output["loss"]).item()
+    assert output["predictions"].shape == (B, Q + 1, 101)
 
 
 def test_context_tensor_segment_size_returns_segment_list():
@@ -314,6 +437,174 @@ def test_forward_with_fixed_embedding_energy_is_stateless():
     assert output["energy_state"] is None
 
 
+def test_cross_entropy_inner_objective_has_no_energy_model():
+    model = _model(K=1, inner_objective="cross_entropy", energy_future_mode="next_token")
+
+    assert not hasattr(model, "energy_encoder")
+    assert not hasattr(model, "energy_head")
+
+
+def test_forward_cross_entropy_inner_objective_prefix():
+    torch.manual_seed(0)
+    model = _model(K=1, inner_objective="cross_entropy", energy_future_mode="next_token")
+    model.eval()
+
+    B, Q = 2, 4
+    context = torch.randint(1, 101, (B, 5))
+    query = torch.randint(1, 101, (B, Q))
+    labels = torch.randint(1, 101, (B, Q))
+
+    output = model({"context_input_ids": context, "query_input_ids": query}, labels=labels, return_energy_state=True)
+
+    assert torch.isfinite(output["loss"]).item()
+    assert output["predictions"].shape == (B, Q + 1, 101)
+    assert output["energy_state"] is None
+    assert output["inner_loop_stats"]["inner_energy_loss"].item() == 0.0
+    assert torch.allclose(
+        output["inner_loop_stats"]["inner_loss"],
+        output["inner_loop_stats"]["inner_ce_loss"],
+        atol=1e-6,
+    )
+
+
+def test_cross_entropy_inner_objective_clears_stale_energy_state():
+    model = _model(K=1, inner_objective="cross_entropy", energy_future_mode="next_token")
+    stale_state = (
+        torch.ones(2, 2, 32),
+        torch.ones(2, 2, 32),
+    )
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query, "energy_state": stale_state},
+        return_energy_state=True,
+    )
+
+    assert output["energy_state"] is None
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"energy_model_type": "identity"}, "energy_model_type"),
+        ({"energy_inner_ce_weight": 1.0}, "energy_inner_ce_weight"),
+        ({"energy_pretrain_steps": 1}, "energy pretraining"),
+        ({"energy_pretrain_objective": "embedding_l2"}, "energy_pretrain_objective"),
+        ({"energy_pretrain_l2_reg": 0.1}, "energy_pretrain_l2_reg"),
+    ],
+)
+def test_cross_entropy_rejects_irrelevant_energy_settings(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        EnergyGradMemConfig(
+            base_config=_base_config(),
+            inner_objective="cross_entropy",
+            memory_backend="prefix",
+            n_mem_tokens=4,
+            K=1,
+            lr=0.01,
+            use_adam=False,
+            grad_mode="second",
+            use_mem_proj=False,
+            mem_proj_mode="none",
+            use_write_head=False,
+            attn_implementation="eager",
+            **kwargs,
+        )
+
+
+def test_cross_entropy_matches_gradmemgpt_default_write_loss():
+    torch.manual_seed(0)
+    gradmem = GradMemGPT(
+        GradMemGPTConfig(
+            base_config=_base_config(),
+            memory_backend="prefix",
+            n_mem_tokens=4,
+            K=2,
+            lr=0.01,
+            use_adam=False,
+            grad_mode="first",
+            use_mem_proj=False,
+            mem_proj_mode="none",
+            use_write_head=False,
+            attn_implementation="eager",
+        )
+    )
+    energy = EnergyGradMem(
+        EnergyGradMemConfig(
+            base_config=_base_config(),
+            memory_backend="prefix",
+            n_mem_tokens=4,
+            K=2,
+            lr=0.01,
+            use_adam=False,
+            grad_mode="first",
+            use_mem_proj=False,
+            mem_proj_mode="none",
+            use_write_head=False,
+            attn_implementation="eager",
+            inner_objective="cross_entropy",
+        )
+    )
+    energy.load_state_dict(gradmem.state_dict(), strict=True)
+    gradmem.eval()
+    energy.eval()
+
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+    inputs = {"context_input_ids": context, "query_input_ids": query}
+
+    gradmem_out = gradmem(inputs, labels=labels, return_mem=True)
+    energy_out = energy(inputs, labels=labels, return_mem=True)
+
+    assert torch.allclose(energy_out["predictions"], gradmem_out["predictions"], atol=1e-6)
+    assert torch.allclose(energy_out["mem"], gradmem_out["mem"], atol=1e-6)
+    assert torch.allclose(
+        energy_out["inner_loop_stats"]["inner_loss"],
+        gradmem_out["inner_loop_stats"]["inner_loss"],
+        atol=1e-6,
+    )
+    assert torch.allclose(energy_out["loss"], gradmem_out["loss"], atol=1e-6)
+
+
+def test_cross_entropy_allows_write_head():
+    torch.manual_seed(0)
+    model = _model(K=1, inner_objective="cross_entropy", use_write_head=True)
+    model.eval()
+
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model({"context_input_ids": context, "query_input_ids": query}, labels=labels)
+
+    assert hasattr(model, "write_head")
+    assert torch.isfinite(output["loss"]).item()
+
+
+def test_parallel_cross_entropy_allows_future_mode_because_energy_is_unused():
+    torch.manual_seed(0)
+    model = _model(
+        K=1,
+        inner_objective="cross_entropy",
+        energy_future_mode="next_token",
+        segment_write_mode="parallel",
+    )
+    model.eval()
+
+    B, Q = 2, 4
+    context = torch.randint(1, 101, (B, 10))
+    query = torch.randint(1, 101, (B, Q))
+    labels = torch.randint(1, 101, (B, Q))
+
+    output = model({"context_input_ids": context, "query_input_ids": query}, labels=labels)
+
+    assert torch.isfinite(output["loss"]).item()
+    assert output["predictions"].shape == (B, Q + 1, 101)
+    assert output["inner_loop_stats"]["inner_energy_loss"].item() == 0.0
+
+
 def test_energy_ce_guidance_loss_uses_l1_detached_ce_and_mask():
     energy = torch.tensor([[1.0, 2.0, 100.0]], requires_grad=True)
     ce = torch.tensor([[3.0, 4.0, 1000.0]], requires_grad=True)
@@ -404,7 +695,7 @@ def test_forward_with_ce_guidance_reports_aux_loss():
             use_mem_proj=False,
             mem_proj_mode="none",
             attn_implementation="eager",
-            inner_objective="lstm",
+            inner_objective="neural",
             energy_hidden_size=32,
             energy_num_layers=2,
             energy_ce_guidance=True,
@@ -440,7 +731,7 @@ def test_inner_ce_weight_adds_ce_to_inner_objective():
             use_mem_proj=False,
             mem_proj_mode="none",
             attn_implementation="eager",
-            inner_objective="lstm",
+            inner_objective="neural",
             energy_hidden_size=32,
             energy_num_layers=2,
             energy_future_mode="none",
@@ -475,7 +766,7 @@ def test_energy_pretrain_changes_only_energy_params():
             use_mem_proj=False,
             mem_proj_mode="none",
             attn_implementation="eager",
-            inner_objective="lstm",
+            inner_objective="neural",
             energy_hidden_size=32,
             energy_num_layers=2,
             energy_pretrain_steps=2,
@@ -521,7 +812,7 @@ def test_embedding_mean_abs_diff_pretrain_changes_only_energy_params():
             use_mem_proj=False,
             mem_proj_mode="none",
             attn_implementation="eager",
-            inner_objective="lstm",
+            inner_objective="neural",
             energy_hidden_size=32,
             energy_num_layers=2,
             energy_pretrain_objective="embedding_mean_abs_diff",
@@ -700,6 +991,13 @@ def test_second_order_steps_are_global():
 def test_rejects_unknown_inner_objective():
     with pytest.raises(ValueError, match="inner_objective"):
         EnergyGradMemConfig(base_config=_base_config(), inner_objective="other")
+
+
+def test_lstm_inner_objective_is_deprecated_alias_for_neural():
+    with pytest.warns(DeprecationWarning, match="inner_objective='lstm' is deprecated"):
+        config = EnergyGradMemConfig(base_config=_base_config(), inner_objective="lstm")
+
+    assert config.inner_objective == "neural"
 
 
 def test_rejects_fixed_embedding_objective_without_next_token_target():

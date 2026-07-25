@@ -1,13 +1,61 @@
 import logging
+import warnings
+from types import SimpleNamespace
 
 import torch
 from torch import nn
 from tqdm.auto import tqdm
 
-from grad_memgpt import GradMemGPT, GradMemGPTConfig, _is_main_process
+from grad_memgpt import GradMemGPT, GradMemGPTConfig, _is_main_process, get_backbone
+
+try:
+    from fla.layers.mamba2 import Mamba2 as FlaMamba2
+except ImportError:
+    FlaMamba2 = None
 
 
 logger = logging.getLogger(__name__)
+
+
+class IdentityEnergyEncoder(nn.Module):
+    def __init__(self, input_size):
+        super().__init__()
+        self.input_size = int(input_size)
+
+    def forward(self, hidden, state=None):
+        return hidden, state
+
+
+class FlaMamba2EnergyEncoder(nn.Module):
+    def __init__(
+        self,
+        input_size,
+        state_size=128,
+        conv_kernel=4,
+        expand=2,
+        head_dim=64,
+        chunk_size=256,
+        backend="cuda",
+    ):
+        super().__init__()
+        if FlaMamba2 is None:
+            raise ImportError("energy_model_type='mamba2' requires the flash-linear-attention package (`fla`)")
+        self.input_size = int(input_size)
+        self.mamba = FlaMamba2(
+            hidden_size=self.input_size,
+            state_size=int(state_size),
+            conv_kernel=int(conv_kernel),
+            expand=int(expand),
+            head_dim=int(head_dim),
+            chunk_size=int(chunk_size),
+            backend=backend,
+        )
+
+    def forward(self, hidden, state=None):
+        encoded = self.mamba(hidden)
+        if isinstance(encoded, tuple):
+            encoded = encoded[0]
+        return encoded, state
 
 
 class EnergyGradMemConfig(GradMemGPTConfig):
@@ -15,7 +63,7 @@ class EnergyGradMemConfig(GradMemGPTConfig):
 
     def __init__(
         self,
-        inner_objective="lstm",
+        inner_objective="neural",
         energy_hidden_size=None,
         energy_num_layers=2,
         energy_dropout=0.0,
@@ -23,6 +71,13 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         energy_ce_guidance=False,
         energy_ce_guidance_alpha=0.01,
         energy_inner_ce_weight=0.0,
+        energy_model_type="lstm",
+        energy_mamba_state_size=128,
+        energy_mamba_conv_kernel=4,
+        energy_mamba_expand=2,
+        energy_mamba_head_dim=64,
+        energy_mamba_chunk_size=256,
+        energy_mamba_backend="cuda",
         segment_write_mode="sequential",
         segment_size=None,
         energy_pretrain_objective="ce",
@@ -35,23 +90,45 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         return_energy_state=False,
         **kwargs,
     ):
-        if kwargs.get("use_write_head", False):
-            raise ValueError("EnergyGradMem does not support use_write_head; the energy objective does not use LM logits")
         super().__init__(**kwargs)
-        if inner_objective not in ("lstm", "embedding_l1", "embedding_l2"):
-            raise ValueError("inner_objective must be one of: 'lstm', 'embedding_l1', 'embedding_l2'")
+        if inner_objective == "lstm":
+            warnings.warn(
+                "inner_objective='lstm' is deprecated; use inner_objective='neural' with energy_model_type='lstm' instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            inner_objective = "neural"
+        if inner_objective not in ("neural", "cross_entropy", "embedding_l1", "embedding_l2"):
+            raise ValueError("inner_objective must be one of: 'neural', 'cross_entropy', 'embedding_l1', 'embedding_l2'")
         if energy_future_mode not in ("none", "next_token"):
             raise ValueError("energy_future_mode must be one of: 'none', 'next_token'")
+        if energy_model_type not in ("lstm", "identity", "mamba2"):
+            raise ValueError("energy_model_type must be one of: 'lstm', 'identity', 'mamba2'")
         if segment_write_mode not in ("sequential", "parallel"):
             raise ValueError("segment_write_mode must be one of: 'sequential', 'parallel'")
         if segment_size is not None and int(segment_size) <= 0:
             raise ValueError("segment_size must be a positive integer when set")
         if inner_objective in ("embedding_l1", "embedding_l2") and energy_future_mode != "next_token":
             raise ValueError("embedding_l1/embedding_l2 inner objectives require energy_future_mode='next_token'")
+        if inner_objective == "cross_entropy" and energy_ce_guidance:
+            raise ValueError("inner_objective='cross_entropy' does not support energy_ce_guidance")
+        if inner_objective != "cross_entropy" and self.use_write_head:
+            raise ValueError("EnergyGradMem supports use_write_head=True only with inner_objective='cross_entropy'")
+        if inner_objective == "cross_entropy":
+            if energy_model_type != "lstm":
+                raise ValueError("inner_objective='cross_entropy' does not use energy_model_type; leave energy_model_type='lstm'")
+            if float(energy_inner_ce_weight) != 0.0:
+                raise ValueError("inner_objective='cross_entropy' does not use energy_inner_ce_weight; leave it at 0.0")
+            if int(energy_pretrain_steps) != 0:
+                raise ValueError("inner_objective='cross_entropy' does not support energy pretraining")
+            if energy_pretrain_objective != "ce":
+                raise ValueError("inner_objective='cross_entropy' does not use energy_pretrain_objective; leave it at 'ce'")
+            if float(energy_pretrain_l2_reg) != 0.0:
+                raise ValueError("inner_objective='cross_entropy' does not use energy_pretrain_l2_reg; leave it at 0.0")
         if segment_write_mode == "parallel":
             if self.memory_backend != "prefix":
                 raise ValueError("segment_write_mode='parallel' currently supports memory_backend='prefix' only")
-            if energy_future_mode != "none":
+            if inner_objective != "cross_entropy" and energy_future_mode != "none":
                 raise ValueError("segment_write_mode='parallel' requires energy_future_mode='none'")
             if energy_ce_guidance:
                 raise ValueError("segment_write_mode='parallel' does not support energy_ce_guidance")
@@ -65,6 +142,13 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         self.energy_ce_guidance = energy_ce_guidance
         self.energy_ce_guidance_alpha = energy_ce_guidance_alpha
         self.energy_inner_ce_weight = energy_inner_ce_weight
+        self.energy_model_type = energy_model_type
+        self.energy_mamba_state_size = energy_mamba_state_size
+        self.energy_mamba_conv_kernel = energy_mamba_conv_kernel
+        self.energy_mamba_expand = energy_mamba_expand
+        self.energy_mamba_head_dim = energy_mamba_head_dim
+        self.energy_mamba_chunk_size = energy_mamba_chunk_size
+        self.energy_mamba_backend = energy_mamba_backend
         self.segment_write_mode = segment_write_mode
         self.segment_size = segment_size
         self.energy_pretrain_objective = energy_pretrain_objective
@@ -99,6 +183,7 @@ class EnergyGradMem(GradMemGPT):
         self.energy_ce_guidance = bool(getattr(config, "energy_ce_guidance", False))
         self.energy_ce_guidance_alpha = float(getattr(config, "energy_ce_guidance_alpha", 0.01))
         self.energy_inner_ce_weight = float(getattr(config, "energy_inner_ce_weight", 0.0))
+        self.energy_model_type = getattr(config, "energy_model_type", "lstm")
         self.segment_write_mode = getattr(config, "segment_write_mode", "sequential")
         self.segment_size = getattr(config, "segment_size", None)
         if self.segment_size is not None:
@@ -113,16 +198,50 @@ class EnergyGradMem(GradMemGPT):
         self.return_energy_state = bool(getattr(config, "return_energy_state", False))
         dropout = float(config.energy_dropout) if energy_num_layers > 1 else 0.0
         energy_input_size = model_hidden_size * 2 if self.energy_future_mode == "next_token" else model_hidden_size
+        self.energy_input_size = int(energy_input_size)
 
-        if self.inner_objective == "lstm":
-            self.energy_encoder = nn.LSTM(
-                input_size=energy_input_size,
-                hidden_size=self.energy_hidden_size,
-                num_layers=energy_num_layers,
-                dropout=dropout,
-                batch_first=True,
+        if self.inner_objective == "neural":
+            if self.energy_model_type == "lstm":
+                self.energy_encoder = nn.LSTM(
+                    input_size=energy_input_size,
+                    hidden_size=self.energy_hidden_size,
+                    num_layers=energy_num_layers,
+                    dropout=dropout,
+                    batch_first=True,
+                )
+                energy_head_input_size = self.energy_hidden_size
+            elif self.energy_model_type == "identity":
+                self.energy_encoder = IdentityEnergyEncoder(energy_input_size)
+                energy_head_input_size = energy_input_size
+            elif self.energy_model_type == "mamba2":
+                mamba_expand = int(getattr(config, "energy_mamba_expand", 2))
+                mamba_head_dim = int(getattr(config, "energy_mamba_head_dim", 64))
+                if mamba_expand <= 0 or mamba_head_dim <= 0:
+                    raise ValueError("energy_mamba_expand and energy_mamba_head_dim must be positive integers")
+                if (mamba_expand * self.energy_input_size) % mamba_head_dim != 0:
+                    raise ValueError(
+                        "Invalid Mamba2 energy dimensions: "
+                        "energy_mamba_expand * energy_input_size must be divisible by energy_mamba_head_dim; "
+                        f"energy_mamba_expand={mamba_expand}, "
+                        f"energy_input_size={self.energy_input_size}, "
+                        f"energy_mamba_head_dim={mamba_head_dim}"
+                    )
+                self.energy_encoder = FlaMamba2EnergyEncoder(
+                    energy_input_size,
+                    state_size=getattr(config, "energy_mamba_state_size", 128),
+                    conv_kernel=getattr(config, "energy_mamba_conv_kernel", 4),
+                    expand=mamba_expand,
+                    head_dim=mamba_head_dim,
+                    chunk_size=getattr(config, "energy_mamba_chunk_size", 256),
+                    backend=getattr(config, "energy_mamba_backend", "cuda"),
+                )
+                energy_head_input_size = energy_input_size
+            else:
+                raise ValueError(f"Unsupported energy_model_type={self.energy_model_type}")
+            self.energy_head = nn.Sequential(
+                nn.Linear(energy_head_input_size, 1),
+                nn.Softplus(beta=1, threshold=20),
             )
-            self.energy_head = nn.Linear(self.energy_hidden_size, 1)
 
     def _energy_parameters(self):
         params = []
@@ -131,6 +250,12 @@ class EnergyGradMem(GradMemGPT):
         if hasattr(self, "energy_head"):
             params.extend(self.energy_head.parameters())
         return list(params)
+
+    def _energy_dtype(self):
+        params = self._energy_parameters()
+        if params:
+            return params[0].dtype
+        return next(self.parameters()).dtype
 
     def set_energy_trainable(self, trainable=True):
         for param in self._energy_parameters():
@@ -198,6 +323,14 @@ class EnergyGradMem(GradMemGPT):
     def _run_write_model(self, write_batch, memory_state):
         write_model_kwargs = write_batch.get("model_kwargs", {})
         with self.memory_backend_impl.activation_context(memory_state):
+            if self.use_write_head:
+                outs = get_backbone(self.model)(
+                    inputs_embeds=write_batch["inputs_embeds"],
+                    return_dict=True,
+                    **write_model_kwargs,
+                )
+                hidden = outs.last_hidden_state[:, write_batch["logits_start"]:, :]
+                return SimpleNamespace(logits=self.write_head(hidden), hidden_states=None, logits_start_override=0)
             outs = self.model(
                 inputs_embeds=write_batch["inputs_embeds"],
                 output_hidden_states=True,
@@ -209,7 +342,8 @@ class EnergyGradMem(GradMemGPT):
         return outs
 
     def _write_token_ce(self, write_out, write_batch):
-        logits = write_out.logits[:, write_batch["logits_start"]:, :]
+        logits_start = getattr(write_out, "logits_start_override", write_batch["logits_start"])
+        logits = write_out.logits[:, logits_start:, :]
         logits_loss = logits[:, :-1]
         label_shift = write_batch.get("label_shift", 0)
         labels_loss = write_batch["lm_labels"][:, label_shift:]
@@ -237,7 +371,8 @@ class EnergyGradMem(GradMemGPT):
         return self._masked_token_loss_sum(token_ce, mask_loss)
 
     def _write_inner_ce_tokens(self, write_out, write_batch):
-        logits = write_out.logits[:, write_batch["logits_start"]:, :]
+        logits_start = getattr(write_out, "logits_start_override", write_batch["logits_start"])
+        logits = write_out.logits[:, logits_start:, :]
         logits_loss = logits[:, :-1]
         label_shift = write_batch.get("label_shift", 0)
         labels_loss = write_batch["lm_labels"][:, label_shift:]
@@ -287,13 +422,13 @@ class EnergyGradMem(GradMemGPT):
         return tokens
 
     def _embedding_mean_abs_diff_pretrain_loss(self, batch_size, seq_len, generator, device):
-        if self.inner_objective != "lstm":
-            raise ValueError("embedding_mean_abs_diff pretraining requires trainable inner_objective='lstm'")
+        if self.inner_objective != "neural":
+            raise ValueError("embedding_mean_abs_diff pretraining requires trainable inner_objective='neural'")
         input_size = self.energy_encoder.input_size
         if input_size % 2 != 0:
             raise ValueError("embedding_mean_abs_diff pretraining requires an even energy encoder input size")
         hidden_size = input_size // 2
-        dtype = self.energy_head.weight.dtype
+        dtype = self._energy_dtype()
         h1 = torch.randn(batch_size, seq_len, hidden_size, generator=generator, device=device, dtype=dtype)
         h2 = torch.randn(batch_size, seq_len, hidden_size, generator=generator, device=device, dtype=dtype)
         energy_input = torch.cat([h1, h2], dim=-1)
@@ -302,13 +437,13 @@ class EnergyGradMem(GradMemGPT):
         return (energy - target.detach()).pow(2).mean()
 
     def _embedding_l2_pretrain_loss(self, batch_size, seq_len, generator, device):
-        if self.inner_objective != "lstm":
-            raise ValueError("embedding_l2 pretraining requires trainable inner_objective='lstm'")
+        if self.inner_objective != "neural":
+            raise ValueError("embedding_l2 pretraining requires trainable inner_objective='neural'")
         input_size = self.energy_encoder.input_size
         if input_size % 2 != 0:
             raise ValueError("embedding_l2 pretraining requires an even energy encoder input size")
         hidden_size = input_size // 2
-        dtype = self.energy_head.weight.dtype
+        dtype = self._energy_dtype()
         h1 = torch.randn(batch_size, seq_len, hidden_size, generator=generator, device=device, dtype=dtype)
         h2 = torch.randn(batch_size, seq_len, hidden_size, generator=generator, device=device, dtype=dtype)
         energy_input = torch.cat([h1, h2], dim=-1)
@@ -354,8 +489,8 @@ class EnergyGradMem(GradMemGPT):
             raise ValueError("energy_pretrain_batch_size must be >= 1 and energy_pretrain_seq_len must be >= 2")
         if self.energy_pretrain_steps <= 0:
             return
-        if self.inner_objective != "lstm":
-            raise ValueError("energy pretraining requires trainable inner_objective='lstm'")
+        if self.inner_objective != "neural":
+            raise ValueError("energy pretraining requires trainable inner_objective='neural'")
 
         was_training = self.training
         device = self.model.get_input_embeddings().weight.device
@@ -485,13 +620,13 @@ class EnergyGradMem(GradMemGPT):
             return ctx_hidden
         return torch.cat([ctx_hidden, future.to(dtype=ctx_hidden.dtype)], dim=-1)
 
-    def _inner_grad_options(self, global_step, total_steps, keep_energy_graph=False):
+    def _inner_grad_options(self, global_step, total_steps, keep_energy_graph=False, carries_state_graph=True):
         is_second_order_step = (
             self.grad_mode == "second"
             and global_step >= (total_steps - self.last_K_second_order)
         )
         create_graph = is_second_order_step
-        has_future_energy_use = global_step < (total_steps - 1)
+        has_future_energy_use = carries_state_graph and global_step < (total_steps - 1)
         retain_graph = (
             create_graph
             or has_future_energy_use
@@ -572,20 +707,29 @@ class EnergyGradMem(GradMemGPT):
                 write_memory_state = self._repeat_prefix_memory_state(memory_state, n_segments)
                 write_batch = backend.build_write_inputs(write_memory_state, batch_ctx)
                 write_out = self._run_write_model(write_batch, write_memory_state)
-                ctx_hidden = self._extract_context_hidden(write_out.hidden_states[-1], write_batch, batch_ctx)
-                ctx_len = write_batch["mask"].size(1)
-                ctx_hidden = ctx_hidden.reshape(batch_size, n_segments * ctx_len, ctx_hidden.size(-1))
-                energy_mask = write_batch["mask"].reshape(batch_size, n_segments * ctx_len)
-                energy_loss, energy_state, _ = self._energy_loss(ctx_hidden, energy_mask, energy_state)
-                step_ce_loss = torch.zeros_like(energy_loss)
-                if self.energy_inner_ce_weight != 0.0:
+                if self.inner_objective == "cross_entropy":
                     step_ce_loss = self._write_parallel_inner_ce_loss(write_out, write_batch, batch_size, n_segments)
-                inner_loss = energy_loss + self.energy_inner_ce_weight * step_ce_loss
+                    energy_loss = torch.zeros_like(step_ce_loss)
+                    inner_loss = step_ce_loss
+                else:
+                    ctx_hidden = self._extract_context_hidden(write_out.hidden_states[-1], write_batch, batch_ctx)
+                    ctx_len = write_batch["mask"].size(1)
+                    ctx_hidden = ctx_hidden.reshape(batch_size, n_segments * ctx_len, ctx_hidden.size(-1))
+                    energy_mask = write_batch["mask"].reshape(batch_size, n_segments * ctx_len)
+                    energy_loss, energy_state, _ = self._energy_loss(ctx_hidden, energy_mask, energy_state)
+                    step_ce_loss = torch.zeros_like(energy_loss)
+                    if self.energy_inner_ce_weight != 0.0:
+                        step_ce_loss = self._write_parallel_inner_ce_loss(write_out, write_batch, batch_size, n_segments)
+                    inner_loss = energy_loss + self.energy_inner_ce_weight * step_ce_loss
                 inner_energy_loss = inner_energy_loss + energy_loss.detach()
                 inner_ce_loss = inner_ce_loss + step_ce_loss.detach()
                 del write_out
 
-                create_graph, retain_graph = self._inner_grad_options(k, self.K)
+                create_graph, retain_graph = self._inner_grad_options(
+                    k,
+                    self.K,
+                    carries_state_graph=self.inner_objective != "cross_entropy",
+                )
                 inner_params = backend.inner_params(memory_state)
                 grads = torch.autograd.grad(
                     inner_loss,
@@ -633,18 +777,23 @@ class EnergyGradMem(GradMemGPT):
                 for k in range(self.K):
                     write_batch = backend.build_write_inputs(memory_state, batch_ctx)
                     write_out = self._run_write_model(write_batch, memory_state)
-                    ctx_hidden = self._extract_context_hidden(write_out.hidden_states[-1], write_batch, batch_ctx)
-                    energy_input = self._energy_input(ctx_hidden, segment, write_batch["mask"])
-                    energy_loss, energy_state, energy = self._energy_loss(energy_input, write_batch["mask"], energy_state)
-                    step_ce_loss = torch.zeros_like(energy_loss)
-                    if self.energy_ce_guidance:
-                        token_ce, token_ce_mask = self._write_token_ce(write_out, write_batch)
-                    if self.energy_inner_ce_weight != 0.0:
+                    if self.inner_objective == "cross_entropy":
                         step_ce_loss = self._write_inner_ce_loss(write_out, write_batch)
-                    inner_loss = energy_loss + self.energy_inner_ce_weight * step_ce_loss
+                        energy_loss = torch.zeros_like(step_ce_loss)
+                        inner_loss = step_ce_loss
+                    else:
+                        ctx_hidden = self._extract_context_hidden(write_out.hidden_states[-1], write_batch, batch_ctx)
+                        energy_input = self._energy_input(ctx_hidden, segment, write_batch["mask"])
+                        energy_loss, energy_state, energy = self._energy_loss(energy_input, write_batch["mask"], energy_state)
+                        step_ce_loss = torch.zeros_like(energy_loss)
+                        if self.energy_ce_guidance:
+                            token_ce, token_ce_mask = self._write_token_ce(write_out, write_batch)
+                        if self.energy_inner_ce_weight != 0.0:
+                            step_ce_loss = self._write_inner_ce_loss(write_out, write_batch)
+                        inner_loss = energy_loss + self.energy_inner_ce_weight * step_ce_loss
                     inner_energy_loss = inner_energy_loss + energy_loss.detach()
                     inner_ce_loss = inner_ce_loss + step_ce_loss.detach()
-                    if self.energy_ce_guidance:
+                    if self.inner_objective != "cross_entropy" and self.energy_ce_guidance:
                         guidance_loss = guidance_loss + self._energy_ce_guidance_loss(
                             energy,
                             token_ce,
@@ -656,6 +805,7 @@ class EnergyGradMem(GradMemGPT):
                         global_step,
                         total_steps,
                         keep_energy_graph=self.energy_ce_guidance,
+                        carries_state_graph=self.inner_objective != "cross_entropy",
                     )
                     inner_params = backend.inner_params(memory_state)
                     grads = torch.autograd.grad(
@@ -764,6 +914,8 @@ class EnergyGradMem(GradMemGPT):
         query_input_ids = input_ids["query_input_ids"]
         if energy_state is None:
             energy_state = input_ids.get("energy_state")
+        if self.inner_objective == "cross_entropy":
+            energy_state = None
 
         B = query_input_ids.size(0)
         self._validate_context_segments(context_segments, B)
