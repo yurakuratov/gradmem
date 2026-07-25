@@ -3,10 +3,6 @@
 set -euo pipefail
 shopt -s nullglob
 
-# Two-stage curriculum for hidden-state-only EnergyGradMem:
-# stage 1: inner objective = energy + CE
-# stage 2: inner objective = energy only, initialized from stage 1 checkpoint
-
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BASE_SCRIPT=$SCRIPT_DIR/run_energy_gradmem_on_kv_retrieval.sh
 
@@ -27,28 +23,20 @@ GRAD_MODE=second
 TBS=64
 LR=1e-04
 N_VALUES=1
-CE_WEIGHTS=(1.0 1.0 0.0 0.0)
 INIT_CHECKPOINT=""
 STOP_EXACT_MATCH_VALUE=0.99
-INNER_OBJECTIVE=neural
-ENERGY_MODEL_TYPE=mamba2
-
 
 START_ITERATION=1
 
-if [ ${#CE_WEIGHTS[@]} -eq 0 ]; then
-  echo "CE_WEIGHTS must be non-empty" >&2
+if [ ${#N_PAIRSS_IN_SEGMENT[@]} -eq 0 ]; then
+  echo "N_PAIRSS_IN_SEGMENT must be non-empty" >&2
   exit 1
 fi
-if [ ${#N_PAIRSS_IN_SEGMENT[@]} -ne ${#CE_WEIGHTS[@]} ]; then
-  echo "N_PAIRSS_IN_SEGMENT must have one value per curriculum stage" >&2
-  exit 1
-fi
-if [ ${#N_SEGMENTSS_IN_CONTEXT[@]} -ne ${#CE_WEIGHTS[@]} ]; then
+if [ ${#N_SEGMENTSS_IN_CONTEXT[@]} -ne ${#N_PAIRSS_IN_SEGMENT[@]} ]; then
   echo "N_SEGMENTSS_IN_CONTEXT must have one value per curriculum stage" >&2
   exit 1
 fi
-if [ ${#INNER_LRS[@]} -ne ${#CE_WEIGHTS[@]} ]; then
+if [ ${#INNER_LRS[@]} -ne ${#N_PAIRSS_IN_SEGMENT[@]} ]; then
   echo "INNER_LRS must have one value per curriculum stage" >&2
   exit 1
 fi
@@ -57,6 +45,7 @@ if ! [[ "$START_ITERATION" =~ ^[0-9]+$ ]] || [ "$START_ITERATION" -lt 1 ]; then
   echo "START_ITERATION must be a positive 1-based integer, got: $START_ITERATION" >&2
   exit 1
 fi
+
 latest_checkpoint() {
   local stage_path=$1
   local best_step=-1
@@ -81,18 +70,17 @@ latest_checkpoint() {
 for N in $N_VALUES; do
   INIT_CKPT=$INIT_CHECKPOINT
   STAGE=0
-  for STAGE_INDEX in "${!CE_WEIGHTS[@]}"; do
+  for STAGE_INDEX in "${!N_PAIRSS_IN_SEGMENT[@]}"; do
     STAGE=$((STAGE + 1))
-    CE_WEIGHT=${CE_WEIGHTS[$STAGE_INDEX]}
     INNER_LR=${INNER_LRS[$STAGE_INDEX]}
     N_PAIRS_IN_SEGMENT=${N_PAIRSS_IN_SEGMENT[$STAGE_INDEX]}
     N_SEGMENTS_IN_CONTEXT=${N_SEGMENTSS_IN_CONTEXT[$STAGE_INDEX]}
     N_PAIRS=$((N_PAIRS_IN_SEGMENT * N_SEGMENTS_IN_CONTEXT))
     HF_SUBSET=N${N_PAIRS}-K${K_SIZE}V${V_SIZE}-V${VOCAB_SIZE}
-    RUN_NAME=energy_gradmem_curriculum_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}
-    EXP_ROOT=./runs/energy_gradmem_kv_curriculum/${HF_SUBSET}/${RUN_NAME}
-    STAGE_EXP_PATH=${EXP_ROOT}/run_${N}/stage_${STAGE}_ce_${CE_WEIGHT}
-    STAGE_WANDB_NAME=${MODEL}_curriculum_ce${CE_WEIGHT}_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}
+    RUN_NAME=energy_gradmem_cross_entropy_curriculum_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}
+    EXP_ROOT=./runs/energy_gradmem_kv_cross_entropy_curriculum/${HF_SUBSET}/${RUN_NAME}
+    STAGE_EXP_PATH=${EXP_ROOT}/run_${N}/stage_${STAGE}_cross_entropy
+    STAGE_WANDB_NAME=${MODEL}_cross_entropy_curriculum_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}
 
     if [ "$STAGE" -lt "$START_ITERATION" ]; then
       echo "Skipping stage $STAGE; reading checkpoint from $STAGE_EXP_PATH"
@@ -106,13 +94,15 @@ for N in $N_VALUES; do
       N_PAIRS_IN_SEGMENT="$N_PAIRS_IN_SEGMENT" \
       N_SEGMENTS_IN_CONTEXT="$N_SEGMENTS_IN_CONTEXT" \
       INNER_LR="$INNER_LR" \
-      INNER_OBJECTIVE="$INNER_OBJECTIVE" \
-      ENERGY_MODEL_TYPE="$ENERGY_MODEL_TYPE" \
+      INNER_OBJECTIVE=cross_entropy \
+      ENERGY_MODEL_TYPE=lstm \
       ENERGY_FUTURE_MODE=none \
-      ENERGY_INNER_CE_WEIGHT="$CE_WEIGHT" \
+      ENERGY_INNER_CE_WEIGHT=0.0 \
       ENERGY_CE_GUIDANCE=false \
       ENERGY_CE_GUIDANCE_ALPHA=0.0 \
+      ENERGY_PRETRAIN_OBJECTIVE=ce \
       ENERGY_PRETRAIN_STEPS=0 \
+      ENERGY_PRETRAIN_L2_REG=0.0 \
       ENERGY_FREEZED_STEPS=0 \
       STOP_EXACT_MATCH_VALUE="$STOP_EXACT_MATCH_VALUE" \
       "$BASE_SCRIPT"
