@@ -111,6 +111,7 @@ class ExperimentArgs:
     energy_ce_guidance_alpha: Optional[float] = field(default=0.01)
     energy_inner_ce_weight: Optional[float] = field(default=0.0)
     energy_model_type: Optional[str] = field(default="lstm")
+    energy_segment_state_size: Optional[int] = field(default=None)
     energy_mamba_state_size: Optional[int] = field(default=128)
     energy_mamba_conv_kernel: Optional[int] = field(default=4)
     energy_mamba_expand: Optional[int] = field(default=2)
@@ -208,6 +209,7 @@ def build_model_config(args, base_config):
         energy_ce_guidance_alpha=args.energy_ce_guidance_alpha,
         energy_inner_ce_weight=args.energy_inner_ce_weight,
         energy_model_type=args.energy_model_type,
+        energy_segment_state_size=args.energy_segment_state_size,
         energy_mamba_state_size=args.energy_mamba_state_size,
         energy_mamba_conv_kernel=args.energy_mamba_conv_kernel,
         energy_mamba_expand=args.energy_mamba_expand,
@@ -268,9 +270,9 @@ class EnergyFreezeCallback(TrainerCallback):
 
     def _energy_parameters(self, model):
         target = self._unwrap_model(model)
-        if not (hasattr(target, "energy_encoder") and hasattr(target, "energy_head")):
+        if not hasattr(target, "_energy_parameters"):
             return []
-        return list(target.energy_encoder.parameters()) + list(target.energy_head.parameters())
+        return target._energy_parameters()
 
     def _zero_energy_grads(self, model):
         for param in self._energy_parameters(model):
@@ -354,7 +356,13 @@ if __name__ == "__main__":
     def compute_metrics(eval_pred):
         metrics = compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer)
         _, inner_loop_stats = eval_pred.predictions
-        for key in ("inner_energy_loss", "inner_ce_loss"):
+        for key in (
+            "inner_energy_loss",
+            "inner_ce_loss",
+            "segment_delta_norm_mean",
+            "segment_delta_norm_max",
+            "segment_state_norm_mean",
+        ):
             if key in inner_loop_stats:
                 metrics[key] = float(inner_loop_stats[key].mean())
         return metrics

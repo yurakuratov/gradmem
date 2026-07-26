@@ -28,6 +28,7 @@ def _model(
     energy_future_mode="next_token",
     inner_objective="neural",
     energy_model_type="lstm",
+    energy_segment_state_size=None,
     segment_write_mode="sequential",
     segment_size=None,
     memory_rotation="none",
@@ -55,6 +56,7 @@ def _model(
             energy_dropout=0.0,
             energy_future_mode=energy_future_mode,
             energy_model_type=energy_model_type,
+            energy_segment_state_size=energy_segment_state_size,
             segment_write_mode=segment_write_mode,
             segment_size=segment_size,
             memory_rotation=memory_rotation,
@@ -177,6 +179,302 @@ def test_forward_identity_energy_model_prefix():
     output = model({"context_input_ids": context, "query_input_ids": query}, labels=labels)
 
     assert torch.isfinite(output["loss"]).item()
+
+
+def test_segment_delta_gru_shapes_and_token_energy_reduction():
+    model = _model(
+        K=1,
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=7,
+    )
+    hidden = torch.randn(2, 5, 96)
+    mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 1]], dtype=torch.bool)
+    state = torch.randn(2, 7)
+
+    loss, returned_state, energy = model._energy_loss(hidden, mask, state)
+
+    assert model.segment_state_gru.input_size == 4 * 48
+    assert model.token_energy_mlp[0].in_features == 96 + 7
+    assert energy.shape == (2, 5)
+    assert loss.shape == ()
+    assert returned_state is state
+
+
+def test_segment_delta_gru_preserves_flattened_memory_slot_order():
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=5,
+    )
+    captured = []
+
+    class CaptureGRU(torch.nn.Module):
+        def forward(self, inputs, state):
+            captured.append(inputs.detach().clone())
+            return state
+
+    model.segment_state_gru = CaptureGRU()
+    delta = torch.arange(4 * 48, dtype=torch.float32).reshape(1, 4, 48)
+    state = torch.zeros(1, 5)
+    active = torch.ones(1, dtype=torch.bool)
+
+    model._update_segment_delta_state(state, delta, active)
+    model._update_segment_delta_state(state, delta[:, [1, 0, 2, 3]], active)
+
+    assert torch.equal(captured[0], delta.flatten(start_dim=1))
+    assert torch.equal(captured[1][:, :48], captured[0][:, 48:96])
+    assert torch.equal(captured[1][:, 48:96], captured[0][:, :48])
+    assert not torch.equal(captured[0], captured[1])
+
+
+def test_segment_delta_state_updates_once_per_segment_and_is_used_next_segment():
+    torch.manual_seed(0)
+    model = _model(
+        K=3,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=6,
+    )
+    model.eval()
+    conditioned_states = []
+    gru_outputs = []
+
+    def capture_conditioned(_module, args):
+        conditioned_states.append(args[0][..., -6:].detach().clone())
+
+    def capture_gru_output(_module, _args, output):
+        gru_outputs.append(output.detach().clone())
+
+    mlp_hook = model.token_energy_mlp.register_forward_pre_hook(capture_conditioned)
+    gru_hook = model.segment_state_gru.register_forward_hook(capture_gru_output)
+    segments = [torch.randint(1, 101, (2, 5)), torch.randint(1, 101, (2, 5))]
+    query = torch.randint(1, 101, (2, 4))
+    output = model(
+        {"context_input_ids": segments, "query_input_ids": query},
+        return_energy_state=True,
+    )
+    mlp_hook.remove()
+    gru_hook.remove()
+
+    assert len(conditioned_states) == 2 * model.K
+    assert len(gru_outputs) == 2
+    assert all(torch.equal(state, conditioned_states[0]) for state in conditioned_states[:model.K])
+    assert torch.count_nonzero(conditioned_states[0]) == 0
+    assert all(
+        torch.allclose(state[:, 0, :], gru_outputs[0])
+        for state in conditioned_states[model.K:]
+    )
+    assert torch.allclose(output["energy_state"], gru_outputs[1])
+
+
+def test_segment_delta_gru_uses_memory_before_first_and_after_final_inner_step(monkeypatch):
+    model = _model(
+        K=2,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=5,
+    )
+    model.eval()
+    captured = []
+
+    class CaptureGRU(torch.nn.Module):
+        def forward(self, inputs, state):
+            captured.append(inputs.detach().clone())
+            return state
+
+    model.segment_state_gru = CaptureGRU()
+    increment = torch.arange(4 * 48, dtype=model.mem.dtype).reshape(1, 4, 48) / 1000
+
+    def deterministic_updates(inner_params, grads, opt_state, local_step):
+        del grads, opt_state
+        return [inner_params[0] + (local_step + 1) * increment]
+
+    monkeypatch.setattr(model, "_updated_inner_params", deterministic_updates)
+    context = torch.randint(1, 101, (1, 5))
+    query = torch.randint(1, 101, (1, 4))
+    model(
+        {"context_input_ids": context, "query_input_ids": query},
+        return_energy_state=True,
+    )
+
+    expected_delta = 3 * increment
+    assert len(captured) == 1
+    assert torch.allclose(captured[0], expected_delta.flatten(start_dim=1))
+
+
+def test_segment_delta_gru_padding_updates_only_active_samples():
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=5,
+    )
+    model.eval()
+    calls = 0
+
+    class IncrementStateGRU(torch.nn.Module):
+        def forward(self, inputs, state):
+            nonlocal calls
+            calls += 1
+            return state + 1
+
+    model.segment_state_gru = IncrementStateGRU()
+    segments = [
+        torch.ones(2, 5, dtype=torch.long),
+        torch.tensor([[0, 0, 0, 0, 0], [1, 1, 1, 1, 1]]),
+        torch.zeros(2, 5, dtype=torch.long),
+    ]
+    query = torch.ones(2, 4, dtype=torch.long)
+    output = model(
+        {"context_input_ids": segments, "query_input_ids": query},
+        return_energy_state=True,
+    )
+
+    assert calls == 2
+    assert torch.equal(output["energy_state"][0], torch.ones(5))
+    assert torch.equal(output["energy_state"][1], torch.full((5,), 2.0))
+
+
+def test_segment_delta_gru_k_zero_preserves_state_and_rotation_contract():
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=5,
+        memory_rotation="pairwise",
+        memory_rotation_angle=torch.pi / 2,
+    )
+    model.eval()
+    with torch.no_grad():
+        initial_memory = torch.arange(model.mem.numel(), dtype=model.mem.dtype).reshape_as(model.mem)
+        model.mem.copy_(initial_memory)
+
+    external_state = torch.randn(2, 5)
+    context = torch.tensor(
+        [
+            [1, 1, 1, 1, 1],
+            [0, 0, 0, 0, 0],
+        ]
+    )
+    query = torch.ones(2, 4, dtype=torch.long)
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        return_mem=True,
+        return_energy_state=True,
+        energy_state=external_state,
+    )
+
+    expected_rotated = EnergyGradMem._rotate_feature_pairs(initial_memory, torch.pi / 2)
+    assert torch.allclose(output["mem"][0], expected_rotated, atol=1e-6)
+    assert torch.equal(output["mem"][1], initial_memory)
+    assert torch.equal(output["energy_state"], external_state)
+    assert output["inner_loop_stats"]["segment_delta_norm_mean"] == 0
+
+
+def test_segment_delta_gru_rotates_delta_and_memory_once(monkeypatch):
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=5,
+        memory_rotation="pairwise",
+        memory_rotation_angle=torch.pi / 2,
+    )
+    model.eval()
+    captured = []
+
+    class CaptureGRU(torch.nn.Module):
+        def forward(self, inputs, state):
+            captured.append(inputs.detach().clone())
+            return state
+
+    model.segment_state_gru = CaptureGRU()
+    with torch.no_grad():
+        model.mem.zero_()
+    raw_delta = torch.arange(4 * 48, dtype=model.mem.dtype).reshape(1, 4, 48) / 1000
+
+    def deterministic_updates(inner_params, grads, opt_state, local_step):
+        del grads, opt_state, local_step
+        return [inner_params[0] + raw_delta]
+
+    monkeypatch.setattr(model, "_updated_inner_params", deterministic_updates)
+    context = torch.ones(1, 5, dtype=torch.long)
+    query = torch.ones(1, 4, dtype=torch.long)
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        return_mem=True,
+        return_energy_state=True,
+    )
+
+    once_rotated = EnergyGradMem._rotate_feature_pairs(raw_delta, torch.pi / 2)
+    assert torch.allclose(captured[0], once_rotated.flatten(start_dim=1), atol=1e-6)
+    assert torch.allclose(output["mem"], once_rotated, atol=1e-6)
+
+
+def test_segment_delta_gru_second_order_target_gradients_are_finite():
+    torch.manual_seed(0)
+    model = _model(
+        K=2,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=8,
+    )
+    model.train()
+    segments = [torch.randint(1, 101, (2, 5)), torch.randint(1, 101, (2, 5))]
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model(
+        {"context_input_ids": segments, "query_input_ids": query},
+        labels=labels,
+    )
+    output["loss"].backward()
+
+    assert model.grad_mode == "second"
+    for module in (model.segment_state_gru, model.token_energy_mlp):
+        assert all(param.grad is not None for param in module.parameters())
+        assert all(torch.isfinite(param.grad).all() for param in module.parameters())
+    assert model.mem.grad is not None
+    assert torch.isfinite(model.mem.grad).all()
+
+
+def test_segment_delta_gru_state_round_trip_and_validation():
+    model = _model(
+        K=1,
+        energy_future_mode="next_token",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=5,
+        energy_ce_guidance=True,
+    )
+    model.eval()
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+
+    first = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        return_energy_state=True,
+    )
+    second = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        return_energy_state=True,
+        energy_state=first["energy_state"],
+    )
+
+    assert first["energy_state"].shape == (2, 5)
+    assert second["energy_state"].shape == (2, 5)
+    assert not torch.equal(first["energy_state"], second["energy_state"])
+
+    with pytest.raises(ValueError, match="must be a tensor"):
+        model(
+            {"context_input_ids": context, "query_input_ids": query},
+            energy_state=(torch.zeros(1), torch.zeros(1)),
+        )
+    with pytest.raises(ValueError, match=r"must have shape \(2, 5\)"):
+        model(
+            {"context_input_ids": context, "query_input_ids": query},
+            energy_state=torch.zeros(2, 6),
+        )
 
 
 def test_mamba2_energy_model_uses_fla_layer(monkeypatch):
@@ -1125,6 +1423,53 @@ def test_lstm_inner_objective_is_deprecated_alias_for_neural():
         config = EnergyGradMemConfig(base_config=_base_config(), inner_objective="lstm")
 
     assert config.inner_objective == "neural"
+
+
+@pytest.mark.parametrize(
+    "kwargs,error",
+    [
+        (
+            {"inner_objective": "cross_entropy"},
+            "requires inner_objective='neural'",
+        ),
+        (
+            {"segment_write_mode": "parallel", "energy_future_mode": "none"},
+            "requires segment_write_mode='sequential'",
+        ),
+        (
+            {"memory_backend": "lora"},
+            "requires memory_backend='prefix'",
+        ),
+        (
+            {"energy_pretrain_steps": 1},
+            "does not support energy pretraining",
+        ),
+    ],
+)
+def test_segment_delta_gru_rejects_unsupported_configurations(kwargs, error):
+    with pytest.raises(ValueError, match=error):
+        EnergyGradMemConfig(
+            base_config=_base_config(),
+            energy_model_type="segment_delta_gru",
+            **kwargs,
+        )
+
+
+def test_segment_delta_gru_defaults_state_size_and_rejects_invalid_size():
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+    )
+    assert model.energy_segment_state_size == 48
+
+    with pytest.raises(ValueError, match="positive integer"):
+        _model(
+            K=1,
+            energy_future_mode="none",
+            energy_model_type="segment_delta_gru",
+            energy_segment_state_size=0,
+        )
 
 
 def test_rejects_fixed_embedding_objective_without_next_token_target():

@@ -77,6 +77,7 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         energy_ce_guidance_alpha=0.01,
         energy_inner_ce_weight=0.0,
         energy_model_type="lstm",
+        energy_segment_state_size=None,
         energy_mamba_state_size=128,
         energy_mamba_conv_kernel=4,
         energy_mamba_expand=2,
@@ -109,8 +110,10 @@ class EnergyGradMemConfig(GradMemGPTConfig):
             raise ValueError("inner_objective must be one of: 'neural', 'cross_entropy', 'embedding_l1', 'embedding_l2'")
         if energy_future_mode not in ("none", "next_token"):
             raise ValueError("energy_future_mode must be one of: 'none', 'next_token'")
-        if energy_model_type not in ("lstm", "identity", "mamba2"):
-            raise ValueError("energy_model_type must be one of: 'lstm', 'identity', 'mamba2'")
+        if energy_model_type not in ("lstm", "identity", "mamba2", "segment_delta_gru"):
+            raise ValueError(
+                "energy_model_type must be one of: 'lstm', 'identity', 'mamba2', 'segment_delta_gru'"
+            )
         if segment_write_mode not in ("sequential", "parallel"):
             raise ValueError("segment_write_mode must be one of: 'sequential', 'parallel'")
         if segment_size is not None and int(segment_size) <= 0:
@@ -128,6 +131,15 @@ class EnergyGradMemConfig(GradMemGPTConfig):
                 raise ValueError("memory_rotation='pairwise' currently supports segment_write_mode='sequential' only")
             if self.use_adam:
                 raise ValueError("memory_rotation='pairwise' currently requires use_adam=False")
+        if energy_model_type == "segment_delta_gru":
+            if inner_objective != "neural":
+                raise ValueError("energy_model_type='segment_delta_gru' requires inner_objective='neural'")
+            if segment_write_mode != "sequential":
+                raise ValueError("energy_model_type='segment_delta_gru' requires segment_write_mode='sequential'")
+            if self.memory_backend != "prefix":
+                raise ValueError("energy_model_type='segment_delta_gru' requires memory_backend='prefix'")
+            if int(energy_pretrain_steps) != 0:
+                raise ValueError("energy_model_type='segment_delta_gru' does not support energy pretraining")
         if inner_objective in ("embedding_l1", "embedding_l2") and energy_future_mode != "next_token":
             raise ValueError("embedding_l1/embedding_l2 inner objectives require energy_future_mode='next_token'")
         if inner_objective == "cross_entropy" and energy_ce_guidance:
@@ -163,6 +175,7 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         self.energy_ce_guidance_alpha = energy_ce_guidance_alpha
         self.energy_inner_ce_weight = energy_inner_ce_weight
         self.energy_model_type = energy_model_type
+        self.energy_segment_state_size = energy_segment_state_size
         self.energy_mamba_state_size = energy_mamba_state_size
         self.energy_mamba_conv_kernel = energy_mamba_conv_kernel
         self.energy_mamba_expand = energy_mamba_expand
@@ -206,6 +219,12 @@ class EnergyGradMem(GradMemGPT):
         self.energy_ce_guidance_alpha = float(getattr(config, "energy_ce_guidance_alpha", 0.01))
         self.energy_inner_ce_weight = float(getattr(config, "energy_inner_ce_weight", 0.0))
         self.energy_model_type = getattr(config, "energy_model_type", "lstm")
+        energy_segment_state_size = getattr(config, "energy_segment_state_size", None)
+        self.energy_segment_state_size = int(
+            model_hidden_size if energy_segment_state_size is None else energy_segment_state_size
+        )
+        if self.energy_segment_state_size < 1:
+            raise ValueError("energy_segment_state_size must be a positive integer")
         self.segment_write_mode = getattr(config, "segment_write_mode", "sequential")
         self.segment_size = getattr(config, "segment_size", None)
         if self.segment_size is not None:
@@ -261,15 +280,36 @@ class EnergyGradMem(GradMemGPT):
                     backend=getattr(config, "energy_mamba_backend", "cuda"),
                 )
                 energy_head_input_size = energy_input_size
+            elif self.energy_model_type == "segment_delta_gru":
+                memory_width = self.mem.size(-1)
+                self.segment_state_gru = nn.GRUCell(
+                    input_size=self.n_mem_tokens * memory_width,
+                    hidden_size=self.energy_segment_state_size,
+                )
+                self.token_energy_mlp = nn.Sequential(
+                    nn.Linear(
+                        energy_input_size + self.energy_segment_state_size,
+                        self.energy_hidden_size,
+                    ),
+                    nn.SiLU(),
+                    nn.Linear(self.energy_hidden_size, 1),
+                    nn.Softplus(beta=1, threshold=20),
+                )
+                energy_head_input_size = None
             else:
                 raise ValueError(f"Unsupported energy_model_type={self.energy_model_type}")
-            self.energy_head = nn.Sequential(
-                nn.Linear(energy_head_input_size, 1),
-                nn.Softplus(beta=1, threshold=20),
-            )
+            if energy_head_input_size is not None:
+                self.energy_head = nn.Sequential(
+                    nn.Linear(energy_head_input_size, 1),
+                    nn.Softplus(beta=1, threshold=20),
+                )
 
     def _energy_parameters(self):
         params = []
+        if hasattr(self, "segment_state_gru"):
+            params.extend(self.segment_state_gru.parameters())
+        if hasattr(self, "token_energy_mlp"):
+            params.extend(self.token_energy_mlp.parameters())
         if hasattr(self, "energy_encoder"):
             params.extend(self.energy_encoder.parameters())
         if hasattr(self, "energy_head"):
@@ -329,6 +369,17 @@ class EnergyGradMem(GradMemGPT):
                 return (pred - target).abs().mean(dim=-1), energy_state
             return (pred - target).pow(2).mean(dim=-1), energy_state
 
+        if self.energy_model_type == "segment_delta_gru":
+            if energy_state is None:
+                raise ValueError("segment_delta_gru energy computation requires an initialized segment state")
+            state_tokens = energy_state[:, None, :].expand(
+                hidden.size(0),
+                hidden.size(1),
+                self.energy_segment_state_size,
+            )
+            conditioned = torch.cat((hidden, state_tokens.to(dtype=hidden.dtype)), dim=-1)
+            return self.token_energy_mlp(conditioned).squeeze(-1), energy_state
+
         with torch.backends.cudnn.flags(enabled=False):
             encoded, energy_state = self.energy_encoder(hidden, energy_state)
         energy = self.energy_head(encoded).squeeze(-1)
@@ -344,6 +395,49 @@ class EnergyGradMem(GradMemGPT):
         per_sample_energy = (energy * mask).sum(dim=1) / valid_lengths.clamp_min(1.0)
         per_sample_energy = per_sample_energy * (valid_lengths > 0).to(per_sample_energy.dtype)
         return per_sample_energy.sum(), energy_state, energy
+
+    def _prepare_energy_state(self, energy_state, memory):
+        batch_size = memory.size(0)
+        if self.inner_objective != "neural":
+            return energy_state
+
+        if self.energy_model_type == "segment_delta_gru":
+            expected_shape = (batch_size, self.energy_segment_state_size)
+            if energy_state is None:
+                return memory.new_zeros(expected_shape)
+            if not isinstance(energy_state, torch.Tensor):
+                raise ValueError(
+                    "segment_delta_gru energy_state must be a tensor with shape "
+                    f"{expected_shape}; got {type(energy_state).__name__}"
+                )
+            if tuple(energy_state.shape) != expected_shape:
+                raise ValueError(
+                    "segment_delta_gru energy_state must have shape "
+                    f"{expected_shape}; got {tuple(energy_state.shape)}"
+                )
+            return energy_state.to(device=memory.device, dtype=memory.dtype)
+
+        if self.energy_model_type == "lstm" and energy_state is not None:
+            expected_shape = (self.energy_num_layers, batch_size, self.energy_hidden_size)
+            if not isinstance(energy_state, tuple) or len(energy_state) != 2:
+                raise ValueError(
+                    "LSTM energy_state must be an (h, c) tuple with each tensor shaped "
+                    f"{expected_shape}"
+                )
+            h, c = energy_state
+            if not isinstance(h, torch.Tensor) or not isinstance(c, torch.Tensor):
+                raise ValueError("LSTM energy_state must contain tensors")
+            if tuple(h.shape) != expected_shape or tuple(c.shape) != expected_shape:
+                raise ValueError(
+                    "LSTM energy_state tensors must each have shape "
+                    f"{expected_shape}; got h={tuple(h.shape)}, c={tuple(c.shape)}"
+                )
+            return (
+                h.to(device=memory.device, dtype=self._energy_dtype()),
+                c.to(device=memory.device, dtype=self._energy_dtype()),
+            )
+
+        return energy_state
 
     def _run_write_model(self, write_batch, memory_state):
         write_model_kwargs = write_batch.get("model_kwargs", {})
@@ -516,6 +610,8 @@ class EnergyGradMem(GradMemGPT):
             return
         if self.inner_objective != "neural":
             raise ValueError("energy pretraining requires trainable inner_objective='neural'")
+        if self.energy_model_type == "segment_delta_gru":
+            raise ValueError("energy_model_type='segment_delta_gru' does not support energy pretraining")
 
         was_training = self.training
         device = self.model.get_input_embeddings().weight.device
@@ -707,19 +803,28 @@ class EnergyGradMem(GradMemGPT):
             rotated = torch.cat((rotated, memory[..., pair_width:]), dim=-1)
         return rotated
 
-    def _rotate_memory_after_segment(self, memory_state, active_samples, active_segment_counts):
-        if self.memory_rotation == "none" or not active_samples.any():
-            return
+    def _segment_rotation_angle(self, active_segment_counts):
+        if self.memory_rotation == "none":
+            return None
         if self.memory_rotation != "pairwise":
             raise ValueError(f"Unsupported memory_rotation={self.memory_rotation}")
+        if self.memory_rotation_angle is not None:
+            return self.memory_rotation_angle
+        return math.pi / active_segment_counts.clamp_min(1)
 
-        angle = self.memory_rotation_angle
-        if angle is None:
-            angle = math.pi / active_segment_counts.clamp_min(1)
+    def _rotate_active_tensor(self, tensor, angle, active_samples):
+        if angle is None or not active_samples.any():
+            return tensor
+        rotated = self._rotate_feature_pairs(tensor, angle)
+        active_shape = (active_samples.size(0),) + (1,) * (tensor.ndim - 1)
+        return torch.where(active_samples.reshape(active_shape), rotated, tensor)
 
-        memory = memory_state["mem_batch"]
-        rotated = self._rotate_feature_pairs(memory, angle)
-        memory_state["mem_batch"] = torch.where(active_samples[:, None, None], rotated, memory)
+    def _update_segment_delta_state(self, segment_state, delta_for_state, active_samples):
+        candidate_state = self.segment_state_gru(
+            delta_for_state.flatten(start_dim=1),
+            segment_state,
+        )
+        return torch.where(active_samples[:, None], candidate_state, segment_state)
 
     @staticmethod
     def _validate_parallel_segments(context_segments):
@@ -822,8 +927,15 @@ class EnergyGradMem(GradMemGPT):
         guidance_loss = torch.tensor(0.0, device=device)
         write_steps = 0
         stats = self._init_inner_loop_stats(device)
+        segment_delta_norm_sum = torch.tensor(0.0, device=device)
+        segment_delta_norm_max = torch.tensor(0.0, device=device)
+        segment_delta_count = 0
 
         if not self.K and self.memory_rotation == "none":
+            if self.energy_model_type == "segment_delta_gru":
+                stats["segment_delta_norm_mean"] = segment_delta_norm_sum
+                stats["segment_delta_norm_max"] = segment_delta_norm_max
+                stats["segment_state_norm_mean"] = energy_state.detach().norm(dim=1).mean()
             return memory_state, energy_state, inner_loss, guidance_loss, write_steps, stats
 
         with torch.enable_grad():
@@ -831,11 +943,16 @@ class EnergyGradMem(GradMemGPT):
             global_step = 0
             active_segment_masks = [segment.ne(pad_id).any(dim=1) for segment in context_segments]
             active_segment_counts = torch.stack(active_segment_masks).sum(dim=0)
+            rotation_angle = self._segment_rotation_angle(active_segment_counts)
             for segment, active_samples in zip(context_segments, active_segment_masks):
                 batch_ctx = backend.prepare_batch(segment, query_input_ids, pad_id)
                 if not active_samples.any():
                     global_step += self.K
                     continue
+
+                memory_before = None
+                if self.energy_model_type == "segment_delta_gru" and self.K:
+                    memory_before = memory_state["mem_batch"].clone()
 
                 for k in range(self.K):
                     write_batch = backend.build_write_inputs(memory_state, batch_ctx)
@@ -889,13 +1006,42 @@ class EnergyGradMem(GradMemGPT):
                     write_steps += 1
                     global_step += 1
 
-                self._rotate_memory_after_segment(memory_state, active_samples, active_segment_counts)
+                if memory_before is not None:
+                    raw_delta = memory_state["mem_batch"] - memory_before
+                    delta_for_state = self._rotate_active_tensor(raw_delta, rotation_angle, active_samples)
+                    energy_state = self._update_segment_delta_state(
+                        energy_state,
+                        delta_for_state,
+                        active_samples,
+                    )
+
+                    active_delta_norms = raw_delta.flatten(start_dim=1).norm(dim=1)[active_samples]
+                    segment_delta_norm_sum = segment_delta_norm_sum + active_delta_norms.detach().sum()
+                    segment_delta_norm_max = torch.maximum(
+                        segment_delta_norm_max,
+                        active_delta_norms.detach().max(),
+                    )
+                    segment_delta_count += active_delta_norms.numel()
+
+                memory_state["mem_batch"] = self._rotate_active_tensor(
+                    memory_state["mem_batch"],
+                    rotation_angle,
+                    active_samples,
+                )
 
         if write_steps and self.energy_ce_guidance:
             guidance_loss = guidance_loss / write_steps
         if write_steps:
             stats["inner_energy_loss"] = inner_energy_loss / (write_steps * batch_size)
             stats["inner_ce_loss"] = inner_ce_loss / (write_steps * batch_size)
+        if self.energy_model_type == "segment_delta_gru":
+            if segment_delta_count:
+                stats["segment_delta_norm_mean"] = segment_delta_norm_sum / segment_delta_count
+                stats["segment_delta_norm_max"] = segment_delta_norm_max
+            else:
+                stats["segment_delta_norm_mean"] = segment_delta_norm_sum
+                stats["segment_delta_norm_max"] = segment_delta_norm_max
+            stats["segment_state_norm_mean"] = energy_state.detach().norm(dim=1).mean()
         return memory_state, energy_state, inner_loss, guidance_loss, write_steps, stats
 
     @staticmethod
@@ -991,6 +1137,7 @@ class EnergyGradMem(GradMemGPT):
 
         backend = self.memory_backend_impl
         memory_state, memory_state_initial = backend.init_memory_state(B)
+        energy_state = self._prepare_energy_state(energy_state, memory_state["mem_batch"])
 
         write_fn = self._write_segments_parallel if self.segment_write_mode == "parallel" else self._write_segments
         memory_state, energy_state, inner_loss, guidance_loss, write_steps, inner_loop_stats = write_fn(
