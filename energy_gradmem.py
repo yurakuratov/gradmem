@@ -1,4 +1,5 @@
 import logging
+import math
 import warnings
 from types import SimpleNamespace
 
@@ -10,8 +11,10 @@ from grad_memgpt import GradMemGPT, GradMemGPTConfig, _is_main_process, get_back
 
 try:
     from fla.layers.mamba2 import Mamba2 as FlaMamba2
-except ImportError:
+    _fla_import_error = None
+except (ImportError, RuntimeError) as exc:
     FlaMamba2 = None
+    _fla_import_error = exc
 
 
 logger = logging.getLogger(__name__)
@@ -39,7 +42,9 @@ class FlaMamba2EnergyEncoder(nn.Module):
     ):
         super().__init__()
         if FlaMamba2 is None:
-            raise ImportError("energy_model_type='mamba2' requires the flash-linear-attention package (`fla`)")
+            raise ImportError(
+                "energy_model_type='mamba2' requires a working flash-linear-attention package (`fla`)"
+            ) from _fla_import_error
         self.input_size = int(input_size)
         self.mamba = FlaMamba2(
             hidden_size=self.input_size,
@@ -80,6 +85,8 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         energy_mamba_backend="cuda",
         segment_write_mode="sequential",
         segment_size=None,
+        memory_rotation="none",
+        memory_rotation_angle=None,
         energy_pretrain_objective="ce",
         energy_pretrain_steps=0,
         energy_pretrain_batch_size=16,
@@ -108,6 +115,19 @@ class EnergyGradMemConfig(GradMemGPTConfig):
             raise ValueError("segment_write_mode must be one of: 'sequential', 'parallel'")
         if segment_size is not None and int(segment_size) <= 0:
             raise ValueError("segment_size must be a positive integer when set")
+        if memory_rotation not in ("none", "pairwise"):
+            raise ValueError("memory_rotation must be one of: 'none', 'pairwise'")
+        if memory_rotation_angle is not None and not math.isfinite(float(memory_rotation_angle)):
+            raise ValueError("memory_rotation_angle must be finite when set")
+        if memory_rotation == "none" and memory_rotation_angle is not None:
+            raise ValueError("memory_rotation_angle requires memory_rotation='pairwise'")
+        if memory_rotation == "pairwise":
+            if self.memory_backend != "prefix":
+                raise ValueError("memory_rotation='pairwise' currently supports memory_backend='prefix' only")
+            if segment_write_mode != "sequential":
+                raise ValueError("memory_rotation='pairwise' currently supports segment_write_mode='sequential' only")
+            if self.use_adam:
+                raise ValueError("memory_rotation='pairwise' currently requires use_adam=False")
         if inner_objective in ("embedding_l1", "embedding_l2") and energy_future_mode != "next_token":
             raise ValueError("embedding_l1/embedding_l2 inner objectives require energy_future_mode='next_token'")
         if inner_objective == "cross_entropy" and energy_ce_guidance:
@@ -151,6 +171,8 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         self.energy_mamba_backend = energy_mamba_backend
         self.segment_write_mode = segment_write_mode
         self.segment_size = segment_size
+        self.memory_rotation = memory_rotation
+        self.memory_rotation_angle = memory_rotation_angle
         self.energy_pretrain_objective = energy_pretrain_objective
         self.energy_pretrain_steps = energy_pretrain_steps
         self.energy_pretrain_batch_size = energy_pretrain_batch_size
@@ -188,6 +210,9 @@ class EnergyGradMem(GradMemGPT):
         self.segment_size = getattr(config, "segment_size", None)
         if self.segment_size is not None:
             self.segment_size = int(self.segment_size)
+        self.memory_rotation = getattr(config, "memory_rotation", "none")
+        memory_rotation_angle = getattr(config, "memory_rotation_angle", None)
+        self.memory_rotation_angle = None if memory_rotation_angle is None else float(memory_rotation_angle)
         self.energy_pretrain_objective = getattr(config, "energy_pretrain_objective", "ce")
         self.energy_pretrain_steps = int(getattr(config, "energy_pretrain_steps", 0))
         self.energy_pretrain_batch_size = int(getattr(config, "energy_pretrain_batch_size", 16))
@@ -661,6 +686,42 @@ class EnergyGradMem(GradMemGPT):
         return new_params
 
     @staticmethod
+    def _rotate_feature_pairs(memory, angle):
+        pair_width = memory.size(-1) - memory.size(-1) % 2
+        if pair_width == 0:
+            raise ValueError("Pairwise memory rotation requires memory vectors with at least two features")
+
+        pairs = memory[..., :pair_width].reshape(*memory.shape[:-1], -1, 2)
+        angle = torch.as_tensor(angle, device=memory.device, dtype=memory.dtype)
+        while angle.ndim < memory.ndim:
+            angle = angle.unsqueeze(-1)
+        cos = angle.cos()
+        sin = angle.sin()
+        first, second = pairs.unbind(dim=-1)
+        rotated = torch.stack(
+            (first * cos - second * sin, first * sin + second * cos),
+            dim=-1,
+        ).flatten(-2)
+
+        if pair_width < memory.size(-1):
+            rotated = torch.cat((rotated, memory[..., pair_width:]), dim=-1)
+        return rotated
+
+    def _rotate_memory_after_segment(self, memory_state, active_samples, active_segment_counts):
+        if self.memory_rotation == "none" or not active_samples.any():
+            return
+        if self.memory_rotation != "pairwise":
+            raise ValueError(f"Unsupported memory_rotation={self.memory_rotation}")
+
+        angle = self.memory_rotation_angle
+        if angle is None:
+            angle = math.pi / active_segment_counts.clamp_min(1)
+
+        memory = memory_state["mem_batch"]
+        rotated = self._rotate_feature_pairs(memory, angle)
+        memory_state["mem_batch"] = torch.where(active_samples[:, None, None], rotated, memory)
+
+    @staticmethod
     def _validate_parallel_segments(context_segments):
         segment_len = context_segments[0].size(1)
         for i, segment in enumerate(context_segments):
@@ -762,15 +823,17 @@ class EnergyGradMem(GradMemGPT):
         write_steps = 0
         stats = self._init_inner_loop_stats(device)
 
-        if not self.K:
+        if not self.K and self.memory_rotation == "none":
             return memory_state, energy_state, inner_loss, guidance_loss, write_steps, stats
 
         with torch.enable_grad():
             total_steps = self.K * len(context_segments)
             global_step = 0
-            for segment in context_segments:
+            active_segment_masks = [segment.ne(pad_id).any(dim=1) for segment in context_segments]
+            active_segment_counts = torch.stack(active_segment_masks).sum(dim=0)
+            for segment, active_samples in zip(context_segments, active_segment_masks):
                 batch_ctx = backend.prepare_batch(segment, query_input_ids, pad_id)
-                if not segment.ne(pad_id).any():
+                if not active_samples.any():
                     global_step += self.K
                     continue
 
@@ -784,7 +847,11 @@ class EnergyGradMem(GradMemGPT):
                     else:
                         ctx_hidden = self._extract_context_hidden(write_out.hidden_states[-1], write_batch, batch_ctx)
                         energy_input = self._energy_input(ctx_hidden, segment, write_batch["mask"])
-                        energy_loss, energy_state, energy = self._energy_loss(energy_input, write_batch["mask"], energy_state)
+                        energy_loss, energy_state, energy = self._energy_loss(
+                            energy_input,
+                            write_batch["mask"],
+                            energy_state,
+                        )
                         step_ce_loss = torch.zeros_like(energy_loss)
                         if self.energy_ce_guidance:
                             token_ce, token_ce_mask = self._write_token_ce(write_out, write_batch)
@@ -821,6 +888,8 @@ class EnergyGradMem(GradMemGPT):
                     backend.maybe_detach_after_step(memory_state)
                     write_steps += 1
                     global_step += 1
+
+                self._rotate_memory_after_segment(memory_state, active_samples, active_segment_counts)
 
         if write_steps and self.energy_ce_guidance:
             guidance_loss = guidance_loss / write_steps

@@ -15,23 +15,27 @@ BASE_MODEL=llama
 L=4
 H=4
 D=128
-N_PAIRSS_IN_SEGMENT=(8 8 8 8)
-N_SEGMENTSS_IN_CONTEXT=(1 2 2 4)
+N_PAIRSS_IN_SEGMENT=(8 8 8)
+N_SEGMENTSS_IN_CONTEXT=(1 2 4)
 K_SIZE=2
 V_SIZE=2
 VOCAB_SIZE=62
 N_MEM_TOKENS=8
 K=2
-INNER_LRS=(1.0 0.5 0.5 0.25)
+INNER_LRS=(1.0 1.0 1.0)
 GRAD_MODE=second
 TBS=64
 LR=1e-04
 N_VALUES=1
-CE_WEIGHTS=(1.0 1.0 0.0 0.0)
+CE_WEIGHTS=(1.0 0.0 0.0)
 INIT_CHECKPOINT=""
 STOP_EXACT_MATCH_VALUE=0.99
 INNER_OBJECTIVE=neural
-ENERGY_MODEL_TYPE=mamba2
+ENERGY_MODEL_TYPE=lstm
+MEMORY_ROTATION=pairwise
+
+PI=3.141592653589793
+MEMORY_ROTATION_ANGLES=(0.0 None None)
 
 
 START_ITERATION=1
@@ -50,6 +54,10 @@ if [ ${#N_SEGMENTSS_IN_CONTEXT[@]} -ne ${#CE_WEIGHTS[@]} ]; then
 fi
 if [ ${#INNER_LRS[@]} -ne ${#CE_WEIGHTS[@]} ]; then
   echo "INNER_LRS must have one value per curriculum stage" >&2
+  exit 1
+fi
+if [ ${#MEMORY_ROTATION_ANGLES[@]} -ne ${#CE_WEIGHTS[@]} ]; then
+  echo "MEMORY_ROTATION_ANGLES must have one value per curriculum stage" >&2
   exit 1
 fi
 
@@ -79,12 +87,14 @@ latest_checkpoint() {
 }
 
 for N in $N_VALUES; do
+  SEED=$((N + 42))
   INIT_CKPT=$INIT_CHECKPOINT
   STAGE=0
   for STAGE_INDEX in "${!CE_WEIGHTS[@]}"; do
     STAGE=$((STAGE + 1))
     CE_WEIGHT=${CE_WEIGHTS[$STAGE_INDEX]}
     INNER_LR=${INNER_LRS[$STAGE_INDEX]}
+    MEMORY_ROTATION_ANGLE=${MEMORY_ROTATION_ANGLES[$STAGE_INDEX]}
     N_PAIRS_IN_SEGMENT=${N_PAIRSS_IN_SEGMENT[$STAGE_INDEX]}
     N_SEGMENTS_IN_CONTEXT=${N_SEGMENTSS_IN_CONTEXT[$STAGE_INDEX]}
     N_PAIRS=$((N_PAIRS_IN_SEGMENT * N_SEGMENTS_IN_CONTEXT))
@@ -92,13 +102,14 @@ for N in $N_VALUES; do
     RUN_NAME=energy_gradmem_curriculum_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}
     EXP_ROOT=./runs/energy_gradmem_kv_curriculum/${HF_SUBSET}/${RUN_NAME}
     STAGE_EXP_PATH=${EXP_ROOT}/run_${N}/stage_${STAGE}_ce_${CE_WEIGHT}
-    STAGE_WANDB_NAME=${MODEL}_curriculum_ce${CE_WEIGHT}_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}
+    STAGE_WANDB_NAME=${MODEL}_curriculum_ce${CE_WEIGHT}_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}_ilr${INNER_LR}_rot${MEMORY_ROTATION}_run${N}
 
     if [ "$STAGE" -lt "$START_ITERATION" ]; then
       echo "Skipping stage $STAGE; reading checkpoint from $STAGE_EXP_PATH"
     else
       EXP_PATH="$STAGE_EXP_PATH" \
       N_VALUES="$N" \
+      SEED="$SEED" \
       RUN_NAME="$RUN_NAME" \
       WANDB_NAME="$STAGE_WANDB_NAME" \
       INIT_CHECKPOINT="$INIT_CKPT" \
@@ -108,6 +119,8 @@ for N in $N_VALUES; do
       INNER_LR="$INNER_LR" \
       INNER_OBJECTIVE="$INNER_OBJECTIVE" \
       ENERGY_MODEL_TYPE="$ENERGY_MODEL_TYPE" \
+      MEMORY_ROTATION="$MEMORY_ROTATION" \
+      MEMORY_ROTATION_ANGLE="$MEMORY_ROTATION_ANGLE" \
       ENERGY_FUTURE_MODE=none \
       ENERGY_INNER_CE_WEIGHT="$CE_WEIGHT" \
       ENERGY_CE_GUIDANCE=false \

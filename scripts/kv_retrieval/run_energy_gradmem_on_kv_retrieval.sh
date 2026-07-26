@@ -63,6 +63,8 @@ ADD_INNER_LOSS_TO_OUTER=${ADD_INNER_LOSS_TO_OUTER:-false}
 INNER_LOSS_WEIGHT=${INNER_LOSS_WEIGHT:-0.5}
 SEGMENT_WRITE_MODE=${SEGMENT_WRITE_MODE:-sequential}
 SEGMENT_SIZE=$((${N_PAIRS_IN_SEGMENT}*(${K_SIZE}+${V_SIZE}+3)))
+MEMORY_ROTATION=${MEMORY_ROTATION:-none}
+MEMORY_ROTATION_ANGLE=${MEMORY_ROTATION_ANGLE:-None}
 
 # LoRA / KV-cache memory backend options
 LORA_MEM_PLACEMENT=${LORA_MEM_PLACEMENT:-between_layers}
@@ -139,6 +141,7 @@ export WANDB_NAME=${WANDB_NAME:-${MODEL}_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_
 
 N_VALUES=${N_VALUES:-1}
 for N in $N_VALUES; do
+  RUN_SEED=${SEED:-$((N + 42))}
   EXP_PATH=${EXP_PATH:-./runs/energy_gradmem_kv/${HF_SUBSET}/${RUN_NAME}/run_${N}}
   PORT=$((29500 + TBS + N + 17))
 
@@ -201,6 +204,8 @@ for N in $N_VALUES; do
     $( [ "$INNER_LOSS_WEIGHT" != "None" ] && echo "--inner_loss_weight $INNER_LOSS_WEIGHT" ) \
     --segment_write_mode "$SEGMENT_WRITE_MODE" \
     $( [ "$SEGMENT_SIZE" != "None" ] && echo "--segment_size $SEGMENT_SIZE" ) \
+    --memory_rotation "$MEMORY_ROTATION" \
+    $( [ "$MEMORY_ROTATION_ANGLE" != "None" ] && echo "--memory_rotation_angle $MEMORY_ROTATION_ANGLE" ) \
     --inner_objective "$INNER_OBJECTIVE" \
     --energy_hidden_size "$ENERGY_HIDDEN_SIZE" \
     --energy_num_layers "$ENERGY_NUM_LAYERS" \
@@ -229,5 +234,5 @@ for N in $N_VALUES; do
     --logging_steps "$LOGGING_STEPS" \
     --warmup_steps "$WARMUP_STEPS" \
     --early_stopping_patience "$EARLY_STOPPING_PATIENCE" \
-    --seed $((142 + N))
+    --seed "$RUN_SEED"
 done

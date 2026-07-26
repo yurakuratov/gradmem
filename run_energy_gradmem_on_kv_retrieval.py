@@ -99,6 +99,8 @@ class ExperimentArgs:
     inner_loss_weight: Optional[float] = field(default=None)
     segment_write_mode: Optional[str] = field(default="sequential")
     segment_size: Optional[int] = field(default=None)
+    memory_rotation: Optional[str] = field(default="none")
+    memory_rotation_angle: Optional[float] = field(default=None)
 
     inner_objective: Optional[str] = field(default="neural")
     energy_hidden_size: Optional[int] = field(default=None)
@@ -195,6 +197,8 @@ def build_model_config(args, base_config):
         inner_loss_weight=args.inner_loss_weight,
         segment_write_mode=args.segment_write_mode,
         segment_size=args.segment_size,
+        memory_rotation=args.memory_rotation,
+        memory_rotation_angle=args.memory_rotation_angle,
         inner_objective=args.inner_objective,
         energy_hidden_size=args.energy_hidden_size,
         energy_num_layers=args.energy_num_layers,

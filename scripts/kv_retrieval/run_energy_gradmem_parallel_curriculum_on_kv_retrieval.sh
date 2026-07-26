@@ -78,6 +78,7 @@ latest_checkpoint() {
 }
 
 for N in $N_VALUES; do
+  SEED=$((N + 42))
   INIT_CKPT=$INIT_CHECKPOINT
   STAGE=0
   for STAGE_INDEX in "${!CE_WEIGHTS[@]}"; do
@@ -98,6 +99,7 @@ for N in $N_VALUES; do
     else
       EXP_PATH="$STAGE_EXP_PATH" \
       N_VALUES="$N" \
+      SEED="$SEED" \
       RUN_NAME="$RUN_NAME" \
       WANDB_NAME="$STAGE_WANDB_NAME" \
       INIT_CHECKPOINT="$INIT_CKPT" \

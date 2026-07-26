@@ -30,6 +30,9 @@ def _model(
     energy_model_type="lstm",
     segment_write_mode="sequential",
     segment_size=None,
+    memory_rotation="none",
+    memory_rotation_angle=None,
+    use_adam=False,
     use_write_head=False,
     **kwargs,
 ):
@@ -40,7 +43,7 @@ def _model(
             n_mem_tokens=4,
             K=K,
             lr=0.01,
-            use_adam=False,
+            use_adam=use_adam,
             grad_mode="second",
             use_mem_proj=False,
             mem_proj_mode="none",
@@ -54,6 +57,8 @@ def _model(
             energy_model_type=energy_model_type,
             segment_write_mode=segment_write_mode,
             segment_size=segment_size,
+            memory_rotation=memory_rotation,
+            memory_rotation_angle=memory_rotation_angle,
             **kwargs,
         )
     )
@@ -312,6 +317,128 @@ def test_sequential_tensor_segment_size_matches_segment_list():
 
     assert torch.allclose(output_tensor["predictions"], output_list["predictions"])
     assert torch.allclose(output_tensor["inner_loop_stats"]["inner_loss"], output_list["inner_loop_stats"]["inner_loss"])
+
+
+def test_pairwise_memory_rotation_preserves_norm_and_odd_feature():
+    memory = torch.tensor([[[1.0, 2.0, 3.0, 4.0, 5.0]]])
+
+    rotated = EnergyGradMem._rotate_feature_pairs(memory, torch.pi / 2)
+
+    expected = torch.tensor([[[-2.0, 1.0, -4.0, 3.0, 5.0]]])
+    assert torch.allclose(rotated, expected, atol=1e-6)
+    assert torch.allclose(rotated.norm(dim=-1), memory.norm(dim=-1))
+
+
+def test_sequential_rotation_uses_pi_over_segments_and_rotates_final_segment():
+    torch.manual_seed(0)
+    model = _model(K=0, memory_rotation="pairwise")
+    model.eval()
+
+    with torch.no_grad():
+        initial_memory = torch.arange(model.mem.numel(), dtype=model.mem.dtype).reshape_as(model.mem)
+        model.mem.copy_(initial_memory)
+
+    B, Q = 2, 4
+    segments = [torch.randint(1, 101, (B, 5)), torch.randint(1, 101, (B, 5))]
+    query = torch.randint(1, 101, (B, Q))
+
+    output = model(
+        {"context_input_ids": segments, "query_input_ids": query},
+        return_mem=True,
+    )
+
+    expected = -initial_memory.unsqueeze(0).expand(B, -1, -1)
+    assert torch.allclose(output["mem"], expected, atol=1e-5)
+
+
+def test_explicit_memory_rotation_angle_overrides_default():
+    model = _model(K=0, memory_rotation="pairwise", memory_rotation_angle=torch.pi / 2)
+    model.eval()
+
+    with torch.no_grad():
+        model.mem.zero_()
+        model.mem[..., 0] = 1.0
+
+    context = torch.ones(1, 5, dtype=torch.long)
+    query = torch.ones(1, 4, dtype=torch.long)
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        return_mem=True,
+    )
+
+    assert torch.allclose(output["mem"][..., 0], torch.zeros_like(output["mem"][..., 0]), atol=1e-6)
+    assert torch.allclose(output["mem"][..., 1], torch.ones_like(output["mem"][..., 1]), atol=1e-6)
+
+
+def test_forward_with_memory_rotation_preserves_outer_gradients():
+    torch.manual_seed(0)
+    model = _model(K=1, memory_rotation="pairwise", memory_rotation_angle=0.1)
+    model.train()
+
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        labels=labels,
+    )
+    output["loss"].backward()
+
+    assert torch.isfinite(output["loss"]).item()
+    assert model.mem.grad is not None
+    assert torch.isfinite(model.mem.grad).all().item()
+
+
+def test_padding_only_segment_does_not_change_default_rotation():
+    torch.manual_seed(0)
+    model_without_padding = _model(K=1, energy_future_mode="none", memory_rotation="pairwise")
+    model_with_padding = _model(K=1, energy_future_mode="none", memory_rotation="pairwise")
+    model_with_padding.load_state_dict(model_without_padding.state_dict())
+    model_without_padding.eval()
+    model_with_padding.eval()
+
+    active_segments = [torch.randint(1, 101, (1, 5)), torch.randint(1, 101, (1, 5))]
+    padded_segments = active_segments + [torch.zeros(1, 5, dtype=torch.long)]
+    query = torch.randint(1, 101, (1, 4))
+
+    output_without_padding = model_without_padding(
+        {"context_input_ids": active_segments, "query_input_ids": query},
+        return_mem=True,
+    )
+    output_with_padding = model_with_padding(
+        {"context_input_ids": padded_segments, "query_input_ids": query},
+        return_mem=True,
+    )
+
+    assert torch.allclose(output_with_padding["mem"], output_without_padding["mem"])
+    assert torch.allclose(
+        output_with_padding["predictions"],
+        output_without_padding["predictions"],
+        atol=1e-6,
+    )
+
+
+def test_rotation_mask_is_independent_for_each_sample():
+    model = _model(K=0, memory_rotation="pairwise", memory_rotation_angle=torch.pi / 2)
+    model.eval()
+
+    with torch.no_grad():
+        initial_memory = torch.arange(model.mem.numel(), dtype=model.mem.dtype).reshape_as(model.mem)
+        model.mem.copy_(initial_memory)
+
+    segments = [
+        torch.ones(2, 5, dtype=torch.long),
+        torch.tensor([[0, 0, 0, 0, 0], [1, 1, 1, 1, 1]]),
+    ]
+    query = torch.ones(2, 4, dtype=torch.long)
+    output = model(
+        {"context_input_ids": segments, "query_input_ids": query},
+        return_mem=True,
+    )
+
+    once_rotated = EnergyGradMem._rotate_feature_pairs(initial_memory, torch.pi / 2)
+    assert torch.allclose(output["mem"][0], once_rotated, atol=1e-6)
+    assert torch.allclose(output["mem"][1], -initial_memory, atol=1e-5)
 
 
 def test_forward_parallel_segments_tensor_segment_size():
@@ -1036,6 +1163,37 @@ def test_rejects_parallel_segments_with_energy_ce_guidance():
             energy_future_mode="none",
             energy_ce_guidance=True,
         )
+
+
+@pytest.mark.parametrize(
+    "kwargs,error",
+    [
+        ({"memory_rotation": "other"}, "memory_rotation"),
+        (
+            {"memory_rotation": "none", "memory_rotation_angle": 0.1},
+            "requires memory_rotation='pairwise'",
+        ),
+        (
+            {"memory_backend": "lora", "memory_rotation": "pairwise"},
+            "memory_backend='prefix'",
+        ),
+        (
+            {
+                "memory_rotation": "pairwise",
+                "segment_write_mode": "parallel",
+                "energy_future_mode": "none",
+            },
+            "segment_write_mode='sequential'",
+        ),
+        (
+            {"memory_rotation": "pairwise", "use_adam": True},
+            "use_adam=False",
+        ),
+    ],
+)
+def test_rejects_invalid_memory_rotation_config(kwargs, error):
+    with pytest.raises(ValueError, match=error):
+        EnergyGradMemConfig(base_config=_base_config(), **kwargs)
 
 
 def test_rejects_pretraining_for_fixed_embedding_objective():
