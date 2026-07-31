@@ -172,10 +172,8 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         for name, value in regularization_values.items():
             if not math.isfinite(float(value)) or float(value) < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
-        if inner_objective != "neural" and (
-            float(energy_weight_rms_reg) != 0.0 or float(energy_delta_reg) != 0.0
-        ):
-            raise ValueError("energy regularization requires inner_objective='neural'")
+        if inner_objective != "neural" and float(energy_weight_rms_reg) != 0.0:
+            raise ValueError("energy_weight_rms_reg requires inner_objective='neural'")
         if float(energy_delta_reg) != 0.0:
             if segment_write_mode != "sequential":
                 raise ValueError("energy_delta_reg requires segment_write_mode='sequential'")
@@ -1013,7 +1011,7 @@ class EnergyGradMem(GradMemGPT):
         segment_delta_penalty_sum = None
 
         if not self.K and self.memory_rotation == "none":
-            if self.inner_objective == "neural":
+            if self.inner_objective == "neural" or self.energy_delta_reg > 0.0:
                 stats["_energy_delta_reg_loss"] = inner_loss.new_zeros(())
                 stats["energy_delta_reg_loss"] = inner_loss.new_zeros(())
                 stats["energy_delta_exceed_fraction"] = inner_loss.new_zeros(())
@@ -1134,7 +1132,7 @@ class EnergyGradMem(GradMemGPT):
         if write_steps:
             stats["inner_energy_loss"] = inner_energy_loss / (write_steps * batch_size)
             stats["inner_ce_loss"] = inner_ce_loss / (write_steps * batch_size)
-        if self.inner_objective == "neural":
+        if self.inner_objective == "neural" or self.energy_delta_reg > 0.0:
             if segment_delta_count:
                 stats["segment_delta_norm_mean"] = segment_delta_norm_sum / segment_delta_count
                 stats["segment_delta_norm_max"] = segment_delta_norm_max
@@ -1297,6 +1295,7 @@ class EnergyGradMem(GradMemGPT):
         if self.energy_ce_guidance:
             combined_loss = combined_loss + self.energy_ce_guidance_alpha * guidance_loss
         if self.inner_objective == "neural":
-            combined_loss = combined_loss + energy_weight_reg_loss + energy_delta_reg_loss
+            combined_loss = combined_loss + energy_weight_reg_loss
+        combined_loss = combined_loss + energy_delta_reg_loss
         output["loss"] = combined_loss
         return output

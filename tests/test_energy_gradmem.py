@@ -1006,6 +1006,42 @@ def test_forward_cross_entropy_inner_objective_prefix():
     )
 
 
+def test_cross_entropy_supports_outer_memory_delta_regularization(monkeypatch):
+    model = _model(
+        K=2,
+        inner_objective="cross_entropy",
+        energy_future_mode="none",
+        energy_delta_reg=0.5,
+        energy_delta_max=0.2,
+    )
+    increment = torch.full((1, 4, 48), 0.01, dtype=model.mem.dtype)
+
+    def deterministic_updates(inner_params, grads, opt_state, global_step):
+        del grads, opt_state
+        return [inner_params[0] + (global_step + 1) * increment]
+
+    monkeypatch.setattr(model, "_updated_inner_params", deterministic_updates)
+    context = torch.ones(1, 5, dtype=torch.long)
+    query = torch.ones(1, 4, dtype=torch.long)
+    labels = torch.ones(1, 4, dtype=torch.long)
+
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        labels=labels,
+    )
+
+    delta_norm = torch.linalg.vector_norm(3 * increment)
+    expected_regularization = 0.5 * torch.relu(delta_norm - 0.2).square()
+    assert torch.allclose(
+        output["inner_loop_stats"]["energy_delta_reg_loss"],
+        expected_regularization,
+    )
+    assert torch.allclose(
+        output["loss"],
+        output["inner_loop_stats"]["target_loss"] + expected_regularization,
+    )
+
+
 def test_cross_entropy_inner_objective_clears_stale_energy_state():
     model = _model(K=1, inner_objective="cross_entropy", energy_future_mode="next_token")
     stale_state = (

@@ -1,4 +1,5 @@
 #!/bin/bash
+export CUDA_VISIBLE_DEVICES=1
 
 set -euo pipefail
 shopt -s nullglob
@@ -11,14 +12,16 @@ BASE_MODEL=llama
 L=4
 H=4
 D=128
-N_PAIRSS_IN_SEGMENT=(8 8 8 8)
-N_SEGMENTSS_IN_CONTEXT=(1 2 2 4)
+N_PAIRSS_IN_SEGMENT=(8 8 8)
+N_SEGMENTSS_IN_CONTEXT=(1 2 4)
 K_SIZE=2
 V_SIZE=2
 VOCAB_SIZE=62
 N_MEM_TOKENS=8
 K=2
-INNER_LRS=(1.0 0.5 0.5 0.25)
+INNER_LRS=(1.0 0.1 0.1)
+MEMORY_ROTATION_ANGLES=(None None None)
+INNER_CLIP_NORM=1.0
 GRAD_MODE=second
 TBS=64
 LR=1e-04
@@ -26,7 +29,10 @@ N_VALUES=1
 INIT_CHECKPOINT=""
 STOP_EXACT_MATCH_VALUE=0.99
 MEMORY_ROTATION=none
-MEMORY_ROTATION_ANGLE=None
+ENERGY_WEIGHT_RMS_REG=0.0
+ENERGY_WEIGHT_RMS_THRESHOLD=8.0
+ENERGY_DELTA_REG=0.1
+ENERGY_DELTA_MAX=1.0
 
 START_ITERATION=1
 
@@ -40,6 +46,10 @@ if [ ${#N_SEGMENTSS_IN_CONTEXT[@]} -ne ${#N_PAIRSS_IN_SEGMENT[@]} ]; then
 fi
 if [ ${#INNER_LRS[@]} -ne ${#N_PAIRSS_IN_SEGMENT[@]} ]; then
   echo "INNER_LRS must have one value per curriculum stage" >&2
+  exit 1
+fi
+if [ ${#MEMORY_ROTATION_ANGLES[@]} -ne ${#N_PAIRSS_IN_SEGMENT[@]} ]; then
+  echo "MEMORY_ROTATION_ANGLES must have one value per curriculum stage" >&2
   exit 1
 fi
 
@@ -76,6 +86,7 @@ for N in $N_VALUES; do
   for STAGE_INDEX in "${!N_PAIRSS_IN_SEGMENT[@]}"; do
     STAGE=$((STAGE + 1))
     INNER_LR=${INNER_LRS[$STAGE_INDEX]}
+    MEMORY_ROTATION_ANGLE=${MEMORY_ROTATION_ANGLES[$STAGE_INDEX]}
     N_PAIRS_IN_SEGMENT=${N_PAIRSS_IN_SEGMENT[$STAGE_INDEX]}
     N_SEGMENTS_IN_CONTEXT=${N_SEGMENTSS_IN_CONTEXT[$STAGE_INDEX]}
     N_PAIRS=$((N_PAIRS_IN_SEGMENT * N_SEGMENTS_IN_CONTEXT))
@@ -83,7 +94,7 @@ for N in $N_VALUES; do
     RUN_NAME=energy_gradmem_cross_entropy_curriculum_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}
     EXP_ROOT=./runs/energy_gradmem_kv_cross_entropy_curriculum/${HF_SUBSET}/${RUN_NAME}
     STAGE_EXP_PATH=${EXP_ROOT}/run_${N}/stage_${STAGE}_cross_entropy
-    STAGE_WANDB_NAME=${MODEL}_cross_entropy_curriculum_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}
+    STAGE_WANDB_NAME=${MODEL}_cross_entropy_curriculum_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}_ilr${INNER_LR}_rot_${MEMORY_ROTATION}_run${N}
 
     if [ "$STAGE" -lt "$START_ITERATION" ]; then
       echo "Skipping stage $STAGE; reading checkpoint from $STAGE_EXP_PATH"
@@ -98,7 +109,13 @@ for N in $N_VALUES; do
       N_PAIRS_IN_SEGMENT="$N_PAIRS_IN_SEGMENT" \
       N_SEGMENTS_IN_CONTEXT="$N_SEGMENTS_IN_CONTEXT" \
       INNER_LR="$INNER_LR" \
+      INNER_CLIP_NORM="$INNER_CLIP_NORM" \
+      GRAD_MODE="$GRAD_MODE" \
       INNER_OBJECTIVE=cross_entropy \
+      ENERGY_WEIGHT_RMS_REG="$ENERGY_WEIGHT_RMS_REG" \
+      ENERGY_WEIGHT_RMS_THRESHOLD="$ENERGY_WEIGHT_RMS_THRESHOLD" \
+      ENERGY_DELTA_REG="$ENERGY_DELTA_REG" \
+      ENERGY_DELTA_MAX="$ENERGY_DELTA_MAX" \
       MEMORY_ROTATION="$MEMORY_ROTATION" \
       MEMORY_ROTATION_ANGLE="$MEMORY_ROTATION_ANGLE" \
       ENERGY_MODEL_TYPE=lstm \

@@ -1,4 +1,5 @@
 #!/bin/bash
+export CUDA_VISIBLE_DEVICES=0
 
 set -euo pipefail
 shopt -s nullglob
