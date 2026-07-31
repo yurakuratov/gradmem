@@ -110,6 +110,10 @@ class ExperimentArgs:
     energy_ce_guidance: Optional[bool] = field(default=False)
     energy_ce_guidance_alpha: Optional[float] = field(default=0.01)
     energy_inner_ce_weight: Optional[float] = field(default=0.0)
+    energy_weight_rms_reg: Optional[float] = field(default=0.0)
+    energy_weight_rms_threshold: Optional[float] = field(default=0.0)
+    energy_delta_reg: Optional[float] = field(default=0.0)
+    energy_delta_max: Optional[float] = field(default=1.0)
     energy_model_type: Optional[str] = field(default="lstm")
     energy_segment_state_size: Optional[int] = field(default=None)
     energy_mamba_state_size: Optional[int] = field(default=128)
@@ -208,6 +212,10 @@ def build_model_config(args, base_config):
         energy_ce_guidance=args.energy_ce_guidance,
         energy_ce_guidance_alpha=args.energy_ce_guidance_alpha,
         energy_inner_ce_weight=args.energy_inner_ce_weight,
+        energy_weight_rms_reg=args.energy_weight_rms_reg,
+        energy_weight_rms_threshold=args.energy_weight_rms_threshold,
+        energy_delta_reg=args.energy_delta_reg,
+        energy_delta_max=args.energy_delta_max,
         energy_model_type=args.energy_model_type,
         energy_segment_state_size=args.energy_segment_state_size,
         energy_mamba_state_size=args.energy_mamba_state_size,
@@ -359,6 +367,10 @@ if __name__ == "__main__":
         for key in (
             "inner_energy_loss",
             "inner_ce_loss",
+            "energy_weight_rms_reg_loss",
+            "energy_weight_rms",
+            "energy_delta_reg_loss",
+            "energy_delta_exceed_fraction",
             "segment_delta_norm_mean",
             "segment_delta_norm_max",
             "segment_state_norm_mean",

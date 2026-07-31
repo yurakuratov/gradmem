@@ -33,6 +33,8 @@ def _model(
     segment_size=None,
     memory_rotation="none",
     memory_rotation_angle=None,
+    inner_lr=0.01,
+    inner_clip_norm=None,
     use_adam=False,
     use_write_head=False,
     **kwargs,
@@ -43,13 +45,14 @@ def _model(
             memory_backend=memory_backend,
             n_mem_tokens=4,
             K=K,
-            lr=0.01,
+            lr=inner_lr,
             use_adam=use_adam,
             grad_mode="second",
             use_mem_proj=False,
             mem_proj_mode="none",
             use_write_head=use_write_head,
             attn_implementation="eager",
+            inner_clip_norm=inner_clip_norm,
             inner_objective=inner_objective,
             energy_hidden_size=32,
             energy_num_layers=2,
@@ -181,6 +184,45 @@ def test_forward_identity_energy_model_prefix():
     assert torch.isfinite(output["loss"]).item()
 
 
+@pytest.mark.parametrize("memory_backend", ["lora", "kv_cache"])
+@pytest.mark.parametrize("energy_model_type", ["lstm", "identity"])
+def test_neural_energy_forward_without_delta_regularization_supports_nonprefix_backends(
+    memory_backend,
+    energy_model_type,
+):
+    torch.manual_seed(0)
+    backend_kwargs = {}
+    if memory_backend == "lora":
+        backend_kwargs = {
+            "lora_mem_placement": "between_layers",
+            "lora_mem_layers": "all",
+            "lora_mem_r": 4,
+            "lora_mem_alpha": 8,
+        }
+    model = _model(
+        memory_backend=memory_backend,
+        K=1,
+        energy_future_mode="none",
+        energy_model_type=energy_model_type,
+        energy_delta_reg=0.0,
+        **backend_kwargs,
+    )
+    model.eval()
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        labels=labels,
+        return_mem=True,
+    )
+
+    assert torch.isfinite(output["loss"]).item()
+    assert ("lora_mem" if memory_backend == "lora" else "kv_mem") in output
+    assert output["inner_loop_stats"]["energy_delta_reg_loss"] == 0
+
+
 def test_segment_delta_gru_shapes_and_token_energy_reduction():
     model = _model(
         K=1,
@@ -198,6 +240,78 @@ def test_segment_delta_gru_shapes_and_token_energy_reduction():
     assert energy.shape == (2, 5)
     assert loss.shape == ()
     assert returned_state is state
+
+
+def test_inner_gradient_norm_clipping_bounds_update_and_preserves_direction():
+    inner_lr = 0.25
+    clip_norm = 1.0
+    model = _model(
+        K=1,
+        energy_model_type="identity",
+        energy_future_mode="none",
+        inner_lr=inner_lr,
+        inner_clip_norm=clip_norm,
+    )
+    param = torch.zeros(2, 2, 3)
+    grad = torch.tensor(
+        [
+            [[3.0, 4.0, 0.0], [0.0, 0.0, 12.0]],
+            [[-6.0, 8.0, 0.0], [0.0, 15.0, 0.0]],
+        ]
+    )
+
+    updated = model._updated_inner_params([param], [grad], {}, local_step=0)[0]
+    update = updated - param
+    update_norms = update.flatten(start_dim=1).norm(dim=1)
+    expected_directions = -grad.flatten(start_dim=1)
+    actual_directions = update.flatten(start_dim=1)
+    cosine = torch.nn.functional.cosine_similarity(actual_directions, expected_directions)
+
+    assert torch.all(update_norms <= inner_lr * clip_norm + 1e-6)
+    assert torch.allclose(update_norms, torch.full_like(update_norms, inner_lr), atol=1e-6)
+    assert torch.allclose(cosine, torch.ones_like(cosine), atol=1e-6)
+
+
+def test_segment_delta_gru_initial_energy_is_independent_of_segment_state():
+    torch.manual_seed(0)
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=7,
+    )
+    hidden = torch.randn(2, 5, 48)
+    zero_state = torch.zeros(2, 7)
+    random_state = torch.randn(2, 7)
+
+    zero_state_energy, _ = model._energy_values(hidden, zero_state)
+    random_state_energy, _ = model._energy_values(hidden, random_state)
+
+    first_linear = model.token_energy_mlp[0]
+    assert torch.count_nonzero(first_linear.weight[:, 48:]) == 0
+    assert torch.count_nonzero(first_linear.weight[:, :48]) > 0
+    assert torch.allclose(zero_state_energy, random_state_energy)
+
+
+def test_segment_delta_gru_zero_initialized_state_columns_receive_gradients():
+    torch.manual_seed(0)
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=7,
+    )
+    hidden = torch.randn(2, 5, 48)
+    state = torch.randn(2, 7)
+    mask = torch.ones(2, 5, dtype=torch.bool)
+
+    loss, _, _ = model._energy_loss(hidden, mask, state)
+    loss.backward()
+
+    state_column_grad = model.token_energy_mlp[0].weight.grad[:, 48:]
+    assert torch.count_nonzero(model.token_energy_mlp[0].weight[:, 48:]) == 0
+    assert torch.isfinite(state_column_grad).all()
+    assert state_column_grad.norm() > 0
 
 
 def test_segment_delta_gru_preserves_flattened_memory_slot_order():
@@ -1356,6 +1470,246 @@ def test_energy_pretrain_l2_regularization_uses_energy_params_only():
     assert torch.allclose(model._energy_pretrain_l2_regularization(), expected)
 
 
+@pytest.mark.parametrize(
+    "energy_model_type,energy_future_mode",
+    [
+        ("lstm", "none"),
+        ("identity", "none"),
+        ("segment_delta_gru", "none"),
+    ],
+)
+def test_outer_energy_weight_rms_uses_all_weights_and_excludes_biases(
+    energy_model_type,
+    energy_future_mode,
+):
+    model = _model(
+        K=1,
+        energy_model_type=energy_model_type,
+        energy_future_mode=energy_future_mode,
+        energy_weight_rms_reg=0.25,
+        energy_weight_rms_threshold=0.5,
+    )
+    with torch.no_grad():
+        for name, parameter in model._named_energy_parameters():
+            parameter.fill_(100.0 if "bias" in name.rsplit(".", 1)[-1].lower() else 2.0)
+
+    regularization, rms = model._energy_weight_rms_regularization()
+    assert torch.allclose(rms, torch.tensor(2.0))
+    assert torch.allclose(regularization, torch.tensor(0.25 * (2.0 - 0.5) ** 2))
+    assert sum(parameter.numel() for parameter in model._energy_weight_parameters()) > 0
+
+    with torch.no_grad():
+        model.mem.add_(100.0)
+    unchanged_regularization, unchanged_rms = model._energy_weight_rms_regularization()
+    assert torch.equal(unchanged_rms, rms)
+    assert torch.equal(unchanged_regularization, regularization)
+
+
+def test_outer_energy_weight_rms_penalty_is_exactly_zero_below_threshold():
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        energy_weight_rms_reg=3.0,
+        energy_weight_rms_threshold=1.1,
+    )
+    with torch.no_grad():
+        for parameter in model._energy_weight_parameters():
+            parameter.fill_(1.0)
+
+    regularization, rms = model._energy_weight_rms_regularization()
+
+    assert torch.equal(rms, torch.tensor(1.0))
+    assert torch.equal(regularization, torch.tensor(0.0))
+
+
+def test_outer_energy_weight_rms_regularization_is_added_to_main_objective():
+    torch.manual_seed(0)
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="lstm",
+        energy_weight_rms_reg=0.1,
+        energy_weight_rms_threshold=0.0,
+    )
+    model.eval()
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        labels=labels,
+    )
+    expected_regularization, expected_rms = model._energy_weight_rms_regularization()
+
+    assert torch.allclose(
+        output["inner_loop_stats"]["energy_weight_rms_reg_loss"],
+        expected_regularization.detach(),
+    )
+    assert torch.allclose(output["inner_loop_stats"]["energy_weight_rms"], expected_rms.detach())
+    assert torch.allclose(
+        output["loss"],
+        output["inner_loop_stats"]["target_loss"] + expected_regularization,
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs,error",
+    [
+        ({"energy_weight_rms_reg": -0.1}, "must be finite and non-negative"),
+        ({"energy_weight_rms_threshold": float("nan")}, "must be finite and non-negative"),
+        ({"energy_delta_reg": float("inf")}, "must be finite and non-negative"),
+        ({"energy_delta_max": -0.1}, "must be finite and non-negative"),
+        (
+            {"inner_objective": "cross_entropy", "energy_weight_rms_reg": 0.1},
+            "requires inner_objective='neural'",
+        ),
+        ({"energy_delta_reg": 0.1, "grad_mode": "first"}, "requires grad_mode='second'"),
+        ({"energy_delta_reg": 0.1, "use_adam": True}, "requires use_adam=False"),
+        (
+            {"energy_delta_reg": 0.1, "segment_write_mode": "parallel", "energy_future_mode": "none"},
+            "requires segment_write_mode='sequential'",
+        ),
+    ],
+)
+def test_outer_energy_regularization_rejects_invalid_config(kwargs, error):
+    with pytest.raises(ValueError, match=error):
+        EnergyGradMemConfig(base_config=_base_config(), **kwargs)
+
+
+@pytest.mark.parametrize("energy_model_type", ["lstm", "identity", "segment_delta_gru"])
+def test_energy_delta_penalty_uses_full_segment_delta_and_active_samples(
+    monkeypatch,
+    energy_model_type,
+):
+    model = _model(
+        K=2,
+        energy_future_mode="none",
+        energy_model_type=energy_model_type,
+        energy_delta_reg=0.5,
+        energy_delta_max=0.2,
+    )
+    model.eval()
+    increment = torch.full((1, 4, 48), 0.01, dtype=model.mem.dtype)
+
+    def deterministic_updates(inner_params, grads, opt_state, global_step):
+        del grads, opt_state
+        return [inner_params[0] + (global_step + 1) * increment]
+
+    monkeypatch.setattr(model, "_updated_inner_params", deterministic_updates)
+    segments = [
+        torch.ones(2, 5, dtype=torch.long),
+        torch.tensor([[1, 1, 1, 1, 1], [0, 0, 0, 0, 0]]),
+        torch.zeros(2, 5, dtype=torch.long),
+    ]
+    query = torch.ones(2, 4, dtype=torch.long)
+
+    output = model({"context_input_ids": segments, "query_input_ids": query})
+
+    first_delta_norm = torch.linalg.vector_norm(3 * increment)
+    second_delta_norm = torch.linalg.vector_norm(7 * increment)
+    active_norms = torch.stack([first_delta_norm, first_delta_norm, second_delta_norm])
+    expected = 0.5 * torch.relu(active_norms - 0.2).square().mean()
+    stats = output["inner_loop_stats"]
+    assert torch.allclose(stats["energy_delta_reg_loss"], expected)
+    assert torch.allclose(
+        stats["energy_delta_exceed_fraction"],
+        (active_norms > 0.2).float().mean(),
+    )
+    assert torch.allclose(stats["segment_delta_norm_mean"], active_norms.mean())
+    assert torch.allclose(stats["segment_delta_norm_max"], active_norms.max())
+
+
+def test_energy_delta_penalty_uses_pre_rotation_delta(monkeypatch):
+    common = dict(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        energy_delta_reg=0.5,
+        energy_delta_max=0.1,
+    )
+    plain = _model(**common)
+    rotated = _model(
+        **common,
+        memory_rotation="pairwise",
+        memory_rotation_angle=torch.pi / 2,
+    )
+    rotated.load_state_dict(plain.state_dict())
+    increment = torch.arange(4 * 48, dtype=plain.mem.dtype).reshape(1, 4, 48) / 1000
+
+    def deterministic_updates(inner_params, grads, opt_state, global_step):
+        del grads, opt_state, global_step
+        return [inner_params[0] + increment]
+
+    monkeypatch.setattr(plain, "_updated_inner_params", deterministic_updates)
+    monkeypatch.setattr(rotated, "_updated_inner_params", deterministic_updates)
+    context = torch.ones(1, 5, dtype=torch.long)
+    query = torch.ones(1, 4, dtype=torch.long)
+
+    plain_output = plain(
+        {"context_input_ids": context, "query_input_ids": query},
+        return_mem=True,
+    )
+    rotated_output = rotated(
+        {"context_input_ids": context, "query_input_ids": query},
+        return_mem=True,
+    )
+
+    assert torch.allclose(
+        plain_output["inner_loop_stats"]["energy_delta_reg_loss"],
+        rotated_output["inner_loop_stats"]["energy_delta_reg_loss"],
+    )
+    expected_rotated = EnergyGradMem._rotate_feature_pairs(plain_output["mem"], torch.pi / 2)
+    assert torch.allclose(rotated_output["mem"], expected_rotated, atol=1e-6)
+
+
+def test_energy_delta_penalty_is_exactly_zero_below_upper_bound():
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        energy_delta_reg=2.0,
+        energy_delta_max=100.0,
+    )
+    context = torch.ones(1, 5, dtype=torch.long)
+    query = torch.ones(1, 4, dtype=torch.long)
+
+    stats = model({"context_input_ids": context, "query_input_ids": query})["inner_loop_stats"]
+
+    assert torch.equal(stats["energy_delta_reg_loss"], torch.tensor(0.0))
+    assert torch.equal(stats["energy_delta_exceed_fraction"], torch.tensor(0.0))
+
+
+def test_energy_delta_penalty_propagates_gradients_to_energy_model():
+    torch.manual_seed(0)
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        energy_delta_reg=1.0,
+        energy_delta_max=0.0,
+    )
+    backend = model.memory_backend_impl
+    memory_state, _ = backend.init_memory_state(1)
+    energy_state = model._prepare_energy_state(None, memory_state["mem_batch"])
+    context = [torch.randint(1, 101, (1, 5))]
+    query = torch.randint(1, 101, (1, 4))
+
+    _, _, _, _, _, stats = model._write_segments(
+        context,
+        query,
+        memory_state,
+        energy_state,
+    )
+    delta_reg_loss = stats["_energy_delta_reg_loss"]
+    gradients = torch.autograd.grad(delta_reg_loss, tuple(model.energy_head.parameters()))
+
+    assert delta_reg_loss > 0
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert any(torch.count_nonzero(gradient) > 0 for gradient in gradients)
+
+
 def test_energy_pretrain_optimizer_has_no_adamw_weight_decay(monkeypatch):
     model = _model(K=1)
     model.energy_pretrain_steps = 1
@@ -1411,6 +1765,68 @@ def test_second_order_steps_are_global():
     create_graph_flags = [model._inner_grad_options(step, total_steps=12)[0] for step in range(12)]
 
     assert create_graph_flags == [False] * 11 + [True]
+
+
+def test_trailing_padding_does_not_consume_second_order_steps(monkeypatch):
+    torch.manual_seed(0)
+    model = _model(
+        K=2,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        last_K_second_order=1,
+    )
+    model.train()
+    seen_options = []
+    original_inner_grad_options = model._inner_grad_options
+
+    def recording_inner_grad_options(global_step, total_steps, **kwargs):
+        options = original_inner_grad_options(global_step, total_steps, **kwargs)
+        seen_options.append((global_step, total_steps, options[0]))
+        return options
+
+    monkeypatch.setattr(model, "_inner_grad_options", recording_inner_grad_options)
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.zeros(2, 5, dtype=torch.long),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model(
+        {"context_input_ids": segments, "query_input_ids": query},
+        labels=labels,
+    )
+    output["loss"].backward()
+
+    assert seen_options == [(0, 2, False), (1, 2, True)]
+    assert all(parameter.grad is not None for parameter in model.energy_head.parameters())
+
+
+def test_sequential_adam_bias_correction_uses_global_write_step(monkeypatch):
+    model = _model(
+        K=2,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        use_adam=True,
+    )
+    model.eval()
+    seen_step_indices = []
+
+    def recording_adam_step(param, grad, state, step_idx, lr):
+        del state
+        seen_step_indices.append(step_idx)
+        return param - lr * grad
+
+    monkeypatch.setattr(model, "_adam_step", recording_adam_step)
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+
+    model({"context_input_ids": segments, "query_input_ids": query})
+
+    assert seen_step_indices == [1, 2, 3, 4]
 
 
 def test_rejects_unknown_inner_objective():
