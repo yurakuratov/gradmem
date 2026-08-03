@@ -502,49 +502,70 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
         B = len(batch)
 
         # --- per-sample KV probe pairs ---
-        per_sample = []  # list of [(q_ids, t_ids, seg_idx), ...]
-        for item in batch:
+        # Each probe is the TEACHER-FORCED query '?!K:V!|' (query + target
+        # concatenated, exactly as collate_fn builds the normal READ query), plus
+        # a target_mask flagging the 'V!|' positions. EM is scored only there,
+        # mirroring compute_metrics_fn -- so a probe is correct iff the model
+        # re-predicts the value tokens given the correct preceding tokens.
+        #
+        # KV->segment attribution MUST match the model's forward chunking. The
+        # model chunks the PADDED context (ctx_emb.size(1), which includes the
+        # left-pad the collator added) via ceil(padded_len / n_segments). So we
+        # attribute each KV by its position in the PADDED sequence: a KV at real
+        # char position ts sits at padded position (pad_count + ts), where
+        # pad_count = padded_len - real_len. This keeps the collator and the
+        # model on exactly the same segment boundaries.
+        padded_len = context_input_ids.size(1)
+        per_sample = []  # list of [(q_ids, target_mask, seg_idx), ...]
+        for b_idx, item in enumerate(batch):
             text = item['context']
             pairs = []
             for m in _re.finditer(r'!([^!|:]+):([^!|]+)!', text):
                 k, v = m.group(1), m.group(2)
                 pairs.append((m.start(), m.end(), k, v))
-            # real-token count of this sample's context (no pad) == char count
             real_len = len(text)
+            pad_count = padded_len - real_len   # left-pad tokens for this sample
             if segment_size is not None:
-                n_seg = max(1, math.ceil(real_len / segment_size))
+                n_seg = max(1, math.ceil(padded_len / segment_size))
                 seg_sz = segment_size
             else:
                 n_seg = n_segments if n_segments else 1
-                seg_sz = max(1, math.ceil(real_len / n_seg))
+                seg_sz = max(1, math.ceil(padded_len / n_seg))
             sample_pairs = []
             for ts, te, k, v in pairs:
+                # KV's token span in the PADDED coordinate (matches forward)
+                pad_ts = pad_count + ts
+                pad_te = pad_count + te
                 src_seg = None
                 for si in range(n_seg):
                     sstart = si * seg_sz
-                    send = min((si + 1) * seg_sz, real_len)
-                    if sstart <= ts and (te - 1) < send:
+                    send = min((si + 1) * seg_sz, padded_len)
+                    if sstart <= pad_ts and (pad_te - 1) < send:
                         src_seg = si
                         break
                 if src_seg is None:
-                    src_seg = min(ts // seg_sz, n_seg - 1)
-                q_ids = tokenizer(f'?!{k}:', add_special_tokens=False).input_ids
-                t_ids = tokenizer(f'{v}!|', add_special_tokens=False).input_ids
-                sample_pairs.append((q_ids, t_ids, src_seg))
+                    src_seg = min(pad_ts // seg_sz, n_seg - 1)
+                # teacher-forced query: '?!K:' + target 'V!|'
+                q_str = f'?!{k}:'
+                t_str = f'{v}!|'
+                q_ids = tokenizer(q_str, add_special_tokens=False).input_ids
+                t_ids = tokenizer(t_str, add_special_tokens=False).input_ids
+                full = q_ids + t_ids
+                tmask = [False] * len(q_ids) + [True] * len(t_ids)
+                sample_pairs.append((full, tmask, src_seg))
             per_sample.append(sample_pairs)
 
         n_q_max = max((len(p) for p in per_sample), default=1) or 1
         Q = max((len(q) for p in per_sample for (q, _, _) in p), default=1) or 1
-        T = max((len(t) for p in per_sample for (_, t, _) in p), default=1) or 1
 
         query_input_ids = torch.full((B, n_q_max, Q), pad_id, dtype=torch.long)
-        target_ids = torch.full((B, n_q_max, T), pad_id, dtype=torch.long)
+        target_mask = torch.zeros(B, n_q_max, Q, dtype=torch.bool)
         seg_idx = torch.zeros(B, n_q_max, dtype=torch.long)
         qmask = torch.zeros(B, n_q_max, dtype=torch.bool)
         for b, pairs in enumerate(per_sample):
-            for j, (q, t, s) in enumerate(pairs):
+            for j, (q, tm, s) in enumerate(pairs):
                 query_input_ids[b, j, :len(q)] = torch.tensor(q, dtype=torch.long)
-                target_ids[b, j, :len(t)] = torch.tensor(t, dtype=torch.long)
+                target_mask[b, j, :len(tm)] = torch.tensor(tm, dtype=torch.bool)
                 seg_idx[b, j] = s
                 qmask[b, j] = True
 
@@ -555,7 +576,7 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
             },
             'kv_queries': {
                 'query_input_ids': query_input_ids,
-                'target_ids': target_ids,
+                'target_mask': target_mask,
                 'seg_idx': seg_idx,
                 'mask': qmask,
                 'ignore_token_ids': [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']],
@@ -571,8 +592,10 @@ class PerSegmentForgettingTrainer(DualEvalTrainer):
     On cadence (every ``per_segment_eval_steps``), runs a manual no-grad loop
     that calls ``model.forward_per_segment_eval`` to build the [n_seg, n_seg]
     forgetting matrix, writes it to disk as .json/.csv, optionally logs it as a
-    comet table, and injects a handful of summary scalars into the metrics dict
-    (the full N^2 matrix lives in the table artifact, not the metric stream).
+    comet table, and injects the per-cell matrix values as scalars into the
+    metrics dict (forget_seg{s}_at_seg{k}, which CometCallback auto-forwards to
+    comet as chartable lines) plus a few summary scalars. The full matrix also
+    lives in the local .json/.csv artifact.
 
     The pass reuses the same eval dataset (the context is what gets written);
     only the collator differs (it emits KV-probe queries). Normal eval and the
@@ -644,23 +667,31 @@ class PerSegmentForgettingTrainer(DualEvalTrainer):
                 ctx_ids = batch['input_ids']['context_input_ids'].to(device)
                 kv_q = {k: (v.to(device) if hasattr(v, 'to') else v)
                         for k, v in batch['kv_queries'].items()}
-                correct, count = model.forward_per_segment_eval(
+                # forward_per_segment_eval returns FLAT per-probe arrays
+                # (src_seg, probe_seg, em): one entry per (sample, KV, probe-seg).
+                # A segment can hold multiple KVs, so we bin by (src,probe) cell
+                # and average -- this is why we can't return a [B,n_seg,n_seg]
+                # bool matrix (it would be overwritten by the last KV in a cell).
+                src_seg, probe_seg, em_flags = model.forward_per_segment_eval(
                     {'context_input_ids': ctx_ids}, kv_q)
-                # reduce per-batch [B, nb, nb] -> per-cell sums over B.
-                # nb may vary by context length under segment_size mode; grow the
-                # accumulators to the largest nb seen so n_seg is the global max.
-                nb = correct.size(1)
+                if src_seg.numel() == 0:
+                    continue
+                src_seg = src_seg.cpu(); probe_seg = probe_seg.cpu(); em_flags = em_flags.cpu()
+                mx = int(max(src_seg.max(), probe_seg.max())) + 1
+                # grow accumulators to the largest seg index seen (segment_size mode)
                 if correct_acc is None:
-                    n_seg = nb
-                    correct_acc = torch.zeros(nb, nb, dtype=torch.float32)
-                    count_acc = torch.zeros(nb, nb, dtype=torch.float32)
-                elif nb > n_seg:
-                    pad = nb - n_seg
+                    n_seg = mx
+                    correct_acc = torch.zeros(mx, mx, dtype=torch.float32)
+                    count_acc = torch.zeros(mx, mx, dtype=torch.float32)
+                elif mx > n_seg:
+                    pad = mx - n_seg
                     correct_acc = F.pad(correct_acc, (0, pad, 0, pad))
                     count_acc = F.pad(count_acc, (0, pad, 0, pad))
-                    n_seg = nb
-                correct_acc[:nb, :nb] += correct.sum(dim=0).float().cpu()
-                count_acc[:nb, :nb] += count.sum(dim=0).float().cpu()
+                    n_seg = mx
+                # scatter-add: each probe contributes to its (src, probe) cell
+                for s, p, ok in zip(src_seg.tolist(), probe_seg.tolist(), em_flags.tolist()):
+                    correct_acc[s, p] += 1.0 if ok else 0.0
+                    count_acc[s, p] += 1.0
         if was_training:
             model.train()
 
@@ -692,35 +723,35 @@ class PerSegmentForgettingTrainer(DualEvalTrainer):
                                      for k in cols]
                 w.writerow(row)
 
-        # ---- optional comet table ---- #
-        try:
-            for cb in self.callback_handler.callbacks:
-                if type(cb).__name__ == 'CometCallback':
-                    exp = cb.get_experiment() if hasattr(cb, 'get_experiment') else None
-                    if exp is not None and hasattr(exp, 'log_table'):
-                        exp.log_table(f'forgetting_matrix_step{step}.csv',
-                                      headers=['source_seg'] + [f'after_seg{k}' for k in cols],
-                                      values=[[s] + [em_np[s, k] for k in cols] for s in rows])
-                    break
-        except Exception:
-            pass
-
-        # ---- summary scalars (the only things in the metric stream) ---- #
+        # ---- metrics injected into the returned dict ---- #
+        # HF prefixes these with the eval prefix and CometCallback.on_evaluate
+        # forwards them to comet as line charts, so the full matrix IS visible on
+        # comet (one chartable scalar per cell), in addition to the local
+        # .json/.csv artifact. We emit:
+        #   forget_seg{s}_at_seg{k}  -- per-cell EM (the matrix), for every probed
+        #                               (s,k); NaN cells are skipped (comet can't
+        #                               chart NaN, and HF would reject the key).
+        #   forget_diag_mean         -- mean of the diagonal (write quality).
+        #   forget_seg0_final        -- seg0's EM at the last probe (headline
+        #                               forgetting number for the oldest info).
+        #   forget_slope             -- mean per-source-seg EM drop (first probe
+        #                               -> last probe); positive = forgetting.
+        metrics = {}
+        for s in rows:
+            for k in cols:
+                if not _isnan(em_np[s, k]):
+                    metrics[f'forget_seg{s}_at_seg{k}'] = float(em_np[s, k])
         diag = [em_np[i, i] for i in range(n_seg) if not _isnan(em_np[i, i])]
         seg0_final = em_np[0, n_seg - 1] if n_seg > 0 and not _isnan(em_np[0, n_seg - 1]) else float('nan')
-        # mean per-source-seg drop from its first probe to its last probe
         drops = []
         for s in range(n_seg):
             pts = [em_np[s, k] for k in range(s, n_seg) if not _isnan(em_np[s, k])]
             if len(pts) >= 2:
                 drops.append(pts[0] - pts[-1])
-        slope = float(np.mean(drops)) if drops else 0.0
-
-        return {
-            'forget_diag_mean': float(np.mean(diag)) if diag else float('nan'),
-            'forget_seg0_final': float(seg0_final),
-            'forget_slope': slope,
-        }
+        metrics['forget_diag_mean'] = float(np.mean(diag)) if diag else 0.0
+        metrics['forget_seg0_final'] = float(seg0_final) if not _isnan(seg0_final) else 0.0
+        metrics['forget_slope'] = float(np.mean(drops)) if drops else 0.0
+        return metrics
 
 
 @dataclass
@@ -1356,8 +1387,9 @@ def main(config_path: Optional[str] = None):
         )
 
         # ---- per-segment forgetting eval setup (adaptive model only) ---- #
-        # On cadence, builds the [n_seg,n_seg] forgetting matrix and logs it as a
-        # table artifact + comet table; only summary scalars hit the metric stream.
+        # On cadence, builds the [n_seg,n_seg] forgetting matrix and writes it to
+        # exp_path/forgetting_matrix_step{N}.json + .csv. Per-cell values are also
+        # emitted as metrics (forget_seg{s}_at_seg{k}) so they reach comet as charts.
         use_per_segment_eval = bool(args.per_segment_eval) and use_adaptive_model
         per_segment_collator = None
         per_seg_n_segments = None
