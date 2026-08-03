@@ -23,6 +23,15 @@
 #     - gradmem.K
 #     - {key: training.total_batch_size, prefix: bs}
 #     - gradmem.use_write_head
+#
+# Resume / fine-tune from a checkpoint (optional, top-level). Points to a
+# model.safetensors file written by a previous run (e.g. under
+# <exp_path>/best_model/ or <exp_path>/checkpoint-<step>/). The weights are
+# loaded with strict=False, so a partial match is fine — missing keys are
+# randomly initialized and unexpected keys are ignored. Use this to warm-start
+# the WRITE pathway (e.g. pretrain on clean data, then fine-tune on noisy data)
+# or to continue training.
+# init_checkpoint: "./runs/<data_name>/<run_name>/run_<seed>_<uid8>/best_model/model.safetensors"
 
 model:
   base_model: gpt2
