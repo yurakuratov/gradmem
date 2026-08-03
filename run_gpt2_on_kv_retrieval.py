@@ -228,7 +228,6 @@ def main(config_path: Optional[str] = None):
         # Set exp_path from config if not explicitly set
         if args.exp_path is None:
             from generate_run_name import generate_run_name, get_exp_path, get_data_path
-            run_name = generate_run_name(cfg)
             exp_path = get_exp_path(cfg)
             args.exp_path = str(exp_path)
 
@@ -240,6 +239,13 @@ def main(config_path: Optional[str] = None):
                 args.data_path = get_data_path(cfg)
             if 'tokenizer_path' in dataset:
                 args.tokenizer_path = dataset['tokenizer_path']
+
+        # Resolve the run name (manual override else auto-generated) so it can be
+        # forwarded to TrainingArguments -> CometCallback sets the experiment name
+        # instead of falling back to a random one.
+        if args.run_name is None:
+            from generate_run_name import generate_run_name
+            args.run_name = cfg.get('run_name') or generate_run_name(cfg)
 
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
@@ -376,6 +382,7 @@ def main(config_path: Optional[str] = None):
     training_args = TrainingArguments(
         output_dir=output_dir,
         logging_dir=output_dir,
+        run_name=args.run_name,
         overwrite_output_dir=args.overwrite_output_dir,
 
         max_steps=args.max_steps,

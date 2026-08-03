@@ -56,6 +56,8 @@ gradmem:
 # Optional top-level output-folder controls:
 # runs_dir: "./runs"     # output root prefix (default: ./runs)
 # run_name: "my_run"     # override the auto-generated hyperparameter folder component (default: auto)
+# run_naming:            # build the auto name from listed keys instead of per-model logic
+#   keys: [...]
 ```
 
 ### Output-folder naming & uniqueness
@@ -64,6 +66,10 @@ The output dir layout is `<runs_dir>/<data_name>/<run_name>/run_<seed>_<uid8>`:
 - `run_name` (top-level, default auto-generated from hyperparameters) is the middle component. When set, it **fully replaces** the auto name; `run_name_suffix` only appends to the auto name.
 - `run_<seed>` is the training seed (`training.seed`).
 - `<uid8>` is a unique per-run postfix so identical-config runs no longer overwrite each other. When comet_ml is available, `get_run_uid()` (`generate_run_name.py`) generates the id via `comet_ml.generate_guid()` and exports it as `COMET_EXPERIMENT_KEY` — HF's `CometCallback` then binds the comet experiment to that exact key, so `<uid8>` (its first 8 chars) visually pairs the local folder with the comet URL. `run_from_config.py` generates the uid once and the launched subprocess inherits `COMET_EXPERIMENT_KEY` via the parent env.
+
+### Run name generation & comet
+- **Name → comet:** every run script resolves `run_name` (manual override else auto-generated) and passes it to `TrainingArguments(run_name=...)`. HF's `CometCallback` only sets the comet experiment name when `run_name != output_dir`; previously both defaulted to `output_dir` so comet used a random name. Now the comet experiment name matches the local folder's `run_name` component for *all* runs (manual or auto).
+- **Auto-name source:** `generate_run_name(cfg)` (`generate_run_name.py`). If a top-level `run_naming:` section with a `keys:` list is present, the name is built generically from those keys (fully replacing the per-model-type logic). Each `keys` entry is a plain `"section.key"` string (prefix = key name) or a `{key, prefix}` map for a short prefix. Missing/None/False values are skipped; `True` renders as the flag name. Otherwise the per-model-type generators (`generate_run_name_gradmemgpt/rmt/gpt2`) run as before.
 
 ## Key Scripts
 - `run_gpt2_on_kv_retrieval.py` - vanilla causal LM baseline

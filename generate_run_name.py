@@ -210,6 +210,82 @@ def generate_run_name_rmt(cfg: Dict[str, Any]) -> str:
     return run_name
 
 
+# Sections searched when a bare (un-dotted) key is given to the generic builder.
+_KNOWN_SECTIONS = ['model', 'training', 'dataset', 'gradmem', 'rmt', 'hopfield',
+                   'gated_delta', 'curriculum', 'adaptive']
+
+
+def _resolve_key(cfg: Dict[str, Any], key: str):
+    """Resolve a config key (dotted or bare) to its value, or None if absent.
+
+    Dotted keys (e.g. ``training.learning_rate``) walk the nested config. Bare
+    keys are looked up top-level first, then under each known section.
+    """
+    if '.' in key:
+        cur: Any = cfg
+        for part in key.split('.'):
+            if not isinstance(cur, dict) or part not in cur:
+                return None
+            cur = cur[part]
+        return cur
+    if key in cfg:
+        return cfg[key]
+    for section in _KNOWN_SECTIONS:
+        sec = cfg.get(section)
+        if isinstance(sec, dict) and key in sec:
+            return sec[key]
+    return None
+
+
+def _format_value(key: str, value: Any, prefix: Optional[str]) -> Optional[str]:
+    """Render a single key/value pair as ``<prefix><value>``, or None to skip.
+
+    - ``None`` -> skip.
+    - ``True`` -> the prefix alone (a flag), mirroring the existing ``_whead``
+      / ``_mem_proj`` style.
+    - ``False`` -> skip (negative flags don't add information to a name).
+    - otherwise -> ``str(value)``.
+    """
+    if value is None or value is False:
+        return None
+    label = prefix if prefix is not None else key
+    if value is True:
+        return label
+    return f"{label}{value}"
+
+
+def generate_run_name_from_keys(cfg: Dict[str, Any], keys: list,
+                                separator: str = '_') -> str:
+    """Build a run name from a list of tracked config keys.
+
+    Each entry in ``keys`` is either a plain string (``"training.learning_rate"``,
+    in which case the prefix defaults to the key itself) or a dict with ``key``
+    and an optional ``prefix`` (e.g. ``{key: training.learning_rate, prefix: lr}``
+    renders as ``lr1e-4``). Missing/None/False values are skipped. A top-level
+    ``run_name_suffix`` (if set) is appended for parity with the other builders.
+    """
+    parts = []
+    for entry in keys:
+        if isinstance(entry, dict):
+            key = entry['key']
+            prefix = entry.get('prefix')
+        else:
+            key = entry
+            prefix = None
+        value = _resolve_key(cfg, key)
+        rendered = _format_value(key, value, prefix if prefix is not None else key)
+        if rendered is not None:
+            parts.append(rendered)
+
+    run_name = separator.join(parts)
+
+    suffix = cfg.get('run_name_suffix')
+    if suffix:
+        run_name = f"{run_name}{separator}{suffix}" if run_name else str(suffix)
+
+    return run_name
+
+
 def get_model_type(cfg: Dict[str, Any]) -> str:
     """Detect model type from config."""
     if 'gradmem' in cfg:
@@ -222,7 +298,17 @@ def get_model_type(cfg: Dict[str, Any]) -> str:
 
 
 def generate_run_name(cfg: Dict[str, Any]) -> str:
-    """Generate run name based on model type."""
+    """Generate run name based on config.
+
+    If a ``run_naming`` section with a ``keys`` list is present, the name is
+    built generically from those keys (fully replacing the per-model logic).
+    Otherwise fall back to the per-model-type generators.
+    """
+    naming = cfg.get('run_naming', {})
+    if naming.get('keys'):
+        return generate_run_name_from_keys(cfg, naming['keys'],
+                                           naming.get('separator', '_'))
+
     model_type = get_model_type(cfg)
 
     if model_type == 'gradmemgpt':

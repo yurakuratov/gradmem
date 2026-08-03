@@ -8,6 +8,21 @@
 # of the comet experiment key, tying the folder to the comet run.
 # runs_dir: "./runs"
 # run_name: null
+#
+# Run naming (optional). By default the auto name is built from per-model-type
+# logic. Set run_naming.keys to instead build it generically from the listed
+# config keys (fully replacing the default logic). Each entry is either a plain
+# "section.key" string (prefix defaults to the key name) or a {key, prefix} map
+# for a short prefix. Missing/None/False values are skipped; True renders as the
+# flag name. The resulting name is also forwarded to comet_ml as the experiment
+# name (otherwise comet falls back to a random name).
+# run_naming:
+#   separator: "_"
+#   keys:
+#     - {key: training.learning_rate, prefix: lr}
+#     - gradmem.K
+#     - {key: training.total_batch_size, prefix: bs}
+#     - gradmem.use_write_head
 
 model:
   base_model: gpt2
