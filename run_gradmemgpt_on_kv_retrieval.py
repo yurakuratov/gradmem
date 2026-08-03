@@ -22,6 +22,16 @@ from transformers import (
 import yaml
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
+# adaptive (segmented, gated-recurrence) fork, imported lazily on demand. Aliased
+# to avoid the class-name clash with the base grad_memgpt module.
+_AdaptiveGradMemGPT = None
+_AdaptiveGradMemGPTConfig = None
+def _load_adaptive():
+    global _AdaptiveGradMemGPT, _AdaptiveGradMemGPTConfig
+    if _AdaptiveGradMemGPT is None:
+        from grad_memgpt_adaptive import GradMemGPT as _GM, GradMemGPTConfig as _GC
+        _AdaptiveGradMemGPT, _AdaptiveGradMemGPTConfig = _GM, _GC
+    return _AdaptiveGradMemGPT, _AdaptiveGradMemGPTConfig
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -203,6 +213,16 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     if 'learned_update_imitation_loss' in inner_loop_stats:
         # MSE(delta, g_real); only present during the warmup window.
         metrics['learned_update_imitation_loss'] = float(inner_loop_stats['learned_update_imitation_loss'].mean())
+    # ---- adaptive (segmented/gated) update diagnostics ---- #
+    # Only present under the adaptive model with memory_update_rule != "sgd".
+    # gate_retain_mean / gate_write_mean: mean retention r_t and write w_t of the
+    # gated recurrence m_t = r_t*m_{t-1} + w_t*x_t (->1 = pure SGD running-sum).
+    # gate_delta_mean: mean Mamba Delta (->0 = full retention). seg stats below
+    # are also emitted by the segmented adaptive path.
+    for _k in ('gate_retain_mean', 'gate_write_mean', 'gate_delta_mean',
+               'seg_nonempty_count_mean', 'seg_nonempty_size_mean'):
+        if _k in inner_loop_stats:
+            metrics[_k] = float(inner_loop_stats[_k].mean())
     return metrics
 
 
@@ -552,6 +572,21 @@ class ExperimentArgs:
     # the no-context pass. If None, reuses the main dataset's valid_no_context /
     # valid split.
     no_context_data_path: Optional[str] = field(default=None)
+    # ---- adaptive (segmented, gated-recurrence) fork (grad_memgpt_adaptive) ---- #
+    # Selected by an `adaptive:` section in the config. Segmentation splits the
+    # WRITE context into chunks written into the SAME memory (cross-segment
+    # carry); memory_update_rule selects the gated recurrence. See
+    # grad_memgpt_adaptive.py module docstring. Defaults reproduce the SGD path.
+    n_segments: Optional[int] = field(default=1)
+    segment_size: Optional[int] = field(default=None)
+    seg_bptt: Optional[int] = field(default=None)
+    memory_update_rule: Optional[str] = field(default="sgd")
+    gate_features: Optional[str] = field(default="grad_state")
+    gate_granularity: Optional[str] = field(default="per_dim")
+    gate_retention: Optional[str] = field(default="exp")
+    convex_bias_init: Optional[float] = field(default=3.0)
+    mamba_retain_bias_init: Optional[float] = field(default=-5.0)
+    mamba_write_bias_init: Optional[float] = field(default=3.0)
 
 
 def main(config_path: Optional[str] = None):
@@ -570,7 +605,7 @@ def main(config_path: Optional[str] = None):
             cfg = yaml.safe_load(f)
 
 # Flatten config to args (YAML values override ExperimentArgs defaults)
-        for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield', 'gated_delta', 'curriculum']:
+        for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield', 'gated_delta', 'curriculum', 'adaptive']:
             if section in cfg:
                 for key, value in cfg[section].items():
                     if key == 'stage_overrides':
@@ -718,8 +753,56 @@ def main(config_path: Optional[str] = None):
         learned_update_normalize=args.learned_update_normalize
     )
 
-    # Create gradmemgpt model
-    model = GradMemGPT(gradmem_config)
+    # ---- model selection ------------------------------------------------ #
+    # An `adaptive:` section in the config selects the segmented/gated fork
+    # (grad_memgpt_adaptive.py): WRITE context is split into segments written
+    # into the SAME memory (cross-segment carry), and memory_update_rule picks
+    # the gated recurrence. That fork only implements the gradient inner-loop
+    # path, so it does NOT accept the Hopfield/energy/learned-update kwargs
+    # above (which are ignored if present under adaptive). Routing/collator/
+    # metrics are shared -- only the config class + constructor differ.
+    use_adaptive_model = isinstance(cfg, dict) and 'adaptive' in cfg if args.config is not None else False
+    if use_adaptive_model:
+        AdaptiveGM, AdaptiveGMConfig = _load_adaptive()
+        gradmem_config = AdaptiveGMConfig(
+            pretrained_model=args.pretrained_model, base_config=config,
+            n_mem_tokens=args.n_mem_tokens, K=args.K,
+            last_K_second_order=args.last_K_second_order,
+            lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
+            n_ctrl_tokens=args.n_ctrl_tokens,
+            inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
+            use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
+            use_write_head=args.use_write_head,
+            use_write_lora=args.use_write_lora,
+            write_lora_r=args.write_lora_r, write_lora_alpha=args.write_lora_alpha,
+            write_lora_dropout=args.write_lora_dropout,
+            write_lora_target_modules=args.write_lora_target_modules,
+            freeze_backbone=args.freeze_backbone,
+            use_gradient_checkpointing=args.use_gradient_checkpointing,
+            attn_implementation=args.attn_implementation,
+            add_inner_loss_to_outer=args.add_inner_loss_to_outer,
+            inner_loss_weight=args.inner_loss_weight,
+            # adaptive-only knobs
+            n_segments=args.n_segments,
+            segment_size=args.segment_size,
+            seg_bptt=args.seg_bptt,
+            memory_update_rule=args.memory_update_rule,
+            gate_features=args.gate_features,
+            gate_granularity=args.gate_granularity,
+            gate_retention=args.gate_retention,
+            convex_bias_init=args.convex_bias_init,
+            mamba_retain_bias_init=args.mamba_retain_bias_init,
+            mamba_write_bias_init=args.mamba_write_bias_init,
+        )
+        # Adaptive segments need the full (un-truncated) context so every
+        # segment has real tokens. The shared collator already disables
+        # truncation when use_hopfield_memory/use_gated_delta_memory is set, so
+        # set the gated_delta flag to reuse that path for segmented configs too.
+        if (args.n_segments > 1) or (args.segment_size is not None):
+            args.use_gated_delta_memory = True
+        model = AdaptiveGM(gradmem_config)
+    else:
+        model = GradMemGPT(gradmem_config)
 
     if args.init_checkpoint is not None:
         missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)

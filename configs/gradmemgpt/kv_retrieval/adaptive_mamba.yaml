@@ -1,0 +1,91 @@
+# GradMemGPT — adaptive (segmented, gated-recurrence) fork on KV-retrieval.
+#
+# Selects the grad_memgpt_adaptive model via the `adaptive:` section. Two things
+# change vs the base default.yaml:
+#
+# 1. Segmentation with CROSS-SEGMENT MEMORY CARRY (the "Setup"): the WRITE
+#    context is split into `n_segments` chunks and written into the SAME memory.
+#    The first segment starts from m_0; every later segment CONTINUES from the
+#    previous m_t (NOT reset to m_0). The inner loop is therefore an RNN
+#    unrolled over n_segments*K steps, with the descent step x_t = -lr*grad as
+#    the input signal and m as the hidden state. Information written in segment 1
+#    must survive segments 2, 3, ... without being overwritten -- the regime
+#    where a gated recurrence pays off.
+#
+# 2. Adaptive memory update (the "Goal"): the degenerate running-sum
+#       m_t = m_{t-1} + x_t          (SGD; no retention -> structural forgetting)
+#    is generalised to a gated recurrence
+#       m_t = r_t * m_{t-1} + w_t * x_t
+#    with memory_update_rule selecting the operator. Here "mamba":
+#       r_t = exp(-Delta_t)          (Mamba exponential retention, in (0,1])
+#       Delta_t = softplus(lin_r(phi))   (per-dim, input/state-dependent)
+#       w_t  = sigmoid(lin_w(phi))   (write gate, in (0,1))
+#    Initialised to start as ~SGD (retain ~= 0.993, write ~= 0.95) so the model
+#    begins from the baseline and learns to open the gates selectively.
+#
+# Variants (swap memory_update_rule):
+#   memory_update_rule: "sgd"      -> exact old pure-sum (baseline to beat; no gate params)
+#   memory_update_rule: "convex"   -> m = (1-a)*m + a*x  (single gate, Family 3)
+#   memory_update_rule: "mamba"    -> exponential/GRU gated retention (this file; Family 2/1)
+
+model:
+  base_model: gpt2
+  n_layer: 4
+  n_head: 4
+  n_embd: 128
+
+training:
+  per_device_batch_size: 64
+  total_batch_size: 64
+  learning_rate: 1.0e-4
+  max_steps: 1000000
+  eval_steps: 500
+  logging_steps: 500
+  warmup_steps: 10000
+  early_stopping_patience: 500
+  seed: 143
+
+dataset:
+  # Larger N (8 KV pairs) exercises the cross-segment recurrence: the context is
+  # long enough to be split into multiple segments, so forgetting across
+  # segments is what the gated update is meant to fight.
+  data_path: "./data/N8-K2V2-V62_1M"
+  tokenizer_path: "./tokenizers/kv_alphabet_62/"
+
+gradmem:
+  n_mem_tokens: 8
+  n_ctrl_tokens: 0
+  K: 2
+  last_K_second_order: 2
+  inner_lr: 0.04
+  inner_clip_value: null
+  inner_clip_norm: null
+  use_adam: false
+  grad_mode: "second"
+  use_mem_proj: false
+  mem_proj_mode: "none"
+  use_write_head: true
+  add_inner_loss_to_outer: true
+  inner_loss_weight: 0.5
+
+adaptive:
+  # ---- segmentation (cross-segment carry) ---- #
+  # Exactly one of n_segments / segment_size should be set.
+  n_segments: 4            # equal-sized segments (segment_size = ceil(S / n_segments))
+  segment_size: null       # fixed tokens-per-segment (n_segments = ceil(S / segment_size))
+  seg_bptt: null           # truncated-BPTT window over segments (null = keep full graph)
+
+  # ---- gated memory update ---- #
+  memory_update_rule: "mamba"   # sgd | convex | mamba
+  gate_features: "grad_state"   # phi to gate heads: grad | state | grad_state (true selectivity)
+  gate_granularity: "per_dim"   # gate width: per_dim [B,M,d] | per_token [B,M,1]
+  gate_retention: "exp"         # mamba retention form: exp (Mamba decay) | sigmoid (GRU gate)
+
+  # ---- gate bias inits (calibrated so the operator starts as ~SGD) ---- #
+  # "exp" path: retain = exp(-softplus(retain_bias)) -> 0.993 at -5.0
+  #             write  = sigmoid(write_bias)         -> 0.953 at +3.0
+  # NOTE: if you switch gate_retention to "sigmoid", set mamba_retain_bias_init
+  # to a POSITIVE value (e.g. +5.0 -> retain ~= 0.993); the signs are opposite.
+  convex_bias_init: 3.0           # convex rule: a = sigmoid(bias) -> 0.953
+  mamba_retain_bias_init: -5.0    # exp retention Delta = softplus(bias) -> 0.007
+  mamba_write_bias_init: 3.0      # write gate w = sigmoid(bias) -> 0.953

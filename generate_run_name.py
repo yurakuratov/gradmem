@@ -139,6 +139,34 @@ def generate_run_name_gradmemgpt(cfg: Dict[str, Any]) -> str:
         d = gated_delta.get('gated_delta_state_dim', 128)
         run_name += f"_gd{d}"
 
+    # Adaptive (segmented, gated-recurrence) fork. Encodes the cross-segment
+    # carry + the gated memory update rule so runs are distinguishable:
+    #   _seg<n>            n_segments (or seg<sz> if segment_size is used)
+    #   _<rule>            memory_update_rule (omitted for "sgd" -> identical to base)
+    #   _<gate_features>/<granularity>/<retention>  gate config (only for gated rules)
+    #   _bptt<n>           seg_bptt truncated-BPTT window (only if set)
+    adaptive = cfg.get('adaptive', {})
+    if adaptive:
+        seg_size = adaptive.get('segment_size')
+        n_seg = adaptive.get('n_segments', 1)
+        rule = adaptive.get('memory_update_rule', 'sgd')
+        run_name += f"_seg{seg_size}" if seg_size else (f"_seg{n_seg}" if n_seg and n_seg != 1 else "")
+        if rule and rule != 'sgd':
+            run_name += f"_{rule}"
+            feats = adaptive.get('gate_features', 'grad_state')
+            gran = adaptive.get('gate_granularity', 'per_dim')
+            retain = adaptive.get('gate_retention', 'exp')
+            # only append non-defaults to keep the name readable
+            if feats != 'grad_state':
+                run_name += f"_f{feats}"
+            if gran != 'per_dim':
+                run_name += f"_{gran}"
+            if rule == 'mamba' and retain != 'exp':
+                run_name += f"_r{retain}"
+        bptt = adaptive.get('seg_bptt')
+        if bptt is not None:
+            run_name += f"_bptt{bptt}"
+
     curriculum = cfg.get('curriculum', {})
     if curriculum.get('enabled'):
         threshold = curriculum.get('threshold', 0.95)
