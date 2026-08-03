@@ -54,6 +54,7 @@ clean fork for studying adaptive memory updates in isolation.
 """
 
 import math
+import re
 
 import torch
 from torch import nn
@@ -620,6 +621,330 @@ class GradMemGPT(PreTrainedModel):
         if W is None:
             return mem
         return torch.baddbmm(b.unsqueeze(1), mem, W.transpose(1, 2))
+
+    # ---------------------------------------------------------------- #
+    # Per-segment forgetting evaluation (eval-only)
+    # ---------------------------------------------------------------- #
+    # After each model-segment is written to memory, probe retrieval of every
+    # KV pair written so far (segments [0..k]) to track how older facts degrade
+    # as later segments rewrite the carried memory state. Returns a per-sample
+    # lower-triangular correctness matrix [B, n_seg, n_seg] (row = the segment a
+    # KV pair lives in, col = the segment-after-write at which it was probed) and
+    # a count mask of the same shape (which (s,k) cells were actually probed).
+    # The trainer aggregates these across the eval set into the forgetting curve.
+    # Eval-only, gradient-safe: the WRITE inner loop still runs under enable_grad
+    # (the memory update needs autograd.grad), but every retrieval READ is wrapped
+    # in no_grad + .detach() so it neither pollutes the inner-loop graph nor
+    # retains activations. See forward_per_segment_eval below.
+
+    @staticmethod
+    def _segment_bounds(seq_len, n_segments_cfg, segment_size_cfg):
+        """Same ceil-division chunking as forward() uses for the WRITE context.
+
+        Returns (n_segments, segment_size, [(seg_start, seg_end), ...]) over the
+        REAL (un-padded) token positions [0, seq_len). KV-pair attribution and
+        the forward's segmentation must agree, so this is the single source of
+        truth shared by _parse_kv_pairs and forward_per_segment_eval.
+        """
+        if segment_size_cfg is not None:
+            n_segments = math.ceil(seq_len / segment_size_cfg)
+            segment_size = segment_size_cfg
+        else:
+            n_segments = n_segments_cfg
+            segment_size = (seq_len + n_segments - 1) // n_segments  # ceil division
+        bounds = [(i * segment_size, min((i + 1) * segment_size, seq_len))
+                  for i in range(n_segments)]
+        return n_segments, segment_size, bounds
+
+    def _parse_kv_pairs(self, context_input_ids, tokenizer, n_segments, segment_size):
+        """Recover (query, target) probe pairs and their source model-segment.
+
+        Tokenizer is 1 char = 1 token for the KV alphabet, so char offsets map
+        directly to token positions. KV pairs are regex'd as ``!K:V!`` from the
+        decoded context; each pair is attributed to the model-segment that
+        FULLY contains it (a pair straddling a boundary -> the later segment,
+        since it isn't fully "written" until that segment is processed).
+
+        Returns a list (one per batch sample) of lists of
+        ``(query_ids[Q], target_ids[T], source_seg_idx)``.
+        """
+        device = context_input_ids.device
+        pad_id = tokenizer.pad_token_id
+        results = []
+        for b in range(context_input_ids.size(0)):
+            ids = context_input_ids[b]
+            real = ids[ids != pad_id] if (ids == pad_id).any() else ids
+            real_ids = real.tolist()
+            # decode without special tokens; KV syntax chars are in-vocab regular tokens
+            text = tokenizer.decode(real_ids, skip_special_tokens=True)
+            # !K:V!  -- non-greedy value; K/V are runs of the kv alphabet (no '!|')
+            spans = []
+            for m in re.finditer(r'!([^!|:]+):([^!|]+)!', text):
+                k, v = m.group(1), m.group(2)
+                # char span of this whole !K:V! == token span (1 char/token)
+                tok_start = m.start()
+                tok_end = m.end()          # exclusive
+                spans.append((k, v, tok_start, tok_end))
+            # attribute each KV to the model-segment fully containing it
+            sample_pairs = []
+            for k, v, ts, te in spans:
+                # find the segment whose [start,end) contains [ts,te-1] (last KV token)
+                src_seg = None
+                for si, (sstart, send) in enumerate(
+                        self._segment_bounds(len(real_ids), n_segments, segment_size)[2]):
+                    if sstart <= ts and (te - 1) < send:
+                        src_seg = si
+                        break
+                if src_seg is None:
+                    # straddles a boundary -> the later (writing-completing) segment
+                    src_seg = min(ts // segment_size, n_segments - 1) if segment_size else 0
+                query = f'?!{k}:'
+                target = f'{v}!|'
+                q_ids = tokenizer(query, add_special_tokens=False).input_ids
+                t_ids = tokenizer(target, add_special_tokens=False).input_ids
+                sample_pairs.append((q_ids, t_ids, src_seg))
+            results.append(sample_pairs)
+        return results
+
+    def _read_once(self, mem_batch, query_input_ids, read_st_batch, read_end_batch,
+                   W_batch=None, b_batch=None):
+        """One batched READ against the current memory state.
+
+        Faithful factor of the READ phase (forward lines ~895-917): project mem,
+        concat [read_st?, mem, read_end?, query], forward under disabled write-LoRA,
+        slice out the per-query-token logits. Batched over the query axis by
+        flattening [B, n_q, Q] -> [B*n_q, Q] so this is a single forward pass.
+
+        Args:
+            mem_batch: [B, M, d] carried memory state (caller passes .detach()).
+            query_input_ids: [B, n_q, Q] probe queries (already padded by collator).
+        Returns:
+            logits [B, n_q, Q+1, V].
+        """
+        B, n_q, Q = query_input_ids.shape
+        emb_layer = self.model.get_input_embeddings()
+        # [B, n_q, Q, d] -> [B*n_q, Q, d]
+        qry_emb = emb_layer(query_input_ids.reshape(B * n_q, Q))
+        mem_rep = mem_batch.unsqueeze(1).expand(-1, n_q, -1, -1).reshape(B * n_q, *mem_batch.shape[1:])
+
+        if self.mem_proj_mode == "none":
+            mem_inp = mem_rep
+        elif self.mem_proj_mode == "proj":
+            mem_inp = self.mem_proj(mem_rep)
+        else:  # "per_sample"
+            W_rep = W_batch.unsqueeze(1).expand(-1, n_q, -1, -1).reshape(B * n_q, *W_batch.shape[1:])
+            b_rep = b_batch.unsqueeze(1).expand(-1, n_q, -1).reshape(B * n_q, -1)
+            mem_inp = self._apply_linear(mem_rep, W_rep, b_rep)
+
+        mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
+        if self.n_ctrl_tokens > 0:
+            # [B, C, d] -> [B, 1, C, d] -> [B, n_q, C, d] -> [B*n_q, C, d]
+            rs = read_st_batch.reshape(B, 1, self.n_ctrl_tokens, -1).expand(-1, n_q, -1, -1).reshape(B * n_q, self.n_ctrl_tokens, -1)
+            re_ = read_end_batch.reshape(B, 1, self.n_ctrl_tokens, -1).expand(-1, n_q, -1, -1).reshape(B * n_q, self.n_ctrl_tokens, -1)
+            x_qry = torch.cat([rs, mem_inp, re_, qry_emb], dim=1)
+        else:
+            x_qry = torch.cat([mem_inp, qry_emb], dim=1)                       # [B*n_q, M+Q, d]
+
+        if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+            pad_list = [0, 0, 0, -x_qry.size(1) % 32]
+            x_qry = F.pad(x_qry, pad_list, "constant", 0)
+
+        with self._disable_write_lora():
+            logits = self.model(inputs_embeds=x_qry).logits                   # [B*n_q, M+Q, V]
+        logits = logits[:, mem_offset - 1:mem_offset + Q, :]                  # [B*n_q, Q+1, V]
+        return logits.reshape(B, n_q, Q + 1, -1)
+
+    @staticmethod
+    def _probe_exact_match(logits, target_ids, ignore_token_ids):
+        """Per-probe exact-match flag. logits: [n_q, Q+1, V]; target_ids: [n_q, T].
+
+        Compares argmax at the first T target-token positions (the value + '!|');
+        positions whose target token is in ignore_token_ids ('!','|') are skipped.
+        Returns [n_q] bool tensor.
+        """
+        preds = logits.argmax(dim=-1)[:, :-1]                                  # [n_q, Q]
+        n_q = logits.size(0)
+        correct = torch.ones(n_q, dtype=torch.bool, device=logits.device)
+        for i in range(n_q):
+            tgt = target_ids[i]
+            T = tgt.size(0)
+            if T == 0 or T > preds.size(1):
+                correct[i] = False
+                continue
+            p = preds[i, :T]
+            mask = torch.ones(T, dtype=torch.bool, device=logits.device)
+            for ig in ignore_token_ids:
+                mask &= (tgt != ig)
+            if mask.sum() == 0:
+                correct[i] = True
+                continue
+            correct[i] = (p[mask] == tgt[mask]).all()
+        return correct
+
+    def forward_per_segment_eval(self, input_ids, kv_queries):
+        """Eval-only: the forgetting matrix for one batch.
+
+        Runs the normal segmented WRITE inner loop (so the memory state is
+        identical to training), and after each model-segment's K steps, probes
+        retrieval of every KV pair in segments [0..current_seg]. Returns a
+        lower-triangular correctness matrix and its count mask.
+
+        Args:
+            input_ids: {'context_input_ids': [B,S]} (the WRITE context).
+            kv_queries: {'query_input_ids': [B, n_q_max, Q],
+                         'target_ids':       [B, n_q_max, T],
+                         'seg_idx':          [B, n_q_max],
+                         'mask':             [B, n_q_max] bool}
+        Returns:
+            correct:  [B, n_seg, n_seg] bool  (row=source seg, col=probe seg)
+            count:    [B, n_seg, n_seg] bool  (which cells were probed)
+        """
+        context_input_ids = input_ids['context_input_ids']
+        pad_id = self.model.config.pad_token_id
+        device = context_input_ids.device
+        B = context_input_ids.size(0)
+        n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
+
+        qids = kv_queries['query_input_ids']            # [B, n_q, Q]
+        tids = kv_queries['target_ids']                 # [B, n_q, T]
+        seg_idx = kv_queries['seg_idx']                 # [B, n_q]
+        qmask = kv_queries['mask']                      # [B, n_q]
+        n_q_max, Q = qids.shape[1], qids.shape[2]
+        ignore_token_ids = kv_queries.get('ignore_token_ids', [])
+
+        # segment bounds must match forward()'s chunking
+        seq_len_real = (context_input_ids != pad_id).sum(dim=1).max().item()
+        n_seg, seg_sz, _ = self._segment_bounds(seq_len_real, self.n_segments, self.segment_size)
+
+        correct = torch.zeros(B, n_seg, n_seg, dtype=torch.bool, device=device)
+        count = torch.zeros(B, n_seg, n_seg, dtype=torch.bool, device=device)
+
+        if not self.K or not (context_input_ids != pad_id).any():
+            return correct, count
+        if qmask.sum() == 0:
+            return correct, count
+
+        # ---- replicate the WRITE inner loop (carry memory across segments) ---- #
+        mem_batch = self.mem.unsqueeze(0).expand(B, -1, -1).clone()           # [B,M,d]
+        if self.mem_proj_mode == "per_sample":
+            W_batch = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1).clone()
+            b_batch = self.mem_proj.bias.unsqueeze(0).expand(B, -1).clone()
+        else:
+            W_batch = b_batch = None
+
+        mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
+        if self.n_ctrl_tokens > 0:
+            read_st_batch = self.read_st.unsqueeze(0).expand(B, -1, -1)
+            read_end_batch = self.read_end.unsqueeze(0).expand(B, -1, -1)
+            write_st_batch = self.write_st.unsqueeze(0).expand(B, -1, -1)
+            write_end_batch = self.write_end.unsqueeze(0).expand(B, -1, -1)
+        else:
+            read_st_batch = read_end_batch = write_st_batch = write_end_batch = None
+
+        with torch.enable_grad():
+            ctx_emb = self.model.get_input_embeddings()(context_input_ids)    # [B,S,d]
+            lm_labels = context_input_ids.clone()
+            lm_labels[lm_labels == pad_id] = -100
+            mask = (lm_labels != -100)
+            pad_len = seg_sz * n_seg - ctx_emb.size(1)
+            if pad_len > 0:
+                ctx_emb = F.pad(ctx_emb, [0, 0, pad_len, 0], "constant", 0)
+                mask = F.pad(mask, [pad_len, 0], "constant", 0)
+                lm_labels = F.pad(lm_labels, [pad_len, 0], "constant", -100)
+
+            opt_state = {}
+            for seg_idx_loop in range(n_seg):
+                sstart = seg_idx_loop * seg_sz
+                send = sstart + seg_sz
+                seg_emb = ctx_emb[:, sstart:send, :]
+                seg_mask = mask[:, sstart:send]
+                seg_labels = lm_labels[:, sstart:send]
+                if not seg_mask.any(dim=1).any():
+                    # still probe if any queries are attributable to <= this seg,
+                    # using the carried (unchanged) memory
+                    pass
+                seg_seq_len = seg_mask.sum(dim=1).clamp_min(1)
+
+                # K inner steps (same as forward), graph detached after each
+                for k in range(self.K):
+                    mem_batch = mem_batch.detach().requires_grad_(True)
+                    if self.mem_proj_mode == "per_sample":
+                        W_batch = W_batch.detach().requires_grad_(True)
+                        b_batch = b_batch.detach().requires_grad_(True)
+                    if self.mem_proj_mode == 'none':
+                        mem_inp = mem_batch
+                    elif self.mem_proj_mode == 'proj':
+                        mem_inp = self.mem_proj(mem_batch)
+                    else:
+                        mem_inp = self._apply_linear(mem_batch, W_batch, b_batch)
+                    if self.n_ctrl_tokens > 0:
+                        x_ctx = torch.cat([write_st_batch, mem_inp, write_end_batch, seg_emb], dim=1)
+                    else:
+                        x_ctx = torch.cat([mem_inp, seg_emb], dim=1)
+                    cur_mem_attn_mask = torch.ones(B, mem_offset + seg_emb.size(1),
+                                                   dtype=torch.long, device=device)
+                    cur_mem_attn_mask[:, mem_offset:] = seg_mask.long()
+                    cur_position_ids = (cur_mem_attn_mask.cumsum(-1) - 1).clamp(min=0)
+                    if self.use_write_head:
+                        outs = get_backbone(self.model)(inputs_embeds=x_ctx,
+                                                        attention_mask=cur_mem_attn_mask,
+                                                        position_ids=cur_position_ids, return_dict=True)
+                        h = outs.last_hidden_state[:, mem_offset - 1:, :]
+                        logits = self.write_head(h)
+                    else:
+                        outs = self.model(inputs_embeds=x_ctx, attention_mask=cur_mem_attn_mask,
+                                          position_ids=cur_position_ids, return_dict=True)
+                        logits = outs.logits[:, mem_offset - 1:, :]
+                    inner_loss = nn.functional.cross_entropy(
+                        logits[:, :-1].reshape(-1, logits.size(-1)),
+                        seg_labels.reshape(-1), ignore_index=-100, reduction='none',
+                    ).view(B, -1)
+                    inner_loss = (inner_loss * seg_mask).sum(1) / seg_seq_len
+                    inner_loss = inner_loss.sum()
+                    if self.mem_proj_mode == 'per_sample':
+                        g_mem, g_W, g_b = torch.autograd.grad(
+                            inner_loss, [mem_batch, W_batch, b_batch], create_graph=False)
+                    else:
+                        g_mem = torch.autograd.grad(inner_loss, mem_batch)[0]
+                    if self.memory_update_rule == "sgd":
+                        mem_batch = self._sgd_step(mem_batch, g_mem)
+                        if self.mem_proj_mode == 'per_sample':
+                            W_batch = self._sgd_step(W_batch, g_W)
+                            b_batch = self._sgd_step(b_batch, g_b)
+                    else:
+                        mem_batch, _ = self._gated_step(mem_batch, g_mem)
+                        if self.mem_proj_mode == 'per_sample':
+                            W_batch, _ = self._gated_step(W_batch, g_W)
+                            b_batch, _ = self._gated_step(b_batch, g_b)
+
+                # ---- probe all KV pairs whose source seg <= current seg ---- #
+                probe_here = (seg_idx <= seg_idx_loop) & qmask                  # [B, n_q]
+                if not probe_here.any():
+                    continue
+                with torch.no_grad():
+                    mem_det = mem_batch.detach()
+                    # gather, per sample, the active queries into a dense [B, n_q_a, Q] block.
+                    # Since n_q is small and queries are the same length Q across the batch
+                    # (collator pads them jointly), we can probe the full [B, n_q, Q] block in
+                    # one _read_once call and mask afterwards -- cheaper than ragged gather.
+                    logits_q = self._read_once(mem_det, qids, read_st_batch, read_end_batch,
+                                               W_batch.detach() if W_batch is not None else None,
+                                               b_batch.detach() if b_batch is not None else None)
+                    # logits_q: [B, n_q, Q+1, V]
+                    for b in range(B):
+                        active = probe_here[b]
+                        if not active.any():
+                            continue
+                        ai = active.nonzero(as_tuple=True)[0]
+                        for q_i in ai.tolist():
+                            s_src = int(seg_idx[b, q_i].item())
+                            em = self._probe_exact_match(
+                                logits_q[b:b+1, q_i:q_i+1], tids[b:b+1, q_i],
+                                ignore_token_ids)
+                            correct[b, s_src, seg_idx_loop] = em[0]
+                            count[b, s_src, seg_idx_loop] = True
+
+        return correct, count
 
     def forward(self, input_ids, labels=None, return_mem=False):
         # context_input_ids : B × S   (segments only, each ends with `|`)

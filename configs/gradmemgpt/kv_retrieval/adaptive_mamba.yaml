@@ -44,6 +44,15 @@ training:
   warmup_steps: 10000
   early_stopping_patience: 500
   seed: 143
+  # Per-segment forgetting eval (adaptive model only). On cadence, after each
+  # model-segment is written to memory, probe retrieval of every KV pair written
+  # so far to build a [n_seg, n_seg] forgetting matrix (row = KV's source segment,
+  # col = probe-after-segment). The full matrix is logged as
+  # exp_path/forgetting_matrix_step{N}.json + .csv (and a comet table if comet is
+  # available); only 3 summary scalars hit the metric stream (forget_diag_mean,
+  # forget_seg0_final, forget_slope). cadence must be a multiple of eval_steps.
+  per_segment_eval: true
+  per_segment_eval_steps: 2500   # = 5 * eval_steps; the forgetting pass runs every 2500 steps
 
 dataset:
   # Larger N (8 KV pairs) exercises the cross-segment recurrence: the context is

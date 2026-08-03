@@ -1,9 +1,11 @@
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Optional
 from dataclasses import dataclass, field
@@ -458,6 +460,269 @@ class DualEvalTrainer(CustomTrainer):
         return metrics
 
 
+def _isnan(x):
+    import math as _m
+    try:
+        return _m.isnan(x)
+    except (TypeError, ValueError):
+        return False
+
+
+def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=None,
+                                segment_size=None):
+    """Build a collator that emits, per sample, the WRITE context PLUS one probe
+    query per KV pair in the context (with the source model-segment of each KV).
+
+    Context tokenization is identical to ``collate_fn`` (left-padded). For each
+    sample we regex the decoded context for ``!K:V!`` pairs and emit:
+      query_input_ids: [n_kv, Q]   tokenizing ``?!K:`` for each KV
+      target_ids:      [n_kv, T]   tokenizing ``V!|`` for each KV
+      seg_idx:         [n_kv]      source model-segment (computed with the same
+                                   ceil-division as the model's forward)
+    These are stacked into per-batch padded tensors so the model can batch-probe.
+
+    The KV pair -> segment attribution matches the model's segmentation exactly
+    (the model shares the same _segment_bounds logic). KV pairs straddling a
+    segment boundary are attributed to the later segment (not fully written
+    until then).
+    """
+    import re as _re
+
+    def collate_fn_per_segment(batch, tokenizer, max_context_length=None):
+        # --- context: identical to collate_fn ---
+        context = [item['context'] for item in batch]
+        orig_padding_side = tokenizer.padding_side
+        tokenizer.padding_side = "left"
+        context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
+                                      padding=True, pad_to_multiple_of=8, max_length=max_context_length,
+                                      truncation=True).input_ids
+        tokenizer.padding_side = orig_padding_side
+
+        pad_id = tokenizer.pad_token_id
+        B = len(batch)
+
+        # --- per-sample KV probe pairs ---
+        per_sample = []  # list of [(q_ids, t_ids, seg_idx), ...]
+        for item in batch:
+            text = item['context']
+            pairs = []
+            for m in _re.finditer(r'!([^!|:]+):([^!|]+)!', text):
+                k, v = m.group(1), m.group(2)
+                pairs.append((m.start(), m.end(), k, v))
+            # real-token count of this sample's context (no pad) == char count
+            real_len = len(text)
+            if segment_size is not None:
+                n_seg = max(1, math.ceil(real_len / segment_size))
+                seg_sz = segment_size
+            else:
+                n_seg = n_segments if n_segments else 1
+                seg_sz = max(1, math.ceil(real_len / n_seg))
+            sample_pairs = []
+            for ts, te, k, v in pairs:
+                src_seg = None
+                for si in range(n_seg):
+                    sstart = si * seg_sz
+                    send = min((si + 1) * seg_sz, real_len)
+                    if sstart <= ts and (te - 1) < send:
+                        src_seg = si
+                        break
+                if src_seg is None:
+                    src_seg = min(ts // seg_sz, n_seg - 1)
+                q_ids = tokenizer(f'?!{k}:', add_special_tokens=False).input_ids
+                t_ids = tokenizer(f'{v}!|', add_special_tokens=False).input_ids
+                sample_pairs.append((q_ids, t_ids, src_seg))
+            per_sample.append(sample_pairs)
+
+        n_q_max = max((len(p) for p in per_sample), default=1) or 1
+        Q = max((len(q) for p in per_sample for (q, _, _) in p), default=1) or 1
+        T = max((len(t) for p in per_sample for (_, t, _) in p), default=1) or 1
+
+        query_input_ids = torch.full((B, n_q_max, Q), pad_id, dtype=torch.long)
+        target_ids = torch.full((B, n_q_max, T), pad_id, dtype=torch.long)
+        seg_idx = torch.zeros(B, n_q_max, dtype=torch.long)
+        qmask = torch.zeros(B, n_q_max, dtype=torch.bool)
+        for b, pairs in enumerate(per_sample):
+            for j, (q, t, s) in enumerate(pairs):
+                query_input_ids[b, j, :len(q)] = torch.tensor(q, dtype=torch.long)
+                target_ids[b, j, :len(t)] = torch.tensor(t, dtype=torch.long)
+                seg_idx[b, j] = s
+                qmask[b, j] = True
+
+        return {
+            'input_ids': {
+                'context_input_ids': context_input_ids,
+                'query_input_ids': None,  # unused by forward_per_segment_eval; kept for shape compat
+            },
+            'kv_queries': {
+                'query_input_ids': query_input_ids,
+                'target_ids': target_ids,
+                'seg_idx': seg_idx,
+                'mask': qmask,
+                'ignore_token_ids': [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']],
+            },
+        }
+
+    return lambda batch: collate_fn_per_segment(batch, tokenizer, max_context_length)
+
+
+class PerSegmentForgettingTrainer(DualEvalTrainer):
+    """DualEvalTrainer + a per-segment forgetting eval pass.
+
+    On cadence (every ``per_segment_eval_steps``), runs a manual no-grad loop
+    that calls ``model.forward_per_segment_eval`` to build the [n_seg, n_seg]
+    forgetting matrix, writes it to disk as .json/.csv, optionally logs it as a
+    comet table, and injects a handful of summary scalars into the metrics dict
+    (the full N^2 matrix lives in the table artifact, not the metric stream).
+
+    The pass reuses the same eval dataset (the context is what gets written);
+    only the collator differs (it emits KV-probe queries). Normal eval and the
+    optional no-context pass keep their own cadence (every eval_steps).
+    """
+
+    def __init__(self, *args, per_segment_dataset=None, per_segment_collator=None,
+                 n_segments=None, segment_size=None, tokenizer=None,
+                 per_segment_eval_steps=None, eval_steps=None, exp_path=None,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.per_segment_dataset = per_segment_dataset
+        self.per_segment_collator = per_segment_collator
+        self.n_segments = n_segments
+        self.segment_size = segment_size
+        self.tokenizer = tokenizer
+        self.per_segment_eval_steps = per_segment_eval_steps
+        self.eval_steps = eval_steps
+        self.exp_path = exp_path
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        metrics = super().evaluate(
+            eval_dataset=eval_dataset, ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix)
+
+        step = self.state.global_step
+        run_pass = (self.per_segment_eval_steps is not None
+                    and self.eval_steps is not None
+                    and self.per_segment_eval_steps > 0
+                    and step % self.per_segment_eval_steps == 0)
+        if not run_pass or self.per_segment_dataset is None:
+            return metrics
+
+        forget_metrics = self._forgetting_pass(step)
+        for k, v in forget_metrics.items():
+            metrics[k] = v
+        return metrics
+
+    def _forgetting_pass(self, step):
+        """Run the per-segment forgetting pass and return summary metrics + write table."""
+        import json as _json
+        import csv as _csv
+        from pathlib import Path as _Path
+        from torch.utils.data import DataLoader
+
+        device = self.args.device if hasattr(self.args, 'device') else \
+                 next(self.model.parameters()).device
+        model = self.model
+        # unwrap DDP/FSDP/DDP-wrapped if present
+        while hasattr(model, "module"):
+            model = model.module
+
+        saved_collator = self.data_collator
+        self.data_collator = self.per_segment_collator
+        try:
+            dl = DataLoader(self.per_segment_dataset,
+                            batch_size=self.args.per_device_eval_batch_size,
+                            collate_fn=self.per_segment_collator, num_workers=0)
+        finally:
+            self.data_collator = saved_collator
+
+        n_seg = self.n_segments
+        correct_acc = torch.zeros(n_seg, n_seg, dtype=torch.float32) if n_seg else None
+        count_acc = torch.zeros(n_seg, n_seg, dtype=torch.float32) if n_seg else None
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            for batch in dl:
+                ctx_ids = batch['input_ids']['context_input_ids'].to(device)
+                kv_q = {k: (v.to(device) if hasattr(v, 'to') else v)
+                        for k, v in batch['kv_queries'].items()}
+                correct, count = model.forward_per_segment_eval(
+                    {'context_input_ids': ctx_ids}, kv_q)
+                # reduce per-batch [B, nb, nb] -> per-cell sums over B.
+                # nb may vary by context length under segment_size mode; grow the
+                # accumulators to the largest nb seen so n_seg is the global max.
+                nb = correct.size(1)
+                if correct_acc is None:
+                    n_seg = nb
+                    correct_acc = torch.zeros(nb, nb, dtype=torch.float32)
+                    count_acc = torch.zeros(nb, nb, dtype=torch.float32)
+                elif nb > n_seg:
+                    pad = nb - n_seg
+                    correct_acc = F.pad(correct_acc, (0, pad, 0, pad))
+                    count_acc = F.pad(count_acc, (0, pad, 0, pad))
+                    n_seg = nb
+                correct_acc[:nb, :nb] += correct.sum(dim=0).float().cpu()
+                count_acc[:nb, :nb] += count.sum(dim=0).float().cpu()
+        if was_training:
+            model.train()
+
+        with torch.no_grad():
+            em = torch.where(count_acc > 0, correct_acc / count_acc.clamp_min(1),
+                             torch.full_like(correct_acc, float('nan')))
+        em_np = em.numpy()
+
+        # ---- write matrix artifact (.json + .csv) ---- #
+        out_dir = _Path(self.exp_path) if self.exp_path else _Path('.')
+        out_dir.mkdir(parents=True, exist_ok=True)
+        rows = list(range(n_seg)); cols = list(range(n_seg))
+        artifact = {
+            'step': step,
+            'n_segments': n_seg,
+            'rows_source_seg': rows,
+            'cols_probe_seg': cols,
+            'matrix_exact_match': [[None if _isnan(em_np[s, k]) else float(em_np[s, k])
+                                    for k in cols] for s in rows],
+            'count_per_cell': [[int(count_acc[s, k].item()) for k in cols] for s in rows],
+        }
+        with open(out_dir / f'forgetting_matrix_step{step}.json', 'w') as f:
+            _json.dump(artifact, f, indent=2)
+        with open(out_dir / f'forgetting_matrix_step{step}.csv', 'w', newline='') as f:
+            w = _csv.writer(f)
+            w.writerow(['source_seg\\probe_seg'] + [f'after_seg{k}' for k in cols])
+            for s in rows:
+                row = [f'seg{s}'] + ['' if _isnan(em_np[s, k]) else f'{em_np[s, k]:.4f}'
+                                     for k in cols]
+                w.writerow(row)
+
+        # ---- optional comet table ---- #
+        try:
+            for cb in self.callback_handler.callbacks:
+                if type(cb).__name__ == 'CometCallback':
+                    exp = cb.get_experiment() if hasattr(cb, 'get_experiment') else None
+                    if exp is not None and hasattr(exp, 'log_table'):
+                        exp.log_table(f'forgetting_matrix_step{step}.csv',
+                                      headers=['source_seg'] + [f'after_seg{k}' for k in cols],
+                                      values=[[s] + [em_np[s, k] for k in cols] for s in rows])
+                    break
+        except Exception:
+            pass
+
+        # ---- summary scalars (the only things in the metric stream) ---- #
+        diag = [em_np[i, i] for i in range(n_seg) if not _isnan(em_np[i, i])]
+        seg0_final = em_np[0, n_seg - 1] if n_seg > 0 and not _isnan(em_np[0, n_seg - 1]) else float('nan')
+        # mean per-source-seg drop from its first probe to its last probe
+        drops = []
+        for s in range(n_seg):
+            pts = [em_np[s, k] for k in range(s, n_seg) if not _isnan(em_np[s, k])]
+            if len(pts) >= 2:
+                drops.append(pts[0] - pts[-1])
+        slope = float(np.mean(drops)) if drops else 0.0
+
+        return {
+            'forget_diag_mean': float(np.mean(diag)) if diag else float('nan'),
+            'forget_seg0_final': float(seg0_final),
+            'forget_slope': slope,
+        }
+
+
 @dataclass
 class ExperimentArgs:
     config: Optional[str] = field(default=None)
@@ -572,6 +837,15 @@ class ExperimentArgs:
     # the no-context pass. If None, reuses the main dataset's valid_no_context /
     # valid split.
     no_context_data_path: Optional[str] = field(default=None)
+    # ---- per-segment forgetting eval (adaptive model only) ---- #
+    # On cadence (per_segment_eval_steps), after each model-segment is written to
+    # memory, probe retrieval of every KV pair written so far to build a [n_seg,
+    # n_seg] forgetting matrix (row = KV's source segment, col = probe-after-seg).
+    # The full matrix is logged as a table artifact + comet table; only 3 summary
+    # scalars hit the metric stream (forget_diag_mean / forget_seg0_final /
+    # forget_slope). Requires the adaptive model (an `adaptive:` config section).
+    per_segment_eval: Optional[bool] = field(default=False)
+    per_segment_eval_steps: Optional[int] = field(default=None)  # default 5*eval_steps if None
     # ---- adaptive (segmented, gated-recurrence) fork (grad_memgpt_adaptive) ---- #
     # Selected by an `adaptive:` section in the config. Segmentation splits the
     # WRITE context into chunks written into the SAME memory (cross-segment
@@ -1081,7 +1355,34 @@ def main(config_path: Optional[str] = None):
             seed=args.seed,
         )
 
-        trainer_cls = DualEvalTrainer if args.no_context_eval else CustomTrainer
+        # ---- per-segment forgetting eval setup (adaptive model only) ---- #
+        # On cadence, builds the [n_seg,n_seg] forgetting matrix and logs it as a
+        # table artifact + comet table; only summary scalars hit the metric stream.
+        use_per_segment_eval = bool(args.per_segment_eval) and use_adaptive_model
+        per_segment_collator = None
+        per_seg_n_segments = None
+        per_seg_eval_steps = None
+        if use_per_segment_eval:
+            per_seg_n_segments = args.n_segments if args.segment_size is None else None
+            per_segment_collator = make_collate_fn_per_segment(
+                tokenizer, max_context_length=args.max_context_length,
+                n_segments=args.n_segments, segment_size=args.segment_size)
+            per_seg_eval_steps = args.per_segment_eval_steps
+            if per_seg_eval_steps is None:
+                per_seg_eval_steps = 5 * args.eval_steps
+            assert per_seg_eval_steps % max(args.eval_steps, 1) == 0, \
+                f"per_segment_eval_steps ({per_seg_eval_steps}) must be a multiple of " \
+                f"eval_steps ({args.eval_steps})"
+            logger.info(f'per-segment forgetting eval enabled: n_segments={args.n_segments}, '
+                        f'segment_size={args.segment_size}, cadence={per_seg_eval_steps} steps')
+
+        # ---- trainer selection ---- #
+        if use_per_segment_eval:
+            trainer_cls = PerSegmentForgettingTrainer
+        elif args.no_context_eval:
+            trainer_cls = DualEvalTrainer
+        else:
+            trainer_cls = CustomTrainer
         trainer_kwargs = dict(
             model=model,
             args=training_args,
@@ -1099,6 +1400,17 @@ def main(config_path: Optional[str] = None):
                 no_context_dataset=no_context_dataset,
                 no_context_data_collator=no_context_data_collator,
                 no_context_compute_metrics=no_context_compute_metrics,
+            )
+        if use_per_segment_eval:
+            trainer_kwargs.update(
+                per_segment_dataset=dataset['valid'],
+                per_segment_collator=per_segment_collator,
+                n_segments=per_seg_n_segments,
+                segment_size=args.segment_size,
+                tokenizer=tokenizer,
+                per_segment_eval_steps=per_seg_eval_steps,
+                eval_steps=args.eval_steps,
+                exp_path=str(output_dir),
             )
         trainer = trainer_cls(**trainer_kwargs)
         trainer.train()
