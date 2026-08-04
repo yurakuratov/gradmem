@@ -768,6 +768,11 @@ class ExperimentArgs:
     learning_rate: Optional[float] = field(default=1e-04)
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
+    stop_on_em_threshold: Optional[float] = field(
+        default=1.0,
+        metadata={"help": "Stop training once eval exact_match >= this threshold. "
+                           "Default 1.0 reproduces the prior hard stop. Set >1.0 "
+                           "(e.g. 1.1) to disable the EM-stop callback."})
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
@@ -1417,7 +1422,7 @@ def main(config_path: Optional[str] = None):
             compute_metrics=compute_metrics,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
             callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                       StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
+                       StopOnMetricValue(metric_name='exact_match', value=args.stop_on_em_threshold, higher_is_better=True),
                        ],
         )
         if args.no_context_eval and no_context_dataset is not None:

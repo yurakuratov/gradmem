@@ -149,6 +149,8 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
         args.append(f'--adam_beta2={training["adam_beta2"]}')
     if training.get('early_stopping_patience'):
         args.append(f'--early_stopping_patience={training["early_stopping_patience"]}')
+    if training.get('stop_on_em_threshold') is not None:
+        args.append(f'--stop_on_em_threshold={training["stop_on_em_threshold"]}')
     if training.get('use_gradient_checkpointing'):
         args.append('--use_gradient_checkpointing')
     if training.get('auto_find_batch_size'):
