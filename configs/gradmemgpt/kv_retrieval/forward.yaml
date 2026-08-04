@@ -42,11 +42,11 @@ gradmem:
   use_write_head: false
   add_inner_loss_to_outer: false  # incompatible with use_energy_inner_loss
   inner_loss_weight: 0.0
-  memory_update: forward_energy  # RMT forward write + energy refinement of the input mem_batch
+  memory_update: forward  # RMT forward write + energy refinement of the input mem_batch
   # RMT forward
   use_mem_residual: false  # for RMT
   use_reconstruction_loss: false  # reconstruction loss for RMT
   # Learnable energy inner objective (read-out is always mem_out; n_energy_tokens unused here)
-  use_energy_inner_loss: true
+  use_energy_inner_loss: false
   energy_mlp_hidden_dim: null  # null -> n_embd (128)
   energy_mlp_n_layers: 2

@@ -53,5 +53,5 @@ gradmem:
   energy_out_scale: 1.0
   # Annealed reconstruction auxiliary: 1.0 -> 0.0 over 50k outer steps
   energy_recon_weight: 1.0
-  energy_recon_weight_end: 0.0
-  energy_recon_anneal_steps: 50000
+  energy_recon_weight_end: 1.0
+  energy_recon_anneal_steps: 0

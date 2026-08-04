@@ -28,6 +28,15 @@
 #   memory_update_rule: "convex"   -> m = (1-a)*m + a*x  (single gate, Family 3)
 #   memory_update_rule: "mamba"    -> exponential/GRU gated retention (this file; Family 2/1)
 
+run_naming:
+  separator: "_"
+  keys:
+    - {key: adaptive.segment_size, prefix: tk}
+    - {key: adaptive.memory_update_rule, prefix: ur_}
+    - {key: adaptive.gate_features, prefix: gf_}
+    - {key: gradmem.use_mem_proj, prefix: proj}
+    - {key: dataset.data_name, prefix: ds_}
+
 model:
   base_model: gpt2
   n_layer: 4
@@ -52,13 +61,14 @@ training:
   # available); only 3 summary scalars hit the metric stream (forget_diag_mean,
   # forget_seg0_final, forget_slope). cadence must be a multiple of eval_steps.
   per_segment_eval: true
-  per_segment_eval_steps: 2500   # = 5 * eval_steps; the forgetting pass runs every 2500 steps
+  per_segment_eval_steps: 10000   # = 5 * eval_steps; the forgetting pass runs every 2500 steps
 
 dataset:
   # Larger N (8 KV pairs) exercises the cross-segment recurrence: the context is
   # long enough to be split into multiple segments, so forgetting across
   # segments is what the gated update is meant to fight.
-  data_path: "./data/N8-K2V2-V62_1M"
+  data_name: "kv4"
+  data_path: "./data/N4-K2V2-V62_1M"
   tokenizer_path: "./tokenizers/kv_alphabet_62/"
 
 gradmem:
@@ -80,13 +90,13 @@ gradmem:
 adaptive:
   # ---- segmentation (cross-segment carry) ---- #
   # Exactly one of n_segments / segment_size should be set.
-  n_segments: 4            # equal-sized segments (segment_size = ceil(S / n_segments))
-  segment_size: null       # fixed tokens-per-segment (n_segments = ceil(S / segment_size))
+  n_segments: 1            # equal-sized segments (segment_size = ceil(S / n_segments))
+  segment_size: 16       # fixed tokens-per-segment (n_segments = ceil(S / segment_size))
   seg_bptt: null           # truncated-BPTT window over segments (null = keep full graph)
 
   # ---- gated memory update ---- #
   memory_update_rule: "mamba"   # sgd | convex | mamba
-  gate_features: "grad_state"   # phi to gate heads: grad | state | grad_state (true selectivity)
+  gate_features: "state"   # phi to gate heads: grad | state | grad_state (true selectivity)
   gate_granularity: "per_dim"   # gate width: per_dim [B,M,d] | per_token [B,M,1]
   gate_retention: "exp"         # mamba retention form: exp (Mamba decay) | sigmoid (GRU gate)
 

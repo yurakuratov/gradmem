@@ -50,8 +50,8 @@ gradmem:
   memory_update: gradient   # required for use_learned_inner_update
   # Learned inner-update head
   use_learned_inner_update: true
-  n_learned_update_tokens: 4
-  learned_update_mlp_hidden_dim: null  # null -> n_embd (128)
+  n_learned_update_tokens: 8
+  learned_update_mlp_hidden_dim: 256  # null -> n_embd (128)
   learned_update_mlp_n_layers: 2
   learned_update_treat_as_gradient: true  # head output feeds _sgd_step (reuses inner_lr + inner_clip_*)
   learned_update_final_tanh: false
