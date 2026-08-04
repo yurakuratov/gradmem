@@ -12,6 +12,7 @@ training:
   logging_steps: 500
   warmup_steps: 10000
   early_stopping_patience: 500
+  stop_on_em_threshold: 0.95
   seed: 142
 
 dataset:
