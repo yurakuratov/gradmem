@@ -470,12 +470,115 @@ def test_curriculum_segmentation_handles_growing_context():
           f"cumulative={cumulative} OK")
 
 
+# --------------------------------------------------------------------------- #
+# 6. Forced forgetting matrix at stage boundary (adaptive + per_segment_eval)
+#    The curriculum loop calls trainer.force_forgetting_pass(stage_idx, label)
+#    before the end-of-stage eval. This must (a) bypass the step-cadence gate,
+#    (b) write a stage-labeled forgetting_matrix_*_stage{idx}_{label}.* artifact,
+#    and (c) clear the one-shot flag so a subsequent (un-forced) eval does NOT
+#    re-fire off-cadence.
+# --------------------------------------------------------------------------- #
+def _make_per_segment_trainer(model, tokenizer, ds, *, stage, label, exp_path,
+                              per_segment_eval_steps=1_000_000):
+    """Like _make_trainer but wires the per-segment forgetting path.
+
+    ``per_segment_eval_steps`` defaults huge so the periodic gate never trips --
+    only an explicit force_forgetting_pass() triggers a pass. This isolates the
+    forced-trigger behavior from cadence.
+    """
+    rgm = _run_module()
+    from transformers import TrainingArguments
+
+    collate = partial(rgm.collate_fn, tokenizer=tokenizer)
+    ignore = [tokenizer.convert_tokens_to_ids(c) for c in "!|"]
+    compute_metrics = partial(rgm.compute_metrics_fn, ignore_token_ids=ignore,
+                              tokenizer=tokenizer)
+    per_segment_collator = rgm.make_collate_fn_per_segment(
+        tokenizer, n_segments=model.n_segments, segment_size=model.segment_size)
+
+    args = TrainingArguments(
+        output_dir=exp_path, report_to=[], max_steps=1, no_cuda=True,
+        disable_tqdm=True, remove_unused_columns=False, include_for_metrics=["inputs"],
+        eval_strategy="no", save_strategy="no", per_device_train_batch_size=8,
+        per_device_eval_batch_size=8, logging_steps=1)
+    trainer = rgm.CurriculumTrainer(
+        model=model, args=args, train_dataset=ds, eval_dataset=ds,
+        data_collator=collate, compute_metrics=compute_metrics,
+        preprocess_logits_for_metrics=rgm.preprocess_logits_for_metrics,
+        callbacks=[rgm.CurriculumCallback(metric_name="exact_match", threshold=2.0)],
+        step_offset=0, curriculum_stage=stage, curriculum_stage_label=label,
+        per_segment_dataset=ds, per_segment_collator=per_segment_collator,
+        n_segments=(model.n_segments if model.segment_size is None else None),
+        segment_size=model.segment_size, tokenizer=tokenizer,
+        per_segment_eval_steps=per_segment_eval_steps, eval_steps=1,
+        exp_path=exp_path)
+    return trainer
+
+
+def test_forced_forgetting_pass_fires_at_stage_boundary():
+    import glob
+    import json as _json
+
+    tokenizer = _tokenizer()
+    # segmented adaptive model so forward_per_segment_eval has >=1 segment
+    model = _make_adaptive_model(n_segments=1, segment_size=8)
+    ds = _stage_dataset(4, seed=0)
+    exp_path = tempfile.mkdtemp(prefix="curr_force_")
+
+    trainer = _make_per_segment_trainer(
+        model, tokenizer, ds, stage=0, label="N4", exp_path=exp_path)
+
+    # No forced pass yet -> a plain evaluate() must NOT write any artifact.
+    # Step must be > 0 and off-cadence: at step 0 the modulo gate is trivially
+    # true (0 % N == 0), so move to step 1 with the huge cadence to avoid that
+    # edge case and isolate the forced-trigger behavior.
+    trainer.state.global_step = 1
+    with _quiet():
+        trainer.evaluate(ds)
+    artifacts = glob.glob(os.path.join(exp_path, "forgetting_matrix_*"))
+    assert artifacts == [], f"no artifact expected before force, got {artifacts}"
+
+    # Force a stage-boundary pass, then evaluate -> stage-labeled artifact appears.
+    trainer.force_forgetting_pass(stage_idx=0, stage_label="N4")
+    with _quiet():
+        trainer.evaluate(ds)
+    forced_json = glob.glob(os.path.join(exp_path, "forgetting_matrix_*_stage0_N4.json"))
+    forced_csv = glob.glob(os.path.join(exp_path, "forgetting_matrix_*_stage0_N4.csv"))
+    assert len(forced_json) == 1, f"expected 1 forced .json, got {forced_json}"
+    assert len(forced_csv) == 1, f"expected 1 forced .csv, got {forced_csv}"
+
+    # the artifact JSON carries the stage-tagging fields
+    with open(forced_json[0]) as f:
+        art = _json.load(f)
+    assert art.get("forced") is True, art
+    assert art.get("stage_idx") == 0, art
+    assert art.get("stage_label") == "N4", art
+    assert "matrix_exact_match" in art, art
+
+    # the one-shot flag cleared: another (un-forced) evaluate() writes nothing new
+    n_before = len(glob.glob(os.path.join(exp_path, "forgetting_matrix_*")))
+    with _quiet():
+        trainer.evaluate(ds)
+    n_after = len(glob.glob(os.path.join(exp_path, "forgetting_matrix_*")))
+    assert n_after == n_before, \
+        f"force flag must be one-shot; artifact count grew {n_before} -> {n_after}"
+
+    # the forced metrics also flow into the evaluate() return dict
+    trainer.force_forgetting_pass(stage_idx=0, stage_label="N4")
+    with _quiet():
+        m = trainer.evaluate(ds)
+    assert "forget_diag_mean" in m, f"forced metrics missing from eval return: {sorted(m)}"
+    print("  [force]  forced forgetting pass: stage0_N4 artifact written, "
+          "JSON tagged, one-shot reset, metrics returned OK")
+
+
 TESTS = [
     test_curriculum_callback_threshold_gate,
     test_curriculum_trainer_injects_stage_metadata_and_offset,
     test_curriculum_advances_when_threshold_reached,
     test_curriculum_stops_when_threshold_not_reached,
     test_curriculum_segmentation_handles_growing_context,
+    test_forced_forgetting_pass_fires_at_stage_boundary,
 ]
 
 

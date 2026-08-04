@@ -376,22 +376,6 @@ class CustomTrainer(Trainer):
         return super().log(logs, start_time=start_time)
 
 
-class CurriculumTrainer(CustomTrainer):
-    def __init__(self, *args, step_offset=0, curriculum_stage=0, curriculum_stage_label="", **kwargs):
-        super().__init__(*args, **kwargs)
-        self.step_offset = step_offset
-        self.curriculum_stage = curriculum_stage
-        self.curriculum_stage_label = curriculum_stage_label
-
-    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
-        logs['curriculum_stage'] = self.curriculum_stage
-        logs['curriculum_stage_label'] = self.curriculum_stage_label
-        original_step = self.state.global_step
-        self.state.global_step += self.step_offset
-        super().log(logs, start_time=start_time)
-        self.state.global_step = original_step
-
-
 class DualEvalTrainer(CustomTrainer):
     """Trainer that also runs a "without memory" (no-context) eval pass.
 
@@ -608,27 +592,68 @@ class PerSegmentForgettingTrainer(DualEvalTrainer):
         self.per_segment_eval_steps = per_segment_eval_steps
         self.eval_steps = eval_steps
         self.exp_path = exp_path
+        # One-shot flag: when set, the next evaluate() runs a forgetting pass
+        # regardless of the step-cadence gate, then clears itself. Used by the
+        # curriculum loop to force a matrix at every stage boundary.
+        self._force_forgetting = False
+        self._force_stage_idx = None
+        self._force_stage_label = None
+
+    def force_forgetting_pass(self, stage_idx=None, stage_label=None):
+        """Request a forgetting pass on the next evaluate(), bypassing cadence.
+
+        Used by the curriculum loop to guarantee a forgetting matrix snapshot at
+        each stage boundary. ``stage_idx`` / ``stage_label`` (when given) tag the
+        resulting artifact (stage-labeled filename + JSON fields) so forced
+        passes are distinguishable from periodic ones. The flag is one-shot: it
+        clears after the next evaluate() consumes it.
+        """
+        self._force_forgetting = True
+        self._force_stage_idx = stage_idx
+        self._force_stage_label = stage_label
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
         metrics = super().evaluate(
             eval_dataset=eval_dataset, ignore_keys=ignore_keys,
             metric_key_prefix=metric_key_prefix)
 
-        step = self.state.global_step
-        run_pass = (self.per_segment_eval_steps is not None
-                    and self.eval_steps is not None
-                    and self.per_segment_eval_steps > 0
-                    and step % self.per_segment_eval_steps == 0)
-        if not run_pass or self.per_segment_dataset is None:
+        if self.per_segment_dataset is None:
             return metrics
 
-        forget_metrics = self._forgetting_pass(step)
+        step = self.state.global_step
+        on_cadence = (self.per_segment_eval_steps is not None
+                      and self.eval_steps is not None
+                      and self.per_segment_eval_steps > 0
+                      and step % self.per_segment_eval_steps == 0)
+        forced = self._force_forgetting
+        # consume the one-shot force BEFORE the pass (so an exception in the pass
+        # still clears the flag)
+        force_stage_idx = self._force_stage_idx
+        force_stage_label = self._force_stage_label
+        self._force_forgetting = False
+        self._force_stage_idx = None
+        self._force_stage_label = None
+
+        if not (on_cadence or forced):
+            return metrics
+
+        forget_metrics = self._forgetting_pass(
+            step, stage_idx=force_stage_idx if forced else None,
+            stage_label=force_stage_label if forced else None,
+            forced=forced)
         for k, v in forget_metrics.items():
             metrics[k] = v
         return metrics
 
-    def _forgetting_pass(self, step):
-        """Run the per-segment forgetting pass and return summary metrics + write table."""
+    def _forgetting_pass(self, step, stage_idx=None, stage_label=None, forced=False):
+        """Run the per-segment forgetting pass and return summary metrics + write table.
+
+        ``stage_idx`` / ``stage_label`` / ``forced`` tag a curriculum stage-boundary
+        pass: the artifact gets a stage-labeled filename and the JSON gains
+        ``stage_idx`` / ``stage_label`` / ``forced`` fields, so forced passes are
+        distinguishable from periodic (cadence) ones. Periodic passes pass these
+        as None/False and keep the plain ``forgetting_matrix_step{N}`` name.
+        """
         import json as _json
         import csv as _csv
         from pathlib import Path as _Path
@@ -694,9 +719,17 @@ class PerSegmentForgettingTrainer(DualEvalTrainer):
         em_np = em.numpy()
 
         # ---- write matrix artifact (.json + .csv) ---- #
+        # Forced (curriculum stage-boundary) passes get a stage-labeled filename
+        # so they don't collide with periodic ones and are easy to find; periodic
+        # passes keep the plain forgetting_matrix_step{N} name.
         out_dir = _Path(self.exp_path) if self.exp_path else _Path('.')
         out_dir.mkdir(parents=True, exist_ok=True)
         rows = list(range(n_seg)); cols = list(range(n_seg))
+        if forced and stage_label is not None:
+            tag = f'_stage{stage_idx}_{stage_label}' if stage_idx is not None else f'_{stage_label}'
+            stem = f'forgetting_matrix_step{step}{tag}'
+        else:
+            stem = f'forgetting_matrix_step{step}'
         artifact = {
             'step': step,
             'n_segments': n_seg,
@@ -706,9 +739,15 @@ class PerSegmentForgettingTrainer(DualEvalTrainer):
                                     for k in cols] for s in rows],
             'count_per_cell': [[int(count_acc[s, k].item()) for k in cols] for s in rows],
         }
-        with open(out_dir / f'forgetting_matrix_step{step}.json', 'w') as f:
+        if forced:
+            artifact['forced'] = True
+            if stage_idx is not None:
+                artifact['stage_idx'] = stage_idx
+            if stage_label is not None:
+                artifact['stage_label'] = stage_label
+        with open(out_dir / f'{stem}.json', 'w') as f:
             _json.dump(artifact, f, indent=2)
-        with open(out_dir / f'forgetting_matrix_step{step}.csv', 'w', newline='') as f:
+        with open(out_dir / f'{stem}.csv', 'w', newline='') as f:
             w = _csv.writer(f)
             w.writerow(['source_seg\\probe_seg'] + [f'after_seg{k}' for k in cols])
             for s in rows:
@@ -745,6 +784,31 @@ class PerSegmentForgettingTrainer(DualEvalTrainer):
         metrics['forget_seg0_final'] = float(seg0_final) if not _isnan(seg0_final) else 0.0
         metrics['forget_slope'] = float(np.mean(drops)) if drops else 0.0
         return metrics
+
+
+class CurriculumTrainer(PerSegmentForgettingTrainer):
+    """PerSegmentForgettingTrainer + curriculum-stage logging and step offset.
+
+    Inherits the per-segment forgetting eval path so that, under curriculum
+    learning, the forgetting matrix can fire both on its periodic cadence AND be
+    forced at every stage boundary (see ``force_forgetting_pass``). When the
+    ``per_segment_*`` kwargs are absent (non-forgetting configs) the forgetting
+    path is a no-op, so this behaves exactly like the plain ``CustomTrainer``.
+    """
+
+    def __init__(self, *args, step_offset=0, curriculum_stage=0, curriculum_stage_label="", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.step_offset = step_offset
+        self.curriculum_stage = curriculum_stage
+        self.curriculum_stage_label = curriculum_stage_label
+
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        logs['curriculum_stage'] = self.curriculum_stage
+        logs['curriculum_stage_label'] = self.curriculum_stage_label
+        original_step = self.state.global_step
+        self.state.global_step += self.step_offset
+        super().log(logs, start_time=start_time)
+        self.state.global_step = original_step
 
 
 @dataclass
@@ -1217,6 +1281,30 @@ def main(config_path: Optional[str] = None):
 
         data_dir = Path(args.curriculum_data_dir)
 
+        # ---- per-segment forgetting eval setup (adaptive model only) ---- #
+        # Under curriculum, the forgetting matrix fires both on its periodic
+        # cadence (per_segment_eval_steps) AND is forced once at every stage
+        # boundary (see force_forgetting_pass below the stage loop). Setup mirrors
+        # the single-stage path so the two branches stay consistent.
+        use_per_segment_eval = bool(args.per_segment_eval) and use_adaptive_model
+        per_segment_collator = None
+        per_seg_n_segments = None
+        per_seg_eval_steps = None
+        if use_per_segment_eval:
+            per_seg_n_segments = args.n_segments if args.segment_size is None else None
+            per_segment_collator = make_collate_fn_per_segment(
+                tokenizer, max_context_length=args.max_context_length,
+                n_segments=args.n_segments, segment_size=args.segment_size)
+            per_seg_eval_steps = args.per_segment_eval_steps
+            if per_seg_eval_steps is None:
+                per_seg_eval_steps = 5 * args.eval_steps
+            assert per_seg_eval_steps % max(args.eval_steps, 1) == 0, \
+                f"per_segment_eval_steps ({per_seg_eval_steps}) must be a multiple of " \
+                f"eval_steps ({args.eval_steps})"
+            logger.info(f'curriculum per-segment forgetting eval enabled: '
+                        f'n_segments={args.n_segments}, segment_size={args.segment_size}, '
+                        f'cadence={per_seg_eval_steps} steps (+ forced at each stage boundary)')
+
         all_metrics = {}
         cumulative_steps = 0
         for stage_idx, level in enumerate(curriculum_levels):
@@ -1309,6 +1397,16 @@ def main(config_path: Optional[str] = None):
                 step_offset=cumulative_steps,
                 curriculum_stage=stage_idx,
                 curriculum_stage_label=label,
+                **({'per_segment_dataset': stage_dataset['valid'],
+                    'per_segment_collator': per_segment_collator,
+                    'n_segments': per_seg_n_segments,
+                    'segment_size': args.segment_size,
+                    'tokenizer': tokenizer,
+                    'per_segment_eval_steps': per_seg_eval_steps,
+                    'eval_steps': args.eval_steps,
+                    # per-stage folder so each stage's forgetting artifacts land
+                    # in stage_<idx>_<label>/ instead of the run root
+                    'exp_path': str(stage_output_dir)} if use_per_segment_eval else {}),
             )
 
             trainer.train()
@@ -1327,6 +1425,10 @@ def main(config_path: Optional[str] = None):
             else:
                 logger.info(f'curriculum stage {stage_idx} ({label}): threshold NOT reached, stopping curriculum')
 
+            # Force a forgetting-matrix snapshot at this stage boundary (bypasses
+            # the step-cadence gate; no-op when per-segment eval is disabled).
+            if use_per_segment_eval:
+                trainer.force_forgetting_pass(stage_idx=stage_idx, stage_label=label)
             metrics = trainer.evaluate(stage_dataset['valid'])
             all_metrics[f'stage_{stage_idx}_{label}'] = metrics
             logger.info(f'stage {stage_idx} ({label}) final metrics: {metrics}')
