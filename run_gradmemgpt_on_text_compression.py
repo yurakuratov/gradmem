@@ -60,12 +60,9 @@ def collate_fn(batch, tokenizer, max_context_length=None):
             ctx = ctx[:max_context_length*15]
         context += [ctx]
 
-    orig_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"
     context_encoded = tokenizer(context, return_tensors="pt", add_special_tokens=True,
                                 padding=True, pad_to_multiple_of=min(8, max_context_length),
                                 max_length=max_context_length, truncation=True)
-    tokenizer.padding_side = orig_padding_side
     context_input_ids = context_encoded['input_ids']
     query_input_ids = context_input_ids
 

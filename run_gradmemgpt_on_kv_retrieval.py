@@ -50,8 +50,6 @@ def collate_fn(batch, tokenizer, max_context_length=None, hopfield=False):
     context = [item['context'] for item in batch]
     query = [item['query'] + item['target'] for item in batch]
 
-    orig_padding_side = tokenizer.padding_side
-    tokenizer.padding_side = "left"
     if hopfield:
         context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
                                       padding=True, pad_to_multiple_of=8).input_ids
@@ -59,7 +57,6 @@ def collate_fn(batch, tokenizer, max_context_length=None, hopfield=False):
         context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
                                       padding=True, pad_to_multiple_of=8, max_length=max_context_length,
                                       truncation=True).input_ids
-    tokenizer.padding_side = orig_padding_side
     query_encoded = tokenizer(query, return_tensors="pt", add_special_tokens=True,
                               padding=True, pad_to_multiple_of=8, return_offsets_mapping=True)
     query_input_ids = query_encoded['input_ids']
@@ -473,7 +470,7 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
     """Build a collator that emits, per sample, the WRITE context PLUS one probe
     query per KV pair in the context (with the source model-segment of each KV).
 
-    Context tokenization is identical to ``collate_fn`` (left-padded). For each
+    Context tokenization is identical to ``collate_fn`` (right-padded). For each
     sample we regex the decoded context for ``!K:V!`` pairs and emit:
       query_input_ids: [n_kv, Q]   tokenizing ``?!K:`` for each KV
       target_ids:      [n_kv, T]   tokenizing ``V!|`` for each KV
@@ -491,12 +488,9 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
     def collate_fn_per_segment(batch, tokenizer, max_context_length=None):
         # --- context: identical to collate_fn ---
         context = [item['context'] for item in batch]
-        orig_padding_side = tokenizer.padding_side
-        tokenizer.padding_side = "left"
         context_input_ids = tokenizer(context, return_tensors="pt", add_special_tokens=True,
                                       padding=True, pad_to_multiple_of=8, max_length=max_context_length,
                                       truncation=True).input_ids
-        tokenizer.padding_side = orig_padding_side
 
         pad_id = tokenizer.pad_token_id
         B = len(batch)
@@ -509,12 +503,12 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
         # re-predicts the value tokens given the correct preceding tokens.
         #
         # KV->segment attribution MUST match the model's forward chunking. The
-        # model chunks the PADDED context (ctx_emb.size(1), which includes the
-        # left-pad the collator added) via ceil(padded_len / n_segments). So we
-        # attribute each KV by its position in the PADDED sequence: a KV at real
-        # char position ts sits at padded position (pad_count + ts), where
-        # pad_count = padded_len - real_len. This keeps the collator and the
-        # model on exactly the same segment boundaries.
+        # model chunks the PADDED context (ctx_emb.size(1)) via
+        # ceil(padded_len / n_segments). The collator right-pads, so a KV's real
+        # char position ts (1 char/token for the KV alphabet) is already its
+        # position in the PADDED sequence (pad tokens sit to the right of the
+        # real tokens). This keeps the collator and the model on exactly the
+        # same segment boundaries.
         padded_len = context_input_ids.size(1)
         per_sample = []  # list of [(q_ids, target_mask, seg_idx), ...]
         for b_idx, item in enumerate(batch):
@@ -523,8 +517,6 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
             for m in _re.finditer(r'!([^!|:]+):([^!|]+)!', text):
                 k, v = m.group(1), m.group(2)
                 pairs.append((m.start(), m.end(), k, v))
-            real_len = len(text)
-            pad_count = padded_len - real_len   # left-pad tokens for this sample
             if segment_size is not None:
                 n_seg = max(1, math.ceil(padded_len / segment_size))
                 seg_sz = segment_size
@@ -533,9 +525,10 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
                 seg_sz = max(1, math.ceil(padded_len / n_seg))
             sample_pairs = []
             for ts, te, k, v in pairs:
-                # KV's token span in the PADDED coordinate (matches forward)
-                pad_ts = pad_count + ts
-                pad_te = pad_count + te
+                # KV's token span in the PADDED coordinate (matches forward).
+                # Under right-padding the real position ts is the padded position.
+                pad_ts = ts
+                pad_te = te
                 src_seg = None
                 for si in range(n_seg):
                     sstart = si * seg_sz

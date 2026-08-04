@@ -879,12 +879,6 @@ class GradMemGPT(PreTrainedModel):
                 torch.tensor(probe_seg_list, dtype=torch.long, device=device),
                 torch.tensor(em_list, dtype=torch.bool, device=device))
 
-        # segment bounds must match forward()'s chunking: forward chunks the
-        # PADDED context (ctx_emb.size(1), incl. left-pad), so use the full
-        # tensor length here, not the real-token count.
-        seq_len_padded = context_input_ids.size(1)
-        n_seg, seg_sz, _ = self._segment_bounds(seq_len_padded, self.n_segments, self.segment_size)
-
     def forward(self, input_ids, labels=None, return_mem=False, collect_segment_mems=False):
         # context_input_ids : B × S   (segments only, each ends with `|`)
         # query_input_ids   : B × Q   (e.g.  "?!K:V!|") i.e. the last segment
@@ -977,10 +971,10 @@ class GradMemGPT(PreTrainedModel):
                     segment_size = (seq_len + n_segments - 1) // n_segments  # ceil division
                 pad_len = segment_size * n_segments - seq_len
                 if pad_len > 0:
-                    # left-pad so real tokens keep their trailing `|` boundary at segment ends
-                    ctx_emb = F.pad(ctx_emb, [0, 0, pad_len, 0], "constant", 0)
-                    mask = F.pad(mask, [pad_len, 0], "constant", 0)
-                    lm_labels = F.pad(lm_labels, [pad_len, 0], "constant", -100)
+                    # right-pad so real tokens keep their trailing `|` boundary at segment ends
+                    ctx_emb = F.pad(ctx_emb, [0, 0, 0, pad_len], "constant", 0)
+                    mask = F.pad(mask, [0, pad_len], "constant", 0)
+                    lm_labels = F.pad(lm_labels, [0, pad_len], "constant", -100)
 
                 # per-segment memory snapshots (eval-only forgetting probe): one
                 # detached copy of the carried state after each segment's K steps.
@@ -1023,17 +1017,6 @@ class GradMemGPT(PreTrainedModel):
                             b_batch = b_batch.requires_grad_(True)
                     opt_state = {}
 
-                    # build attention mask + position_ids for this segment so that
-                    # left-pad positions are neither attended to nor counted in positions
-                    cur_mem_attn_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
-                    if self.n_ctrl_tokens > 0:
-                        cur_ctrl_attn_mask = torch.ones(B, self.n_ctrl_tokens, dtype=torch.long, device=device)
-                        cur_attn_mask = torch.cat([cur_ctrl_attn_mask, cur_mem_attn_mask,
-                                                   cur_ctrl_attn_mask, seg_mask.long()], dim=1)
-                    else:
-                        cur_attn_mask = torch.cat([cur_mem_attn_mask, seg_mask.long()], dim=1)
-                    cur_position_ids = (cur_attn_mask.cumsum(-1) - 1).clamp(min=0)
-
                     for k in range(self.K):
                         if self.mem_proj_mode == 'none':
                             mem_inp = mem_batch
@@ -1048,15 +1031,13 @@ class GradMemGPT(PreTrainedModel):
                             x_ctx = torch.cat([mem_inp, seg_emb], dim=1)    # [B,M+seg_size,d]
 
                         if self.use_write_head:
-                            outs = get_backbone(self.model)(inputs_embeds=x_ctx, attention_mask=cur_attn_mask,
-                                                            position_ids=cur_position_ids, return_dict=True)
+                            outs = get_backbone(self.model)(inputs_embeds=x_ctx, return_dict=True)
                             h = outs.last_hidden_state                     # [B,M+seg_size,V]
                             h = h[:, mem_offset-1:, :]                     # [B,seg_size,V]
                             logits = self.write_head(h)
                             del h
                         else:
-                            outs = self.model(inputs_embeds=x_ctx, attention_mask=cur_attn_mask,
-                                              position_ids=cur_position_ids, return_dict=True)
+                            outs = self.model(inputs_embeds=x_ctx, return_dict=True)
                             logits = outs.logits                           # [B,M+seg_size,V]
                             logits = logits[:, mem_offset-1:, :]           # [B,seg_size,V]
 
