@@ -184,26 +184,46 @@ collect_env_state() {
 }
 
 # Prepare lock-dir based run state and collect metadata.
-# Usage: prepare_locked_run <exp_path> <launch_script_path> <np>
+# Usage: prepare_locked_run <exp_path> <launch_script_path> <np> [allow_existing]
 prepare_locked_run() {
   local exp_path="${1:?exp_path is required}"
   local launch_script_path="${2:?launch_script_path is required}"
   local np="${3:?np is required}"
+  local allow_existing="${4:-false}"
   local lock_dir="${exp_path}.lock"
 
   mkdir -p "$(dirname "$exp_path")"
 
   # If already completed / running / created, skip.
-  if [[ -d "$exp_path" ]]; then
+  if [[ -d "$exp_path" && "$allow_existing" != "true" ]]; then
     echo "[SKIP] exists: $exp_path"
     return 1
   fi
 
-  # Atomically claim this run slot (lock).
+  # Atomically claim this run slot (lock). A resume may reclaim a lock left by
+  # a launcher that is no longer alive, while preserving its diagnostics.
   if ! mkdir "$lock_dir" 2>/dev/null; then
-    echo "[SKIP] locked: $exp_path"
-    return 1
+    if [[ "$allow_existing" == "true" && -f "$lock_dir/launcher.pid" ]]; then
+      local lock_pid
+      read -r lock_pid < "$lock_dir/launcher.pid" || true
+      if [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+        local stale_lock_dir="${lock_dir}.stale.$(date +%Y%m%d%H%M%S).$$"
+        if ! mv "$lock_dir" "$stale_lock_dir" || ! mkdir "$lock_dir"; then
+          echo "[SKIP] could not reclaim stale lock: $exp_path"
+          return 1
+        fi
+        echo "[RESUME] archived stale lock: $stale_lock_dir"
+      else
+        echo "[SKIP] locked by active launcher PID ${lock_pid:-unknown}: $exp_path"
+        return 1
+      fi
+    else
+      echo "[SKIP] locked: $exp_path"
+      return 1
+    fi
   fi
+
+  printf '%s\n' "$$" > "$lock_dir/launcher.pid"
 
   RUN_LOCK_DIR="$lock_dir"
   RUN_LOCK_METADATA_DIR="$RUN_LOCK_DIR/$COLLECT_ENV_STATE_SUBDIR"

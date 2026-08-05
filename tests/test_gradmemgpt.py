@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import pytest
 import torch
 from transformers import GPT2Config, GPTNeoXConfig, LlamaConfig
@@ -172,6 +174,11 @@ def test_forward(model_family: str, memory_backend: str):
     assert torch.isfinite(stats["inner_grad_norm_mean"]).item()
     assert torch.isfinite(stats["delta_mem_norm_mean"]).item()
     assert torch.isfinite(stats["inner_loss"]).item()
+    assert torch.isfinite(stats["inner_reconstruction_loss"]).item()
+    assert torch.isfinite(stats["inner_reconstruction_loss_after_write"]).item()
+    assert torch.isfinite(stats["inner_loss_after_write"]).item()
+    assert "inner_energy_loss" not in stats
+    assert "inner_energy_loss_after_write" not in stats
     assert stats["inner_grad_norm_mean"].item() >= 0
     assert stats["delta_mem_norm_mean"].item() >= 0
 
@@ -599,7 +606,9 @@ def test_forward_prefix_energy_objective():
     assert "inner_loss_after_write" in stats
     assert "inner_loss_initial" in stats
     assert "inner_loss_write_delta" in stats
+    assert "inner_reconstruction_loss" in stats
     assert "inner_energy_loss" in stats
+    assert "inner_reconstruction_loss_after_write" in stats
     assert "inner_energy_loss_after_write" in stats
     assert "energy_rank_loss" in stats
     assert "energy_traj_loss" in stats
@@ -662,6 +671,44 @@ def test_single_batch_train_prefix_energy_objective():
     assert all(torch.isfinite(g).all().item() for g in energy_grads)
     assert model.energy_ln.weight.grad is not None
     assert torch.isfinite(model.energy_ln.weight.grad).all().item()
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_layerwise_energy_sums_transformer_layer_energies():
+    torch.manual_seed(0)
+    base_config = _build_base_config("gpt2")
+    model = GradMemGPT(GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        n_mem_tokens=4,
+        K=1,
+        grad_mode="none",
+        write_objective="energy",
+        use_layerwise_energy=True,
+    ))
+
+    batch_size = 2
+    sequence_length = 7
+    context_start = 3
+    hidden_states = tuple(
+        torch.randn(batch_size, sequence_length, base_config.n_embd)
+        for _ in range(base_config.n_layer)
+    )
+    write_batch = {
+        "context_start": context_start,
+        "mask": torch.ones(batch_size, sequence_length - context_start),
+    }
+
+    energy = model._compute_write_energy(hidden_states, write_batch)
+    expected = []
+    for layer_hidden, layer_norm, energy_head in zip(hidden_states, model.energy_ln, model.energy_head):
+        context_hidden = layer_hidden[:, context_start:, :]
+        token_energy = torch.nn.functional.softplus(energy_head(layer_norm(context_hidden))).squeeze(-1)
+        expected.append(token_energy.mean(dim=1))
+
+    assert len(model.energy_head) == base_config.n_layer
+    assert torch.allclose(energy, torch.stack(expected).sum(dim=0))
 
 
 @pytest.mark.forward
@@ -980,6 +1027,128 @@ def test_energy_negative_memory_geometry():
     assert singleton_negatives["interpolated"] is None
     assert torch.allclose(singleton_negatives["random"], singleton.detach())
     assert torch.isfinite(singleton_negatives["random"]).all().item()
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_energy_memory_search_candidate_geometry():
+    torch.manual_seed(0)
+    model, _, _ = _build_shaped_energy_model(
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        energy_memory_search_num_samples=5,
+        energy_memory_search_radius_scale=0.25,
+    )
+    memory = torch.randn(3, 4, 8, requires_grad=True)
+    previous = memory.detach() + 0.1 * torch.randn_like(memory)
+
+    candidates = model._sample_norm_preserving_memory_candidates(memory, previous)
+
+    assert candidates.shape == (5, 3, 4, 8)
+    assert not candidates.requires_grad
+    expected_norm = memory.detach().flatten(1).norm(dim=1)
+    candidate_norm = candidates.flatten(2).norm(dim=2)
+    assert torch.allclose(candidate_norm, expected_norm.unsqueeze(0), atol=1e-5, rtol=1e-5)
+    expected_radius = 0.25 * (memory.detach() - previous).flatten(1).norm(dim=1)
+    candidate_radius = (candidates - memory.detach().unsqueeze(0)).flatten(2).norm(dim=2)
+    assert torch.allclose(candidate_radius, expected_radius.unsqueeze(0), atol=1e-5, rtol=1e-5)
+
+    unchanged = model._sample_norm_preserving_memory_candidates(memory, memory.detach())
+    assert torch.allclose(unchanged, memory.detach().unsqueeze(0).expand_as(unchanged))
+    zero = torch.zeros_like(memory)
+    zero_candidates = model._sample_norm_preserving_memory_candidates(zero, previous)
+    assert torch.equal(zero_candidates, zero.unsqueeze(0).expand_as(zero_candidates))
+    assert torch.isfinite(zero_candidates).all().item()
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_energy_memory_search_selects_best_candidate_per_example():
+    class FakeBackend:
+        @staticmethod
+        def build_read_inputs(memory_state, _batch_ctx):
+            return {
+                "inputs_embeds": memory_state["mem_batch"],
+                "logits_start": 0,
+                "pred_len": 2,
+                "label_shift": 0,
+            }
+
+        @staticmethod
+        def activation_context(_memory_state):
+            return nullcontext()
+
+    class FakeReadModel(torch.nn.Module):
+        def forward(self, inputs_embeds, return_dict=True, **_kwargs):
+            del return_dict
+            logits = inputs_embeds.new_zeros(inputs_embeds.size(0), 2, 2)
+            logits[:, 0, 0] = inputs_embeds[:, 0, 0]
+            return type("FakeOutput", (), {"logits": logits})()
+
+    model, _, _ = _build_shaped_energy_model(
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        energy_memory_search_num_samples=2,
+    )
+    original_read_model = model.model
+    model.model = FakeReadModel()
+    student = torch.zeros(2, 1, 1, requires_grad=True)
+    perturbed = torch.tensor([
+        [[[4.0]], [[-4.0]]],
+        [[[-4.0]], [[4.0]]],
+    ])
+    model._sample_norm_preserving_memory_candidates = lambda *_args: perturbed
+    try:
+        result = model._compute_energy_memory_search_loss(
+            FakeBackend(),
+            {"mem_batch": student},
+            torch.zeros_like(student),
+            {},
+            torch.zeros(2, 1, dtype=torch.long),
+        )
+    finally:
+        model.model = original_read_model
+
+    assert result["loss"].item() == pytest.approx(8.0)
+    assert result["improvement_rate"].item() == pytest.approx(1.0)
+    assert result["target_gain"].item() > 0.0
+    assert result["max_target_gain"].item() >= result["target_gain"].item()
+    assert result["per_example_loss"].shape == (2,)
+    assert result["relative_target_gain"].shape == (2,)
+    assert torch.all(result["relative_target_gain"] > 0.0)
+    result["loss"].backward()
+    assert student.grad is not None
+    assert torch.all(student.grad < 0.0)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_energy_memory_search_gain_weight_ema_uses_positive_relative_gains():
+    model, _, _ = _build_shaped_energy_model(
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        energy_memory_search_use_gain_weighting=True,
+        energy_memory_search_gain_ema_decay=0.99,
+    )
+    first_gains = torch.tensor([[0.0, 0.1], [0.2, 0.3]])
+    first_weights = model._compute_energy_memory_search_gain_weights(first_gains)
+    assert model.energy_memory_search_gain_ema_initialized.item()
+    assert model.energy_memory_search_gain_ema.item() == pytest.approx(0.2)
+    assert torch.allclose(first_weights, torch.tensor([[0.0, 0.5], [1.0, 1.5]]))
+    assert first_weights[first_gains > 0.0].mean().item() == pytest.approx(1.0)
+
+    second_gains = torch.tensor([[0.4, 0.0]])
+    second_weights = model._compute_energy_memory_search_gain_weights(second_gains)
+    expected_ema = 0.99 * 0.2 + 0.01 * 0.4
+    assert model.energy_memory_search_gain_ema.item() == pytest.approx(expected_ema)
+    assert second_weights[0, 0].item() == pytest.approx(0.4 / expected_ema)
+    ema_before_zero_batch = model.energy_memory_search_gain_ema.clone()
+    zero_weights = model._compute_energy_memory_search_gain_weights(torch.zeros(2, 2))
+    assert torch.equal(zero_weights, torch.zeros_like(zero_weights))
+    assert torch.equal(model.energy_memory_search_gain_ema, ema_before_zero_batch)
 
 
 def _build_shaped_energy_model(batch_size=2, **config_overrides):
@@ -1435,7 +1604,22 @@ def test_trainer_and_eval_metrics_preserve_active_only_schema(tmp_path, shaping_
             assert key in exported
             assert torch.isfinite(torch.tensor(exported[key])).item()
 
-    shaping_keys = set(TRAIN_COMPONENT_KEYS) - {"outer_loss", "target_loss"}
+    diagnostic_keys = {
+        "memory_alignment_loss",
+        "memory_alignment_cosine",
+        "step_alignment_loss",
+        "step_alignment_cosine",
+        "intermediate_read_loss",
+        "orthogonal_loss",
+        "orthogonal_residual_dot",
+        "orthogonal_alpha",
+        "energy_memory_search_loss",
+    }
+    for exported in (logged, metrics):
+        assert diagnostic_keys <= exported.keys()
+        assert all(torch.isfinite(torch.tensor(exported[key])).item() for key in diagnostic_keys)
+
+    shaping_keys = set(TRAIN_COMPONENT_KEYS) - {"outer_loss", "target_loss"} - diagnostic_keys
     if not shaping_active:
         assert shaping_keys.isdisjoint(logged)
         assert shaping_keys.isdisjoint(metrics)

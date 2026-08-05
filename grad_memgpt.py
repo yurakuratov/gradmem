@@ -87,8 +87,8 @@ class GradMemGPTConfig(PretrainedConfig):
                  use_gradient_checkpointing=False,
                  attn_implementation="eager",
                  write_objective="reconstruction",
-                  energy_head_hidden_dim=None,
-                  use_layerwise_energy=False,
+                 energy_head_hidden_dim=None,
+                 use_layerwise_energy=False,
                  write_reconstruction_weight=1.0,
                  write_energy_weight=1.0,
                  energy_rank_weight=0.0,
@@ -97,20 +97,22 @@ class GradMemGPTConfig(PretrainedConfig):
                  energy_traj_margin=0.0,
                  energy_rank_temperature=1.0,
                  energy_mix_alpha=0.75,
-                  energy_anchor_weight=0.0,
-                  add_inner_loss_to_outer=False,
-                  inner_loss_weight=None,
-                  memory_alignment_weight=0.0,
-                  step_alignment_weight=0.0,
-                  grad_align_norm="none",
-                  intermediate_read_weight=0.0,
-                  orthogonal_loss_weight=0.0,
-                  energy_memory_search_weight=0.0,
-                  energy_memory_search_num_samples=4,
-                  energy_memory_search_radius_scale=0.25,
-                  energy_memory_search_use_gain_weighting=False,
-                  energy_memory_search_gain_ema_decay=0.99,
-                  **kwargs):
+                 energy_anchor_weight=0.0,
+                 energy_memory_search_weight=0.0,
+                 energy_memory_search_num_samples=4,
+                 energy_memory_search_radius_scale=0.25,
+                 energy_memory_search_use_gain_weighting=False,
+                 energy_memory_search_gain_ema_decay=0.99,
+                 energy_memory_search_use_best_for_next_step=False,
+                 add_inner_loss_to_outer=False,
+                 inner_loss_weight=None,
+                 memory_alignment_weight=0.0,
+                 step_alignment_weight=0.0,
+                 grad_align_norm="none",
+                 intermediate_read_weight=0.0,
+                 orthogonal_loss_weight=0.0,
+                 ivan_loss_weight=0.0,
+                 **kwargs):
         """
         Args:
             pretrained_model: str, name of pretrained model to load (e.g., 'gpt2')
@@ -152,6 +154,7 @@ class GradMemGPTConfig(PretrainedConfig):
             write_objective: str, inner WRITE objective ("reconstruction", "energy", or
                 "energy_with_reconstruction")
             energy_head_hidden_dim: int|None, hidden dim for energy MLP; defaults to backbone hidden size
+            use_layerwise_energy: bool, use a separate energy head at each transformer layer and sum them
             write_reconstruction_weight: float, reconstruction loss weight for energy_with_reconstruction
             write_energy_weight: float, energy loss weight for energy_with_reconstruction
             energy_rank_weight: float, optional context-memory contrastive ranking loss weight
@@ -161,19 +164,30 @@ class GradMemGPTConfig(PretrainedConfig):
             energy_rank_temperature: float, softplus temperature for contrastive ranking losses
             energy_mix_alpha: float, positive-memory coefficient for interpolated negatives
             energy_anchor_weight: float, optional energy-magnitude anchoring loss weight
+            energy_memory_search_weight: float, weight for matching each WRITE state to a locally
+                perturbed memory with lower downstream READ loss
+            energy_memory_search_num_samples: int, number of perturbed candidates per WRITE state
+            energy_memory_search_radius_scale: float, candidate chord radius as a fraction of the
+                preceding WRITE-step displacement
+            energy_memory_search_use_gain_weighting: bool, weight selected-memory matching by its
+                detached relative READ-loss improvement
+            energy_memory_search_gain_ema_decay: float, decay for the positive-gain mean used to
+                normalize memory-search gain weights
+            energy_memory_search_use_best_for_next_step: bool, use a straight-through copy of the
+                selected target-guided memory as the starting point for the next WRITE step
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
             memory_alignment_weight: float, weight for aligning the cumulative WRITE direction with the
                 stopped READ gradient on the final prefix memory
-            step_alignment_weight: float, weight for aligning the final WRITE update with its READ gradient
-            grad_align_norm: str, step-alignment normalization ("none" or "norm")
-            intermediate_read_weight: float, weight for READ supervision on intermediate WRITE states
-            orthogonal_loss_weight: float, weight for making the residual WRITE update orthogonal to READ gradient
-            energy_memory_search_weight: float, weight for matching WRITE memory to a better READ candidate
-            energy_memory_search_num_samples: int, number of perturbation candidates
-            energy_memory_search_radius_scale: float, perturbation radius relative to the WRITE step
-            energy_memory_search_use_gain_weighting: bool, scale teacher matching by relative READ gain
-            energy_memory_search_gain_ema_decay: float, EMA decay for positive relative gains
+            step_alignment_weight: float, weight for aligning each inner-loop memory update with the
+                stopped READ gradient at the resulting memory state
+            grad_align_norm: str, step-alignment normalization ("none" or "norm"); "norm" weights
+                each per-sample cosine loss by the stopped task-gradient norm
+            intermediate_read_weight: float, weight for reverse-harmonic READ supervision on M_1...M_(K-1)
+            orthogonal_loss_weight: float, weight for enforcing that the scaled stopped outer gradient
+                leaves a residual inner update orthogonal to the outer gradient
+            ivan_loss_weight: float, weight for the squared inner product between the outer gradient
+                and the difference of the summed WRITE gradients and outer gradient
         """
         super().__init__(**kwargs)
 
@@ -228,6 +242,12 @@ class GradMemGPTConfig(PretrainedConfig):
         self.energy_rank_temperature = energy_rank_temperature
         self.energy_mix_alpha = energy_mix_alpha
         self.energy_anchor_weight = energy_anchor_weight
+        self.energy_memory_search_weight = energy_memory_search_weight
+        self.energy_memory_search_num_samples = energy_memory_search_num_samples
+        self.energy_memory_search_radius_scale = energy_memory_search_radius_scale
+        self.energy_memory_search_use_gain_weighting = energy_memory_search_use_gain_weighting
+        self.energy_memory_search_gain_ema_decay = energy_memory_search_gain_ema_decay
+        self.energy_memory_search_use_best_for_next_step = energy_memory_search_use_best_for_next_step
         self.add_inner_loss_to_outer = add_inner_loss_to_outer
         self.inner_loss_weight = inner_loss_weight
         self.memory_alignment_weight = memory_alignment_weight
@@ -235,11 +255,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.grad_align_norm = grad_align_norm
         self.intermediate_read_weight = intermediate_read_weight
         self.orthogonal_loss_weight = float(orthogonal_loss_weight or 0.0)
-        self.energy_memory_search_weight = energy_memory_search_weight
-        self.energy_memory_search_num_samples = energy_memory_search_num_samples
-        self.energy_memory_search_radius_scale = energy_memory_search_radius_scale
-        self.energy_memory_search_use_gain_weighting = energy_memory_search_use_gain_weighting
-        self.energy_memory_search_gain_ema_decay = energy_memory_search_gain_ema_decay
+        self.ivan_loss_weight = float(ivan_loss_weight or 0.0)
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -259,40 +275,85 @@ class GradMemGPTConfig(PretrainedConfig):
             raise ValueError("energy_rank_temperature must be > 0")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
             raise ValueError("energy_mix_alpha must be within [0, 1]")
+        if not math.isfinite(self.energy_memory_search_weight) or self.energy_memory_search_weight < 0.0:
+            raise ValueError("energy_memory_search_weight must be finite and >= 0")
+        if self.energy_memory_search_num_samples < 1:
+            raise ValueError("energy_memory_search_num_samples must be >= 1")
+        if (
+            not math.isfinite(self.energy_memory_search_radius_scale)
+            or self.energy_memory_search_radius_scale <= 0.0
+        ):
+            raise ValueError("energy_memory_search_radius_scale must be finite and > 0")
+        if (
+            not math.isfinite(self.energy_memory_search_gain_ema_decay)
+            or not 0.0 <= self.energy_memory_search_gain_ema_decay < 1.0
+        ):
+            raise ValueError("energy_memory_search_gain_ema_decay must be finite and within [0, 1)")
+        if self.energy_memory_search_weight > 0.0:
+            if self.write_objective not in ("energy", "energy_with_reconstruction"):
+                raise ValueError("energy_memory_search_weight > 0 requires an energy WRITE objective")
+            if self.memory_backend != "prefix":
+                raise ValueError("energy_memory_search_weight > 0 requires memory_backend='prefix'")
+            if self.K <= 0:
+                raise ValueError("energy_memory_search_weight > 0 requires K > 0")
+            if self.grad_mode != "second" or self.last_K_second_order != self.K:
+                raise ValueError(
+                    "energy_memory_search_weight > 0 requires all K WRITE steps to be second order"
+                )
+            if self.use_adam:
+                raise ValueError("energy_memory_search_weight > 0 requires SGD WRITE updates")
+        if self.energy_memory_search_use_best_for_next_step and self.energy_memory_search_weight <= 0.0:
+            raise ValueError(
+                "energy_memory_search_use_best_for_next_step requires energy_memory_search_weight > 0"
+            )
         if self.memory_alignment_weight < 0.0:
             raise ValueError("memory_alignment_weight must be >= 0")
+        if self.step_alignment_weight < 0.0:
+            raise ValueError("step_alignment_weight must be >= 0")
+        if self.grad_align_norm not in ("none", "norm"):
+            raise ValueError("grad_align_norm must be one of: none, norm")
+        if self.intermediate_read_weight < 0.0:
+            raise ValueError("intermediate_read_weight must be >= 0")
+        if self.orthogonal_loss_weight < 0.0:
+            raise ValueError("orthogonal_loss_weight must be >= 0")
+        if self.ivan_loss_weight < 0.0:
+            raise ValueError("ivan_loss_weight must be >= 0")
+        if self.ivan_loss_weight > 0.0:
+            if self.grad_mode != "second":
+                raise ValueError("ivan_loss_weight > 0 requires grad_mode='second'")
+            if self.K <= 0:
+                raise ValueError("ivan_loss_weight > 0 requires K > 0")
+            if self.last_K_second_order != self.K:
+                raise ValueError("ivan_loss_weight > 0 requires all K steps to be second order")
+        if self.orthogonal_loss_weight > 0.0:
+            if self.memory_backend != "prefix":
+                raise ValueError("orthogonal_loss_weight > 0 requires memory_backend='prefix'")
+            if self.grad_mode != "second":
+                raise ValueError("orthogonal_loss_weight > 0 requires grad_mode='second'")
+            if self.K <= 0:
+                raise ValueError("orthogonal_loss_weight > 0 requires K > 0")
+            if self.last_K_second_order <= 0:
+                raise ValueError("orthogonal_loss_weight > 0 requires last_K_second_order > 0")
+            if self.lr <= 0.0:
+                raise ValueError("orthogonal_loss_weight > 0 requires lr > 0")
         if self.memory_alignment_weight > 0.0:
             if self.memory_backend != "prefix":
                 raise ValueError("memory_alignment_weight > 0 requires memory_backend='prefix'")
             if self.grad_mode != "second":
                 raise ValueError("memory_alignment_weight > 0 requires grad_mode='second'")
-            if self.K <= 0 or self.last_K_second_order <= 0:
-                raise ValueError("memory_alignment_weight > 0 requires a second-order WRITE step")
-        if self.step_alignment_weight < 0.0:
-            raise ValueError("step_alignment_weight must be >= 0")
-        if self.grad_align_norm not in ("none", "norm"):
-            raise ValueError("grad_align_norm must be one of: none, norm")
+            if self.K <= 0:
+                raise ValueError("memory_alignment_weight > 0 requires K > 0")
+            if self.last_K_second_order <= 0:
+                raise ValueError("memory_alignment_weight > 0 requires last_K_second_order > 0")
         if self.step_alignment_weight > 0.0:
-            if self.memory_backend != "prefix" or self.grad_mode != "second" or self.K <= 0:
-                raise ValueError("step_alignment_weight requires second-order prefix WRITE")
-        if self.intermediate_read_weight < 0.0:
-            raise ValueError("intermediate_read_weight must be >= 0")
-        if self.orthogonal_loss_weight < 0.0:
-            raise ValueError("orthogonal_loss_weight must be >= 0")
-        if self.orthogonal_loss_weight > 0.0:
-            if self.memory_backend != "prefix" or self.grad_mode != "second" or self.K <= 0 or self.lr <= 0.0:
-                raise ValueError("orthogonal_loss_weight requires second-order prefix WRITE with lr > 0")
-        if self.energy_memory_search_weight < 0.0 or self.energy_memory_search_num_samples < 1:
-            raise ValueError("energy_memory_search parameters must be non-negative with at least one sample")
-        if self.energy_memory_search_radius_scale <= 0.0:
-            raise ValueError("energy_memory_search_radius_scale must be > 0")
-        if not 0.0 <= self.energy_memory_search_gain_ema_decay < 1.0:
-            raise ValueError("energy_memory_search_gain_ema_decay must be within [0, 1)")
-        if self.energy_memory_search_weight > 0.0:
-            if self.memory_backend != "prefix" or self.write_objective not in ("energy", "energy_with_reconstruction"):
-                raise ValueError("energy_memory_search_weight requires prefix energy WRITE")
-            if self.grad_mode != "second" or self.last_K_second_order != self.K or self.use_adam:
-                raise ValueError("energy_memory_search_weight requires full second-order SGD WRITE")
+            if self.memory_backend != "prefix":
+                raise ValueError("step_alignment_weight > 0 requires memory_backend='prefix'")
+            if self.grad_mode != "second":
+                raise ValueError("step_alignment_weight > 0 requires grad_mode='second'")
+            if self.K <= 0:
+                raise ValueError("step_alignment_weight > 0 requires K > 0")
+            if self.last_K_second_order <= 0:
+                raise ValueError("step_alignment_weight > 0 requires last_K_second_order > 0")
         if self.memory_backend == "lora":
             assert self.lora_mem_placement in ["between_layers", "target_modules"], (
                 "lora_mem_placement currently supports: 'between_layers', 'target_modules'"
@@ -309,7 +370,14 @@ class MemoryBackend:
         yield
 
     def snapshot_memory_state(self, memory_state):
-        return dict(memory_state)
+        def snapshot(value):
+            if isinstance(value, dict):
+                return {key: snapshot(item) for key, item in value.items()}
+            if isinstance(value, tuple):
+                return tuple(snapshot(item) for item in value)
+            return value
+
+        return snapshot(memory_state)
 
 
 class InputPrefixMemoryBackend(MemoryBackend):
@@ -833,28 +901,63 @@ class GradMemGPT(PreTrainedModel):
         self.energy_rank_temperature = float(getattr(config, "energy_rank_temperature", 1.0))
         self.energy_mix_alpha = float(getattr(config, "energy_mix_alpha", 0.75))
         self.energy_anchor_weight = float(getattr(config, "energy_anchor_weight", 0.0) or 0.0)
-        self.memory_alignment_weight = float(getattr(config, "memory_alignment_weight", 0.0) or 0.0)
-        self.step_alignment_weight = float(getattr(config, "step_alignment_weight", 0.0) or 0.0)
-        self.grad_align_norm = getattr(config, "grad_align_norm", "none")
-        self.intermediate_read_weight = float(getattr(config, "intermediate_read_weight", 0.0) or 0.0)
-        self.orthogonal_loss_weight = float(getattr(config, "orthogonal_loss_weight", 0.0) or 0.0)
-        self.energy_memory_search_weight = float(getattr(config, "energy_memory_search_weight", 0.0) or 0.0)
-        self.energy_memory_search_num_samples = int(getattr(config, "energy_memory_search_num_samples", 4))
-        self.energy_memory_search_radius_scale = float(getattr(config, "energy_memory_search_radius_scale", 0.25))
+        self.energy_memory_search_weight = float(
+            getattr(config, "energy_memory_search_weight", 0.0) or 0.0
+        )
+        self.energy_memory_search_num_samples = int(
+            getattr(config, "energy_memory_search_num_samples", 4)
+        )
+        self.energy_memory_search_radius_scale = float(
+            getattr(config, "energy_memory_search_radius_scale", 0.25)
+        )
         self.energy_memory_search_use_gain_weighting = bool(
             getattr(config, "energy_memory_search_use_gain_weighting", False)
         )
         self.energy_memory_search_gain_ema_decay = float(
             getattr(config, "energy_memory_search_gain_ema_decay", 0.99)
         )
-        self.register_buffer("energy_memory_search_gain_ema", torch.tensor(0.0))
-        self.register_buffer("energy_memory_search_gain_ema_initialized", torch.tensor(False))
-        alpha_init = self.lr if self.lr > 20.0 else math.log(math.expm1(self.lr))
-        self.orthogonal_alpha_raw = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+        self.energy_memory_search_use_best_for_next_step = bool(
+            getattr(config, "energy_memory_search_use_best_for_next_step", False)
+        )
+        self.memory_alignment_weight = float(getattr(config, "memory_alignment_weight", 0.0) or 0.0)
+        self.step_alignment_weight = float(getattr(config, "step_alignment_weight", 0.0) or 0.0)
+        self.grad_align_norm = getattr(config, "grad_align_norm", "none")
+        self.intermediate_read_weight = float(getattr(config, "intermediate_read_weight", 0.0) or 0.0)
+        self.orthogonal_loss_weight = float(getattr(config, "orthogonal_loss_weight", 0.0) or 0.0)
+        self.ivan_loss_weight = float(getattr(config, "ivan_loss_weight", 0.0) or 0.0)
+        orthogonal_alpha_trainable = self.memory_backend == "prefix" and self.K > 0 and self.lr > 0.0
+        if orthogonal_alpha_trainable:
+            alpha_init = self.lr if self.lr > 20.0 else math.log(math.expm1(self.lr))
+            self.orthogonal_alpha_raw = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+        else:
+            self.register_parameter("orthogonal_alpha_raw", None)
         if self.energy_rank_temperature <= 0.0:
             raise ValueError("energy_rank_temperature must be > 0")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
             raise ValueError("energy_mix_alpha must be within [0, 1]")
+        if not math.isfinite(self.energy_memory_search_weight) or self.energy_memory_search_weight < 0.0:
+            raise ValueError("energy_memory_search_weight must be finite and >= 0")
+        if self.energy_memory_search_num_samples < 1:
+            raise ValueError("energy_memory_search_num_samples must be >= 1")
+        if (
+            not math.isfinite(self.energy_memory_search_radius_scale)
+            or self.energy_memory_search_radius_scale <= 0.0
+        ):
+            raise ValueError("energy_memory_search_radius_scale must be finite and > 0")
+        if (
+            not math.isfinite(self.energy_memory_search_gain_ema_decay)
+            or not 0.0 <= self.energy_memory_search_gain_ema_decay < 1.0
+        ):
+            raise ValueError("energy_memory_search_gain_ema_decay must be finite and within [0, 1)")
+        if self.energy_memory_search_use_best_for_next_step and self.energy_memory_search_weight <= 0.0:
+            raise ValueError(
+                "energy_memory_search_use_best_for_next_step requires energy_memory_search_weight > 0"
+            )
+        self.register_buffer("energy_memory_search_gain_ema", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer(
+            "energy_memory_search_gain_ema_initialized",
+            torch.tensor(False, dtype=torch.bool),
+        )
         if self.write_objective in ("energy", "energy_with_reconstruction") and self.memory_backend != "prefix":
             raise ValueError(
                 "write_objective='energy' and 'energy_with_reconstruction' are currently supported only "
@@ -912,13 +1015,19 @@ class GradMemGPT(PreTrainedModel):
                 n_layers = len(self._get_transformer_blocks())
                 self.energy_ln = nn.ModuleList(nn.LayerNorm(n_embd) for _ in range(n_layers))
                 self.energy_head = nn.ModuleList(
-                    nn.Sequential(nn.Linear(n_embd, energy_hidden), nn.SiLU(), nn.Linear(energy_hidden, 1))
+                    nn.Sequential(
+                        nn.Linear(n_embd, energy_hidden),
+                        nn.SiLU(),
+                        nn.Linear(energy_hidden, 1),
+                    )
                     for _ in range(n_layers)
                 )
             else:
                 self.energy_ln = nn.LayerNorm(n_embd)
                 self.energy_head = nn.Sequential(
-                    nn.Linear(n_embd, energy_hidden), nn.SiLU(), nn.Linear(energy_hidden, 1)
+                    nn.Linear(n_embd, energy_hidden),
+                    nn.SiLU(),
+                    nn.Linear(energy_hidden, 1),
                 )
         else:
             self.energy_ln = None
@@ -1134,17 +1243,38 @@ class GradMemGPT(PreTrainedModel):
     def _compute_write_energy(self, hidden_states, write_batch):
         if self.energy_head is None:
             raise RuntimeError("energy_head is not initialized")
-        def score(hidden, norm, head):
-            context_hidden = hidden[:, write_batch['context_start']:, :]
+
+        def compute_layer_energy(layer_hidden, layer_norm, energy_head):
+            context_hidden = layer_hidden[:, write_batch['context_start']:, :]
             context_mask = write_batch['mask'].to(device=context_hidden.device, dtype=context_hidden.dtype)
-            token_energy = head(norm(context_hidden)).squeeze(-1)
+            if context_hidden.size(1) != context_mask.size(1):
+                raise ValueError(
+                    "Invalid energy context span: "
+                    f"context_hidden_len={context_hidden.size(1)}, mask_len={context_mask.size(1)}, "
+                    f"context_start={write_batch['context_start']}"
+                )
+            token_energy = F.softplus(energy_head(layer_norm(context_hidden))).squeeze(-1)
             return (token_energy * context_mask).sum(dim=1) / context_mask.sum(dim=1).clamp_min(1)
+
         if not self.use_layerwise_energy:
-            return score(hidden_states, self.energy_ln, self.energy_head)
-        return torch.stack([
-            score(hidden, norm, head)
-            for hidden, norm, head in zip(hidden_states, self.energy_ln, self.energy_head)
-        ]).sum(dim=0)
+            return compute_layer_energy(hidden_states, self.energy_ln, self.energy_head)
+        if len(hidden_states) != len(self.energy_head):
+            raise ValueError(
+                f"Expected hidden states for {len(self.energy_head)} transformer layers, "
+                f"got {len(hidden_states)}"
+            )
+        layer_energies = [
+            compute_layer_energy(layer_hidden, layer_norm, energy_head)
+            for layer_hidden, layer_norm, energy_head in zip(hidden_states, self.energy_ln, self.energy_head)
+        ]
+        return torch.stack(layer_energies, dim=0).sum(dim=0)
+
+    def _energy_hidden_states(self, outs):
+        if not self.use_layerwise_energy:
+            return outs.last_hidden_state
+        if outs.hidden_states is None:
+            raise RuntimeError("Layer-wise energy requires model hidden states")
+        return outs.hidden_states[1:]
 
     def _run_energy_write_forward(self, write_batch):
         model_kwargs = dict(write_batch.get("model_kwargs", {}))
@@ -1156,8 +1286,7 @@ class GradMemGPT(PreTrainedModel):
             return_dict=True,
             **model_kwargs,
         )
-        hidden_states = outs.hidden_states[1:] if self.use_layerwise_energy else outs.last_hidden_state
-        return outs, self._compute_write_energy(hidden_states, write_batch)
+        return outs, self._compute_write_energy(self._energy_hidden_states(outs), write_batch)
 
     @staticmethod
     def _fixed_point_free_permutation(batch_size, device):
@@ -1322,93 +1451,8 @@ class GradMemGPT(PreTrainedModel):
                 raise RuntimeError("Model does not expose output embeddings for reconstruction logits")
             logits = output_embeddings(hidden)
         reconstruction_loss = self._compute_write_reconstruction_loss(logits, write_batch)
-        hidden_states = outs.hidden_states[1:] if self.use_layerwise_energy else outs.last_hidden_state
-        energy_loss = self._compute_write_energy(hidden_states, write_batch)
+        energy_loss = self._compute_write_energy(self._energy_hidden_states(outs), write_batch)
         return outs, reconstruction_loss, energy_loss
-
-    @staticmethod
-    def _compute_read_target_loss(predictions, read_batch, labels):
-        target_logits = predictions[:, :-1]
-        target_labels = labels[:, read_batch.get('label_shift', 0):]
-        if target_logits.size(1) != target_labels.size(1):
-            raise ValueError(
-                f"Mismatched target lengths after alignment: logits_len={target_logits.size(1)}, "
-                f"labels_len={target_labels.size(1)}"
-            )
-        return F.cross_entropy(
-            target_logits.reshape(-1, predictions.size(-1)),
-            target_labels.reshape(-1),
-            ignore_index=-100,
-        )
-
-    def _compute_step_alignment(self, outer_grad, inner_update):
-        cosine = F.cosine_similarity(
-            inner_update.float().flatten(1), outer_grad.float().flatten(1), dim=1
-        )
-        if self.grad_align_norm == "norm":
-            return (1.0 - outer_grad.float().flatten(1).norm(dim=1) * cosine).mean(), cosine.mean()
-        return 1.0 - cosine.mean(), cosine.mean()
-
-    @staticmethod
-    def _intermediate_read_weights(K, device, dtype):
-        depths = torch.arange(1, K, device=device, dtype=dtype)
-        weights = (K - depths + 1).reciprocal()
-        return weights / weights.sum()
-
-    def _compute_energy_memory_search_loss(self, backend, memory_state, previous_memory, batch_ctx, labels):
-        student_memory = memory_state["mem_batch"]
-        with torch.no_grad():
-            center = student_memory.detach()
-            displacement = (center - previous_memory.detach()).flatten(1).norm(dim=1, keepdim=True)
-            noise = torch.randn(
-                self.energy_memory_search_num_samples, *center.shape,
-                device=center.device, dtype=center.dtype,
-            )
-            noise = noise / noise.flatten(2).norm(dim=2, keepdim=True).unsqueeze(-1).clamp_min(1e-8)
-            candidates = center.unsqueeze(0) + noise * (
-                self.energy_memory_search_radius_scale * displacement
-            ).view(1, center.size(0), 1, 1)
-            candidates = torch.cat([center.unsqueeze(0), candidates], dim=0)
-            candidate_losses = []
-            for candidate in candidates:
-                candidate_state = dict(memory_state)
-                candidate_state["mem_batch"] = candidate
-                read_batch = backend.build_read_inputs(candidate_state, batch_ctx)
-                with backend.activation_context(candidate_state):
-                    with self._disable_write_lora():
-                        logits = self.model(
-                            inputs_embeds=read_batch["inputs_embeds"], return_dict=True,
-                            **read_batch.get("model_kwargs", {}),
-                        ).logits
-                logits = logits[:, read_batch["logits_start"]:read_batch["logits_start"] + read_batch["pred_len"]]
-                target_logits = logits[:, :-1]
-                target_labels = labels[:, read_batch.get("label_shift", 0):]
-                losses = F.cross_entropy(
-                    target_logits.flatten(0, 1), target_labels.flatten(), ignore_index=-100, reduction="none"
-                ).reshape_as(target_labels)
-                candidate_losses.append(losses.mean(dim=1))
-            candidate_losses = torch.stack(candidate_losses)
-            best_indices = candidate_losses.argmin(dim=0)
-            teacher = candidates[best_indices, torch.arange(center.size(0), device=center.device)]
-            gain = (candidate_losses[0] - candidate_losses[best_indices, torch.arange(center.size(0), device=center.device)]).clamp_min(0)
-        per_example_loss = 0.5 * (student_memory.float() - teacher.float()).square().flatten(1).sum(dim=1)
-        relative_gain = gain / candidate_losses[0].clamp_min(torch.finfo(gain.dtype).eps)
-        return per_example_loss, relative_gain, best_indices.ne(0).float().mean()
-
-    @torch.no_grad()
-    def _compute_energy_memory_search_gain_weights(self, relative_gains):
-        positive = relative_gains.detach().float().clamp_min(0.0)
-        positive = positive[positive.gt(0.0)]
-        if positive.numel() > 0:
-            mean_gain = positive.mean()
-            if self.energy_memory_search_gain_ema_initialized:
-                mean_gain = (
-                    self.energy_memory_search_gain_ema_decay * self.energy_memory_search_gain_ema
-                    + (1.0 - self.energy_memory_search_gain_ema_decay) * mean_gain
-                )
-            self.energy_memory_search_gain_ema.copy_(mean_gain)
-            self.energy_memory_search_gain_ema_initialized.fill_(True)
-        return relative_gains.detach().float().clamp_min(0.0) / self.energy_memory_search_gain_ema.clamp_min(1e-8)
 
     def _get_transformer_blocks(self):
         backbone = get_backbone(self.model)
@@ -1755,6 +1799,324 @@ class GradMemGPT(PreTrainedModel):
         finally:
             self._active_lora_memory = old
 
+    @staticmethod
+    def _intermediate_read_weights(K, device, dtype):
+        if K <= 1:
+            return torch.empty(0, device=device, dtype=dtype)
+        depths = torch.arange(1, K, device=device, dtype=dtype)
+        weights = (K - depths + 1).reciprocal()
+        return weights / weights.sum()
+
+    @staticmethod
+    def _compute_read_target_loss(predictions, read_batch, labels):
+        target_logits = predictions[:, :-1]
+        target_label_shift = read_batch.get('label_shift', 0)
+        # Prefix memory can predict the first target token from memory itself (label_shift=0),
+        # while LoRA/KV-cache memory without a prepended seed token cannot (label_shift=1).
+        target_labels = labels[:, target_label_shift:]
+        if target_logits.size(1) != target_labels.size(1):
+            raise ValueError(
+                f"Mismatched target lengths after alignment: logits_len={target_logits.size(1)}, "
+                f"labels_len={target_labels.size(1)}, label_shift={target_label_shift}"
+            )
+        return nn.functional.cross_entropy(
+            target_logits.reshape(-1, predictions.size(-1)),
+            target_labels.reshape(-1),
+            ignore_index=-100,
+        )
+
+    @staticmethod
+    def _compute_per_example_read_target_loss(predictions, read_batch, labels):
+        target_logits = predictions[:, :-1]
+        target_label_shift = read_batch.get('label_shift', 0)
+        target_labels = labels[:, target_label_shift:]
+        if target_logits.size(1) != target_labels.size(1):
+            raise ValueError(
+                f"Mismatched target lengths after alignment: logits_len={target_logits.size(1)}, "
+                f"labels_len={target_labels.size(1)}, label_shift={target_label_shift}"
+            )
+        token_losses = F.cross_entropy(
+            target_logits.reshape(-1, predictions.size(-1)),
+            target_labels.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).reshape_as(target_labels)
+        valid = target_labels.ne(-100)
+        return (token_losses * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+
+    @contextmanager
+    def _temporary_model_eval(self):
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            yield
+        finally:
+            self.model.train(was_training)
+
+    def _sample_norm_preserving_memory_candidates(self, memory, previous_memory):
+        """Sample on the memory norm sphere at a chord radius tied to the last WRITE step."""
+        center = memory.detach()
+        previous = previous_memory.detach()
+        original_shape = center.shape
+        center_flat = center.float().flatten(1)
+        previous_flat = previous.float().flatten(1)
+        batch_size, flat_dim = center_flat.shape
+        num_samples = self.energy_memory_search_num_samples
+        eps = torch.finfo(center_flat.dtype).eps
+
+        center_norm = center_flat.norm(dim=1, keepdim=True)
+        unit_center = center_flat / center_norm.clamp_min(eps)
+        step_distance = (center_flat - previous_flat).norm(dim=1, keepdim=True)
+        chord_radius = self.energy_memory_search_radius_scale * step_distance
+        chord_radius = torch.minimum(chord_radius, 2.0 * center_norm * (1.0 - eps))
+        angle = 2.0 * torch.asin((chord_radius / (2.0 * center_norm).clamp_min(eps)).clamp(max=1.0 - eps))
+
+        noise = torch.randn(
+            num_samples,
+            batch_size,
+            flat_dim,
+            device=center.device,
+            dtype=center_flat.dtype,
+        )
+        tangent = noise - (noise * unit_center.unsqueeze(0)).sum(dim=-1, keepdim=True) * unit_center.unsqueeze(0)
+        tangent_norm = tangent.norm(dim=-1, keepdim=True)
+        unit_tangent = tangent / tangent_norm.clamp_min(eps)
+        candidates = center_norm.unsqueeze(0) * (
+            angle.cos().unsqueeze(0) * unit_center.unsqueeze(0)
+            + angle.sin().unsqueeze(0) * unit_tangent
+        )
+
+        valid = (center_norm.gt(eps) & step_distance.gt(eps)).unsqueeze(0) & tangent_norm.gt(eps)
+        candidates = torch.where(valid, candidates, center_flat.unsqueeze(0))
+        candidates = candidates.to(dtype=center.dtype)
+        typed_norm = candidates.norm(dim=-1, keepdim=True)
+        target_norm = center.flatten(1).norm(dim=1, keepdim=True).unsqueeze(0)
+        candidates = candidates * (target_norm / typed_norm.clamp_min(torch.finfo(center.dtype).eps))
+        candidates = torch.where(valid, candidates, center.flatten(1).unsqueeze(0))
+        return candidates.reshape(num_samples, *original_shape)
+
+    def _compute_energy_memory_search_loss(
+        self,
+        backend,
+        memory_state,
+        previous_memory,
+        batch_ctx,
+        labels,
+    ):
+        student_memory = memory_state["mem_batch"]
+        with torch.no_grad():
+            perturbed = self._sample_norm_preserving_memory_candidates(student_memory, previous_memory)
+            candidate_memories = torch.cat([student_memory.detach().unsqueeze(0), perturbed], dim=0)
+            candidate_losses = []
+            with self._temporary_model_eval():
+                for candidate_memory in candidate_memories:
+                    candidate_state = dict(memory_state)
+                    candidate_state["mem_batch"] = candidate_memory
+                    read_batch = backend.build_read_inputs(candidate_state, batch_ctx)
+                    model_kwargs = read_batch.get('model_kwargs', {})
+                    with backend.activation_context(candidate_state):
+                        with self._disable_write_lora():
+                            read_out = self.model(
+                                inputs_embeds=read_batch['inputs_embeds'],
+                                return_dict=True,
+                                **model_kwargs,
+                            )
+                    predictions = read_out.logits[
+                        :,
+                        read_batch['logits_start']:read_batch['logits_start'] + read_batch['pred_len'],
+                        :,
+                    ]
+                    candidate_losses.append(
+                        self._compute_per_example_read_target_loss(predictions, read_batch, labels)
+                    )
+
+            candidate_losses = torch.stack(candidate_losses)
+            best_indices = candidate_losses.argmin(dim=0)
+            batch_indices = torch.arange(student_memory.size(0), device=student_memory.device)
+            teacher_memory = candidate_memories[best_indices, batch_indices]
+            baseline_loss = candidate_losses[0]
+            best_loss = candidate_losses[best_indices, batch_indices]
+            target_gain = (baseline_loss - best_loss).clamp_min(0.0)
+            relative_target_gain = target_gain / baseline_loss.clamp_min(
+                torch.finfo(baseline_loss.dtype).eps
+            )
+
+        per_example_half_squared_norm = 0.5 * (
+            student_memory.float() - teacher_memory.float()
+        ).square().flatten(1).sum(dim=1)
+        selected_distance = (student_memory.detach().float() - teacher_memory.float()).flatten(1).norm(dim=1)
+        return {
+            "loss": per_example_half_squared_norm.mean(),
+            "per_example_loss": per_example_half_squared_norm,
+            "relative_target_gain": relative_target_gain,
+            "teacher_memory": teacher_memory,
+            "improvement_rate": best_indices.ne(0).float().mean(),
+            "target_gain": target_gain.mean(),
+            "max_target_gain": target_gain.max(),
+            "selected_distance": selected_distance.mean(),
+        }
+
+    @torch.no_grad()
+    def _compute_energy_memory_search_gain_weights(self, relative_target_gains):
+        gains = relative_target_gains.detach().float().clamp_min(0.0)
+        positive = gains.gt(0.0)
+        gain_sum = gains.masked_select(positive).sum()
+        positive_count = positive.sum().to(dtype=torch.float32)
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(gain_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(positive_count, op=dist.ReduceOp.SUM)
+
+        if positive_count.item() > 0.0:
+            batch_positive_mean = gain_sum / positive_count
+            if not self.energy_memory_search_gain_ema_initialized.item():
+                updated_ema = batch_positive_mean
+                self.energy_memory_search_gain_ema_initialized.fill_(True)
+            else:
+                decay = self.energy_memory_search_gain_ema_decay
+                updated_ema = (
+                    decay * self.energy_memory_search_gain_ema
+                    + (1.0 - decay) * batch_positive_mean
+                )
+            self.energy_memory_search_gain_ema.copy_(updated_ema)
+
+        normalizer = self.energy_memory_search_gain_ema.clamp_min(torch.finfo(torch.float32).eps)
+        return gains / normalizer
+
+    def _combine_depth_auxiliary_losses(
+        self,
+        inner_loss,
+        rank_loss,
+        trajectory_loss,
+        anchor_loss,
+        memory_alignment_loss,
+        orthogonal_loss,
+    ):
+        weighted_inner_loss = self.inner_loss_weight * inner_loss if self.add_inner_loss_to_outer else 0.0
+        return (
+            weighted_inner_loss
+            + self.energy_rank_weight * rank_loss
+            + self.energy_traj_weight * trajectory_loss
+            + self.energy_anchor_weight * anchor_loss
+            + self.memory_alignment_weight * memory_alignment_loss
+            + self.orthogonal_loss_weight * orthogonal_loss
+        )
+
+    def _compute_memory_state_auxiliary_losses(
+        self,
+        backend,
+        memory_state,
+        memory_state_initial,
+        batch_ctx,
+        target_loss,
+        initial_memory,
+        memory_depth,
+        energy_loss_history,
+        energy_loss_after_write,
+        *,
+        memory_alignment_active,
+        orthogonal_loss_active,
+        energy_objective_active,
+    ):
+        """Evaluate auxiliary objectives at one WRITE trajectory memory state."""
+        zero = target_loss.new_tensor(0.0)
+        memory_alignment_loss = zero
+        memory_alignment_cosine = None
+        orthogonal_loss = zero
+        orthogonal_residual_dot = None
+        memory_gradient_active = memory_alignment_active or orthogonal_loss_active
+
+        if memory_gradient_active:
+            memory = memory_state["mem_batch"]
+            outer_grad = torch.autograd.grad(
+                target_loss,
+                memory,
+                create_graph=False,
+                retain_graph=True,
+            )[0].detach()
+            if memory_alignment_active:
+                write_direction = (initial_memory - memory).float().flatten(1)
+                outer_grad_flat = outer_grad.float().flatten(1)
+                memory_alignment_cosine = F.cosine_similarity(write_direction, outer_grad_flat, dim=1)
+                memory_alignment_loss = 1 - memory_alignment_cosine.mean()
+            if orthogonal_loss_active:
+                inner_update = (initial_memory - memory).float()
+                outer_grad_float = outer_grad.float()
+                if self.orthogonal_loss_weight == 0.0:
+                    inner_update = inner_update.detach()
+                alpha = (
+                    F.softplus(self.orthogonal_alpha_raw.float())
+                    if self.orthogonal_alpha_raw is not None
+                    else zero.new_tensor(self.lr)
+                )
+                residual = inner_update - alpha * outer_grad_float
+                orthogonal_residual_dot = (residual * outer_grad_float).flatten(1).sum(dim=1)
+                orthogonal_loss = orthogonal_residual_dot.square().mean()
+
+        rank_loss = zero
+        anchor_loss = zero
+        rank_active = energy_objective_active and self.energy_rank_weight > 0.0
+        anchor_active = energy_objective_active and self.energy_anchor_weight > 0.0
+        landscape = None
+        if rank_active or anchor_active:
+            landscape = self._compute_energy_landscape_losses(
+                backend,
+                memory_state,
+                memory_state_initial,
+                batch_ctx,
+                compute_rank=rank_active,
+                compute_anchor=anchor_active,
+            )
+            if rank_active:
+                rank_loss = landscape["rank_loss"]
+            if anchor_active:
+                anchor_loss = landscape["anchor_loss"]
+
+        trajectory_loss = zero
+        trajectory_active = (
+            energy_objective_active
+            and self.energy_traj_weight > 0.0
+            and memory_depth > 0
+            and energy_loss_after_write is not None
+        )
+        if trajectory_active:
+            energy_states = energy_loss_history + [energy_loss_after_write]
+            trajectory_terms = [
+                F.relu(e_next - e_prev + self.energy_traj_margin).mean()
+                for e_prev, e_next in zip(
+                    energy_states[:memory_depth],
+                    energy_states[1:memory_depth + 1],
+                )
+            ]
+            trajectory_loss = torch.stack(trajectory_terms).mean()
+
+        return {
+            "memory_alignment_loss": memory_alignment_loss,
+            "memory_alignment_cosine": memory_alignment_cosine,
+            "orthogonal_loss": orthogonal_loss,
+            "orthogonal_residual_dot": orthogonal_residual_dot,
+            "rank_loss": rank_loss,
+            "anchor_loss": anchor_loss,
+            "trajectory_loss": trajectory_loss,
+            "landscape": landscape,
+        }
+
+    def _compute_step_alignment(self, target_loss, memory_state, inner_update):
+        outer_grad = torch.autograd.grad(
+            target_loss,
+            memory_state["mem_batch"],
+            create_graph=False,
+            retain_graph=True,
+        )[0].detach()
+        cosine = F.cosine_similarity(
+            inner_update.float().flatten(1),
+            outer_grad.float().flatten(1),
+            dim=1,
+        )
+        if self.grad_align_norm == "norm":
+            task_grad_norm = outer_grad.float().flatten(1).norm(dim=1)
+            return (1 - task_grad_norm * cosine).mean(), cosine.mean()
+        return 1 - cosine.mean(), cosine.mean()
+
     def forward(self, input_ids, labels=None, return_mem=False):
         context_input_ids = input_ids['context_input_ids']
         query_input_ids = input_ids['query_input_ids']
@@ -1766,27 +2128,37 @@ class GradMemGPT(PreTrainedModel):
 
         backend = self.memory_backend_impl
         memory_state, memory_state_initial = backend.init_memory_state(B)
-        memory_alignment_active = (
-            labels is not None
-            and self.memory_alignment_weight > 0.0
-            and self.memory_backend == "prefix"
-            and self.K > 0
+        # These are diagnostics whenever their prefix-memory gradients exist; their
+        # weights control only whether they contribute to the outer objective.
+        memory_alignment_active = labels is not None and self.memory_backend == "prefix" and self.K > 0
+        step_alignment_active = memory_alignment_active
+        orthogonal_loss_active = memory_alignment_active
+        ivan_loss_active = labels is not None and self.ivan_loss_weight > 0.0 and self.K > 0
+        outer_memory_gradient_active = memory_alignment_active or orthogonal_loss_active or ivan_loss_active
+        initial_memory = memory_state["mem_batch"] if memory_alignment_active else None
+        intermediate_read_active = labels is not None and self.K > 1
+        intermediate_read_objective_active = (
+            intermediate_read_active and self.intermediate_read_weight > 0.0
         )
-        step_alignment_active = (
-            labels is not None
-            and self.step_alignment_weight > 0.0
-            and self.memory_backend == "prefix"
-            and self.K > 0
-        )
-        orthogonal_loss_active = labels is not None and self.orthogonal_loss_weight > 0.0 and self.K > 0
-        memory_gradient_active = memory_alignment_active or step_alignment_active or orthogonal_loss_active
-        last_inner_update = None
         intermediate_memory_states = []
-        intermediate_read_active = labels is not None and self.intermediate_read_weight > 0.0 and self.K > 1
+        inner_memory_updates = []
+        inner_grad_sums = None
         batch_ctx = backend.prepare_batch(context_input_ids, query_input_ids, pad_id)
         opt_state = {}
         inner_loss_history = []
         energy_loss_history = []
+        inline_memory_search_results = []
+        has_write_context = bool(context_input_ids.ne(pad_id).any().item())
+        memory_search_active = (
+            self.training
+            and labels is not None
+            and has_write_context
+            and self.energy_memory_search_weight > 0.0
+            and self.write_objective in ("energy", "energy_with_reconstruction")
+        )
+        inline_memory_search_active = (
+            memory_search_active and self.energy_memory_search_use_best_for_next_step
+        )
 
         inner_loop_stats = {
             'inner_grad_norm_mean': torch.tensor(0.0, device=device),
@@ -1794,7 +2166,7 @@ class GradMemGPT(PreTrainedModel):
             'inner_grad_norm_min': torch.tensor(1e06, device=device),
         }
 
-        if self.K and context_input_ids.ne(pad_id).any():
+        if self.K and has_write_context:
             with torch.enable_grad():
                 for k in range(self.K):
                     write_batch = backend.build_write_inputs(memory_state, batch_ctx)
@@ -1802,7 +2174,9 @@ class GradMemGPT(PreTrainedModel):
                     energy_loss = None
                     if self.write_objective == "energy":
                         with backend.activation_context(memory_state):
-                            outs, energy_loss = self._run_energy_write_forward(write_batch)
+                            outs, rec_loss, energy_loss = self._run_energy_reconstruction_write_forward(
+                                write_batch
+                            )
                         inner_loss_per_sample = energy_loss
                         del outs
                     elif self.write_objective == "energy_with_reconstruction":
@@ -1829,11 +2203,19 @@ class GradMemGPT(PreTrainedModel):
 
                     is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
                     create_graph = is_second_order_step
-                    retain_graph = create_graph or (self.add_inner_loss_to_outer and (k == self.K - 1))
+                    retain_graph = create_graph or (
+                        (self.add_inner_loss_to_outer and k == self.K - 1)
+                        or intermediate_read_objective_active
+                    )
 
                     inner_params = backend.inner_params(memory_state)
                     grads = torch.autograd.grad(inner_loss, inner_params,
                                                 create_graph=create_graph, retain_graph=retain_graph)
+                    if ivan_loss_active:
+                        if inner_grad_sums is None:
+                            inner_grad_sums = list(grads)
+                        else:
+                            inner_grad_sums = [grad_sum + grad for grad_sum, grad in zip(inner_grad_sums, grads)]
 
                     g_sq = torch.zeros(B, device=device)
                     for g in grads:
@@ -1852,10 +2234,24 @@ class GradMemGPT(PreTrainedModel):
                                                    clip_value=self.inner_clip_value,
                                                    clip_norm=self.inner_clip_norm)
                         new_params.append(p_new)
-                    if memory_gradient_active:
-                        last_inner_update = inner_params[0] - new_params[0]
+                    if memory_alignment_active:
+                        inner_memory_updates.append(inner_params[0] - new_params[0])
                     backend.assign_inner_params(memory_state, new_params)
                     backend.maybe_detach_after_step(memory_state)
+                    if inline_memory_search_active:
+                        search_result = self._compute_energy_memory_search_loss(
+                            backend,
+                            memory_state,
+                            inner_params[0],
+                            batch_ctx,
+                            labels,
+                        )
+                        inline_memory_search_results.append(search_result)
+                        student_memory = memory_state["mem_batch"]
+                        teacher_memory = search_result["teacher_memory"]
+                        memory_state["mem_batch"] = (
+                            student_memory + (teacher_memory - student_memory.detach())
+                        )
                     if intermediate_read_active and k < self.K - 1:
                         intermediate_memory_states.append(backend.snapshot_memory_state(memory_state))
 
@@ -1864,27 +2260,36 @@ class GradMemGPT(PreTrainedModel):
             inner_loop_stats['inner_loss'] = inner_loss.detach() / B
 
         inner_loss_after_write = None
+        reconstruction_loss_after_write = None
         energy_loss_after_write = None
+        with torch.enable_grad():
+            final_write_batch = backend.build_write_inputs(memory_state, batch_ctx)
+            with backend.activation_context(memory_state):
+                if self.write_objective in ("energy", "energy_with_reconstruction"):
+                    final_outs, reconstruction_loss_after_write, energy_loss_after_write = (
+                        self._run_energy_reconstruction_write_forward(final_write_batch)
+                    )
+                else:
+                    final_outs, reconstruction_loss_after_write = self._run_reconstruction_write_forward(
+                        final_write_batch
+                    )
+
         if self.write_objective == "energy":
-            final_write_batch = backend.build_write_inputs(memory_state, batch_ctx)
-            with backend.activation_context(memory_state):
-                final_outs, energy_loss_after_write = self._run_energy_write_forward(final_write_batch)
-                inner_loss_after_write = energy_loss_after_write
-            inner_loop_stats['inner_energy_loss_after_write'] = energy_loss_after_write.detach().mean()
-            del final_outs
+            inner_loss_after_write = energy_loss_after_write
         elif self.write_objective == "energy_with_reconstruction":
-            final_write_batch = backend.build_write_inputs(memory_state, batch_ctx)
-            with backend.activation_context(memory_state):
-                final_outs, reconstruction_loss_after_write, energy_loss_after_write = (
-                    self._run_energy_reconstruction_write_forward(final_write_batch)
-                )
             inner_loss_after_write = (
                 self.write_reconstruction_weight * reconstruction_loss_after_write
                 + self.write_energy_weight * energy_loss_after_write
             )
-            inner_loop_stats['inner_reconstruction_loss_after_write'] = reconstruction_loss_after_write.detach().mean()
+        else:
+            inner_loss_after_write = reconstruction_loss_after_write
+
+        inner_loop_stats['inner_reconstruction_loss_after_write'] = (
+            reconstruction_loss_after_write.detach().mean()
+        )
+        if energy_loss_after_write is not None:
             inner_loop_stats['inner_energy_loss_after_write'] = energy_loss_after_write.detach().mean()
-            del final_outs
+        del final_outs
         if inner_loss_after_write is not None:
             inner_loop_stats['inner_loss_after_write'] = inner_loss_after_write.detach().mean()
         if inner_loss_after_write is not None and len(inner_loss_history) > 0:
@@ -1905,44 +2310,50 @@ class GradMemGPT(PreTrainedModel):
         inner_loop_stats['delta_mem_norm_max'] = delta_mem_norm.max()
         inner_loop_stats['delta_mem_norm_min'] = delta_mem_norm.min()
 
-        read_batch = backend.build_read_inputs(memory_state, batch_ctx)
-        read_model_kwargs = read_batch.get('model_kwargs', {})
-        log_mem_attn_read = (self.attn_implementation == "eager") and (self.memory_backend in ("prefix", "kv_cache"))
-        if log_mem_attn_read:
-            read_model_kwargs = dict(read_model_kwargs)
-            read_model_kwargs["output_attentions"] = True
-        with backend.activation_context(memory_state):
-            with self._disable_write_lora():
-                read_out = self.model(inputs_embeds=read_batch['inputs_embeds'],
-                                      return_dict=True,
-                                      **read_model_kwargs)
-                logits_q = read_out.logits
+        read_grad_context = torch.enable_grad() if outer_memory_gradient_active else nullcontext()
+        with read_grad_context:
+            read_batch = backend.build_read_inputs(memory_state, batch_ctx)
+            read_model_kwargs = read_batch.get('model_kwargs', {})
+            log_mem_attn_read = (
+                self.attn_implementation == "eager" and self.memory_backend in ("prefix", "kv_cache")
+            )
+            if log_mem_attn_read:
+                read_model_kwargs = dict(read_model_kwargs)
+                read_model_kwargs["output_attentions"] = True
+            with backend.activation_context(memory_state):
+                with self._disable_write_lora():
+                    read_out = self.model(inputs_embeds=read_batch['inputs_embeds'],
+                                          return_dict=True,
+                                          **read_model_kwargs)
+                    logits_q = read_out.logits
 
-        if log_mem_attn_read and read_out.attentions is not None:
-            if self.memory_backend == "prefix":
-                mem_start = self.n_ctrl_tokens
-                mem_end = self.n_ctrl_tokens + self.n_mem_tokens
-            else:
-                mem_start = 0
-                mem_end = self.n_mem_tokens
+            if log_mem_attn_read and read_out.attentions is not None:
+                if self.memory_backend == "prefix":
+                    mem_start = self.n_ctrl_tokens
+                    mem_end = self.n_ctrl_tokens + self.n_mem_tokens
+                else:
+                    mem_start = 0
+                    mem_end = self.n_mem_tokens
 
-            layer_ratios = []
-            for att in read_out.attentions:
-                if att is None:
-                    continue
-                k_len = att.size(-1)
-                if not (0 <= mem_start < mem_end <= k_len):
-                    raise ValueError(
-                        "GradMem: Invalid memory attention span on read: "
-                        f"backend={self.memory_backend}, mem_start={mem_start}, mem_end={mem_end}, k_len={k_len}"
-                    )
-                layer_ratios.append(att[..., mem_start:mem_end].sum(dim=-1).mean())
-            if layer_ratios:
-                inner_loop_stats['mem_attn_read'] = torch.stack(layer_ratios).mean().detach()
+                layer_ratios = []
+                for att in read_out.attentions:
+                    if att is None:
+                        continue
+                    k_len = att.size(-1)
+                    if not (0 <= mem_start < mem_end <= k_len):
+                        raise ValueError(
+                            "GradMem: Invalid memory attention span on read: "
+                            f"backend={self.memory_backend}, mem_start={mem_start}, mem_end={mem_end}, k_len={k_len}"
+                        )
+                    layer_ratios.append(att[..., mem_start:mem_end].sum(dim=-1).mean())
+                if layer_ratios:
+                    inner_loop_stats['mem_attn_read'] = torch.stack(layer_ratios).mean().detach()
 
-        # LoRA/KV-cache memory backends need one seed token to start autoregressive prediction;
-        # they cannot predict the very first token from memory alone when query is empty.
-        logits_q = logits_q[:, read_batch['logits_start']:read_batch['logits_start'] + read_batch['pred_len'], :]
+            # LoRA/KV-cache memory backends need one seed token to start autoregressive prediction;
+            # they cannot predict the very first token from memory alone when query is empty.
+            logits_q = logits_q[
+                :, read_batch['logits_start']:read_batch['logits_start'] + read_batch['pred_len'], :
+            ]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if return_mem:
@@ -1951,142 +2362,249 @@ class GradMemGPT(PreTrainedModel):
         if labels is None:
             return output
 
-        if memory_gradient_active:
-            # Re-run READ with gradients because evaluation commonly wraps forward in no_grad.
-            with torch.enable_grad():
-                alignment_read_batch = backend.build_read_inputs(memory_state, batch_ctx)
-                with backend.activation_context(memory_state):
-                    with self._disable_write_lora():
-                        alignment_predictions = self.model(
-                            inputs_embeds=alignment_read_batch['inputs_embeds'],
-                            return_dict=True,
-                            **alignment_read_batch.get('model_kwargs', {}),
-                        ).logits
-                alignment_predictions = alignment_predictions[
-                    :, alignment_read_batch['logits_start']:
-                    alignment_read_batch['logits_start'] + alignment_read_batch['pred_len'],
-                    :,
-                ]
-                target_loss = self._compute_read_target_loss(
-                    alignment_predictions, alignment_read_batch, labels
-                )
-                outer_grad = torch.autograd.grad(
-                    target_loss, memory_state['mem_batch'], retain_graph=True
-                )[0].detach()
-            if memory_alignment_active:
-                write_direction = (
-                    memory_state_initial['mem_batch'] - memory_state['mem_batch']
-                ).float().flatten(1)
-                alignment_cosine = F.cosine_similarity(
-                    write_direction, outer_grad.float().flatten(1), dim=1
-                )
-                memory_alignment_loss = 1.0 - alignment_cosine.mean()
-            else:
-                memory_alignment_loss = target_loss.new_tensor(0.0)
-                alignment_cosine = target_loss.new_tensor(0.0)
-            step_alignment_loss, step_alignment_cosine = self._compute_step_alignment(
-                outer_grad, last_inner_update
-            )
-            if orthogonal_loss_active:
-                alpha = F.softplus(self.orthogonal_alpha_raw.float())
-                residual_dot = (
-                    (memory_state_initial['mem_batch'] - memory_state['mem_batch'] - alpha * outer_grad)
-                    * outer_grad
-                ).float().flatten(1).sum(dim=1)
-                orthogonal_loss = residual_dot.square().mean()
-            else:
-                orthogonal_loss = target_loss.new_tensor(0.0)
-                residual_dot = target_loss.new_tensor(0.0)
-        else:
+        target_grad_context = torch.enable_grad() if outer_memory_gradient_active else nullcontext()
+        with target_grad_context:
             target_loss = self._compute_read_target_loss(output['predictions'], read_batch, labels)
-            memory_alignment_loss = target_loss.new_tensor(0.0)
-            alignment_cosine = target_loss.new_tensor(0.0)
-            step_alignment_loss = target_loss.new_tensor(0.0)
-            step_alignment_cosine = target_loss.new_tensor(0.0)
-            orthogonal_loss = target_loss.new_tensor(0.0)
-            residual_dot = target_loss.new_tensor(0.0)
 
-        intermediate_read_loss = target_loss.new_tensor(0.0)
+        zero = target_loss.new_tensor(0.0)
+        memory_search_loss = zero
+        memory_search_unweighted_loss = zero
+        memory_search_improvement_rate = zero
+        memory_search_target_gain = zero
+        memory_search_max_target_gain = zero
+        memory_search_relative_target_gain = zero
+        memory_search_max_relative_target_gain = zero
+        memory_search_gain_weight_mean = zero
+        memory_search_gain_weight_max = zero
+        memory_search_gain_ema = zero
+        memory_search_selected_distance = zero
+        if memory_search_active:
+            if inline_memory_search_active:
+                search_results = inline_memory_search_results
+            else:
+                search_states = intermediate_memory_states + [memory_state]
+                previous_memory = memory_state_initial["mem_batch"]
+                search_results = []
+                for search_state in search_states:
+                    search_results.append(
+                        self._compute_energy_memory_search_loss(
+                            backend,
+                            search_state,
+                            previous_memory,
+                            batch_ctx,
+                            labels,
+                        )
+                    )
+                    previous_memory = search_state["mem_batch"].detach()
+            per_example_search_losses = torch.stack(
+                [result["per_example_loss"] for result in search_results]
+            )
+            relative_target_gains = torch.stack(
+                [result["relative_target_gain"] for result in search_results]
+            )
+            memory_search_unweighted_loss = per_example_search_losses.mean()
+            memory_search_relative_target_gain = relative_target_gains.mean()
+            memory_search_max_relative_target_gain = relative_target_gains.max()
+            if self.energy_memory_search_use_gain_weighting:
+                gain_weights = self._compute_energy_memory_search_gain_weights(relative_target_gains)
+                memory_search_loss = (gain_weights * per_example_search_losses).mean()
+                positive_weights = gain_weights.masked_select(relative_target_gains.gt(0.0))
+                if positive_weights.numel() > 0:
+                    memory_search_gain_weight_mean = positive_weights.mean()
+                    memory_search_gain_weight_max = positive_weights.max()
+                memory_search_gain_ema = self.energy_memory_search_gain_ema
+            else:
+                memory_search_loss = memory_search_unweighted_loss
+            memory_search_improvement_rate = torch.stack(
+                [result["improvement_rate"] for result in search_results]
+            ).mean()
+            memory_search_target_gain = torch.stack(
+                [result["target_gain"] for result in search_results]
+            ).mean()
+            memory_search_max_target_gain = torch.stack(
+                [result["max_target_gain"] for result in search_results]
+            ).max()
+            memory_search_selected_distance = torch.stack(
+                [result["selected_distance"] for result in search_results]
+            ).mean()
+
+        ivan_loss = zero
+        ivan_residual_dot = zero
+        if ivan_loss_active and inner_grad_sums is not None:
+            final_inner_params = backend.inner_params(memory_state)
+            outer_grads = torch.autograd.grad(
+                target_loss,
+                final_inner_params,
+                create_graph=True,
+                retain_graph=True,
+            )
+            ivan_residual_dot_per_sample = torch.zeros(B, device=device, dtype=torch.float32)
+            for inner_grad_sum, outer_grad in zip(inner_grad_sums, outer_grads):
+                outer_grad_float = outer_grad.float()
+                ivan_residual_dot_per_sample = ivan_residual_dot_per_sample + (
+                    (inner_grad_sum.float() - outer_grad_float) * outer_grad_float
+                ).reshape(B, -1).sum(dim=1)
+            ivan_residual_dot = ivan_residual_dot_per_sample.mean()
+            ivan_loss = ivan_residual_dot_per_sample.square().mean()
+        intermediate_read_loss = zero
+        step_alignment_losses = []
+        step_alignment_cosines = []
         if intermediate_memory_states:
-            intermediate_losses = []
-            with torch.enable_grad():
-                for intermediate_memory_state in intermediate_memory_states:
+            intermediate_depth_losses = []
+            energy_objective_active = self.write_objective in ("energy", "energy_with_reconstruction")
+            for depth, intermediate_memory_state in enumerate(intermediate_memory_states, start=1):
+                intermediate_grad_context = (
+                    torch.enable_grad()
+                    if step_alignment_active or intermediate_read_objective_active
+                    else torch.no_grad()
+                )
+                with intermediate_grad_context:
                     intermediate_read_batch = backend.build_read_inputs(intermediate_memory_state, batch_ctx)
+                    intermediate_model_kwargs = intermediate_read_batch.get('model_kwargs', {})
                     with backend.activation_context(intermediate_memory_state):
                         with self._disable_write_lora():
-                            predictions = self.model(
+                            intermediate_read_out = self.model(
                                 inputs_embeds=intermediate_read_batch['inputs_embeds'],
                                 return_dict=True,
-                                **intermediate_read_batch.get('model_kwargs', {}),
-                            ).logits
-                    predictions = predictions[
-                        :, intermediate_read_batch['logits_start']:
+                                **intermediate_model_kwargs,
+                            )
+                    intermediate_predictions = intermediate_read_out.logits[
+                        :,
+                        intermediate_read_batch['logits_start']:
                         intermediate_read_batch['logits_start'] + intermediate_read_batch['pred_len'],
                         :,
                     ]
-                    intermediate_losses.append(
-                        self._compute_read_target_loss(predictions, intermediate_read_batch, labels)
+                    depth_target_loss = self._compute_read_target_loss(
+                        intermediate_predictions,
+                        intermediate_read_batch,
+                        labels,
                     )
-            losses = torch.stack(intermediate_losses)
-            intermediate_read_loss = (
-                self._intermediate_read_weights(self.K, losses.device, losses.dtype) * losses
-            ).sum()
 
-        memory_search_loss = target_loss.new_tensor(0.0)
-        memory_search_gain = target_loss.new_tensor(0.0)
-        memory_search_improvement_rate = target_loss.new_tensor(0.0)
-        if (
-            self.training
-            and self.energy_memory_search_weight > 0.0
-            and context_input_ids.ne(pad_id).any()
-        ):
-            per_example_memory_search_loss, relative_memory_search_gain, memory_search_improvement_rate = (
-                self._compute_energy_memory_search_loss(
-                    backend, memory_state, memory_state_initial['mem_batch'], batch_ctx, labels
-                )
+                if step_alignment_active:
+                    depth_step_alignment_loss, depth_step_alignment_cosine = self._compute_step_alignment(
+                        depth_target_loss,
+                        intermediate_memory_state,
+                        inner_memory_updates[depth - 1],
+                    )
+                    step_alignment_losses.append(depth_step_alignment_loss)
+                    step_alignment_cosines.append(depth_step_alignment_cosine)
+
+                if intermediate_read_objective_active:
+                    depth_inner_loss = inner_loss_history[depth - 1].sum() / B
+                    depth_auxiliary_losses = self._compute_memory_state_auxiliary_losses(
+                        backend,
+                        intermediate_memory_state,
+                        memory_state_initial,
+                        batch_ctx,
+                        depth_target_loss,
+                        initial_memory,
+                        depth,
+                        energy_loss_history,
+                        energy_loss_after_write,
+                        memory_alignment_active=memory_alignment_active,
+                        orthogonal_loss_active=orthogonal_loss_active,
+                        energy_objective_active=energy_objective_active,
+                    )
+                    depth_aux_loss = self._combine_depth_auxiliary_losses(
+                        inner_loss=depth_inner_loss,
+                        rank_loss=depth_auxiliary_losses["rank_loss"],
+                        trajectory_loss=depth_auxiliary_losses["trajectory_loss"],
+                        anchor_loss=depth_auxiliary_losses["anchor_loss"],
+                        memory_alignment_loss=depth_auxiliary_losses["memory_alignment_loss"],
+                        orthogonal_loss=depth_auxiliary_losses["orthogonal_loss"],
+                    )
+                    intermediate_depth_losses.append(depth_target_loss + depth_aux_loss)
+                else:
+                    intermediate_depth_losses.append(depth_target_loss)
+
+            intermediate_depth_losses = torch.stack(intermediate_depth_losses)
+            intermediate_weights = self._intermediate_read_weights(
+                self.K,
+                device=intermediate_depth_losses.device,
+                dtype=intermediate_depth_losses.dtype,
             )
-            memory_search_gain = relative_memory_search_gain.mean()
-            if self.energy_memory_search_use_gain_weighting:
-                memory_search_loss = (
-                    self._compute_energy_memory_search_gain_weights(relative_memory_search_gain)
-                    * per_example_memory_search_loss
-                ).mean()
-            else:
-                memory_search_loss = per_example_memory_search_loss.mean()
-
-        zero = target_loss.new_tensor(0.0)
+            intermediate_read_loss = (intermediate_weights * intermediate_depth_losses).sum()
         inner_loss_for_outer = inner_loss / B
-        # energy shaping losses:
-        rank_loss = zero
-        rank_deranged_loss = zero
-        rank_interpolated_loss = zero
-        rank_random_loss = zero
-        traj_loss = zero
-        anchor_loss = zero
-
         loss_stats = {}
         landscape_stats = {}
         energy_objective_active = self.write_objective in ("energy", "energy_with_reconstruction")
         rank_active = energy_objective_active and self.energy_rank_weight > 0.0
         anchor_active = energy_objective_active and self.energy_anchor_weight > 0.0
-        trajectory_active = (energy_objective_active and self.energy_traj_weight > 0.0 and len(energy_loss_history) > 0)
-
-        if rank_active or anchor_active:
-            # Candidate memories are detached inside this helper, so these
-            # auxiliary losses shape energy at fixed written states.
-            landscape = self._compute_energy_landscape_losses(
-                backend,
+        trajectory_active = (
+            energy_objective_active
+            and self.energy_traj_weight > 0.0
+            and energy_loss_after_write is not None
+        )
+        final_auxiliary_losses = self._compute_memory_state_auxiliary_losses(
+            backend,
+            memory_state,
+            memory_state_initial,
+            batch_ctx,
+            target_loss,
+            initial_memory,
+            self.K,
+            energy_loss_history,
+            energy_loss_after_write,
+            memory_alignment_active=memory_alignment_active,
+            orthogonal_loss_active=orthogonal_loss_active,
+            energy_objective_active=energy_objective_active,
+        )
+        if step_alignment_active and inner_memory_updates:
+            final_step_alignment_loss, final_step_alignment_cosine = self._compute_step_alignment(
+                target_loss,
                 memory_state,
-                memory_state_initial,
-                batch_ctx,
-                compute_rank=rank_active,
-                compute_anchor=anchor_active,
+                inner_memory_updates[-1],
             )
+            step_alignment_losses.append(final_step_alignment_loss)
+            step_alignment_cosines.append(final_step_alignment_cosine)
+
+            with torch.enable_grad():
+                reconstruction_grad_after_write = torch.autograd.grad(
+                    reconstruction_loss_after_write.sum(),
+                    memory_state["mem_batch"],
+                    create_graph=self.step_alignment_weight > 0.0,
+                    retain_graph=True,
+                )[0]
+            reconstruction_alignment_loss_after_write, reconstruction_alignment_cosine_after_write = (
+                self._compute_step_alignment(
+                    target_loss,
+                    memory_state,
+                    reconstruction_grad_after_write,
+                )
+            )
+            step_alignment_losses.append(reconstruction_alignment_loss_after_write)
+            step_alignment_cosines.append(reconstruction_alignment_cosine_after_write)
+            step_alignment_loss = torch.stack(step_alignment_losses).mean()
+            step_alignment_cosine = torch.stack(step_alignment_cosines).mean()
+        else:
+            step_alignment_loss = zero
+            step_alignment_cosine = zero
+        memory_alignment_loss = final_auxiliary_losses["memory_alignment_loss"]
+        memory_alignment_cosine = final_auxiliary_losses["memory_alignment_cosine"]
+        orthogonal_loss = final_auxiliary_losses["orthogonal_loss"]
+        orthogonal_residual_dot = final_auxiliary_losses["orthogonal_residual_dot"]
+        rank_loss = final_auxiliary_losses["rank_loss"]
+        anchor_loss = final_auxiliary_losses["anchor_loss"]
+        traj_loss = final_auxiliary_losses["trajectory_loss"]
+        landscape = final_auxiliary_losses["landscape"]
+        rank_deranged_loss = zero
+        rank_interpolated_loss = zero
+        rank_random_loss = zero
+        if memory_alignment_cosine is None:
+            memory_alignment_cosine = zero
+        if orthogonal_residual_dot is None:
+            orthogonal_residual_dot = zero
+        orthogonal_alpha = (
+            F.softplus(self.orthogonal_alpha_raw.float())
+            if self.orthogonal_alpha_raw is not None
+            else zero.new_tensor(self.lr)
+        )
+
+        if landscape is not None:
             energy_positive = landscape["energy_positive"]
             landscape_stats["energy_positive_mean"] = energy_positive.mean()
 
         if rank_active:
-            rank_loss = landscape["rank_loss"]
             loss_names = {
                 "deranged": "energy_rank_deranged_loss",
                 "interpolated": "energy_rank_interpolated_loss",
@@ -2114,51 +2632,82 @@ class GradMemGPT(PreTrainedModel):
             })
 
         if anchor_active:
-            anchor_loss = landscape["anchor_loss"]
             loss_stats["energy_anchor_loss"] = anchor_loss
 
         if trajectory_active:
-            energy_next = energy_loss_history[1:] + [energy_loss_after_write]
-            traj_terms = [
-                F.relu(e_next - e_prev + self.energy_traj_margin).mean()
-                for e_prev, e_next in zip(energy_loss_history, energy_next)
-            ]
-            traj_loss = torch.stack(traj_terms).mean()
             loss_stats["energy_traj_loss"] = traj_loss
 
         weighted_inner_loss = self.inner_loss_weight * inner_loss_for_outer if self.add_inner_loss_to_outer else zero
         weighted_rank_loss = self.energy_rank_weight * rank_loss if rank_active else zero
         weighted_traj_loss = self.energy_traj_weight * traj_loss if trajectory_active else zero
         weighted_anchor_loss = self.energy_anchor_weight * anchor_loss if anchor_active else zero
-        energy_aux_loss = weighted_rank_loss + weighted_traj_loss + weighted_anchor_loss
+        weighted_memory_search_loss = (
+            self.energy_memory_search_weight * memory_search_loss if memory_search_active else zero
+        )
+        energy_aux_loss = (
+            weighted_rank_loss
+            + weighted_traj_loss
+            + weighted_anchor_loss
+            + weighted_memory_search_loss
+        )
+        weighted_memory_alignment_loss = self.memory_alignment_weight * memory_alignment_loss
+        weighted_step_alignment_loss = self.step_alignment_weight * step_alignment_loss
+        weighted_intermediate_read_loss = self.intermediate_read_weight * intermediate_read_loss
+        weighted_orthogonal_loss = self.orthogonal_loss_weight * orthogonal_loss
+        weighted_ivan_loss = self.ivan_loss_weight * ivan_loss
+        auxiliary_loss = self._combine_depth_auxiliary_losses(
+            inner_loss=inner_loss_for_outer,
+            rank_loss=rank_loss,
+            trajectory_loss=traj_loss,
+            anchor_loss=anchor_loss,
+            memory_alignment_loss=memory_alignment_loss,
+            orthogonal_loss=orthogonal_loss,
+        )
         outer_loss = (
             target_loss
-            + weighted_inner_loss
-            + energy_aux_loss
-            + self.memory_alignment_weight * memory_alignment_loss
-            + self.step_alignment_weight * step_alignment_loss
-            + self.intermediate_read_weight * intermediate_read_loss
-            + self.orthogonal_loss_weight * orthogonal_loss
-            + self.energy_memory_search_weight * memory_search_loss
+            + auxiliary_loss
+            + weighted_memory_search_loss
+            + weighted_ivan_loss
+            + weighted_step_alignment_loss
+            + weighted_intermediate_read_loss
         )
+        if self.orthogonal_loss_weight == 0.0 and self.orthogonal_alpha_raw is not None:
+            # Train alpha from the detached diagnostic without changing the loss value or other parameters.
+            outer_loss = outer_loss + orthogonal_loss - orthogonal_loss.detach()
 
         loss_stats.update({
             "outer_loss": outer_loss,
             "target_loss": target_loss,
             "memory_alignment_loss": memory_alignment_loss,
-            "memory_alignment_cosine": alignment_cosine.mean(),
+            "memory_alignment_cosine": memory_alignment_cosine.mean(),
             "step_alignment_loss": step_alignment_loss,
             "step_alignment_cosine": step_alignment_cosine,
-            "intermediate_read_loss": intermediate_read_loss,
             "orthogonal_loss": orthogonal_loss,
-            "orthogonal_residual_dot": residual_dot.mean(),
-            "orthogonal_alpha": F.softplus(self.orthogonal_alpha_raw.float()),
-            "energy_memory_search_loss": memory_search_loss,
-            "energy_memory_search_target_gain": memory_search_gain,
-            "energy_memory_search_improvement_rate": memory_search_improvement_rate,
-            "energy_memory_search_gain_ema": self.energy_memory_search_gain_ema,
+            "orthogonal_residual_dot": orthogonal_residual_dot.mean(),
+            "orthogonal_alpha": orthogonal_alpha,
+            "ivan_loss": ivan_loss,
+            "ivan_residual_dot": ivan_residual_dot,
+            "intermediate_read_loss": intermediate_read_loss,
         })
-        if rank_active or trajectory_active or anchor_active:
+        if memory_search_active:
+            loss_stats.update({
+                "energy_memory_search_loss": memory_search_loss,
+                "energy_memory_search_unweighted_loss": memory_search_unweighted_loss,
+                "energy_memory_search_improvement_rate": memory_search_improvement_rate,
+                "energy_memory_search_target_gain": memory_search_target_gain,
+                "energy_memory_search_max_target_gain": memory_search_max_target_gain,
+                "energy_memory_search_relative_target_gain": memory_search_relative_target_gain,
+                "energy_memory_search_mean_relative_target_gain": memory_search_relative_target_gain,
+                "energy_memory_search_max_relative_target_gain": memory_search_max_relative_target_gain,
+                "energy_memory_search_selected_distance": memory_search_selected_distance,
+            })
+            if self.energy_memory_search_use_gain_weighting:
+                loss_stats.update({
+                    "energy_memory_search_gain_weight_mean": memory_search_gain_weight_mean,
+                    "energy_memory_search_gain_weight_max": memory_search_gain_weight_max,
+                    "energy_memory_search_gain_ema": memory_search_gain_ema,
+                })
+        if rank_active or trajectory_active or anchor_active or memory_search_active:
             loss_stats["energy_aux_loss"] = energy_aux_loss
         for name, value in {**loss_stats, **landscape_stats}.items():
             output["inner_loop_stats"][name] = value.detach()
