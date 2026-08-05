@@ -76,6 +76,7 @@ MEMORY_ALIGNMENT_WEIGHT=${MEMORY_ALIGNMENT_WEIGHT:-0.0}
 STEP_ALIGNMENT_WEIGHT=${STEP_ALIGNMENT_WEIGHT:-0.0}
 GRAD_ALIGN_NORM=${GRAD_ALIGN_NORM:-none}
 INTERMEDIATE_READ_WEIGHT=${INTERMEDIATE_READ_WEIGHT:-0.0}
+ORTHOGONAL_LOSS_WEIGHT=${ORTHOGONAL_LOSS_WEIGHT:-0.0}
 STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
 
 ATTN_IMPL="eager"
@@ -149,6 +150,9 @@ fi
 if [ "$INTERMEDIATE_READ_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_iread${INTERMEDIATE_READ_WEIGHT}
 fi
+if [ "$ORTHOGONAL_LOSS_WEIGHT" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_orth${ORTHOGONAL_LOSS_WEIGHT}
+fi
 if [ "$USE_ADAM" = true ]; then
   RUN_NAME=${RUN_NAME}_with_adam
 fi
@@ -212,6 +216,7 @@ for N in "${N_VALUES[@]}"; do
     --step_alignment_weight "$STEP_ALIGNMENT_WEIGHT"
     --grad_align_norm "$GRAD_ALIGN_NORM"
     --intermediate_read_weight "$INTERMEDIATE_READ_WEIGHT"
+    --orthogonal_loss_weight "$ORTHOGONAL_LOSS_WEIGHT"
     --freeze_backbone "$FREEZE_BACKBONE"
     --max_steps 1000000
     --eval_steps 500

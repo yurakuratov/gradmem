@@ -49,6 +49,9 @@ LOSS_COMPONENT_KEYS = [
     "step_alignment_loss",
     "step_alignment_cosine",
     "intermediate_read_loss",
+    "orthogonal_loss",
+    "orthogonal_residual_dot",
+    "orthogonal_alpha",
 ]
 
 ENERGY_LANDSCAPE_STAT_KEYS = [
@@ -356,6 +359,7 @@ class ExperimentArgs:
     step_alignment_weight: Optional[float] = field(default=0.0)
     grad_align_norm: Optional[str] = field(default="none")
     intermediate_read_weight: Optional[float] = field(default=0.0)
+    orthogonal_loss_weight: Optional[float] = field(default=0.0)
 
 
 if __name__ == '__main__':
@@ -460,7 +464,8 @@ if __name__ == '__main__':
                                        memory_alignment_weight=args.memory_alignment_weight,
                                        step_alignment_weight=args.step_alignment_weight,
                                        grad_align_norm=args.grad_align_norm,
-                                       intermediate_read_weight=args.intermediate_read_weight)
+                                       intermediate_read_weight=args.intermediate_read_weight,
+                                       orthogonal_loss_weight=args.orthogonal_loss_weight)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)

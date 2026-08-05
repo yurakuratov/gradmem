@@ -103,6 +103,7 @@ class GradMemGPTConfig(PretrainedConfig):
                   step_alignment_weight=0.0,
                   grad_align_norm="none",
                   intermediate_read_weight=0.0,
+                  orthogonal_loss_weight=0.0,
                   **kwargs):
         """
         Args:
@@ -161,6 +162,7 @@ class GradMemGPTConfig(PretrainedConfig):
             step_alignment_weight: float, weight for aligning the final WRITE update with its READ gradient
             grad_align_norm: str, step-alignment normalization ("none" or "norm")
             intermediate_read_weight: float, weight for READ supervision on intermediate WRITE states
+            orthogonal_loss_weight: float, weight for making the residual WRITE update orthogonal to READ gradient
         """
         super().__init__(**kwargs)
 
@@ -220,6 +222,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.step_alignment_weight = step_alignment_weight
         self.grad_align_norm = grad_align_norm
         self.intermediate_read_weight = intermediate_read_weight
+        self.orthogonal_loss_weight = float(orthogonal_loss_weight or 0.0)
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -257,6 +260,11 @@ class GradMemGPTConfig(PretrainedConfig):
                 raise ValueError("step_alignment_weight requires second-order prefix WRITE")
         if self.intermediate_read_weight < 0.0:
             raise ValueError("intermediate_read_weight must be >= 0")
+        if self.orthogonal_loss_weight < 0.0:
+            raise ValueError("orthogonal_loss_weight must be >= 0")
+        if self.orthogonal_loss_weight > 0.0:
+            if self.memory_backend != "prefix" or self.grad_mode != "second" or self.K <= 0 or self.lr <= 0.0:
+                raise ValueError("orthogonal_loss_weight requires second-order prefix WRITE with lr > 0")
         if self.memory_backend == "lora":
             assert self.lora_mem_placement in ["between_layers", "target_modules"], (
                 "lora_mem_placement currently supports: 'between_layers', 'target_modules'"
@@ -800,6 +808,9 @@ class GradMemGPT(PreTrainedModel):
         self.step_alignment_weight = float(getattr(config, "step_alignment_weight", 0.0) or 0.0)
         self.grad_align_norm = getattr(config, "grad_align_norm", "none")
         self.intermediate_read_weight = float(getattr(config, "intermediate_read_weight", 0.0) or 0.0)
+        self.orthogonal_loss_weight = float(getattr(config, "orthogonal_loss_weight", 0.0) or 0.0)
+        alpha_init = self.lr if self.lr > 20.0 else math.log(math.expm1(self.lr))
+        self.orthogonal_alpha_raw = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
         if self.energy_rank_temperature <= 0.0:
             raise ValueError("energy_rank_temperature must be > 0")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
@@ -1661,7 +1672,8 @@ class GradMemGPT(PreTrainedModel):
             and self.memory_backend == "prefix"
             and self.K > 0
         )
-        memory_gradient_active = memory_alignment_active or step_alignment_active
+        orthogonal_loss_active = labels is not None and self.orthogonal_loss_weight > 0.0 and self.K > 0
+        memory_gradient_active = memory_alignment_active or step_alignment_active or orthogonal_loss_active
         last_inner_update = None
         intermediate_memory_states = []
         intermediate_read_active = labels is not None and self.intermediate_read_weight > 0.0 and self.K > 1
@@ -1869,12 +1881,24 @@ class GradMemGPT(PreTrainedModel):
             step_alignment_loss, step_alignment_cosine = self._compute_step_alignment(
                 outer_grad, last_inner_update
             )
+            if orthogonal_loss_active:
+                alpha = F.softplus(self.orthogonal_alpha_raw.float())
+                residual_dot = (
+                    (memory_state_initial['mem_batch'] - memory_state['mem_batch'] - alpha * outer_grad)
+                    * outer_grad
+                ).float().flatten(1).sum(dim=1)
+                orthogonal_loss = residual_dot.square().mean()
+            else:
+                orthogonal_loss = target_loss.new_tensor(0.0)
+                residual_dot = target_loss.new_tensor(0.0)
         else:
             target_loss = self._compute_read_target_loss(output['predictions'], read_batch, labels)
             memory_alignment_loss = target_loss.new_tensor(0.0)
             alignment_cosine = target_loss.new_tensor(0.0)
             step_alignment_loss = target_loss.new_tensor(0.0)
             step_alignment_cosine = target_loss.new_tensor(0.0)
+            orthogonal_loss = target_loss.new_tensor(0.0)
+            residual_dot = target_loss.new_tensor(0.0)
 
         intermediate_read_loss = target_loss.new_tensor(0.0)
         if intermediate_memory_states:
@@ -1986,6 +2010,7 @@ class GradMemGPT(PreTrainedModel):
             + self.memory_alignment_weight * memory_alignment_loss
             + self.step_alignment_weight * step_alignment_loss
             + self.intermediate_read_weight * intermediate_read_loss
+            + self.orthogonal_loss_weight * orthogonal_loss
         )
 
         loss_stats.update({
@@ -1996,6 +2021,9 @@ class GradMemGPT(PreTrainedModel):
             "step_alignment_loss": step_alignment_loss,
             "step_alignment_cosine": step_alignment_cosine,
             "intermediate_read_loss": intermediate_read_loss,
+            "orthogonal_loss": orthogonal_loss,
+            "orthogonal_residual_dot": residual_dot.mean(),
+            "orthogonal_alpha": F.softplus(self.orthogonal_alpha_raw.float()),
         })
         if rank_active or trajectory_active or anchor_active:
             loss_stats["energy_aux_loss"] = energy_aux_loss
