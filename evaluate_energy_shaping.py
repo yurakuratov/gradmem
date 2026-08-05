@@ -3,7 +3,9 @@
 
 The evaluator deliberately does not use ``Trainer``: it reconstructs each model
 from the config saved beside the checkpoint, disables auxiliary outer losses,
-and evaluates fixed checkpoints without mutating their parameters.
+and evaluates fixed checkpoints without mutating their parameters. Expensive
+measurements are cached by metric family under each checkpoint directory;
+comparison outputs only materialize aliases, aggregates, reports, and plots.
 """
 
 from __future__ import annotations
@@ -22,7 +24,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from itertools import zip_longest
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence
+from typing import Any, Iterable, Iterator, Mapping, MutableMapping, Sequence
 
 import datasets
 import numpy as np
@@ -34,11 +36,27 @@ from transformers import AutoConfig, AutoTokenizer
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
 
 
-EXPECTED_MISSING_CHECKPOINT_KEYS = {"model.lm_head.weight"}
+EXPECTED_MISSING_CHECKPOINT_KEYS = {
+    "model.lm_head.weight",
+    "energy_memory_search_gain_ema",
+    "energy_memory_search_gain_ema_initialized",
+}
 SAFE_ALIAS_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 RUN_DIR_RE = re.compile(r"^run_(\d+)$")
 CHECKPOINT_DIR_RE = re.compile(r"^checkpoint-(\d+)$")
-EVALUATOR_SCHEMA_VERSION = 1
+EVALUATOR_SCHEMA_VERSION = 2
+METRIC_CACHE_SCHEMA_VERSION = 1
+METRIC_CACHE_DIRNAME = "energy_shaping_metrics"
+METRIC_FAMILY_VERSIONS = {
+    # Bump only the affected family when its measurements or stored fields
+    # change. Other families will continue to reuse their checkpoint cache.
+    "task": 1,
+    "matching": 1,
+    "interpolation": 1,
+    "radial": 1,
+    "contours": 1,
+}
+CACHE_MODEL_LABEL = "checkpoint"
 
 
 @dataclass(frozen=True)
@@ -79,6 +97,12 @@ class FrozenModel:
     device: torch.device
     objective_type: str
     expected_training_exact_match: float | None
+
+
+@dataclass(frozen=True)
+class ReportCheckpoint:
+    label: str
+    checkpoint_path: Path
 
 
 @dataclass
@@ -300,6 +324,18 @@ def load_trainer_state(run_path: Path) -> dict[str, Any] | None:
 def recorded_best_checkpoint(run_path: Path) -> Path | None:
     state = load_trainer_state(run_path)
     if state is None or not state.get("best_model_checkpoint"):
+        checkpoint_states = []
+        for checkpoint_dir in run_path.iterdir():
+            match = CHECKPOINT_DIR_RE.fullmatch(checkpoint_dir.name) if checkpoint_dir.is_dir() else None
+            state_path = checkpoint_dir / "trainer_state.json"
+            if match and state_path.is_file():
+                checkpoint_states.append((int(match.group(1)), state_path))
+        for _, state_path in sorted(checkpoint_states, reverse=True):
+            candidate_state = json.loads(state_path.read_text())
+            if candidate_state.get("best_model_checkpoint"):
+                state = candidate_state
+                break
+    if state is None or not state.get("best_model_checkpoint"):
         return None
     checkpoint_name = Path(str(state["best_model_checkpoint"])).name
     candidate = run_path / checkpoint_name / "model.safetensors"
@@ -350,7 +386,16 @@ def resolve_experiment_inputs(
         for run_path in run_paths:
             completed = is_completed_run(run_path)
             explicitly_addressed_checkpoint = experiment.checkpoint_selector not in ("best",)
-            if not completed and not include_incomplete and not (is_exact_run and explicitly_addressed_checkpoint):
+            has_recorded_best = (
+                experiment.checkpoint_selector == "best"
+                and recorded_best_checkpoint(run_path) is not None
+            )
+            if (
+                not completed
+                and not include_incomplete
+                and not (is_exact_run and explicitly_addressed_checkpoint)
+                and not has_recorded_best
+            ):
                 skipped.append(SkippedRun(
                     alias=experiment.alias,
                     run_path=run_path,
@@ -482,7 +527,10 @@ def load_frozen_model(
     config.energy_rank_weight = 0.0
     config.energy_traj_weight = 0.0
     config.energy_anchor_weight = 0.0
+    config.energy_memory_search_weight = 0.0
+    config.ivan_loss_weight = 0.0
     config.add_inner_loss_to_outer = False
+    config.step_alignment_weight = 0.0
     config.last_K_second_order = 0
 
     model = GradMemGPT(config)
@@ -1669,7 +1717,7 @@ def format_markdown_table(headers: Sequence[str], rows: Sequence[Sequence[Any]])
 
 def generate_report(
     output_dir: Path,
-    frozen_models: Sequence[FrozenModel],
+    frozen_models: Sequence[FrozenModel | ReportCheckpoint],
     task_summary: Sequence[Mapping[str, Any]],
     paired_summary: Sequence[Mapping[str, Any]],
     matching_summary: Sequence[Mapping[str, Any]],
@@ -1885,6 +1933,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default="checkpoint-18500")
     parser.add_argument("--include-incomplete", action="store_true")
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--recompute-metrics",
+        nargs="*",
+        choices=("all", *METRIC_FAMILY_VERSIONS),
+        default=(),
+        help="ignore selected checkpoint-local metric caches",
+    )
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="populate checkpoint-local caches without building aggregate comparisons",
+    )
     parser.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="cpu")
     parser.add_argument("--data-root", type=Path, default=Path("./data"))
     parser.add_argument("--n-values", nargs="+", default=[4, 8, 16, 32, 64])
@@ -2011,6 +2071,60 @@ def evaluation_config(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def metric_family_configs(args: argparse.Namespace) -> dict[str, dict[str, Any]]:
+    """Return computation inputs grouped by independently cacheable family."""
+    common = {
+        "data_root": str(args.data_root.resolve()),
+        "batch_size": int(args.batch_size),
+        "seed": int(args.seed),
+        "dtype": "float32",
+    }
+    landscape = {
+        **common,
+        "inner_steps": 2,
+    }
+    return {
+        "task": {
+            **common,
+            "n_values": list(args.n_values),
+            "inner_steps": list(args.inner_steps),
+            "max_eval_examples": args.max_eval_examples,
+        },
+        "matching": {
+            **landscape,
+            "n_values": [] if args.skip_landscape else list(args.matching_n_values),
+            "examples": int(args.matching_examples),
+            "bank_size": int(args.matching_bank_size),
+            "margin": 0.1,
+        },
+        "interpolation": {
+            **landscape,
+            "n_values": [] if args.skip_landscape else list(args.landscape_n_values),
+            "examples": int(args.scan_examples),
+            "bank_size": int(args.matching_bank_size),
+            "bootstrap_resamples": int(args.bootstrap_resamples),
+            "values": [float(value) for value in np.linspace(0.0, 1.0, 21)],
+        },
+        "radial": {
+            **landscape,
+            "n_values": [] if args.skip_landscape else list(args.landscape_n_values),
+            "examples": int(args.scan_examples),
+            "bank_size": int(args.matching_bank_size),
+            "num_directions": int(args.num_radial_directions),
+            "radii": [0.0, 0.125, 0.25, 0.5, 1.0, 1.5],
+        },
+        "contours": {
+            **landscape,
+            "n_values": [] if args.skip_landscape else list(args.landscape_n_values),
+            "examples": int(args.contour_examples),
+            "bank_size": int(args.matching_bank_size),
+            "x_values": [float(value) for value in np.linspace(-0.5, 1.5, 31)],
+            "y_values": [float(value) for value in np.linspace(-1.0, 1.0, 31)],
+            "direction_seed_offset": 71,
+        },
+    }
+
+
 def tokenizer_signature_digest(tokenizer: Any) -> str:
     def stable(value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
@@ -2038,6 +2152,79 @@ def per_checkpoint_output_dir(output_dir: Path, spec: ResolvedRun) -> Path:
     return output_dir / "per_checkpoint" / spec.alias / spec.run_id / spec.checkpoint_name
 
 
+def checkpoint_metric_cache_root(spec: ResolvedRun) -> Path:
+    return spec.checkpoint_path.parent / METRIC_CACHE_DIRNAME
+
+
+def metric_cache_signature(
+    checkpoint_sha256: str,
+    family: str,
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "cache_schema_version": METRIC_CACHE_SCHEMA_VERSION,
+        "family": family,
+        "family_version": METRIC_FAMILY_VERSIONS[family],
+        "checkpoint_sha256": checkpoint_sha256,
+        "config": json_safe(config),
+    }
+
+
+def metric_cache_path(spec: ResolvedRun, signature: Mapping[str, Any]) -> Path:
+    encoded = json.dumps(json_safe(signature), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    key = hashlib.sha256(encoded).hexdigest()[:20]
+    return checkpoint_metric_cache_root(spec) / str(signature["family"]) / key
+
+
+def load_metric_cache(
+    cache_path: Path,
+    signature: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    manifest_path = cache_path / "manifest.json"
+    payload_path = cache_path / "metrics.json"
+    if not manifest_path.exists() or not payload_path.exists():
+        return None
+    manifest = json.loads(manifest_path.read_text())
+    if manifest.get("status") != "complete" or manifest.get("signature") != json_safe(signature):
+        return None
+    payload = json.loads(payload_path.read_text())
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid metric cache payload: {payload_path}")
+    return payload, manifest
+
+
+def write_metric_cache(
+    cache_path: Path,
+    signature: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    frozen: FrozenModel,
+) -> dict[str, Any]:
+    cache_path.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "status": "running",
+        "signature": signature,
+        "checkpoint_path": frozen.checkpoint_path,
+        "objective_type": frozen.objective_type,
+        "tokenizer_signature_sha256": tokenizer_signature_digest(frozen.tokenizer),
+        "torch_version": torch.__version__,
+        "datasets_version": datasets.__version__,
+    }
+    write_json(cache_path / "manifest.json", manifest)
+    write_json(cache_path / "metrics.json", payload)
+    manifest["status"] = "complete"
+    write_json(cache_path / "manifest.json", manifest)
+    return manifest
+
+
+def relabel_metric_rows(rows: Sequence[Mapping[str, Any]], spec: ResolvedRun) -> list[dict[str, Any]]:
+    materialized = [dict(row) for row in rows]
+    for row in materialized:
+        if "model" in row:
+            row["model"] = spec.alias
+    add_run_metadata(materialized, spec)
+    return materialized
+
+
 def validate_resume_manifest(
     manifest: Mapping[str, Any],
     signature: Mapping[str, Any],
@@ -2052,10 +2239,27 @@ def validate_resume_manifest(
 def evaluate_resolved_run(
     spec: ResolvedRun,
     args: argparse.Namespace,
-    loaded_datasets: Mapping[int, Any],
+    loaded_datasets: MutableMapping[int, Any],
     device: torch.device,
 ) -> tuple[Path, str]:
+    def dataset_for(n_value: int) -> Any:
+        if n_value not in loaded_datasets:
+            dataset_path = args.data_root / f"N{n_value}-K2V2-V62_1M"
+            if not dataset_path.exists():
+                raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+            loaded_datasets[n_value] = datasets.load_from_disk(str(dataset_path))["valid"]
+        return loaded_datasets[n_value]
+
     checkpoint_digest = checkpoint_file_digest(spec.checkpoint_path)
+    family_configs = metric_family_configs(args)
+    family_signatures = {
+        family: metric_cache_signature(checkpoint_digest, family, config)
+        for family, config in family_configs.items()
+    }
+    family_paths = {
+        family: metric_cache_path(spec, signature)
+        for family, signature in family_signatures.items()
+    }
     signature = {
         "checkpoint_sha256": checkpoint_digest,
         "evaluation": evaluation_config(args),
@@ -2071,20 +2275,169 @@ def evaluate_resolved_run(
             raise FileExistsError(
                 f"Checkpoint output already exists; use --resume or a new output directory: {checkpoint_output}"
             )
-        if not manifest_path.exists():
+        if not manifest_path.exists() and not args.cache_only:
             raise ValueError(f"Cannot resume checkpoint without manifest: {checkpoint_output}")
-        existing = json.loads(manifest_path.read_text())
-        validate_resume_manifest(existing, signature, checkpoint_output)
-        return checkpoint_output, str(existing["tokenizer_signature_sha256"])
+        if manifest_path.exists() and not args.cache_only:
+            existing = json.loads(manifest_path.read_text())
+            validate_resume_manifest(existing, signature, checkpoint_output)
+    else:
+        checkpoint_output.mkdir(parents=True, exist_ok=False)
 
-    checkpoint_output.mkdir(parents=True, exist_ok=False)
-    frozen = load_frozen_model(
-        spec.alias,
-        spec.run_path,
-        spec.checkpoint_path,
-        device=device,
-    )
-    tokenizer_digest = tokenizer_signature_digest(frozen.tokenizer)
+    recompute = set(args.recompute_metrics)
+    cache_results: dict[str, dict[str, Any]] = {}
+    cache_manifests: dict[str, dict[str, Any]] = {}
+    for family in METRIC_FAMILY_VERSIONS:
+        cached = None
+        if "all" not in recompute and family not in recompute:
+            cached = load_metric_cache(family_paths[family], family_signatures[family])
+        if cached is not None:
+            cache_results[family], cache_manifests[family] = cached
+            print(
+                f"[cache hit] alias={spec.alias} run={spec.run_id} "
+                f"checkpoint={spec.checkpoint_name} metric={family}",
+                flush=True,
+            )
+
+    missing_families = set(METRIC_FAMILY_VERSIONS) - set(cache_results)
+    frozen: FrozenModel | None = None
+    if missing_families:
+        frozen = load_frozen_model(
+            CACHE_MODEL_LABEL,
+            spec.run_path,
+            spec.checkpoint_path,
+            device=device,
+        )
+
+    if "task" in missing_families:
+        assert frozen is not None
+        task_rows: list[dict[str, Any]] = []
+        task_summary: list[dict[str, Any]] = []
+        for n_value in args.n_values:
+            for inner_steps in args.inner_steps:
+                print(
+                    f"[task] alias={spec.alias} run={spec.run_id} seed={spec.seed} "
+                    f"checkpoint={spec.checkpoint_name} N={n_value} K={inner_steps}",
+                    flush=True,
+                )
+                rows, summary = evaluate_task_cell(
+                    frozen,
+                    dataset_for(n_value),
+                    n_value,
+                    inner_steps,
+                    args.batch_size,
+                    max_examples=args.max_eval_examples,
+                )
+                task_rows.extend(rows)
+                task_summary.append(summary)
+        cache_results["task"] = {"rows": task_rows, "summary": task_summary}
+
+    landscape_missing = missing_families - {"task"}
+    landscape_payloads: dict[str, dict[str, Any]] = {
+        "matching": {"summary": [], "rows": []},
+        "interpolation": {"rows": [], "summary": []},
+        "radial": {"rows": []},
+        "contours": {"rows": []},
+    }
+    if landscape_missing:
+        assert frozen is not None
+        requested_by_family = {
+            family: set(family_configs[family]["n_values"])
+            for family in landscape_missing
+        }
+        landscape_n_values = sorted(set().union(*requested_by_family.values()))
+        for n_value in landscape_n_values:
+            required_counts = []
+            if n_value in requested_by_family.get("matching", set()):
+                required_counts.append(args.matching_examples)
+            if n_value in requested_by_family.get("interpolation", set()):
+                required_counts.append(args.scan_examples)
+            if n_value in requested_by_family.get("radial", set()):
+                required_counts.append(args.scan_examples)
+            if n_value in requested_by_family.get("contours", set()):
+                required_counts.append(args.contour_examples)
+            landscape_count = max(required_counts)
+            indices = deterministic_subset_indices(
+                len(dataset_for(n_value)), landscape_count, args.seed + n_value
+            )
+            print(
+                f"[landscape] alias={spec.alias} run={spec.run_id} seed={spec.seed} N={n_value} "
+                f"metrics={','.join(sorted(family for family, values in requested_by_family.items() if n_value in values))}",
+                flush=True,
+            )
+            batches = collect_landscape_batches(
+                frozen,
+                dataset_for(n_value),
+                indices,
+                args.matching_bank_size,
+                inner_steps=2,
+            )
+            if n_value in requested_by_family.get("matching", set()):
+                matching_batch_count = args.matching_examples // args.matching_bank_size
+                summary, rows = matching_probe(
+                    frozen,
+                    batches[:matching_batch_count],
+                    n_value,
+                    margin=0.1,
+                    eval_batch_size=args.batch_size,
+                )
+                landscape_payloads["matching"]["summary"].append(summary)
+                landscape_payloads["matching"]["rows"].extend(rows)
+            if n_value in requested_by_family.get("interpolation", set()):
+                scan_data = concatenate_landscape_batches(batches, args.scan_examples)
+                rows, summary = interpolation_probe(
+                    frozen,
+                    scan_data,
+                    n_value,
+                    t_values=np.linspace(0.0, 1.0, 21),
+                    eval_batch_size=args.batch_size,
+                    bootstrap_resamples=args.bootstrap_resamples,
+                    seed=args.seed,
+                )
+                landscape_payloads["interpolation"]["rows"].extend(rows)
+                landscape_payloads["interpolation"]["summary"].append(summary)
+            if n_value in requested_by_family.get("radial", set()):
+                scan_data = concatenate_landscape_batches(batches, args.scan_examples)
+                landscape_payloads["radial"]["rows"].extend(radial_probe(
+                    frozen,
+                    scan_data,
+                    n_value,
+                    radii=[0.0, 0.125, 0.25, 0.5, 1.0, 1.5],
+                    num_directions=args.num_radial_directions,
+                    eval_batch_size=args.batch_size,
+                    seed=args.seed,
+                ))
+            if n_value in requested_by_family.get("contours", set()):
+                contour_data = concatenate_landscape_batches(batches, args.contour_examples)
+                landscape_payloads["contours"]["rows"].extend(contour_probe(
+                    frozen,
+                    contour_data,
+                    n_value,
+                    x_values=np.linspace(-0.5, 1.5, 31),
+                    y_values=np.linspace(-1.0, 1.0, 31),
+                    eval_batch_size=args.batch_size,
+                    seed=args.seed + 71,
+                ))
+        for family in landscape_missing:
+            cache_results[family] = landscape_payloads[family]
+
+    if missing_families:
+        assert frozen is not None
+        digest_after = parameter_digest(frozen.model)
+        if digest_after != frozen.digest_before:
+            raise AssertionError(f"Frozen model parameters changed during evaluation: {spec.alias}/{spec.run_id}")
+        for family in sorted(missing_families):
+            cache_manifests[family] = write_metric_cache(
+                family_paths[family],
+                family_signatures[family],
+                cache_results[family],
+                frozen,
+            )
+    else:
+        digest_after = None
+
+    metadata_manifest = next(iter(cache_manifests.values()))
+    tokenizer_digest = str(metadata_manifest["tokenizer_signature_sha256"])
+    objective_type = str(metadata_manifest["objective_type"])
     manifest = {
         "status": "running",
         "signature": signature,
@@ -2097,9 +2450,17 @@ def evaluate_resolved_run(
         "checkpoint_path": spec.checkpoint_path,
         "checkpoint_name": spec.checkpoint_name,
         "is_recorded_best": spec.is_recorded_best,
-        "objective_type": frozen.objective_type,
-        "parameter_digest_before": frozen.digest_before,
+        "objective_type": objective_type,
+        "parameter_digest_before": frozen.digest_before if frozen is not None else None,
         "tokenizer_signature_sha256": tokenizer_digest,
+        "metric_caches": {
+            family: {
+                "path": family_paths[family],
+                "signature": family_signatures[family],
+                "reused": family not in missing_families,
+            }
+            for family in METRIC_FAMILY_VERSIONS
+        },
         "device": str(device),
         "dtype": "float32",
         "torch_version": torch.__version__,
@@ -2107,27 +2468,22 @@ def evaluate_resolved_run(
     }
     write_json(manifest_path, manifest)
 
-    task_rows: list[dict[str, Any]] = []
-    task_summary: list[dict[str, Any]] = []
-    for n_value in args.n_values:
-        for inner_steps in args.inner_steps:
-            print(
-                f"[task] alias={spec.alias} run={spec.run_id} seed={spec.seed} "
-                f"checkpoint={spec.checkpoint_name} N={n_value} K={inner_steps}",
-                flush=True,
-            )
-            rows, summary = evaluate_task_cell(
-                frozen,
-                loaded_datasets[n_value],
-                n_value,
-                inner_steps,
-                args.batch_size,
-                max_examples=args.max_eval_examples,
-            )
-            task_rows.extend(rows)
-            task_summary.append(summary)
-    add_run_metadata(task_rows, spec)
-    add_run_metadata(task_summary, spec)
+    if args.cache_only:
+        manifest.update({
+            "status": "complete",
+            "parameter_digest_after": digest_after,
+        })
+        write_json(manifest_path, manifest)
+        del frozen
+        gc.collect()
+        if device.type == "mps":
+            torch.mps.empty_cache()
+        elif device.type == "cuda":
+            torch.cuda.empty_cache()
+        return checkpoint_output, tokenizer_digest
+
+    task_rows = relabel_metric_rows(cache_results["task"]["rows"], spec)
+    task_summary = relabel_metric_rows(cache_results["task"]["summary"], spec)
 
     reference = training_reference(spec.run_path) if spec.is_recorded_best else None
     reproduction = verify_reproduction(
@@ -2142,82 +2498,13 @@ def evaluate_resolved_run(
     write_json(checkpoint_output / "task_summary.json", task_summary)
     write_json(checkpoint_output / "reproduction.json", reproduction)
 
-    matching_summary: list[dict[str, Any]] = []
-    matching_rows: list[dict[str, Any]] = []
-    interpolation_rows: list[dict[str, Any]] = []
-    interpolation_summary: list[dict[str, Any]] = []
-    radial_rows: list[dict[str, Any]] = []
-    contour_rows: list[dict[str, Any]] = []
+    matching_summary = relabel_metric_rows(cache_results["matching"]["summary"], spec)
+    matching_rows = relabel_metric_rows(cache_results["matching"]["rows"], spec)
+    interpolation_rows = relabel_metric_rows(cache_results["interpolation"]["rows"], spec)
+    interpolation_summary = relabel_metric_rows(cache_results["interpolation"]["summary"], spec)
+    radial_rows = relabel_metric_rows(cache_results["radial"]["rows"], spec)
+    contour_rows = relabel_metric_rows(cache_results["contours"]["rows"], spec)
     if not args.skip_landscape:
-        for n_value in sorted(set(args.matching_n_values) | set(args.landscape_n_values)):
-            landscape_count = max(args.matching_examples, args.scan_examples)
-            indices = deterministic_subset_indices(
-                len(loaded_datasets[n_value]), landscape_count, args.seed + n_value
-            )
-            print(
-                f"[landscape] alias={spec.alias} run={spec.run_id} seed={spec.seed} N={n_value}",
-                flush=True,
-            )
-            batches = collect_landscape_batches(
-                frozen,
-                loaded_datasets[n_value],
-                indices,
-                args.matching_bank_size,
-                inner_steps=2,
-            )
-            matching_batch_count = args.matching_examples // args.matching_bank_size
-            summary, rows = matching_probe(
-                frozen,
-                batches[:matching_batch_count],
-                n_value,
-                margin=0.1,
-                eval_batch_size=args.batch_size,
-            )
-            matching_summary.append(summary)
-            matching_rows.extend(rows)
-            if n_value not in args.landscape_n_values:
-                continue
-            scan_data = concatenate_landscape_batches(batches, args.scan_examples)
-            interpolation, interpolation_stats = interpolation_probe(
-                frozen,
-                scan_data,
-                n_value,
-                t_values=np.linspace(0.0, 1.0, 21),
-                eval_batch_size=args.batch_size,
-                bootstrap_resamples=args.bootstrap_resamples,
-                seed=args.seed,
-            )
-            interpolation_rows.extend(interpolation)
-            interpolation_summary.append(interpolation_stats)
-            radial_rows.extend(radial_probe(
-                frozen,
-                scan_data,
-                n_value,
-                radii=[0.0, 0.125, 0.25, 0.5, 1.0, 1.5],
-                num_directions=args.num_radial_directions,
-                eval_batch_size=args.batch_size,
-                seed=args.seed,
-            ))
-            contour_data = concatenate_landscape_batches(batches, args.contour_examples)
-            contour_rows.extend(contour_probe(
-                frozen,
-                contour_data,
-                n_value,
-                x_values=np.linspace(-0.5, 1.5, 31),
-                y_values=np.linspace(-1.0, 1.0, 31),
-                eval_batch_size=args.batch_size,
-                seed=args.seed + 71,
-            ))
-
-        for rows in (
-            matching_summary,
-            matching_rows,
-            interpolation_rows,
-            interpolation_summary,
-            radial_rows,
-            contour_rows,
-        ):
-            add_run_metadata(rows, spec)
         write_csv(checkpoint_output / "matching_summary.csv", matching_summary)
         write_jsonl(checkpoint_output / "matching_examples.jsonl", matching_rows)
         write_csv(checkpoint_output / "interpolation.csv", interpolation_rows)
@@ -2231,9 +2518,6 @@ def evaluate_resolved_run(
             "radial": radial_rows,
         })
 
-    digest_after = parameter_digest(frozen.model)
-    if digest_after != frozen.digest_before:
-        raise AssertionError(f"Frozen model parameters changed during evaluation: {spec.alias}/{spec.run_id}")
     generate_plots(
         checkpoint_output,
         task_summary,
@@ -2244,7 +2528,7 @@ def evaluate_resolved_run(
     )
     generate_report(
         checkpoint_output,
-        [frozen],
+        [ReportCheckpoint(spec.alias, spec.checkpoint_path)],
         task_summary,
         [],
         matching_summary,
@@ -2755,17 +3039,7 @@ def main() -> int:
     }
     write_json(args.output_dir / "manifest.json", root_manifest)
 
-    required_n_values = set(args.n_values)
-    if not args.skip_landscape:
-        required_n_values.update(args.landscape_n_values)
-        required_n_values.update(args.matching_n_values)
     loaded_datasets: dict[int, Any] = {}
-    for n_value in sorted(required_n_values):
-        dataset_path = args.data_root / f"N{n_value}-K2V2-V62_1M"
-        if not dataset_path.exists():
-            raise FileNotFoundError(f"Dataset not found: {dataset_path}")
-        loaded_datasets[n_value] = datasets.load_from_disk(str(dataset_path))["valid"]
-
     checkpoint_outputs: dict[tuple[str, int], Path] = {}
     tokenizer_digest: str | None = None
     checkpoint_manifests: list[dict[str, Any]] = []
@@ -2782,6 +3056,17 @@ def main() -> int:
             )
         checkpoint_outputs[(spec.alias, spec.seed)] = checkpoint_output
         checkpoint_manifests.append(json.loads((checkpoint_output / "manifest.json").read_text()))
+
+    if args.cache_only:
+        root_manifest.update({
+            "status": "complete",
+            "tokenizer_signature_sha256": tokenizer_digest,
+            "checkpoints": checkpoint_manifests,
+            "comparisons": [],
+        })
+        write_json(args.output_dir / "manifest.json", root_manifest)
+        print(f"Checkpoint metric caches are complete: {args.output_dir}", flush=True)
+        return 0
 
     alias_order = list(dict.fromkeys(item.alias for item in inputs))
     specs_by_alias = {
