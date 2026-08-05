@@ -219,7 +219,8 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     # gate_delta_mean: mean Mamba Delta (->0 = full retention). seg stats below
     # are also emitted by the segmented adaptive path.
     for _k in ('gate_retain_mean', 'gate_write_mean', 'gate_delta_mean',
-               'seg_nonempty_count_mean', 'seg_nonempty_size_mean'):
+               'seg_nonempty_count_mean', 'seg_nonempty_size_mean',
+               'mem_prior_loss', 'mem_prior_weight_now', 'mem_sampled_delta_norm_mean'):
         if _k in inner_loop_stats:
             metrics[_k] = float(inner_loop_stats[_k].mean())
     return metrics
@@ -501,6 +502,11 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
             for m in _re.finditer(r'!([^!|:]+):([^!|]+)!', text):
                 k, v = m.group(1), m.group(2)
                 pairs.append((m.start(), m.end(), k, v))
+            # The context is RIGHT-padded (tokenizer default padding_side='right';
+            # collate_fn does not override it). Pads append after the trailing '|',
+            # so a KV's real char position == its padded token position. The model
+            # chunks the padded tensor, so we attribute using these positions to
+            # stay aligned with the model's segment boundaries.
             if segment_size is not None:
                 n_seg = max(1, math.ceil(padded_len / segment_size))
                 seg_sz = segment_size
@@ -509,8 +515,7 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
                 seg_sz = max(1, math.ceil(padded_len / n_seg))
             sample_pairs = []
             for ts, te, k, v in pairs:
-                # KV's token span in the PADDED coordinate (matches forward).
-                # Under right-padding the real position ts is the padded position.
+                # right-padding: padded position == real position (pads are past the '|')
                 pad_ts = ts
                 pad_te = te
                 src_seg = None
@@ -954,6 +959,10 @@ class ExperimentArgs:
     convex_bias_init: Optional[float] = field(default=3.0)
     mamba_retain_bias_init: Optional[float] = field(default=-5.0)
     mamba_write_bias_init: Optional[float] = field(default=3.0)
+    # ---- VAE-style memory regularisation (default-off; adaptive fork only) ---- #
+    mem_noise_std: Optional[float] = field(default=0.0)
+    mem_prior_weight: Optional[float] = field(default=0.0)
+    mem_prior_anneal_steps: Optional[int] = field(default=0)
 
 
 def main(config_path: Optional[str] = None):
@@ -1166,6 +1175,9 @@ def main(config_path: Optional[str] = None):
             convex_bias_init=args.convex_bias_init,
             mamba_retain_bias_init=args.mamba_retain_bias_init,
             mamba_write_bias_init=args.mamba_write_bias_init,
+            mem_noise_std=args.mem_noise_std,
+            mem_prior_weight=args.mem_prior_weight,
+            mem_prior_anneal_steps=args.mem_prior_anneal_steps,
         )
         # Adaptive segments need the full (un-truncated) context so every
         # segment has real tokens. The shared collator already disables

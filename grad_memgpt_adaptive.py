@@ -133,6 +133,11 @@ class GradMemGPTConfig(PretrainedConfig):
                  convex_bias_init=3.0,
                  mamba_retain_bias_init=-5.0,
                  mamba_write_bias_init=3.0,
+                 # ---- VAE-style memory regularisation (default-off) ---- #
+                 # See "Recent additions" in AGENTS.md for the full rationale.
+                 mem_noise_std=0.0,           # σ: fixed Gaussian noise on mem before READ (0 = off)
+                 mem_prior_weight=0.0,        # λ: weight of MSE(m_0, m_final) outer-loop prior (0 = off)
+                 mem_prior_anneal_steps=0,    # λ warmup: 0 -> mem_prior_weight over this many steps (0 = constant)
                  **kwargs):
         """
         Args (new vs grad_memgpt_old.py):
@@ -173,6 +178,20 @@ class GradMemGPTConfig(PretrainedConfig):
                 at -5.0 -> retention ~= 0.993 -> starts near SGD).
             mamba_write_bias_init: float, bias init for write gate (sigmoid(b) ~= 0.95
                 at 3.0 -> starts near SGD).
+            mem_noise_std: float, VAE-style sampling. After the WRITE inner loop the
+                final (deterministic) memory m is perturbed as m_used = m + sigma*eps,
+                eps ~ N(0, I), and READ consumes m_used. Reparameterised, so gradients
+                flow to the mean m and through it to the inner-loop params; eps carries
+                no grad. Train-only (eval READ stays deterministic). 0.0 = off.
+            mem_prior_weight: float, VAE-style prior regularisation weight lambda.
+                Adds lambda * MSE(m_0, m_final) to the OUTER loss only, where m_0 are
+                the initial (meta-learned) memory tokens. m_0 is DETACHED in the term,
+                so the reg pulls m -> m_0 but never m_0 -> m (avoids the "prior drifts
+                to satisfy the reg" collapse). Computed on the deterministic endpoint
+                (pre-sampling), not the noisy sample. 0.0 = off.
+            mem_prior_anneal_steps: int, lambda warmup: linear 0 -> mem_prior_weight
+                over this many outer steps, then constant. 0 = constant lambda from
+                step 0 (no warmup).
 
         (All other args are unchanged from grad_memgpt_old.py; see its docstring.)
         """
@@ -226,6 +245,11 @@ class GradMemGPTConfig(PretrainedConfig):
         self.mamba_retain_bias_init = mamba_retain_bias_init
         self.mamba_write_bias_init = mamba_write_bias_init
 
+        # VAE-style memory regularisation
+        self.mem_noise_std = mem_noise_std
+        self.mem_prior_weight = mem_prior_weight
+        self.mem_prior_anneal_steps = mem_prior_anneal_steps
+
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), \
@@ -250,6 +274,12 @@ class GradMemGPTConfig(PretrainedConfig):
             f"gate_granularity must be 'per_dim' or 'per_token', got '{gate_granularity}'"
         assert gate_retention in ("exp", "sigmoid"), \
             f"gate_retention must be 'exp' or 'sigmoid', got '{gate_retention}'"
+
+        # Validate VAE-style regularisation settings
+        assert mem_noise_std >= 0.0, f"mem_noise_std must be >= 0.0, got {mem_noise_std}"
+        assert mem_prior_weight >= 0.0, f"mem_prior_weight must be >= 0.0, got {mem_prior_weight}"
+        assert mem_prior_anneal_steps >= 0, \
+            f"mem_prior_anneal_steps must be >= 0, got {mem_prior_anneal_steps}"
 
 
 class GradMemGPT(PreTrainedModel):
@@ -342,6 +372,12 @@ class GradMemGPT(PreTrainedModel):
         self.gate_features = config.gate_features
         self.gate_granularity = config.gate_granularity
         self.gate_retention = config.gate_retention
+
+        # VAE-style memory regularisation
+        self.mem_noise_std = config.mem_noise_std
+        self.mem_prior_weight = config.mem_prior_weight
+        self.mem_prior_anneal_steps = config.mem_prior_anneal_steps
+        self.current_train_step = 0   # stamped by CustomTrainer.compute_loss via set_train_step
 
         # memory parameters (shape = n_mem_tokens × d)
         n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
@@ -559,6 +595,26 @@ class GradMemGPT(PreTrainedModel):
             scale = self.inner_clip_norm / (g_norm + 1e-6)
             g = torch.where(g_norm > self.inner_clip_norm, g * scale, g)
         return g
+
+    # ---------------------------------------------------------------- #
+    # Train-step / schedule hooks for the VAE-style prior warmup.
+    # The adaptive model extends PreTrainedModel directly (it does NOT
+    # inherit the base grad_memgpt.GradMemGPT), so these accessors must be
+    # defined here. CustomTrainer.compute_loss already calls
+    # m.set_train_step(self.state.global_step) guarded by hasattr; without
+    # these the call silently no-ops and current_train_step stays at 0.
+    # Mirrors the _energy_recon_weight_now shape in grad_memgpt.py:776.
+    # ---------------------------------------------------------------- #
+    def set_train_step(self, step):
+        """Stamped by the trainer so the lambda warmup schedule knows the outer step."""
+        self.current_train_step = int(step)
+
+    def _mem_prior_weight_now(self):
+        """Lambda schedule: 0 -> mem_prior_weight over mem_prior_anneal_steps, then constant."""
+        if self.mem_prior_anneal_steps <= 0:
+            return self.mem_prior_weight
+        frac = min(self.current_train_step / self.mem_prior_anneal_steps, 1.0)
+        return self.mem_prior_weight * frac
 
     def _sgd_step(self, p, g, lr=None):
         """Stateless SGD: m = m - lr*g. r_t = 1, w_t = 1 (degenerate running-sum RNN)."""
@@ -1165,6 +1221,38 @@ class GradMemGPT(PreTrainedModel):
             del ctx_emb, lm_labels
 
         # ---------------------------------------------------------------- #
+        # VAE-style regularisation: prior on the deterministic mean, then
+        # (optionally) sample a perturbed memory for READ.
+        # ---------------------------------------------------------------- #
+        # The prior is computed on the DETERMINISTIC inner-loop endpoint m
+        # (not the noisy sample), so it constrains where the inner loop lands.
+        # m_0 = mem_batch_initial is DETACHED -> the reg pulls m -> m_0 only,
+        # never m_0 -> m (avoids the "prior drifts to satisfy the reg" collapse).
+        # lambda is scheduled by _mem_prior_weight_now (0 -> mem_prior_weight
+        # over mem_prior_anneal_steps). Default mem_prior_weight=0 -> no-op.
+        mem_prior_w = self._mem_prior_weight_now()
+        if self.mem_prior_weight > 0:
+            mem_prior_loss = F.mse_loss(mem_batch, mem_batch_initial.detach())
+        else:
+            mem_prior_loss = torch.tensor(0.0, device=device)
+        inner_loop_stats['mem_prior_loss'] = mem_prior_loss.detach()
+        inner_loop_stats['mem_prior_weight_now'] = torch.tensor(float(mem_prior_w), device=device)
+
+        # Reparameterised sampling: m_used = m + sigma*eps, eps ~ N(0, I). eps
+        # carries no grad, so gradients flow to the mean m (and through it to
+        # the inner-loop params) exactly as in a VAE; the noise is a forward-
+        # pass bottleneck forcing READ-time robustness to memory perturbation.
+        # Train-only: eval READ stays deterministic (keeps token_accuracy
+        # stable; the per-segment forgetting probes snapshot BEFORE this point,
+        # so they are unaffected regardless). Default mem_noise_std=0 -> no-op.
+        if self.training and self.mem_noise_std > 0:
+            noise = torch.randn_like(mem_batch)
+            mem_sampled = mem_batch + self.mem_noise_std * noise
+            inner_loop_stats['mem_sampled_delta_norm_mean'] = \
+                (mem_sampled - mem_batch).detach().norm(dim=(1, 2)).mean()
+            mem_batch = mem_sampled
+
+        # ---------------------------------------------------------------- #
         # 2.  READ phase – compute outer loss on target predictions based on query, read from mem
         # ---------------------------------------------------------------- #
         qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
@@ -1212,10 +1300,15 @@ class GradMemGPT(PreTrainedModel):
         )
 
         output['inner_loop_stats']['target_loss'] = target_loss.detach()
+        # Additive chain so target / inner-loss / prior terms compose cleanly.
+        # With both weights at their defaults (inner_loss_weight=0 when
+        # add_inner_loss_to_outer is False, mem_prior_weight=0) this reduces
+        # to exactly `target_loss` -- bitwise-identical to the pre-regulariser
+        # forward.
+        combined_loss = target_loss
         if self.add_inner_loss_to_outer:
-            inner_loss_mean = inner_loss / B
-            combined_loss = target_loss + self.inner_loss_weight * inner_loss_mean
-        else:
-            combined_loss = target_loss
+            combined_loss = combined_loss + self.inner_loss_weight * (inner_loss / B)
+        if self.mem_prior_weight > 0:
+            combined_loss = combined_loss + mem_prior_w * mem_prior_loss
         output['loss'] = combined_loss
         return output
