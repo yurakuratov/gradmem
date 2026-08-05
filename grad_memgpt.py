@@ -87,7 +87,8 @@ class GradMemGPTConfig(PretrainedConfig):
                  use_gradient_checkpointing=False,
                  attn_implementation="eager",
                  write_objective="reconstruction",
-                 energy_head_hidden_dim=None,
+                  energy_head_hidden_dim=None,
+                  use_layerwise_energy=False,
                  write_reconstruction_weight=1.0,
                  write_energy_weight=1.0,
                  energy_rank_weight=0.0,
@@ -217,6 +218,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.attn_implementation = attn_implementation
         self.write_objective = write_objective
         self.energy_head_hidden_dim = energy_head_hidden_dim
+        self.use_layerwise_energy = use_layerwise_energy
         self.write_reconstruction_weight = write_reconstruction_weight
         self.write_energy_weight = write_energy_weight
         self.energy_rank_weight = energy_rank_weight
@@ -821,6 +823,7 @@ class GradMemGPT(PreTrainedModel):
         self.use_write_head = config.use_write_head
         self.write_objective = getattr(config, "write_objective", "reconstruction")
         self.energy_head_hidden_dim = getattr(config, "energy_head_hidden_dim", None)
+        self.use_layerwise_energy = bool(getattr(config, "use_layerwise_energy", False))
         self.write_reconstruction_weight = float(getattr(config, "write_reconstruction_weight", 1.0))
         self.write_energy_weight = float(getattr(config, "write_energy_weight", 1.0))
         self.energy_rank_weight = float(getattr(config, "energy_rank_weight", 0.0) or 0.0)
@@ -905,12 +908,18 @@ class GradMemGPT(PreTrainedModel):
 
         if self.write_objective in ("energy", "energy_with_reconstruction"):
             energy_hidden = self.energy_head_hidden_dim or n_embd
-            self.energy_ln = nn.LayerNorm(n_embd)
-            self.energy_head = nn.Sequential(
-                nn.Linear(n_embd, energy_hidden),
-                nn.SiLU(),
-                nn.Linear(energy_hidden, 1),
-            )
+            if self.use_layerwise_energy:
+                n_layers = len(self._get_transformer_blocks())
+                self.energy_ln = nn.ModuleList(nn.LayerNorm(n_embd) for _ in range(n_layers))
+                self.energy_head = nn.ModuleList(
+                    nn.Sequential(nn.Linear(n_embd, energy_hidden), nn.SiLU(), nn.Linear(energy_hidden, 1))
+                    for _ in range(n_layers)
+                )
+            else:
+                self.energy_ln = nn.LayerNorm(n_embd)
+                self.energy_head = nn.Sequential(
+                    nn.Linear(n_embd, energy_hidden), nn.SiLU(), nn.Linear(energy_hidden, 1)
+                )
         else:
             self.energy_ln = None
             self.energy_head = None
@@ -1125,27 +1134,30 @@ class GradMemGPT(PreTrainedModel):
     def _compute_write_energy(self, hidden_states, write_batch):
         if self.energy_head is None:
             raise RuntimeError("energy_head is not initialized")
-        context_hidden = hidden_states[:, write_batch['context_start']:, :]
-        context_mask = write_batch['mask'].to(device=context_hidden.device, dtype=context_hidden.dtype)
-        if context_hidden.size(1) != context_mask.size(1):
-            raise ValueError(
-                "Invalid energy context span: "
-                f"context_hidden_len={context_hidden.size(1)}, mask_len={context_mask.size(1)}, "
-                f"context_start={write_batch['context_start']}"
-            )
-        token_energy = self.energy_head(self.energy_ln(context_hidden)).squeeze(-1)
-        return (token_energy * context_mask).sum(dim=1) / context_mask.sum(dim=1).clamp_min(1)
+        def score(hidden, norm, head):
+            context_hidden = hidden[:, write_batch['context_start']:, :]
+            context_mask = write_batch['mask'].to(device=context_hidden.device, dtype=context_hidden.dtype)
+            token_energy = head(norm(context_hidden)).squeeze(-1)
+            return (token_energy * context_mask).sum(dim=1) / context_mask.sum(dim=1).clamp_min(1)
+        if not self.use_layerwise_energy:
+            return score(hidden_states, self.energy_ln, self.energy_head)
+        return torch.stack([
+            score(hidden, norm, head)
+            for hidden, norm, head in zip(hidden_states, self.energy_ln, self.energy_head)
+        ]).sum(dim=0)
 
     def _run_energy_write_forward(self, write_batch):
         model_kwargs = dict(write_batch.get("model_kwargs", {}))
         if "attention_mask" in write_batch:
             model_kwargs["attention_mask"] = write_batch["attention_mask"]
+        model_kwargs["output_hidden_states"] = self.use_layerwise_energy
         outs = get_backbone(self.model)(
             inputs_embeds=write_batch["inputs_embeds"],
             return_dict=True,
             **model_kwargs,
         )
-        return outs, self._compute_write_energy(outs.last_hidden_state, write_batch)
+        hidden_states = outs.hidden_states[1:] if self.use_layerwise_energy else outs.last_hidden_state
+        return outs, self._compute_write_energy(hidden_states, write_batch)
 
     @staticmethod
     def _fixed_point_free_permutation(batch_size, device):
@@ -1295,6 +1307,7 @@ class GradMemGPT(PreTrainedModel):
         model_kwargs = dict(write_batch.get('model_kwargs', {}))
         if 'attention_mask' in write_batch:
             model_kwargs['attention_mask'] = write_batch['attention_mask']
+        model_kwargs['output_hidden_states'] = self.use_layerwise_energy
         outs = get_backbone(self.model)(
             inputs_embeds=write_batch['inputs_embeds'],
             return_dict=True,
@@ -1309,7 +1322,8 @@ class GradMemGPT(PreTrainedModel):
                 raise RuntimeError("Model does not expose output embeddings for reconstruction logits")
             logits = output_embeddings(hidden)
         reconstruction_loss = self._compute_write_reconstruction_loss(logits, write_batch)
-        energy_loss = self._compute_write_energy(outs.last_hidden_state, write_batch)
+        hidden_states = outs.hidden_states[1:] if self.use_layerwise_energy else outs.last_hidden_state
+        energy_loss = self._compute_write_energy(hidden_states, write_batch)
         return outs, reconstruction_loss, energy_loss
 
     @staticmethod

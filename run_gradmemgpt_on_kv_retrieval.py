@@ -345,6 +345,7 @@ class ExperimentArgs:
     attn_implementation: Optional[str] = field(default="eager")
     write_objective: Optional[str] = field(default="reconstruction")
     energy_head_hidden_dim: Optional[int] = field(default=None)
+    use_layerwise_energy: Optional[bool] = field(default=False)
     write_reconstruction_weight: Optional[float] = field(default=1.0)
     write_energy_weight: Optional[float] = field(default=1.0)
     energy_rank_weight: Optional[float] = field(default=0.0)
@@ -455,7 +456,8 @@ if __name__ == '__main__':
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
                                       attn_implementation=args.attn_implementation,
                                       write_objective=args.write_objective,
-                                      energy_head_hidden_dim=args.energy_head_hidden_dim,
+                                       energy_head_hidden_dim=args.energy_head_hidden_dim,
+                                       use_layerwise_energy=args.use_layerwise_energy,
                                       write_reconstruction_weight=args.write_reconstruction_weight,
                                       write_energy_weight=args.write_energy_weight,
                                       energy_rank_weight=args.energy_rank_weight,

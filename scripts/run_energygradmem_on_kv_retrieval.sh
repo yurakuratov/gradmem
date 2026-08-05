@@ -48,6 +48,7 @@ ORTHOGONAL_LOSS_WEIGHT=${ORTHOGONAL_LOSS_WEIGHT:-0.0}
 # Energy head and optional landscape-shaping losses. Environment overrides let
 # dedicated experiment wrappers reuse this launcher without duplicating it.
 ENERGY_HEAD_HIDDEN_DIM=None
+USE_LAYERWISE_ENERGY=${USE_LAYERWISE_ENERGY:-false}
 WRITE_RECONSTRUCTION_WEIGHT=1.0
 WRITE_ENERGY_WEIGHT=1.0
 ENERGY_RANK_WEIGHT=${ENERGY_RANK_WEIGHT:-0.0}
@@ -98,6 +99,9 @@ if [ "$USE_MEM_PROJ" = true ]; then
   fi
 fi
 RUN_NAME=${RUN_NAME}_energy
+if [ "$USE_LAYERWISE_ENERGY" = true ]; then
+  RUN_NAME=${RUN_NAME}_layers
+fi
 if [ "$WRITE_OBJECTIVE" = "energy_with_reconstruction" ]; then
   RUN_NAME=${RUN_NAME}_recon${WRITE_RECONSTRUCTION_WEIGHT}_energy${WRITE_ENERGY_WEIGHT}
 fi
@@ -238,6 +242,9 @@ for N in "${N_VALUES[@]}"; do
   fi
   if [ "$ENERGY_HEAD_HIDDEN_DIM" != "None" ]; then
     CMD+=( --energy_head_hidden_dim "$ENERGY_HEAD_HIDDEN_DIM" )
+  fi
+  if [ "$USE_LAYERWISE_ENERGY" = true ]; then
+    CMD+=( --use_layerwise_energy )
   fi
   if [ -n "${MAX_CONTEXT_LENGTH:-}" ]; then
     CMD+=( --max_context_length "$MAX_CONTEXT_LENGTH" )

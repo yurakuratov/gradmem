@@ -1358,6 +1358,19 @@ def test_memory_search_gain_weighting_uses_positive_gain_ema():
     assert torch.allclose(weights, torch.tensor([0.5, 1.5, 0.0]))
 
 
+@pytest.mark.forward
+@pytest.mark.all
+def test_layerwise_energy_sums_layer_scores():
+    base_config = _build_base_config("gpt2")
+    model = GradMemGPT(GradMemGPTConfig(
+        base_config=base_config, memory_backend="prefix", write_objective="energy", use_layerwise_energy=True
+    ))
+    hidden = tuple(torch.randn(2, 7, base_config.n_embd) for _ in range(base_config.n_layer))
+    energy = model._compute_write_energy(hidden, {"context_start": 3, "mask": torch.ones(2, 4)})
+    assert energy.shape == (2,)
+    assert torch.isfinite(energy).all()
+
+
 @pytest.mark.one_batch_train
 @pytest.mark.all
 @pytest.mark.parametrize("shaping_active", [False, True])
