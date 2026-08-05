@@ -1346,6 +1346,18 @@ def test_memory_search_matches_best_read_candidate():
     assert torch.isfinite(stats["energy_memory_search_target_gain"])
 
 
+@pytest.mark.forward
+@pytest.mark.all
+def test_memory_search_gain_weighting_uses_positive_gain_ema():
+    model, _, _ = _build_shaped_energy_model(
+        energy_memory_search_use_gain_weighting=True,
+        energy_memory_search_gain_ema_decay=0.9,
+    )
+    weights = model._compute_energy_memory_search_gain_weights(torch.tensor([0.1, 0.3, 0.0]))
+    assert model.energy_memory_search_gain_ema.item() == pytest.approx(0.2)
+    assert torch.allclose(weights, torch.tensor([0.5, 1.5, 0.0]))
+
+
 @pytest.mark.one_batch_train
 @pytest.mark.all
 @pytest.mark.parametrize("shaping_active", [False, True])

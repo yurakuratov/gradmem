@@ -60,6 +60,8 @@ ENERGY_ANCHOR_WEIGHT=${ENERGY_ANCHOR_WEIGHT:-0.0}
 ENERGY_MEMORY_SEARCH_WEIGHT=${ENERGY_MEMORY_SEARCH_WEIGHT:-0.0}
 ENERGY_MEMORY_SEARCH_NUM_SAMPLES=${ENERGY_MEMORY_SEARCH_NUM_SAMPLES:-4}
 ENERGY_MEMORY_SEARCH_RADIUS_SCALE=${ENERGY_MEMORY_SEARCH_RADIUS_SCALE:-0.25}
+ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING=${ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING:-false}
+ENERGY_MEMORY_SEARCH_GAIN_EMA_DECAY=${ENERGY_MEMORY_SEARCH_GAIN_EMA_DECAY:-0.99}
 
 STOP_ON_METRIC_VALUE=0.99
 
@@ -114,6 +116,9 @@ if [ "$ENERGY_ANCHOR_WEIGHT" != "0.0" ]; then
 fi
 if [ "$ENERGY_MEMORY_SEARCH_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_msearch${ENERGY_MEMORY_SEARCH_WEIGHT}_n${ENERGY_MEMORY_SEARCH_NUM_SAMPLES}
+  if [ "$ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING" = true ]; then
+    RUN_NAME=${RUN_NAME}_gainema${ENERGY_MEMORY_SEARCH_GAIN_EMA_DECAY}
+  fi
 fi
 RUN_NAME=${RUN_NAME}_grad_${GRAD_MODE}
 if [ "$ADD_INNER_LOSS_TO_OUTER" = true ]; then
@@ -206,6 +211,7 @@ for N in "${N_VALUES[@]}"; do
     --energy_memory_search_weight "$ENERGY_MEMORY_SEARCH_WEIGHT"
     --energy_memory_search_num_samples "$ENERGY_MEMORY_SEARCH_NUM_SAMPLES"
     --energy_memory_search_radius_scale "$ENERGY_MEMORY_SEARCH_RADIUS_SCALE"
+    --energy_memory_search_gain_ema_decay "$ENERGY_MEMORY_SEARCH_GAIN_EMA_DECAY"
     --max_steps 200000
     --eval_steps 500
     --logging_steps 500
@@ -241,6 +247,9 @@ for N in "${N_VALUES[@]}"; do
     if [ "$INNER_LOSS_WEIGHT" != "None" ]; then
       CMD+=( --inner_loss_weight "$INNER_LOSS_WEIGHT" )
     fi
+  fi
+  if [ "$ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING" = true ]; then
+    CMD+=( --energy_memory_search_use_gain_weighting )
   fi
 
   print_run_header "$EXP_PATH" "$PORT" "$NP" "$MIXED_PRECISION" "${CMD[@]}"

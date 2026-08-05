@@ -107,6 +107,8 @@ class GradMemGPTConfig(PretrainedConfig):
                   energy_memory_search_weight=0.0,
                   energy_memory_search_num_samples=4,
                   energy_memory_search_radius_scale=0.25,
+                  energy_memory_search_use_gain_weighting=False,
+                  energy_memory_search_gain_ema_decay=0.99,
                   **kwargs):
         """
         Args:
@@ -169,6 +171,8 @@ class GradMemGPTConfig(PretrainedConfig):
             energy_memory_search_weight: float, weight for matching WRITE memory to a better READ candidate
             energy_memory_search_num_samples: int, number of perturbation candidates
             energy_memory_search_radius_scale: float, perturbation radius relative to the WRITE step
+            energy_memory_search_use_gain_weighting: bool, scale teacher matching by relative READ gain
+            energy_memory_search_gain_ema_decay: float, EMA decay for positive relative gains
         """
         super().__init__(**kwargs)
 
@@ -232,6 +236,8 @@ class GradMemGPTConfig(PretrainedConfig):
         self.energy_memory_search_weight = energy_memory_search_weight
         self.energy_memory_search_num_samples = energy_memory_search_num_samples
         self.energy_memory_search_radius_scale = energy_memory_search_radius_scale
+        self.energy_memory_search_use_gain_weighting = energy_memory_search_use_gain_weighting
+        self.energy_memory_search_gain_ema_decay = energy_memory_search_gain_ema_decay
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -278,6 +284,8 @@ class GradMemGPTConfig(PretrainedConfig):
             raise ValueError("energy_memory_search parameters must be non-negative with at least one sample")
         if self.energy_memory_search_radius_scale <= 0.0:
             raise ValueError("energy_memory_search_radius_scale must be > 0")
+        if not 0.0 <= self.energy_memory_search_gain_ema_decay < 1.0:
+            raise ValueError("energy_memory_search_gain_ema_decay must be within [0, 1)")
         if self.energy_memory_search_weight > 0.0:
             if self.memory_backend != "prefix" or self.write_objective not in ("energy", "energy_with_reconstruction"):
                 raise ValueError("energy_memory_search_weight requires prefix energy WRITE")
@@ -830,6 +838,14 @@ class GradMemGPT(PreTrainedModel):
         self.energy_memory_search_weight = float(getattr(config, "energy_memory_search_weight", 0.0) or 0.0)
         self.energy_memory_search_num_samples = int(getattr(config, "energy_memory_search_num_samples", 4))
         self.energy_memory_search_radius_scale = float(getattr(config, "energy_memory_search_radius_scale", 0.25))
+        self.energy_memory_search_use_gain_weighting = bool(
+            getattr(config, "energy_memory_search_use_gain_weighting", False)
+        )
+        self.energy_memory_search_gain_ema_decay = float(
+            getattr(config, "energy_memory_search_gain_ema_decay", 0.99)
+        )
+        self.register_buffer("energy_memory_search_gain_ema", torch.tensor(0.0))
+        self.register_buffer("energy_memory_search_gain_ema_initialized", torch.tensor(False))
         alpha_init = self.lr if self.lr > 20.0 else math.log(math.expm1(self.lr))
         self.orthogonal_alpha_raw = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
         if self.energy_rank_temperature <= 0.0:
@@ -1362,7 +1378,23 @@ class GradMemGPT(PreTrainedModel):
             teacher = candidates[best_indices, torch.arange(center.size(0), device=center.device)]
             gain = (candidate_losses[0] - candidate_losses[best_indices, torch.arange(center.size(0), device=center.device)]).clamp_min(0)
         per_example_loss = 0.5 * (student_memory.float() - teacher.float()).square().flatten(1).sum(dim=1)
-        return per_example_loss.mean(), gain.mean(), best_indices.ne(0).float().mean()
+        relative_gain = gain / candidate_losses[0].clamp_min(torch.finfo(gain.dtype).eps)
+        return per_example_loss, relative_gain, best_indices.ne(0).float().mean()
+
+    @torch.no_grad()
+    def _compute_energy_memory_search_gain_weights(self, relative_gains):
+        positive = relative_gains.detach().float().clamp_min(0.0)
+        positive = positive[positive.gt(0.0)]
+        if positive.numel() > 0:
+            mean_gain = positive.mean()
+            if self.energy_memory_search_gain_ema_initialized:
+                mean_gain = (
+                    self.energy_memory_search_gain_ema_decay * self.energy_memory_search_gain_ema
+                    + (1.0 - self.energy_memory_search_gain_ema_decay) * mean_gain
+                )
+            self.energy_memory_search_gain_ema.copy_(mean_gain)
+            self.energy_memory_search_gain_ema_initialized.fill_(True)
+        return relative_gains.detach().float().clamp_min(0.0) / self.energy_memory_search_gain_ema.clamp_min(1e-8)
 
     def _get_transformer_blocks(self):
         backbone = get_backbone(self.model)
@@ -1994,11 +2026,19 @@ class GradMemGPT(PreTrainedModel):
             and self.energy_memory_search_weight > 0.0
             and context_input_ids.ne(pad_id).any()
         ):
-            memory_search_loss, memory_search_gain, memory_search_improvement_rate = (
+            per_example_memory_search_loss, relative_memory_search_gain, memory_search_improvement_rate = (
                 self._compute_energy_memory_search_loss(
                     backend, memory_state, memory_state_initial['mem_batch'], batch_ctx, labels
                 )
             )
+            memory_search_gain = relative_memory_search_gain.mean()
+            if self.energy_memory_search_use_gain_weighting:
+                memory_search_loss = (
+                    self._compute_energy_memory_search_gain_weights(relative_memory_search_gain)
+                    * per_example_memory_search_loss
+                ).mean()
+            else:
+                memory_search_loss = per_example_memory_search_loss.mean()
 
         zero = target_loss.new_tensor(0.0)
         inner_loss_for_outer = inner_loss / B
@@ -2102,6 +2142,7 @@ class GradMemGPT(PreTrainedModel):
             "energy_memory_search_loss": memory_search_loss,
             "energy_memory_search_target_gain": memory_search_gain,
             "energy_memory_search_improvement_rate": memory_search_improvement_rate,
+            "energy_memory_search_gain_ema": self.energy_memory_search_gain_ema,
         })
         if rank_active or trajectory_active or anchor_active:
             loss_stats["energy_aux_loss"] = energy_aux_loss

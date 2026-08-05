@@ -364,6 +364,8 @@ class ExperimentArgs:
     energy_memory_search_weight: Optional[float] = field(default=0.0)
     energy_memory_search_num_samples: Optional[int] = field(default=4)
     energy_memory_search_radius_scale: Optional[float] = field(default=0.25)
+    energy_memory_search_use_gain_weighting: Optional[bool] = field(default=False)
+    energy_memory_search_gain_ema_decay: Optional[float] = field(default=0.99)
 
 
 if __name__ == '__main__':
@@ -472,7 +474,9 @@ if __name__ == '__main__':
                                        orthogonal_loss_weight=args.orthogonal_loss_weight,
                                        energy_memory_search_weight=args.energy_memory_search_weight,
                                        energy_memory_search_num_samples=args.energy_memory_search_num_samples,
-                                       energy_memory_search_radius_scale=args.energy_memory_search_radius_scale)
+                                       energy_memory_search_radius_scale=args.energy_memory_search_radius_scale,
+                                       energy_memory_search_use_gain_weighting=args.energy_memory_search_use_gain_weighting,
+                                       energy_memory_search_gain_ema_decay=args.energy_memory_search_gain_ema_decay)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
