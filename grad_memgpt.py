@@ -4,7 +4,7 @@ from torch import nn
 from torch.nn import functional as F
 from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
 from transformers.cache_utils import DynamicCache
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import math
 import logging
 import re
@@ -96,10 +96,11 @@ class GradMemGPTConfig(PretrainedConfig):
                  energy_traj_margin=0.0,
                  energy_rank_temperature=1.0,
                  energy_mix_alpha=0.75,
-                 energy_anchor_weight=0.0,
-                 add_inner_loss_to_outer=False,
-                 inner_loss_weight=None,
-                 **kwargs):
+                  energy_anchor_weight=0.0,
+                  add_inner_loss_to_outer=False,
+                  inner_loss_weight=None,
+                  memory_alignment_weight=0.0,
+                  **kwargs):
         """
         Args:
             pretrained_model: str, name of pretrained model to load (e.g., 'gpt2')
@@ -152,6 +153,8 @@ class GradMemGPTConfig(PretrainedConfig):
             energy_anchor_weight: float, optional energy-magnitude anchoring loss weight
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
+            memory_alignment_weight: float, weight for aligning the cumulative WRITE direction with the
+                stopped READ gradient on the final prefix memory
         """
         super().__init__(**kwargs)
 
@@ -207,6 +210,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.energy_anchor_weight = energy_anchor_weight
         self.add_inner_loss_to_outer = add_inner_loss_to_outer
         self.inner_loss_weight = inner_loss_weight
+        self.memory_alignment_weight = memory_alignment_weight
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -226,6 +230,15 @@ class GradMemGPTConfig(PretrainedConfig):
             raise ValueError("energy_rank_temperature must be > 0")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
             raise ValueError("energy_mix_alpha must be within [0, 1]")
+        if self.memory_alignment_weight < 0.0:
+            raise ValueError("memory_alignment_weight must be >= 0")
+        if self.memory_alignment_weight > 0.0:
+            if self.memory_backend != "prefix":
+                raise ValueError("memory_alignment_weight > 0 requires memory_backend='prefix'")
+            if self.grad_mode != "second":
+                raise ValueError("memory_alignment_weight > 0 requires grad_mode='second'")
+            if self.K <= 0 or self.last_K_second_order <= 0:
+                raise ValueError("memory_alignment_weight > 0 requires a second-order WRITE step")
         if self.memory_backend == "lora":
             assert self.lora_mem_placement in ["between_layers", "target_modules"], (
                 "lora_mem_placement currently supports: 'between_layers', 'target_modules'"
@@ -762,6 +775,7 @@ class GradMemGPT(PreTrainedModel):
         self.energy_rank_temperature = float(getattr(config, "energy_rank_temperature", 1.0))
         self.energy_mix_alpha = float(getattr(config, "energy_mix_alpha", 0.75))
         self.energy_anchor_weight = float(getattr(config, "energy_anchor_weight", 0.0) or 0.0)
+        self.memory_alignment_weight = float(getattr(config, "memory_alignment_weight", 0.0) or 0.0)
         if self.energy_rank_temperature <= 0.0:
             raise ValueError("energy_rank_temperature must be > 0")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
@@ -1226,6 +1240,21 @@ class GradMemGPT(PreTrainedModel):
         energy_loss = self._compute_write_energy(outs.last_hidden_state, write_batch)
         return outs, reconstruction_loss, energy_loss
 
+    @staticmethod
+    def _compute_read_target_loss(predictions, read_batch, labels):
+        target_logits = predictions[:, :-1]
+        target_labels = labels[:, read_batch.get('label_shift', 0):]
+        if target_logits.size(1) != target_labels.size(1):
+            raise ValueError(
+                f"Mismatched target lengths after alignment: logits_len={target_logits.size(1)}, "
+                f"labels_len={target_labels.size(1)}"
+            )
+        return F.cross_entropy(
+            target_logits.reshape(-1, predictions.size(-1)),
+            target_labels.reshape(-1),
+            ignore_index=-100,
+        )
+
     def _get_transformer_blocks(self):
         backbone = get_backbone(self.model)
         for attr in ("h", "layers", "block", "blocks"):
@@ -1582,6 +1611,12 @@ class GradMemGPT(PreTrainedModel):
 
         backend = self.memory_backend_impl
         memory_state, memory_state_initial = backend.init_memory_state(B)
+        memory_alignment_active = (
+            labels is not None
+            and self.memory_alignment_weight > 0.0
+            and self.memory_backend == "prefix"
+            and self.K > 0
+        )
         batch_ctx = backend.prepare_batch(context_input_ids, query_input_ids, pad_id)
         opt_state = {}
         inner_loss_history = []
@@ -1746,22 +1781,39 @@ class GradMemGPT(PreTrainedModel):
         if labels is None:
             return output
 
-        target_logits = output['predictions'][:, :-1]
-        target_label_shift = read_batch.get('label_shift', 0)
-        # Prefix memory can predict the first target token from memory itself (label_shift=0),
-        # while LoRA/KV-cache memory without a prepended seed token cannot (label_shift=1).
-        # Backends should produce exactly aligned lengths after this shift.
-        target_labels = labels[:, target_label_shift:]
-        if target_logits.size(1) != target_labels.size(1):
-            raise ValueError(
-                f"Mismatched target lengths after alignment: logits_len={target_logits.size(1)}, "
-                f"labels_len={target_labels.size(1)}, label_shift={target_label_shift}"
+        if memory_alignment_active:
+            # Re-run READ with gradients because evaluation commonly wraps forward in no_grad.
+            with torch.enable_grad():
+                alignment_read_batch = backend.build_read_inputs(memory_state, batch_ctx)
+                with backend.activation_context(memory_state):
+                    with self._disable_write_lora():
+                        alignment_predictions = self.model(
+                            inputs_embeds=alignment_read_batch['inputs_embeds'],
+                            return_dict=True,
+                            **alignment_read_batch.get('model_kwargs', {}),
+                        ).logits
+                alignment_predictions = alignment_predictions[
+                    :, alignment_read_batch['logits_start']:
+                    alignment_read_batch['logits_start'] + alignment_read_batch['pred_len'],
+                    :,
+                ]
+                target_loss = self._compute_read_target_loss(
+                    alignment_predictions, alignment_read_batch, labels
+                )
+                outer_grad = torch.autograd.grad(
+                    target_loss, memory_state['mem_batch'], retain_graph=True
+                )[0].detach()
+            write_direction = (
+                memory_state_initial['mem_batch'] - memory_state['mem_batch']
+            ).float().flatten(1)
+            alignment_cosine = F.cosine_similarity(
+                write_direction, outer_grad.float().flatten(1), dim=1
             )
-        target_loss = nn.functional.cross_entropy(
-            target_logits.reshape(-1, output['predictions'].size(-1)),
-            target_labels.reshape(-1),
-            ignore_index=-100,
-        )
+            memory_alignment_loss = 1.0 - alignment_cosine.mean()
+        else:
+            target_loss = self._compute_read_target_loss(output['predictions'], read_batch, labels)
+            memory_alignment_loss = target_loss.new_tensor(0.0)
+            alignment_cosine = target_loss.new_tensor(0.0)
 
         zero = target_loss.new_tensor(0.0)
         inner_loss_for_outer = inner_loss / B
@@ -1840,11 +1892,18 @@ class GradMemGPT(PreTrainedModel):
         weighted_traj_loss = self.energy_traj_weight * traj_loss if trajectory_active else zero
         weighted_anchor_loss = self.energy_anchor_weight * anchor_loss if anchor_active else zero
         energy_aux_loss = weighted_rank_loss + weighted_traj_loss + weighted_anchor_loss
-        outer_loss = target_loss + weighted_inner_loss + energy_aux_loss
+        outer_loss = (
+            target_loss
+            + weighted_inner_loss
+            + energy_aux_loss
+            + self.memory_alignment_weight * memory_alignment_loss
+        )
 
         loss_stats.update({
             "outer_loss": outer_loss,
             "target_loss": target_loss,
+            "memory_alignment_loss": memory_alignment_loss,
+            "memory_alignment_cosine": alignment_cosine.mean(),
         })
         if rank_active or trajectory_active or anchor_active:
             loss_stats["energy_aux_loss"] = energy_aux_loss

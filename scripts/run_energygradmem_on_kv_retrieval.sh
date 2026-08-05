@@ -39,6 +39,7 @@ GRAD_MODE="second"
 USE_MEM_PROJ=false
 MEM_PROJ_MODE="none"
 FREEZE_BACKBONE=false
+MEMORY_ALIGNMENT_WEIGHT=${MEMORY_ALIGNMENT_WEIGHT:-0.0}
 
 # Energy head and optional landscape-shaping losses. Environment overrides let
 # dedicated experiment wrappers reuse this launcher without duplicating it.
@@ -111,6 +112,9 @@ if [ "$ADD_INNER_LOSS_TO_OUTER" = true ]; then
     RUN_NAME=${RUN_NAME}_w${INNER_LOSS_WEIGHT}
   fi
 fi
+if [ "$MEMORY_ALIGNMENT_WEIGHT" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_align${MEMORY_ALIGNMENT_WEIGHT}
+fi
 if [ "$USE_ADAM" = true ]; then
   RUN_NAME=${RUN_NAME}_with_adam
 fi
@@ -165,6 +169,7 @@ for N in "${N_VALUES[@]}"; do
     --inner_lr "$INNER_LR"
     --use_adam "$USE_ADAM"
     --grad_mode "$GRAD_MODE"
+    --memory_alignment_weight "$MEMORY_ALIGNMENT_WEIGHT"
     --freeze_backbone "$FREEZE_BACKBONE"
     --energy_rank_weight "$ENERGY_RANK_WEIGHT"
     --energy_traj_weight "$ENERGY_TRAJ_WEIGHT"

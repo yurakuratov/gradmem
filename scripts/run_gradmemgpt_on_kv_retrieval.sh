@@ -72,6 +72,7 @@ KV_MEM_LAYERS="all"
 # - Does not use LoRA/KV-cache layer settings.
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
+MEMORY_ALIGNMENT_WEIGHT=${MEMORY_ALIGNMENT_WEIGHT:-0.0}
 STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
 
 ATTN_IMPL="eager"
@@ -136,6 +137,9 @@ if [ "$ADD_INNER_LOSS_TO_OUTER" = true ]; then
     RUN_NAME=${RUN_NAME}_w${INNER_LOSS_WEIGHT}
   fi
 fi
+if [ "$MEMORY_ALIGNMENT_WEIGHT" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_align${MEMORY_ALIGNMENT_WEIGHT}
+fi
 if [ "$USE_ADAM" = true ]; then
   RUN_NAME=${RUN_NAME}_with_adam
 fi
@@ -195,6 +199,7 @@ for N in "${N_VALUES[@]}"; do
     --inner_lr "$INNER_LR"
     --use_adam "$USE_ADAM"
     --grad_mode "$GRAD_MODE"
+    --memory_alignment_weight "$MEMORY_ALIGNMENT_WEIGHT"
     --freeze_backbone "$FREEZE_BACKBONE"
     --max_steps 1000000
     --eval_steps 500

@@ -44,6 +44,8 @@ LOSS_COMPONENT_KEYS = [
     "energy_traj_loss",
     "energy_anchor_loss",
     "energy_aux_loss",
+    "memory_alignment_loss",
+    "memory_alignment_cosine",
 ]
 
 ENERGY_LANDSCAPE_STAT_KEYS = [
@@ -347,6 +349,7 @@ class ExperimentArgs:
     energy_anchor_weight: Optional[float] = field(default=0.0)
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
     inner_loss_weight: Optional[float] = field(default=None)
+    memory_alignment_weight: Optional[float] = field(default=0.0)
 
 
 if __name__ == '__main__':
@@ -446,8 +449,9 @@ if __name__ == '__main__':
                                       energy_rank_temperature=args.energy_rank_temperature,
                                       energy_mix_alpha=args.energy_mix_alpha,
                                       energy_anchor_weight=args.energy_anchor_weight,
-                                      add_inner_loss_to_outer=args.add_inner_loss_to_outer,
-                                      inner_loss_weight=args.inner_loss_weight)
+                                       add_inner_loss_to_outer=args.add_inner_loss_to_outer,
+                                       inner_loss_weight=args.inner_loss_weight,
+                                       memory_alignment_weight=args.memory_alignment_weight)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)

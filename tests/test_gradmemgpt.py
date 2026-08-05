@@ -1221,6 +1221,51 @@ def test_energy_shaping_parameter_validation():
 
 @pytest.mark.one_batch_train
 @pytest.mark.all
+def test_memory_alignment_loss_is_added_to_outer_objective():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_shaped_energy_model(
+        memory_alignment_weight=0.3,
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        add_inner_loss_to_outer=False,
+    )
+    model.train()
+    output = model(inputs, labels=labels)
+    stats = output["inner_loop_stats"]
+
+    assert torch.isfinite(stats["memory_alignment_loss"])
+    assert torch.isfinite(stats["memory_alignment_cosine"])
+    assert torch.allclose(
+        output["loss"].detach(),
+        stats["target_loss"] + model.memory_alignment_weight * stats["memory_alignment_loss"],
+    )
+    output["loss"].backward()
+    assert model.mem.grad is not None
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_memory_alignment_validation_and_serialization(tmp_path):
+    base_config = _build_base_config("gpt2")
+    with pytest.raises(ValueError, match="memory_alignment_weight"):
+        GradMemGPTConfig(base_config=base_config, memory_alignment_weight=-0.1)
+    with pytest.raises(ValueError, match="memory_alignment_weight"):
+        GradMemGPTConfig(base_config=base_config, memory_alignment_weight=0.1, grad_mode="first")
+
+    config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        K=1,
+        grad_mode="second",
+        memory_alignment_weight=0.25,
+    )
+    config.save_pretrained(tmp_path)
+    assert GradMemGPTConfig.from_pretrained(tmp_path).memory_alignment_weight == pytest.approx(0.25)
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
 @pytest.mark.parametrize("shaping_active", [False, True])
 def test_trainer_and_eval_metrics_preserve_active_only_schema(tmp_path, shaping_active):
     from transformers import EvalPrediction, TrainingArguments
