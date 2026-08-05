@@ -73,6 +73,8 @@ KV_MEM_LAYERS="all"
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
 MEMORY_ALIGNMENT_WEIGHT=${MEMORY_ALIGNMENT_WEIGHT:-0.0}
+STEP_ALIGNMENT_WEIGHT=${STEP_ALIGNMENT_WEIGHT:-0.0}
+GRAD_ALIGN_NORM=${GRAD_ALIGN_NORM:-none}
 STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
 
 ATTN_IMPL="eager"
@@ -140,6 +142,9 @@ fi
 if [ "$MEMORY_ALIGNMENT_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_align${MEMORY_ALIGNMENT_WEIGHT}
 fi
+if [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}_${GRAD_ALIGN_NORM}
+fi
 if [ "$USE_ADAM" = true ]; then
   RUN_NAME=${RUN_NAME}_with_adam
 fi
@@ -200,6 +205,8 @@ for N in "${N_VALUES[@]}"; do
     --use_adam "$USE_ADAM"
     --grad_mode "$GRAD_MODE"
     --memory_alignment_weight "$MEMORY_ALIGNMENT_WEIGHT"
+    --step_alignment_weight "$STEP_ALIGNMENT_WEIGHT"
+    --grad_align_norm "$GRAD_ALIGN_NORM"
     --freeze_backbone "$FREEZE_BACKBONE"
     --max_steps 1000000
     --eval_steps 500

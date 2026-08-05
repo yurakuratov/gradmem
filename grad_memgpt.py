@@ -100,6 +100,8 @@ class GradMemGPTConfig(PretrainedConfig):
                   add_inner_loss_to_outer=False,
                   inner_loss_weight=None,
                   memory_alignment_weight=0.0,
+                  step_alignment_weight=0.0,
+                  grad_align_norm="none",
                   **kwargs):
         """
         Args:
@@ -155,6 +157,8 @@ class GradMemGPTConfig(PretrainedConfig):
             inner_loss_weight: float, weight of inner loss in combined loss
             memory_alignment_weight: float, weight for aligning the cumulative WRITE direction with the
                 stopped READ gradient on the final prefix memory
+            step_alignment_weight: float, weight for aligning the final WRITE update with its READ gradient
+            grad_align_norm: str, step-alignment normalization ("none" or "norm")
         """
         super().__init__(**kwargs)
 
@@ -211,6 +215,8 @@ class GradMemGPTConfig(PretrainedConfig):
         self.add_inner_loss_to_outer = add_inner_loss_to_outer
         self.inner_loss_weight = inner_loss_weight
         self.memory_alignment_weight = memory_alignment_weight
+        self.step_alignment_weight = step_alignment_weight
+        self.grad_align_norm = grad_align_norm
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -239,6 +245,13 @@ class GradMemGPTConfig(PretrainedConfig):
                 raise ValueError("memory_alignment_weight > 0 requires grad_mode='second'")
             if self.K <= 0 or self.last_K_second_order <= 0:
                 raise ValueError("memory_alignment_weight > 0 requires a second-order WRITE step")
+        if self.step_alignment_weight < 0.0:
+            raise ValueError("step_alignment_weight must be >= 0")
+        if self.grad_align_norm not in ("none", "norm"):
+            raise ValueError("grad_align_norm must be one of: none, norm")
+        if self.step_alignment_weight > 0.0:
+            if self.memory_backend != "prefix" or self.grad_mode != "second" or self.K <= 0:
+                raise ValueError("step_alignment_weight requires second-order prefix WRITE")
         if self.memory_backend == "lora":
             assert self.lora_mem_placement in ["between_layers", "target_modules"], (
                 "lora_mem_placement currently supports: 'between_layers', 'target_modules'"
@@ -776,6 +789,8 @@ class GradMemGPT(PreTrainedModel):
         self.energy_mix_alpha = float(getattr(config, "energy_mix_alpha", 0.75))
         self.energy_anchor_weight = float(getattr(config, "energy_anchor_weight", 0.0) or 0.0)
         self.memory_alignment_weight = float(getattr(config, "memory_alignment_weight", 0.0) or 0.0)
+        self.step_alignment_weight = float(getattr(config, "step_alignment_weight", 0.0) or 0.0)
+        self.grad_align_norm = getattr(config, "grad_align_norm", "none")
         if self.energy_rank_temperature <= 0.0:
             raise ValueError("energy_rank_temperature must be > 0")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
@@ -1255,6 +1270,14 @@ class GradMemGPT(PreTrainedModel):
             ignore_index=-100,
         )
 
+    def _compute_step_alignment(self, outer_grad, inner_update):
+        cosine = F.cosine_similarity(
+            inner_update.float().flatten(1), outer_grad.float().flatten(1), dim=1
+        )
+        if self.grad_align_norm == "norm":
+            return (1.0 - outer_grad.float().flatten(1).norm(dim=1) * cosine).mean(), cosine.mean()
+        return 1.0 - cosine.mean(), cosine.mean()
+
     def _get_transformer_blocks(self):
         backbone = get_backbone(self.model)
         for attr in ("h", "layers", "block", "blocks"):
@@ -1617,6 +1640,14 @@ class GradMemGPT(PreTrainedModel):
             and self.memory_backend == "prefix"
             and self.K > 0
         )
+        step_alignment_active = (
+            labels is not None
+            and self.step_alignment_weight > 0.0
+            and self.memory_backend == "prefix"
+            and self.K > 0
+        )
+        memory_gradient_active = memory_alignment_active or step_alignment_active
+        last_inner_update = None
         batch_ctx = backend.prepare_batch(context_input_ids, query_input_ids, pad_id)
         opt_state = {}
         inner_loss_history = []
@@ -1686,6 +1717,8 @@ class GradMemGPT(PreTrainedModel):
                                                    clip_value=self.inner_clip_value,
                                                    clip_norm=self.inner_clip_norm)
                         new_params.append(p_new)
+                    if memory_gradient_active:
+                        last_inner_update = inner_params[0] - new_params[0]
                     backend.assign_inner_params(memory_state, new_params)
                     backend.maybe_detach_after_step(memory_state)
 
@@ -1781,7 +1814,7 @@ class GradMemGPT(PreTrainedModel):
         if labels is None:
             return output
 
-        if memory_alignment_active:
+        if memory_gradient_active:
             # Re-run READ with gradients because evaluation commonly wraps forward in no_grad.
             with torch.enable_grad():
                 alignment_read_batch = backend.build_read_inputs(memory_state, batch_ctx)
@@ -1803,17 +1836,26 @@ class GradMemGPT(PreTrainedModel):
                 outer_grad = torch.autograd.grad(
                     target_loss, memory_state['mem_batch'], retain_graph=True
                 )[0].detach()
-            write_direction = (
-                memory_state_initial['mem_batch'] - memory_state['mem_batch']
-            ).float().flatten(1)
-            alignment_cosine = F.cosine_similarity(
-                write_direction, outer_grad.float().flatten(1), dim=1
+            if memory_alignment_active:
+                write_direction = (
+                    memory_state_initial['mem_batch'] - memory_state['mem_batch']
+                ).float().flatten(1)
+                alignment_cosine = F.cosine_similarity(
+                    write_direction, outer_grad.float().flatten(1), dim=1
+                )
+                memory_alignment_loss = 1.0 - alignment_cosine.mean()
+            else:
+                memory_alignment_loss = target_loss.new_tensor(0.0)
+                alignment_cosine = target_loss.new_tensor(0.0)
+            step_alignment_loss, step_alignment_cosine = self._compute_step_alignment(
+                outer_grad, last_inner_update
             )
-            memory_alignment_loss = 1.0 - alignment_cosine.mean()
         else:
             target_loss = self._compute_read_target_loss(output['predictions'], read_batch, labels)
             memory_alignment_loss = target_loss.new_tensor(0.0)
             alignment_cosine = target_loss.new_tensor(0.0)
+            step_alignment_loss = target_loss.new_tensor(0.0)
+            step_alignment_cosine = target_loss.new_tensor(0.0)
 
         zero = target_loss.new_tensor(0.0)
         inner_loss_for_outer = inner_loss / B
@@ -1897,6 +1939,7 @@ class GradMemGPT(PreTrainedModel):
             + weighted_inner_loss
             + energy_aux_loss
             + self.memory_alignment_weight * memory_alignment_loss
+            + self.step_alignment_weight * step_alignment_loss
         )
 
         loss_stats.update({
@@ -1904,6 +1947,8 @@ class GradMemGPT(PreTrainedModel):
             "target_loss": target_loss,
             "memory_alignment_loss": memory_alignment_loss,
             "memory_alignment_cosine": alignment_cosine.mean(),
+            "step_alignment_loss": step_alignment_loss,
+            "step_alignment_cosine": step_alignment_cosine,
         })
         if rank_active or trajectory_active or anchor_active:
             loss_stats["energy_aux_loss"] = energy_aux_loss

@@ -1266,6 +1266,27 @@ def test_memory_alignment_validation_and_serialization(tmp_path):
 
 @pytest.mark.one_batch_train
 @pytest.mark.all
+def test_step_alignment_loss_is_added_to_outer_objective():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_shaped_energy_model(
+        memory_alignment_weight=0.0,
+        step_alignment_weight=0.4,
+        add_inner_loss_to_outer=False,
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+    )
+    output = model(inputs, labels=labels)
+    stats = output["inner_loop_stats"]
+    assert torch.isfinite(stats["step_alignment_loss"])
+    assert torch.allclose(
+        output["loss"].detach(),
+        stats["target_loss"] + model.step_alignment_weight * stats["step_alignment_loss"],
+    )
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
 @pytest.mark.parametrize("shaping_active", [False, True])
 def test_trainer_and_eval_metrics_preserve_active_only_schema(tmp_path, shaping_active):
     from transformers import EvalPrediction, TrainingArguments
