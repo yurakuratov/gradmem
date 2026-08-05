@@ -842,8 +842,8 @@ class GradMemGPT(PreTrainedModel):
         fwd_input = {'context_input_ids': context_input_ids,
                      'query_input_ids': context_input_ids[:, :1]}
         out = self.forward(fwd_input, labels=None, collect_segment_mems=True)
-        segment_mems = out['segment_mems']           # list of [B,M,d]
-        n_seg_actual = len(segment_mems)
+        segment_mems = out['segment_mems']           # list[n_segments] of [B,M,d] or None
+        n_seg_actual = len(segment_mems)             # == n_segments (None placeholders keep alignment)
 
         if self.n_ctrl_tokens > 0:
             read_st_batch = self.read_st.unsqueeze(0).expand(B, -1, -1)
@@ -853,7 +853,20 @@ class GradMemGPT(PreTrainedModel):
 
         with torch.no_grad():
             for seg_idx_loop in range(min(n_seg_actual, n_seg)):
+                # use the TRUE segment index: segment_mems is indexed by seg_idx,
+                # and empty segments are None (memory unchanged from the previous
+                # non-empty segment). Using the true index (not a list offset)
+                # keeps the probe-seg aligned with the KV's source-seg so the
+                # forgetting matrix diagonal is meaningful.
                 mem_det = segment_mems[seg_idx_loop]
+                if mem_det is None:
+                    # empty segment: no WRITE ran, memory unchanged. Still probe
+                    # so KV pairs in segments <= seg_idx_loop are tested at this
+                    # probe point -- use the last available snapshot.
+                    mem_det = next((segment_mems[j] for j in range(seg_idx_loop, -1, -1)
+                                    if segment_mems[j] is not None), None)
+                    if mem_det is None:
+                        continue
                 probe_here = (seg_idx <= seg_idx_loop) & qmask             # [B, n_q]
                 if not probe_here.any():
                     continue
@@ -977,8 +990,13 @@ class GradMemGPT(PreTrainedModel):
                     lm_labels = F.pad(lm_labels, [0, pad_len], "constant", -100)
 
                 # per-segment memory snapshots (eval-only forgetting probe): one
-                # detached copy of the carried state after each segment's K steps.
-                segment_mems = [] if collect_segment_mems else None
+                # detached copy of the carried state after each segment's K steps,
+                # indexed by the TRUE segment index. Empty segments (all-pad,
+                # possible with left-padding) are skipped by `continue` below, so
+                # we must NOT use append-order -- that would misalign snapshot[i]
+                # with segment i and corrupt the forgetting matrix diagonal. We
+                # store None for skipped segments so indices stay aligned.
+                segment_mems = ([None] * n_segments) if collect_segment_mems else None
 
                 for seg_idx in range(n_segments):
                     seg_start = seg_idx * segment_size
@@ -1115,8 +1133,10 @@ class GradMemGPT(PreTrainedModel):
                     # snapshot the carried memory after this segment's K steps
                     # (eval-only forgetting probe uses these EXACT states so the
                     # measured retrieval matches what the model actually produces).
+                    # Store at the TRUE seg_idx so probe alignment holds even when
+                    # earlier empty segments were skipped.
                     if collect_segment_mems:
-                        segment_mems.append(mem_batch.detach())
+                        segment_mems[seg_idx] = mem_batch.detach()
 
         if total_inner_steps > 0:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / total_inner_steps
