@@ -42,6 +42,7 @@ FREEZE_BACKBONE=false
 MEMORY_ALIGNMENT_WEIGHT=${MEMORY_ALIGNMENT_WEIGHT:-0.0}
 STEP_ALIGNMENT_WEIGHT=${STEP_ALIGNMENT_WEIGHT:-0.0}
 GRAD_ALIGN_NORM=${GRAD_ALIGN_NORM:-none}
+INTERMEDIATE_READ_WEIGHT=${INTERMEDIATE_READ_WEIGHT:-0.0}
 
 # Energy head and optional landscape-shaping losses. Environment overrides let
 # dedicated experiment wrappers reuse this launcher without duplicating it.
@@ -120,6 +121,9 @@ fi
 if [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}_${GRAD_ALIGN_NORM}
 fi
+if [ "$INTERMEDIATE_READ_WEIGHT" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_iread${INTERMEDIATE_READ_WEIGHT}
+fi
 if [ "$USE_ADAM" = true ]; then
   RUN_NAME=${RUN_NAME}_with_adam
 fi
@@ -177,6 +181,7 @@ for N in "${N_VALUES[@]}"; do
     --memory_alignment_weight "$MEMORY_ALIGNMENT_WEIGHT"
     --step_alignment_weight "$STEP_ALIGNMENT_WEIGHT"
     --grad_align_norm "$GRAD_ALIGN_NORM"
+    --intermediate_read_weight "$INTERMEDIATE_READ_WEIGHT"
     --freeze_backbone "$FREEZE_BACKBONE"
     --energy_rank_weight "$ENERGY_RANK_WEIGHT"
     --energy_traj_weight "$ENERGY_TRAJ_WEIGHT"

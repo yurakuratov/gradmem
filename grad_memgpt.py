@@ -102,6 +102,7 @@ class GradMemGPTConfig(PretrainedConfig):
                   memory_alignment_weight=0.0,
                   step_alignment_weight=0.0,
                   grad_align_norm="none",
+                  intermediate_read_weight=0.0,
                   **kwargs):
         """
         Args:
@@ -159,6 +160,7 @@ class GradMemGPTConfig(PretrainedConfig):
                 stopped READ gradient on the final prefix memory
             step_alignment_weight: float, weight for aligning the final WRITE update with its READ gradient
             grad_align_norm: str, step-alignment normalization ("none" or "norm")
+            intermediate_read_weight: float, weight for READ supervision on intermediate WRITE states
         """
         super().__init__(**kwargs)
 
@@ -217,6 +219,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.memory_alignment_weight = memory_alignment_weight
         self.step_alignment_weight = step_alignment_weight
         self.grad_align_norm = grad_align_norm
+        self.intermediate_read_weight = intermediate_read_weight
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -252,6 +255,8 @@ class GradMemGPTConfig(PretrainedConfig):
         if self.step_alignment_weight > 0.0:
             if self.memory_backend != "prefix" or self.grad_mode != "second" or self.K <= 0:
                 raise ValueError("step_alignment_weight requires second-order prefix WRITE")
+        if self.intermediate_read_weight < 0.0:
+            raise ValueError("intermediate_read_weight must be >= 0")
         if self.memory_backend == "lora":
             assert self.lora_mem_placement in ["between_layers", "target_modules"], (
                 "lora_mem_placement currently supports: 'between_layers', 'target_modules'"
@@ -266,6 +271,9 @@ class MemoryBackend:
     def activation_context(self, memory_state):
         _ = memory_state
         yield
+
+    def snapshot_memory_state(self, memory_state):
+        return dict(memory_state)
 
 
 class InputPrefixMemoryBackend(MemoryBackend):
@@ -791,6 +799,7 @@ class GradMemGPT(PreTrainedModel):
         self.memory_alignment_weight = float(getattr(config, "memory_alignment_weight", 0.0) or 0.0)
         self.step_alignment_weight = float(getattr(config, "step_alignment_weight", 0.0) or 0.0)
         self.grad_align_norm = getattr(config, "grad_align_norm", "none")
+        self.intermediate_read_weight = float(getattr(config, "intermediate_read_weight", 0.0) or 0.0)
         if self.energy_rank_temperature <= 0.0:
             raise ValueError("energy_rank_temperature must be > 0")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
@@ -1278,6 +1287,12 @@ class GradMemGPT(PreTrainedModel):
             return (1.0 - outer_grad.float().flatten(1).norm(dim=1) * cosine).mean(), cosine.mean()
         return 1.0 - cosine.mean(), cosine.mean()
 
+    @staticmethod
+    def _intermediate_read_weights(K, device, dtype):
+        depths = torch.arange(1, K, device=device, dtype=dtype)
+        weights = (K - depths + 1).reciprocal()
+        return weights / weights.sum()
+
     def _get_transformer_blocks(self):
         backbone = get_backbone(self.model)
         for attr in ("h", "layers", "block", "blocks"):
@@ -1648,6 +1663,8 @@ class GradMemGPT(PreTrainedModel):
         )
         memory_gradient_active = memory_alignment_active or step_alignment_active
         last_inner_update = None
+        intermediate_memory_states = []
+        intermediate_read_active = labels is not None and self.intermediate_read_weight > 0.0 and self.K > 1
         batch_ctx = backend.prepare_batch(context_input_ids, query_input_ids, pad_id)
         opt_state = {}
         inner_loss_history = []
@@ -1721,6 +1738,8 @@ class GradMemGPT(PreTrainedModel):
                         last_inner_update = inner_params[0] - new_params[0]
                     backend.assign_inner_params(memory_state, new_params)
                     backend.maybe_detach_after_step(memory_state)
+                    if intermediate_read_active and k < self.K - 1:
+                        intermediate_memory_states.append(backend.snapshot_memory_state(memory_state))
 
         if self.K:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
@@ -1857,6 +1876,32 @@ class GradMemGPT(PreTrainedModel):
             step_alignment_loss = target_loss.new_tensor(0.0)
             step_alignment_cosine = target_loss.new_tensor(0.0)
 
+        intermediate_read_loss = target_loss.new_tensor(0.0)
+        if intermediate_memory_states:
+            intermediate_losses = []
+            with torch.enable_grad():
+                for intermediate_memory_state in intermediate_memory_states:
+                    intermediate_read_batch = backend.build_read_inputs(intermediate_memory_state, batch_ctx)
+                    with backend.activation_context(intermediate_memory_state):
+                        with self._disable_write_lora():
+                            predictions = self.model(
+                                inputs_embeds=intermediate_read_batch['inputs_embeds'],
+                                return_dict=True,
+                                **intermediate_read_batch.get('model_kwargs', {}),
+                            ).logits
+                    predictions = predictions[
+                        :, intermediate_read_batch['logits_start']:
+                        intermediate_read_batch['logits_start'] + intermediate_read_batch['pred_len'],
+                        :,
+                    ]
+                    intermediate_losses.append(
+                        self._compute_read_target_loss(predictions, intermediate_read_batch, labels)
+                    )
+            losses = torch.stack(intermediate_losses)
+            intermediate_read_loss = (
+                self._intermediate_read_weights(self.K, losses.device, losses.dtype) * losses
+            ).sum()
+
         zero = target_loss.new_tensor(0.0)
         inner_loss_for_outer = inner_loss / B
         # energy shaping losses:
@@ -1940,6 +1985,7 @@ class GradMemGPT(PreTrainedModel):
             + energy_aux_loss
             + self.memory_alignment_weight * memory_alignment_loss
             + self.step_alignment_weight * step_alignment_loss
+            + self.intermediate_read_weight * intermediate_read_loss
         )
 
         loss_stats.update({
@@ -1949,6 +1995,7 @@ class GradMemGPT(PreTrainedModel):
             "memory_alignment_cosine": alignment_cosine.mean(),
             "step_alignment_loss": step_alignment_loss,
             "step_alignment_cosine": step_alignment_cosine,
+            "intermediate_read_loss": intermediate_read_loss,
         })
         if rank_active or trajectory_active or anchor_active:
             loss_stats["energy_aux_loss"] = energy_aux_loss
