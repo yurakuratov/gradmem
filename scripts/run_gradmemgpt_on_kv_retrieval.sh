@@ -7,6 +7,27 @@ source "$SCRIPT_DIR/collect_env_state.sh"
 
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
+RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resume_from_checkpoint|--resume-from-checkpoint)
+      if [[ $# -lt 2 ]]; then
+        echo "[ERROR] $1 requires a checkpoint directory" >&2
+        exit 2
+      fi
+      RESUME_FROM_CHECKPOINT="$2"
+      shift 2
+      ;;
+    --resume_from_checkpoint=*|--resume-from-checkpoint=*)
+      RESUME_FROM_CHECKPOINT="${1#*=}"
+      shift
+      ;;
+    *)
+      echo "[ERROR] unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
 LR=1e-04
 TBS=64
 PER_DEVICE_BATCH_SIZE=64
@@ -25,7 +46,7 @@ V=62
 # DATA_NAME="N0-S1(4-4)_1M"
 # DATA_NAME="N10-K2V2-S4(32-64)_1M"
 # DATA_NAME="N16-K1V1-vocab512_1M"
-DATA_NAME="N8-K2V2-V${V}_1M"
+DATA_NAME="mix-N8-K2V2-V${V}_1M"
 DATA_PATH="./data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
@@ -37,7 +58,7 @@ MEMORY_BACKEND="prefix"
 # - lora backend ignores n_mem_tokens.
 N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
-K=2
+K=1
 LAST_K_SECOND_ORDER=${K}
 INNER_LR=0.04
 INNER_CLIP_VALUE=None
@@ -77,6 +98,7 @@ STEP_ALIGNMENT_WEIGHT=${STEP_ALIGNMENT_WEIGHT:-0.0}
 GRAD_ALIGN_NORM=${GRAD_ALIGN_NORM:-none}
 INTERMEDIATE_READ_WEIGHT=${INTERMEDIATE_READ_WEIGHT:-0.0}
 ORTHOGONAL_LOSS_WEIGHT=${ORTHOGONAL_LOSS_WEIGHT:-0.0}
+IVAN_LOSS_WEIGHT=${IVAN_LOSS_WEIGHT:-0.0}
 STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
 
 ATTN_IMPL="eager"
@@ -145,13 +167,19 @@ if [ "$MEMORY_ALIGNMENT_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_align${MEMORY_ALIGNMENT_WEIGHT}
 fi
 if [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
-  RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}_${GRAD_ALIGN_NORM}
+  RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}
+  if [ "$GRAD_ALIGN_NORM" != "none" ]; then
+    RUN_NAME=${RUN_NAME}_${GRAD_ALIGN_NORM}
+  fi
 fi
 if [ "$INTERMEDIATE_READ_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_iread${INTERMEDIATE_READ_WEIGHT}
 fi
-if [ "$ORTHOGONAL_LOSS_WEIGHT" != "0.0" ]; then
+if [ "$ORTHOGONAL_LOSS_WEIGHT" != "0.0" ] && [ "$ORTHOGONAL_LOSS_WEIGHT" != "None" ]; then
   RUN_NAME=${RUN_NAME}_orth${ORTHOGONAL_LOSS_WEIGHT}
+fi
+if [ "$IVAN_LOSS_WEIGHT" != "0.0" ] && [ "$IVAN_LOSS_WEIGHT" != "None" ]; then
+  RUN_NAME=${RUN_NAME}_ivan${IVAN_LOSS_WEIGHT}
 fi
 if [ "$USE_ADAM" = true ]; then
   RUN_NAME=${RUN_NAME}_with_adam
@@ -167,7 +195,21 @@ if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
 fi
 
 # Run ID
-N_VALUES=(1 2 3)
+N_VALUES=(1 2)
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+  if [ ! -d "$RESUME_FROM_CHECKPOINT" ]; then
+    echo "[ERROR] resume checkpoint directory does not exist: $RESUME_FROM_CHECKPOINT" >&2
+    exit 1
+  fi
+  RESUME_FROM_CHECKPOINT="$(realpath "$RESUME_FROM_CHECKPOINT")"
+  RESUME_EXP_PATH="$(dirname "$RESUME_FROM_CHECKPOINT")"
+  RESUME_RUN_DIR="$(basename "$RESUME_EXP_PATH")"
+  if [[ ! "$RESUME_RUN_DIR" =~ ^run_([0-9]+)(_(bf16|fp16))?$ ]]; then
+    echo "[ERROR] could not infer run number from resume path: $RESUME_EXP_PATH" >&2
+    exit 1
+  fi
+  N_VALUES=("${BASH_REMATCH[1]}")
+fi
 for N in "${N_VALUES[@]}"; do
   # Path to save experiment results
   RND=$(date +%Y%m%d%H%M%S)
@@ -177,7 +219,13 @@ for N in "${N_VALUES[@]}"; do
     EXP_PATH="${EXP_PATH}_${MIXED_PRECISION}"
   fi
 
-  if ! prepare_locked_run "$EXP_PATH" "$0" "$NP"; then
+  ALLOW_EXISTING=false
+  if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    EXP_PATH="$RESUME_EXP_PATH"
+    ALLOW_EXISTING=true
+  fi
+
+  if ! prepare_locked_run "$EXP_PATH" "$0" "$NP" "$ALLOW_EXISTING"; then
     continue
   fi
 
@@ -216,7 +264,6 @@ for N in "${N_VALUES[@]}"; do
     --step_alignment_weight "$STEP_ALIGNMENT_WEIGHT"
     --grad_align_norm "$GRAD_ALIGN_NORM"
     --intermediate_read_weight "$INTERMEDIATE_READ_WEIGHT"
-    --orthogonal_loss_weight "$ORTHOGONAL_LOSS_WEIGHT"
     --freeze_backbone "$FREEZE_BACKBONE"
     --max_steps 1000000
     --eval_steps 500
@@ -229,6 +276,9 @@ for N in "${N_VALUES[@]}"; do
   # Optional args
   if [ -n "${INIT_CHECKPOINT:-}" ]; then
     CMD+=( --init_checkpoint "$INIT_CHECKPOINT" )
+  fi
+  if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    CMD+=( --resume_from_checkpoint "$RESUME_FROM_CHECKPOINT" )
   fi
   if [ "$INNER_CLIP_VALUE" != "None" ]; then
     CMD+=( --inner_clip_value "$INNER_CLIP_VALUE" )
@@ -277,6 +327,12 @@ for N in "${N_VALUES[@]}"; do
     if [ "$INNER_LOSS_WEIGHT" != "None" ]; then
       CMD+=( --inner_loss_weight "$INNER_LOSS_WEIGHT" )
     fi
+  fi
+  if [ "$ORTHOGONAL_LOSS_WEIGHT" != "0.0" ] && [ "$ORTHOGONAL_LOSS_WEIGHT" != "None" ]; then
+    CMD+=( --orthogonal_loss_weight "$ORTHOGONAL_LOSS_WEIGHT" )
+  fi
+  if [ "$IVAN_LOSS_WEIGHT" != "0.0" ] && [ "$IVAN_LOSS_WEIGHT" != "None" ]; then
+    CMD+=( --ivan_loss_weight "$IVAN_LOSS_WEIGHT" )
   fi
 
   print_run_header "$EXP_PATH" "$PORT" "$NP" "$MIXED_PRECISION" "${CMD[@]}"

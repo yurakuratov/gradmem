@@ -203,6 +203,8 @@ def build_model_config(cli_args, base_config=None):
         attn_implementation=cli_args.get("attn_implementation", "eager"),
         add_inner_loss_to_outer=cli_args.get("add_inner_loss_to_outer", False),
         inner_loss_weight=cli_args.get("inner_loss_weight"),
+        grad_align_norm=cli_args.get("grad_align_norm", "none"),
+        ivan_loss_weight=cli_args.get("ivan_loss_weight", 0.0),
     )
 
 

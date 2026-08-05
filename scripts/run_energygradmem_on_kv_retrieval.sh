@@ -7,6 +7,27 @@ source "$SCRIPT_DIR/collect_env_state.sh"
 
 # Define arguments for the script
 NP=${NP:-1}
+RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resume_from_checkpoint|--resume-from-checkpoint)
+      if [[ $# -lt 2 ]]; then
+        echo "[ERROR] $1 requires a checkpoint directory" >&2
+        exit 2
+      fi
+      RESUME_FROM_CHECKPOINT="$2"
+      shift 2
+      ;;
+    --resume_from_checkpoint=*|--resume-from-checkpoint=*)
+      RESUME_FROM_CHECKPOINT="${1#*=}"
+      shift
+      ;;
+    *)
+      echo "[ERROR] unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
 LR=1e-04
 TBS=64
 PER_DEVICE_BATCH_SIZE=64
@@ -24,7 +45,10 @@ TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
 # Energy-GradMem currently supports prefix memory only.
 MEMORY_BACKEND="prefix"
-WRITE_OBJECTIVE=${WRITE_OBJECTIVE:-"energy"}
+# WRITE_OBJECTIVE=${WRITE_OBJECTIVE:-"energy"}
+# WRITE_OBJECTIVE="reconstruction"
+# WRITE_OBJECTIVE="energy_with_reconstruction"
+WRITE_OBJECTIVE="energy"
 
 # Memory/write params. Start from known-good GradMem N8 setup.
 N_MEM_TOKENS=8
@@ -39,16 +63,16 @@ GRAD_MODE="second"
 USE_MEM_PROJ=false
 MEM_PROJ_MODE="none"
 FREEZE_BACKBONE=false
-MEMORY_ALIGNMENT_WEIGHT=${MEMORY_ALIGNMENT_WEIGHT:-0.0}
-STEP_ALIGNMENT_WEIGHT=${STEP_ALIGNMENT_WEIGHT:-0.0}
-GRAD_ALIGN_NORM=${GRAD_ALIGN_NORM:-none}
-INTERMEDIATE_READ_WEIGHT=${INTERMEDIATE_READ_WEIGHT:-0.0}
-ORTHOGONAL_LOSS_WEIGHT=${ORTHOGONAL_LOSS_WEIGHT:-0.0}
+MEMORY_ALIGNMENT_WEIGHT=0.0
+STEP_ALIGNMENT_WEIGHT=0.0
+GRAD_ALIGN_NORM="norm"
+INTERMEDIATE_READ_WEIGHT=0.1
+ORTHOGONAL_LOSS_WEIGHT=0.0
+IVAN_LOSS_WEIGHT=0.0
 
 # Energy head and optional landscape-shaping losses. Environment overrides let
 # dedicated experiment wrappers reuse this launcher without duplicating it.
 ENERGY_HEAD_HIDDEN_DIM=None
-USE_LAYERWISE_ENERGY=${USE_LAYERWISE_ENERGY:-false}
 WRITE_RECONSTRUCTION_WEIGHT=1.0
 WRITE_ENERGY_WEIGHT=1.0
 ENERGY_RANK_WEIGHT=${ENERGY_RANK_WEIGHT:-0.0}
@@ -58,11 +82,13 @@ ENERGY_TRAJ_MARGIN=${ENERGY_TRAJ_MARGIN:-0.0}
 ENERGY_RANK_TEMPERATURE=${ENERGY_RANK_TEMPERATURE:-1.0}
 ENERGY_MIX_ALPHA=${ENERGY_MIX_ALPHA:-0.75}
 ENERGY_ANCHOR_WEIGHT=${ENERGY_ANCHOR_WEIGHT:-0.0}
-ENERGY_MEMORY_SEARCH_WEIGHT=${ENERGY_MEMORY_SEARCH_WEIGHT:-0.0}
+ENERGY_MEMORY_SEARCH_WEIGHT=0.1
 ENERGY_MEMORY_SEARCH_NUM_SAMPLES=${ENERGY_MEMORY_SEARCH_NUM_SAMPLES:-4}
 ENERGY_MEMORY_SEARCH_RADIUS_SCALE=${ENERGY_MEMORY_SEARCH_RADIUS_SCALE:-0.25}
 ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING=${ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING:-false}
 ENERGY_MEMORY_SEARCH_GAIN_EMA_DECAY=${ENERGY_MEMORY_SEARCH_GAIN_EMA_DECAY:-0.99}
+ENERGY_MEMORY_SEARCH_USE_BEST_FOR_NEXT_STEP=${ENERGY_MEMORY_SEARCH_USE_BEST_FOR_NEXT_STEP:-false}
+USE_LAYERWISE_ENERGY=false
 
 STOP_ON_METRIC_VALUE=0.99
 
@@ -71,15 +97,6 @@ INNER_LOSS_WEIGHT=0.5
 
 ATTN_IMPL="eager"
 MIXED_PRECISION='no'
-
-# INIT_CHECKPOINT=./runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D128_mem8_K2_ilr0.4_energy_recon1.0_energy1.0_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-15000/model.safetensors
-# RUN_NAME_SUFFIX=init_N8_K2_ilr0.4_recon1.0_energy1.0
-
-# INIT_CHECKPOINT=runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D128_mem8_K2_ilr0.4_energy_recon1.0_energy1.0_rank0.01_m0.1_t1.0_mix0.75_anchor0.001_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-15500/model.safetensors
-# RUN_NAME_SUFFIX=init_N8_K2_ilr0.4_recon1.0_energy1.0_shaping
-# INIT_CHECKPOINT=./runs/N8-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.4_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-12500/model.safetensors
-# INIT_CHECKPOINT=./runs/N8-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.4_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-14500/model.safetensors
-# RUN_NAME_SUFFIX=init_gradmem_N8_K2_ilr0.4
 
 RUN_NAME=energygradmem_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
@@ -119,9 +136,13 @@ if [ "$ENERGY_ANCHOR_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_anchor${ENERGY_ANCHOR_WEIGHT}
 fi
 if [ "$ENERGY_MEMORY_SEARCH_WEIGHT" != "0.0" ]; then
-  RUN_NAME=${RUN_NAME}_msearch${ENERGY_MEMORY_SEARCH_WEIGHT}_n${ENERGY_MEMORY_SEARCH_NUM_SAMPLES}
+  RUN_NAME=${RUN_NAME}_msearch${ENERGY_MEMORY_SEARCH_WEIGHT}
+  RUN_NAME=${RUN_NAME}_n${ENERGY_MEMORY_SEARCH_NUM_SAMPLES}_r${ENERGY_MEMORY_SEARCH_RADIUS_SCALE}
   if [ "$ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING" = true ]; then
     RUN_NAME=${RUN_NAME}_gainema${ENERGY_MEMORY_SEARCH_GAIN_EMA_DECAY}
+  fi
+  if [ "$ENERGY_MEMORY_SEARCH_USE_BEST_FOR_NEXT_STEP" = true ]; then
+    RUN_NAME=${RUN_NAME}_rollout
   fi
 fi
 RUN_NAME=${RUN_NAME}_grad_${GRAD_MODE}
@@ -135,13 +156,19 @@ if [ "$MEMORY_ALIGNMENT_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_align${MEMORY_ALIGNMENT_WEIGHT}
 fi
 if [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
-  RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}_${GRAD_ALIGN_NORM}
+  RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}
+  if [ "$GRAD_ALIGN_NORM" != "none" ]; then
+    RUN_NAME=${RUN_NAME}_${GRAD_ALIGN_NORM}
+  fi
 fi
 if [ "$INTERMEDIATE_READ_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_iread${INTERMEDIATE_READ_WEIGHT}
 fi
-if [ "$ORTHOGONAL_LOSS_WEIGHT" != "0.0" ]; then
+if [ "$ORTHOGONAL_LOSS_WEIGHT" != "0.0" ] && [ "$ORTHOGONAL_LOSS_WEIGHT" != "None" ]; then
   RUN_NAME=${RUN_NAME}_orth${ORTHOGONAL_LOSS_WEIGHT}
+fi
+if [ "$IVAN_LOSS_WEIGHT" != "0.0" ] && [ "$IVAN_LOSS_WEIGHT" != "None" ]; then
+  RUN_NAME=${RUN_NAME}_ivan${IVAN_LOSS_WEIGHT}
 fi
 if [ "$USE_ADAM" = true ]; then
   RUN_NAME=${RUN_NAME}_with_adam
@@ -156,7 +183,21 @@ if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
   RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
 fi
 
-N_VALUES=(2)
+N_VALUES=(1 2 3)
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+  if [ ! -d "$RESUME_FROM_CHECKPOINT" ]; then
+    echo "[ERROR] resume checkpoint directory does not exist: $RESUME_FROM_CHECKPOINT" >&2
+    exit 1
+  fi
+  RESUME_FROM_CHECKPOINT="$(realpath "$RESUME_FROM_CHECKPOINT")"
+  RESUME_EXP_PATH="$(dirname "$RESUME_FROM_CHECKPOINT")"
+  RESUME_RUN_DIR="$(basename "$RESUME_EXP_PATH")"
+  if [[ ! "$RESUME_RUN_DIR" =~ ^run_([0-9]+)(_(bf16|fp16))?$ ]]; then
+    echo "[ERROR] could not infer run number from resume path: $RESUME_EXP_PATH" >&2
+    exit 1
+  fi
+  N_VALUES=("${BASH_REMATCH[1]}")
+fi
 for N in "${N_VALUES[@]}"; do
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_${N}"
 
@@ -164,7 +205,13 @@ for N in "${N_VALUES[@]}"; do
     EXP_PATH="${EXP_PATH}_${MIXED_PRECISION}"
   fi
 
-  if ! prepare_locked_run "$EXP_PATH" "$0" "$NP"; then
+  ALLOW_EXISTING=false
+  if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    EXP_PATH="$RESUME_EXP_PATH"
+    ALLOW_EXISTING=true
+  fi
+
+  if ! prepare_locked_run "$EXP_PATH" "$0" "$NP" "$ALLOW_EXISTING"; then
     continue
   fi
 
@@ -201,7 +248,6 @@ for N in "${N_VALUES[@]}"; do
     --step_alignment_weight "$STEP_ALIGNMENT_WEIGHT"
     --grad_align_norm "$GRAD_ALIGN_NORM"
     --intermediate_read_weight "$INTERMEDIATE_READ_WEIGHT"
-    --orthogonal_loss_weight "$ORTHOGONAL_LOSS_WEIGHT"
     --freeze_backbone "$FREEZE_BACKBONE"
     --energy_rank_weight "$ENERGY_RANK_WEIGHT"
     --energy_traj_weight "$ENERGY_TRAJ_WEIGHT"
@@ -216,7 +262,7 @@ for N in "${N_VALUES[@]}"; do
     --energy_memory_search_num_samples "$ENERGY_MEMORY_SEARCH_NUM_SAMPLES"
     --energy_memory_search_radius_scale "$ENERGY_MEMORY_SEARCH_RADIUS_SCALE"
     --energy_memory_search_gain_ema_decay "$ENERGY_MEMORY_SEARCH_GAIN_EMA_DECAY"
-    --max_steps 200000
+    --max_steps 1000000
     --eval_steps 500
     --logging_steps 500
     --warmup_steps 10000
@@ -227,6 +273,9 @@ for N in "${N_VALUES[@]}"; do
 
   if [ -n "${INIT_CHECKPOINT:-}" ]; then
     CMD+=( --init_checkpoint "$INIT_CHECKPOINT" )
+  fi
+  if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    CMD+=( --resume_from_checkpoint "$RESUME_FROM_CHECKPOINT" )
   fi
   if [ "$INNER_CLIP_VALUE" != "None" ]; then
     CMD+=( --inner_clip_value "$INNER_CLIP_VALUE" )
@@ -243,9 +292,6 @@ for N in "${N_VALUES[@]}"; do
   if [ "$ENERGY_HEAD_HIDDEN_DIM" != "None" ]; then
     CMD+=( --energy_head_hidden_dim "$ENERGY_HEAD_HIDDEN_DIM" )
   fi
-  if [ "$USE_LAYERWISE_ENERGY" = true ]; then
-    CMD+=( --use_layerwise_energy )
-  fi
   if [ -n "${MAX_CONTEXT_LENGTH:-}" ]; then
     CMD+=( --max_context_length "$MAX_CONTEXT_LENGTH" )
   fi
@@ -255,8 +301,20 @@ for N in "${N_VALUES[@]}"; do
       CMD+=( --inner_loss_weight "$INNER_LOSS_WEIGHT" )
     fi
   fi
+  if [ "$USE_LAYERWISE_ENERGY" = true ]; then
+    CMD+=( --use_layerwise_energy )
+  fi
   if [ "$ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING" = true ]; then
     CMD+=( --energy_memory_search_use_gain_weighting )
+  fi
+  if [ "$ENERGY_MEMORY_SEARCH_USE_BEST_FOR_NEXT_STEP" = true ]; then
+    CMD+=( --energy_memory_search_use_best_for_next_step )
+  fi
+  if [ "$ORTHOGONAL_LOSS_WEIGHT" != "0.0" ] && [ "$ORTHOGONAL_LOSS_WEIGHT" != "None" ]; then
+    CMD+=( --orthogonal_loss_weight "$ORTHOGONAL_LOSS_WEIGHT" )
+  fi
+  if [ "$IVAN_LOSS_WEIGHT" != "0.0" ] && [ "$IVAN_LOSS_WEIGHT" != "None" ]; then
+    CMD+=( --ivan_loss_weight "$IVAN_LOSS_WEIGHT" )
   fi
 
   print_run_header "$EXP_PATH" "$PORT" "$NP" "$MIXED_PRECISION" "${CMD[@]}"

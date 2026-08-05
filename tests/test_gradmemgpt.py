@@ -1239,6 +1239,206 @@ def test_energy_shaping_loss_accounting_and_backward():
 
 @pytest.mark.one_batch_train
 @pytest.mark.all
+def test_energy_memory_search_runs_after_each_write_step_and_is_training_only():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_shaped_energy_model(
+        batch_size=2,
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        energy_memory_search_weight=0.2,
+        energy_memory_search_num_samples=2,
+        energy_memory_search_radius_scale=0.25,
+        add_inner_loss_to_outer=False,
+        memory_alignment_weight=0.0,
+        step_alignment_weight=0.0,
+        intermediate_read_weight=0.0,
+    )
+    calls = []
+
+    def _fixed_search(_backend, memory_state, previous_memory, _batch_ctx, _labels):
+        calls.append((memory_state["mem_batch"], previous_memory))
+        value = memory_state["mem_batch"].float().square().mean()
+        return {
+            "loss": value,
+            "per_example_loss": value.expand(memory_state["mem_batch"].size(0)),
+            "relative_target_gain": value.new_tensor([0.1, 0.2]),
+            "improvement_rate": value.new_tensor(0.5),
+            "target_gain": value.new_tensor(0.25),
+            "max_target_gain": value.new_tensor(0.25 + 0.125 * len(calls)),
+            "selected_distance": value.new_tensor(0.125),
+        }
+
+    model._compute_energy_memory_search_loss = _fixed_search
+    model.train()
+    output = model(inputs, labels=labels)
+    stats = output["inner_loop_stats"]
+
+    assert len(calls) == model.K
+    assert calls[0][1].grad_fn is None
+    assert torch.equal(calls[1][1], calls[0][0].detach())
+    expected_search_loss = torch.stack([
+        state[0].float().square().mean() for state in calls
+    ]).mean()
+    assert torch.allclose(stats["energy_memory_search_loss"], expected_search_loss.detach())
+    assert stats["energy_memory_search_improvement_rate"].item() == pytest.approx(0.5)
+    assert stats["energy_memory_search_target_gain"].item() == pytest.approx(0.25)
+    assert stats["energy_memory_search_max_target_gain"].item() == pytest.approx(0.5)
+    assert stats["energy_memory_search_selected_distance"].item() == pytest.approx(0.125)
+    assert torch.allclose(
+        stats["energy_aux_loss"],
+        model.energy_memory_search_weight * stats["energy_memory_search_loss"],
+    )
+    assert torch.allclose(
+        stats["outer_loss"],
+        stats["target_loss"] + model.energy_memory_search_weight * stats["energy_memory_search_loss"],
+    )
+    output["loss"].backward()
+    energy_gradients = [
+        parameter.grad for parameter in model.energy_head.parameters()
+        if parameter.grad is not None
+    ]
+    assert energy_gradients
+    assert all(torch.isfinite(gradient).all().item() for gradient in energy_gradients)
+
+    def _unexpected_search(*_args, **_kwargs):
+        raise AssertionError("memory search must be disabled during evaluation")
+
+    model._compute_energy_memory_search_loss = _unexpected_search
+    model.eval()
+    evaluation = model(inputs, labels=labels)
+    assert "energy_memory_search_loss" not in evaluation["inner_loop_stats"]
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_energy_memory_search_applies_gain_weights_across_all_write_states():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_shaped_energy_model(
+        batch_size=2,
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        energy_memory_search_weight=0.2,
+        energy_memory_search_use_gain_weighting=True,
+        energy_memory_search_gain_ema_decay=0.99,
+        add_inner_loss_to_outer=False,
+        memory_alignment_weight=0.0,
+        step_alignment_weight=0.0,
+        intermediate_read_weight=0.0,
+    )
+    calls = 0
+
+    def _fixed_search(_backend, memory_state, _previous_memory, _batch_ctx, _labels):
+        nonlocal calls
+        calls += 1
+        graph_anchor = memory_state["mem_batch"].float().flatten(1).sum(dim=1) * 0.0
+        if calls == 1:
+            per_example_loss = graph_anchor + graph_anchor.new_tensor([1.0, 2.0])
+            relative_gain = graph_anchor.new_tensor([0.1, 0.2])
+        else:
+            per_example_loss = graph_anchor + graph_anchor.new_tensor([3.0, 4.0])
+            relative_gain = graph_anchor.new_tensor([0.0, 0.3])
+        return {
+            "loss": per_example_loss.mean(),
+            "per_example_loss": per_example_loss,
+            "relative_target_gain": relative_gain,
+            "improvement_rate": relative_gain.gt(0.0).float().mean(),
+            "target_gain": relative_gain.mean(),
+            "max_target_gain": relative_gain.max(),
+            "selected_distance": per_example_loss.new_tensor(0.125),
+        }
+
+    model._compute_energy_memory_search_loss = _fixed_search
+    model.train()
+    output = model(inputs, labels=labels)
+    stats = output["inner_loop_stats"]
+
+    assert calls == model.K
+    assert model.energy_memory_search_gain_ema.item() == pytest.approx(0.2)
+    assert stats["energy_memory_search_unweighted_loss"].item() == pytest.approx(2.5)
+    assert stats["energy_memory_search_loss"].item() == pytest.approx(2.125)
+    assert stats["energy_memory_search_relative_target_gain"].item() == pytest.approx(0.15)
+    assert stats["energy_memory_search_mean_relative_target_gain"].item() == pytest.approx(0.15)
+    assert stats["energy_memory_search_max_relative_target_gain"].item() == pytest.approx(0.3)
+    assert stats["energy_memory_search_gain_weight_mean"].item() == pytest.approx(1.0)
+    assert stats["energy_memory_search_gain_weight_max"].item() == pytest.approx(1.5)
+    assert stats["energy_memory_search_gain_ema"].item() == pytest.approx(0.2)
+    assert torch.allclose(
+        stats["outer_loss"],
+        stats["target_loss"] + model.energy_memory_search_weight * stats["energy_memory_search_loss"],
+    )
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_energy_memory_search_can_roll_best_candidate_into_next_write_step():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_shaped_energy_model(
+        batch_size=2,
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        energy_memory_search_weight=0.2,
+        energy_memory_search_use_best_for_next_step=True,
+        add_inner_loss_to_outer=False,
+        memory_alignment_weight=0.0,
+        step_alignment_weight=0.0,
+        intermediate_read_weight=0.0,
+    )
+    backend = model.memory_backend_impl
+    original_build_write_inputs = backend.build_write_inputs
+    write_memories = []
+    search_students = []
+    search_previous = []
+    search_teachers = []
+
+    def _record_build_write_inputs(memory_state, batch_ctx):
+        write_memories.append(memory_state["mem_batch"].detach().clone())
+        return original_build_write_inputs(memory_state, batch_ctx)
+
+    def _fixed_search(_backend, memory_state, previous_memory, _batch_ctx, _labels):
+        student = memory_state["mem_batch"]
+        teacher = student.detach() + 0.01
+        search_students.append(student.detach().clone())
+        search_previous.append(previous_memory.detach().clone())
+        search_teachers.append(teacher.clone())
+        per_example_loss = 0.5 * (student.float() - teacher.float()).square().flatten(1).sum(dim=1)
+        batch_size = student.size(0)
+        return {
+            "loss": per_example_loss.mean(),
+            "per_example_loss": per_example_loss,
+            "relative_target_gain": student.new_full((batch_size,), 0.1),
+            "teacher_memory": teacher,
+            "improvement_rate": student.new_tensor(1.0),
+            "target_gain": student.new_tensor(0.1),
+            "max_target_gain": student.new_tensor(0.1),
+            "selected_distance": (student.detach() - teacher).flatten(1).norm(dim=1).mean(),
+        }
+
+    backend.build_write_inputs = _record_build_write_inputs
+    model._compute_energy_memory_search_loss = _fixed_search
+    model.train()
+    output = model(inputs, labels=labels, return_mem=True)
+
+    assert len(search_students) == model.K
+    assert len(write_memories) == model.K + 1  # K inner forwards plus the post-WRITE diagnostic.
+    assert torch.allclose(write_memories[1], search_teachers[0])
+    assert torch.allclose(search_previous[1], search_teachers[0])
+    assert torch.allclose(write_memories[-1], search_teachers[-1])
+    assert torch.allclose(output["mem"].detach(), search_teachers[-1])
+    assert output["mem"].grad_fn is not None
+    output["loss"].backward()
+    energy_gradients = [
+        parameter.grad for parameter in model.energy_head.parameters()
+        if parameter.grad is not None
+    ]
+    assert energy_gradients
+    assert all(torch.isfinite(gradient).all().item() for gradient in energy_gradients)
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
 def test_disabled_energy_shaping_preserves_target_only_loss():
     torch.manual_seed(0)
     base_config = _build_base_config("gpt2")
@@ -1264,6 +1464,7 @@ def test_disabled_energy_shaping_preserves_target_only_loss():
         raise AssertionError("disabled shaping must not evaluate landscape candidates")
 
     model._compute_energy_landscape_losses = _unexpected_landscape_call
+    model._compute_energy_memory_search_loss = _unexpected_landscape_call
     output = model(
         {"context_input_ids": context, "query_input_ids": query},
         labels=labels,
@@ -1388,156 +1589,687 @@ def test_energy_shaping_parameter_validation():
         GradMemGPTConfig(base_config=base_config, energy_mix_alpha=1.1)
 
 
+@pytest.mark.forward
+@pytest.mark.all
+def test_energy_memory_search_defaults_validation_and_serialization(tmp_path):
+    base_config = _build_base_config("gpt2")
+    defaults = GradMemGPTConfig(base_config=base_config)
+    assert defaults.energy_memory_search_weight == 0.0
+    assert defaults.energy_memory_search_num_samples == 4
+    assert defaults.energy_memory_search_radius_scale == pytest.approx(0.25)
+    assert defaults.energy_memory_search_use_gain_weighting is False
+    assert defaults.energy_memory_search_gain_ema_decay == pytest.approx(0.99)
+    assert defaults.energy_memory_search_use_best_for_next_step is False
+
+    invalid_overrides = [
+        {"energy_memory_search_weight": -0.1},
+        {"energy_memory_search_num_samples": 0},
+        {"energy_memory_search_radius_scale": 0.0},
+        {"energy_memory_search_gain_ema_decay": -0.1},
+        {"energy_memory_search_gain_ema_decay": 1.0},
+        {"energy_memory_search_use_best_for_next_step": True},
+        {"energy_memory_search_weight": 0.1, "write_objective": "reconstruction"},
+        {
+            "energy_memory_search_weight": 0.1,
+            "write_objective": "energy",
+            "memory_backend": "prefix",
+            "K": 0,
+            "grad_mode": "second",
+        },
+        {
+            "energy_memory_search_weight": 0.1,
+            "write_objective": "energy",
+            "memory_backend": "prefix",
+            "K": 2,
+            "grad_mode": "first",
+        },
+        {
+            "energy_memory_search_weight": 0.1,
+            "write_objective": "energy",
+            "memory_backend": "prefix",
+            "K": 2,
+            "grad_mode": "second",
+            "last_K_second_order": 1,
+        },
+        {
+            "energy_memory_search_weight": 0.1,
+            "write_objective": "energy",
+            "memory_backend": "prefix",
+            "K": 2,
+            "grad_mode": "second",
+            "use_adam": True,
+        },
+    ]
+    for overrides in invalid_overrides:
+        with pytest.raises(ValueError, match="energy_memory_search"):
+            GradMemGPTConfig(base_config=base_config, **overrides)
+
+    config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        K=2,
+        grad_mode="second",
+        use_adam=False,
+        write_objective="energy",
+        energy_memory_search_weight=0.1,
+        energy_memory_search_num_samples=7,
+        energy_memory_search_radius_scale=0.4,
+        energy_memory_search_use_gain_weighting=True,
+        energy_memory_search_gain_ema_decay=0.95,
+        energy_memory_search_use_best_for_next_step=True,
+    )
+    config.save_pretrained(tmp_path)
+    restored = GradMemGPTConfig.from_pretrained(tmp_path)
+    assert restored.energy_memory_search_weight == pytest.approx(0.1)
+    assert restored.energy_memory_search_num_samples == 7
+    assert restored.energy_memory_search_radius_scale == pytest.approx(0.4)
+    assert restored.energy_memory_search_use_gain_weighting is True
+    assert restored.energy_memory_search_gain_ema_decay == pytest.approx(0.95)
+    assert restored.energy_memory_search_use_best_for_next_step is True
+
+    model = GradMemGPT(config)
+    model.energy_memory_search_gain_ema.fill_(0.3)
+    model.energy_memory_search_gain_ema_initialized.fill_(True)
+    state_dict = model.state_dict()
+    assert state_dict["energy_memory_search_gain_ema"].item() == pytest.approx(0.3)
+    assert state_dict["energy_memory_search_gain_ema_initialized"].item()
+
+
+def _build_memory_alignment_model(**config_overrides):
+    base_config = _build_base_config("gpt2")
+    config_values = dict(
+        base_config=base_config,
+        memory_backend="prefix",
+        n_mem_tokens=4,
+        K=2,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="second",
+        use_mem_proj=True,
+        mem_proj_mode="per_sample",
+        use_write_head=False,
+        attn_implementation="eager",
+        write_objective="energy",
+        memory_alignment_weight=0.3,
+    )
+    config_values.update(config_overrides)
+    model = GradMemGPT(GradMemGPTConfig(**config_values))
+    inputs = {
+        "context_input_ids": torch.randint(0, base_config.vocab_size, (2, 6)),
+        "query_input_ids": torch.randint(0, base_config.vocab_size, (2, 4)),
+    }
+    labels = torch.randint(0, base_config.vocab_size, (2, 4))
+    return model, inputs, labels
+
+
 @pytest.mark.one_batch_train
 @pytest.mark.all
-def test_memory_alignment_loss_is_added_to_outer_objective():
+def test_memory_alignment_loss_formula_and_backward():
     torch.manual_seed(0)
-    model, inputs, labels = _build_shaped_energy_model(
-        memory_alignment_weight=0.3,
-        energy_rank_weight=0.0,
-        energy_traj_weight=0.0,
-        energy_anchor_weight=0.0,
-        add_inner_loss_to_outer=False,
-    )
+    model, inputs, labels = _build_memory_alignment_model()
     model.train()
-    output = model(inputs, labels=labels)
-    stats = output["inner_loop_stats"]
 
-    assert torch.isfinite(stats["memory_alignment_loss"])
-    assert torch.isfinite(stats["memory_alignment_cosine"])
+    output = model(inputs, labels=labels, return_mem=True)
+    target_loss = torch.nn.functional.cross_entropy(
+        output["predictions"][:, :-1].reshape(-1, output["predictions"].size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
+    final_memory_outer_grad = torch.autograd.grad(
+        target_loss,
+        output["mem"],
+        retain_graph=True,
+    )[0].detach()
+    initial_memory = model.mem.unsqueeze(0).expand_as(output["mem"])
+    write_direction = (initial_memory - output["mem"]).float().flatten(1)
+    expected_cosine = torch.nn.functional.cosine_similarity(
+        write_direction,
+        final_memory_outer_grad.float().flatten(1),
+        dim=1,
+    )
+    expected_alignment_loss = 1 - expected_cosine.mean()
+
+    stats = output["inner_loop_stats"]
+    assert torch.allclose(
+        stats["memory_alignment_cosine"],
+        expected_cosine.detach().mean(),
+    )
+    assert torch.allclose(stats["memory_alignment_loss"], expected_alignment_loss.detach())
     assert torch.allclose(
         output["loss"].detach(),
         stats["target_loss"] + model.memory_alignment_weight * stats["memory_alignment_loss"],
     )
+
     output["loss"].backward()
     assert model.mem.grad is not None
+    assert torch.isfinite(model.mem.grad).all().item()
+    assert model.mem_proj.weight.grad is not None
+    assert torch.isfinite(model.mem_proj.weight.grad).all().item()
+    energy_gradients = [
+        parameter.grad for parameter in model.energy_head.parameters()
+        if parameter.grad is not None
+    ]
+    assert energy_gradients
+    assert all(torch.isfinite(gradient).all().item() for gradient in energy_gradients)
+    assert any(gradient.norm().item() > 0.0 for gradient in energy_gradients)
 
 
 @pytest.mark.forward
 @pytest.mark.all
 def test_memory_alignment_validation_and_serialization(tmp_path):
     base_config = _build_base_config("gpt2")
-    with pytest.raises(ValueError, match="memory_alignment_weight"):
-        GradMemGPTConfig(base_config=base_config, memory_alignment_weight=-0.1)
-    with pytest.raises(ValueError, match="memory_alignment_weight"):
-        GradMemGPTConfig(base_config=base_config, memory_alignment_weight=0.1, grad_mode="first")
+    invalid_overrides = [
+        {"memory_alignment_weight": -0.1},
+        {"memory_alignment_weight": 0.1, "memory_backend": "lora"},
+        {"memory_alignment_weight": 0.1, "grad_mode": "first"},
+        {"memory_alignment_weight": 0.1, "K": 0},
+        {"memory_alignment_weight": 0.1, "K": 2, "last_K_second_order": 0},
+    ]
+    for overrides in invalid_overrides:
+        with pytest.raises(ValueError, match="memory_alignment_weight"):
+            GradMemGPTConfig(base_config=base_config, **overrides)
 
     config = GradMemGPTConfig(
         base_config=base_config,
         memory_backend="prefix",
-        K=1,
+        K=2,
         grad_mode="second",
         memory_alignment_weight=0.25,
     )
     config.save_pretrained(tmp_path)
-    assert GradMemGPTConfig.from_pretrained(tmp_path).memory_alignment_weight == pytest.approx(0.25)
+    restored = GradMemGPTConfig.from_pretrained(tmp_path)
+    assert restored.memory_alignment_weight == pytest.approx(0.25)
 
 
 @pytest.mark.one_batch_train
 @pytest.mark.all
-def test_step_alignment_loss_is_added_to_outer_objective():
+@pytest.mark.parametrize("grad_align_norm", ["none", "norm"])
+def test_step_alignment_uses_each_inner_update_and_resulting_memory_gradient(grad_align_norm):
     torch.manual_seed(0)
-    model, inputs, labels = _build_shaped_energy_model(
+    model, inputs, labels = _build_memory_alignment_model(
         memory_alignment_weight=0.0,
         step_alignment_weight=0.4,
-        add_inner_loss_to_outer=False,
-        energy_rank_weight=0.0,
-        energy_traj_weight=0.0,
-        energy_anchor_weight=0.0,
+        grad_align_norm=grad_align_norm,
+        intermediate_read_weight=0.0,
     )
+    model.train()
+    recorded_losses = []
+    recorded_cosines = []
+    original_step_alignment = model._compute_step_alignment
+
+    def _record_step_alignment(target_loss, memory_state, inner_update):
+        loss, cosine = original_step_alignment(target_loss, memory_state, inner_update)
+        outer_grad = torch.autograd.grad(
+            target_loss,
+            memory_state["mem_batch"],
+            retain_graph=True,
+        )[0].detach()
+        expected_cosine = torch.nn.functional.cosine_similarity(
+            inner_update.float().flatten(1),
+            outer_grad.float().flatten(1),
+            dim=1,
+        )
+        expected_loss = 1 - expected_cosine.mean()
+        if grad_align_norm == "norm":
+            expected_loss = (1 - outer_grad.float().flatten(1).norm(dim=1) * expected_cosine).mean()
+        assert torch.allclose(cosine, expected_cosine.mean())
+        assert torch.allclose(loss, expected_loss)
+        recorded_losses.append(loss)
+        recorded_cosines.append(cosine)
+        return loss, cosine
+
+    model._compute_step_alignment = _record_step_alignment
     output = model(inputs, labels=labels)
     stats = output["inner_loop_stats"]
-    assert torch.isfinite(stats["step_alignment_loss"])
+
+    assert len(recorded_losses) == model.K + 1
+    expected_loss = torch.stack(recorded_losses).mean()
+    expected_cosine = torch.stack(recorded_cosines).mean()
+    assert torch.allclose(stats["step_alignment_loss"], expected_loss.detach())
+    assert torch.allclose(stats["step_alignment_cosine"], expected_cosine.detach())
     assert torch.allclose(
         output["loss"].detach(),
         stats["target_loss"] + model.step_alignment_weight * stats["step_alignment_loss"],
     )
 
+    output["loss"].backward()
+    energy_gradients = [
+        parameter.grad for parameter in model.energy_head.parameters()
+        if parameter.grad is not None
+    ]
+    assert energy_gradients
+    assert all(torch.isfinite(gradient).all().item() for gradient in energy_gradients)
+    assert any(gradient.norm().item() > 0.0 for gradient in energy_gradients)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_step_alignment_defaults_validation_and_serialization(tmp_path):
+    base_config = _build_base_config("gpt2")
+    assert GradMemGPTConfig(base_config=base_config).step_alignment_weight == 0.0
+    assert GradMemGPTConfig(base_config=base_config).grad_align_norm == "none"
+    invalid_overrides = [
+        {"step_alignment_weight": -0.1},
+        {"step_alignment_weight": 0.1, "memory_backend": "lora"},
+        {"step_alignment_weight": 0.1, "grad_mode": "first"},
+        {"step_alignment_weight": 0.1, "K": 0},
+        {"step_alignment_weight": 0.1, "K": 2, "last_K_second_order": 0},
+    ]
+    for overrides in invalid_overrides:
+        with pytest.raises(ValueError, match="step_alignment_weight"):
+            GradMemGPTConfig(base_config=base_config, **overrides)
+    with pytest.raises(ValueError, match="grad_align_norm"):
+        GradMemGPTConfig(base_config=base_config, grad_align_norm="invalid")
+
+    config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        K=2,
+        grad_mode="second",
+        step_alignment_weight=0.25,
+        grad_align_norm="norm",
+    )
+    config.save_pretrained(tmp_path)
+    restored = GradMemGPTConfig.from_pretrained(tmp_path)
+    assert restored.step_alignment_weight == pytest.approx(0.25)
+    assert restored.grad_align_norm == "norm"
+
 
 @pytest.mark.one_batch_train
 @pytest.mark.all
-def test_intermediate_read_supervises_written_memory_states():
+def test_trainer_supports_memory_alignment_during_train_and_no_grad_eval(tmp_path):
+    from transformers import TrainingArguments
+    from run_gradmemgpt_on_kv_retrieval import CustomTrainer
+
     torch.manual_seed(0)
-    model, inputs, labels = _build_shaped_energy_model(
-        K=3,
-        intermediate_read_weight=0.4,
-        add_inner_loss_to_outer=False,
-        energy_rank_weight=0.0,
-        energy_traj_weight=0.0,
-        energy_anchor_weight=0.0,
+    model, inputs, labels = _build_memory_alignment_model(
+        use_mem_proj=False,
+        mem_proj_mode="none",
     )
-    output = model(inputs, labels=labels)
-    stats = output["inner_loop_stats"]
-    assert torch.isfinite(stats["intermediate_read_loss"])
+    trainer = CustomTrainer(
+        model=model,
+        args=TrainingArguments(
+            output_dir=str(tmp_path),
+            per_device_train_batch_size=2,
+            report_to=[],
+            disable_tqdm=True,
+            use_cpu=True,
+        ),
+    )
+
+    model.train()
+    train_loss = trainer.compute_loss(model, {"input_ids": inputs, "labels": labels})
+    trainer.log({"loss": train_loss.detach().item()})
+    logged = trainer.state.log_history[-1]
+    for key in ("memory_alignment_loss", "memory_alignment_cosine"):
+        assert key in logged
+        assert torch.isfinite(torch.tensor(logged[key])).item()
+
+    model.eval()
+    with torch.no_grad():
+        output = model(inputs, labels=labels)
+    assert torch.isfinite(output["loss"]).item()
+    for key in ("memory_alignment_loss", "memory_alignment_cosine"):
+        assert key in output["inner_loop_stats"]
+        assert torch.isfinite(output["inner_loop_stats"][key]).item()
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_orthogonal_loss_formula_alpha_initialization_and_backward():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_memory_alignment_model(
+        memory_alignment_weight=0.0,
+        orthogonal_loss_weight=0.7,
+    )
+    model.train()
     assert torch.allclose(
-        output["loss"].detach(),
-        stats["target_loss"] + model.intermediate_read_weight * stats["intermediate_read_loss"],
+        torch.nn.functional.softplus(model.orthogonal_alpha_raw.detach()),
+        torch.tensor(model.lr),
     )
 
-
-@pytest.mark.one_batch_train
-@pytest.mark.all
-def test_orthogonal_loss_is_added_to_outer_objective():
-    torch.manual_seed(0)
-    model, inputs, labels = _build_shaped_energy_model(
-        orthogonal_loss_weight=0.2,
-        add_inner_loss_to_outer=False,
-        energy_rank_weight=0.0,
-        energy_traj_weight=0.0,
-        energy_anchor_weight=0.0,
+    output = model(inputs, labels=labels, return_mem=True)
+    target_loss = torch.nn.functional.cross_entropy(
+        output["predictions"][:, :-1].reshape(-1, output["predictions"].size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
     )
-    output = model(inputs, labels=labels)
+    stopped_outer_grad = torch.autograd.grad(
+        target_loss,
+        output["mem"],
+        retain_graph=True,
+    )[0].detach().float()
+    initial_memory = model.mem.unsqueeze(0).expand_as(output["mem"])
+    cumulative_inner_update = (initial_memory - output["mem"]).float()
+    alpha = torch.nn.functional.softplus(model.orthogonal_alpha_raw.float())
+    residual_dot = (
+        (cumulative_inner_update - alpha * stopped_outer_grad) * stopped_outer_grad
+    ).flatten(1).sum(dim=1)
+    expected_loss = residual_dot.square().mean()
+
     stats = output["inner_loop_stats"]
-    assert torch.isfinite(stats["orthogonal_loss"])
+    assert torch.allclose(stats["orthogonal_residual_dot"], residual_dot.detach().mean())
+    assert torch.allclose(stats["orthogonal_alpha"], alpha.detach())
+    assert torch.allclose(stats["orthogonal_loss"], expected_loss.detach())
     assert torch.allclose(
         output["loss"].detach(),
         stats["target_loss"] + model.orthogonal_loss_weight * stats["orthogonal_loss"],
     )
 
+    output["loss"].backward()
+    assert model.orthogonal_alpha_raw.grad is not None
+    assert torch.isfinite(model.orthogonal_alpha_raw.grad).item()
+    assert model.orthogonal_alpha_raw.grad.abs().item() > 0.0
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_orthogonal_loss_defaults_validation_and_serialization(tmp_path):
+    base_config = _build_base_config("gpt2")
+    for disabled_weight in (None, 0.0):
+        config = GradMemGPTConfig(base_config=base_config, orthogonal_loss_weight=disabled_weight)
+        model = GradMemGPT(config)
+        assert config.orthogonal_loss_weight == 0.0
+        assert model.orthogonal_alpha_raw is not None
+        assert torch.allclose(
+            torch.nn.functional.softplus(model.orthogonal_alpha_raw.detach()),
+            torch.tensor(model.lr),
+        )
+
+    invalid_overrides = [
+        {"orthogonal_loss_weight": -0.1},
+        {"orthogonal_loss_weight": 0.1, "memory_backend": "lora"},
+        {"orthogonal_loss_weight": 0.1, "grad_mode": "first"},
+        {"orthogonal_loss_weight": 0.1, "K": 0},
+        {"orthogonal_loss_weight": 0.1, "K": 2, "last_K_second_order": 0},
+        {"orthogonal_loss_weight": 0.1, "lr": 0.0},
+    ]
+    for overrides in invalid_overrides:
+        with pytest.raises(ValueError, match="orthogonal_loss_weight"):
+            GradMemGPTConfig(base_config=base_config, **overrides)
+
+    config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        K=2,
+        grad_mode="second",
+        orthogonal_loss_weight=0.25,
+    )
+    config.save_pretrained(tmp_path)
+    restored = GradMemGPTConfig.from_pretrained(tmp_path)
+    assert restored.orthogonal_loss_weight == pytest.approx(0.25)
+
 
 @pytest.mark.one_batch_train
 @pytest.mark.all
-def test_memory_search_matches_best_read_candidate():
+def test_ivan_loss_formula_and_backward():
     torch.manual_seed(0)
-    model, inputs, labels = _build_shaped_energy_model(
-        energy_memory_search_weight=0.1,
-        energy_memory_search_num_samples=2,
-        energy_memory_search_radius_scale=0.25,
-        add_inner_loss_to_outer=False,
-        energy_rank_weight=0.0,
-        energy_traj_weight=0.0,
-        energy_anchor_weight=0.0,
+    model, inputs, labels = _build_memory_alignment_model(
+        use_mem_proj=False,
+        mem_proj_mode="none",
+        memory_alignment_weight=0.0,
+        ivan_loss_weight=0.7,
     )
     model.train()
-    output = model(inputs, labels=labels)
-    stats = output["inner_loop_stats"]
-    assert torch.isfinite(stats["energy_memory_search_loss"])
-    assert torch.isfinite(stats["energy_memory_search_target_gain"])
+    inner_grads = []
+    original_sgd_step = model._sgd_step
 
+    def _record_sgd_step(parameter, gradient, **kwargs):
+        inner_grads.append(gradient)
+        return original_sgd_step(parameter, gradient, **kwargs)
 
-@pytest.mark.forward
-@pytest.mark.all
-def test_memory_search_gain_weighting_uses_positive_gain_ema():
-    model, _, _ = _build_shaped_energy_model(
-        energy_memory_search_use_gain_weighting=True,
-        energy_memory_search_gain_ema_decay=0.9,
+    model._sgd_step = _record_sgd_step
+    output = model(inputs, labels=labels, return_mem=True)
+    target_loss = torch.nn.functional.cross_entropy(
+        output["predictions"][:, :-1].reshape(-1, output["predictions"].size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
     )
-    weights = model._compute_energy_memory_search_gain_weights(torch.tensor([0.1, 0.3, 0.0]))
-    assert model.energy_memory_search_gain_ema.item() == pytest.approx(0.2)
-    assert torch.allclose(weights, torch.tensor([0.5, 1.5, 0.0]))
+    outer_grad = torch.autograd.grad(target_loss, output["mem"], retain_graph=True)[0].float()
+    inner_grad_sum = torch.stack(inner_grads).sum(dim=0).float()
+    residual_dot = ((inner_grad_sum - outer_grad) * outer_grad).flatten(1).sum(dim=1)
+    expected_loss = residual_dot.square().mean()
+
+    stats = output["inner_loop_stats"]
+    assert len(inner_grads) == model.K
+    assert torch.allclose(stats["ivan_residual_dot"], residual_dot.detach().mean())
+    assert torch.allclose(stats["ivan_loss"], expected_loss.detach())
+    assert torch.allclose(
+        output["loss"].detach(),
+        stats["target_loss"] + model.ivan_loss_weight * stats["ivan_loss"],
+    )
+
+    output["loss"].backward()
+    assert model.mem.grad is not None
+    assert torch.isfinite(model.mem.grad).all().item()
+    energy_gradients = [
+        parameter.grad for parameter in model.energy_head.parameters()
+        if parameter.grad is not None
+    ]
+    assert energy_gradients
+    assert all(torch.isfinite(gradient).all().item() for gradient in energy_gradients)
 
 
 @pytest.mark.forward
 @pytest.mark.all
-def test_layerwise_energy_sums_layer_scores():
+def test_ivan_loss_defaults_validation_and_serialization(tmp_path):
+    base_config = _build_base_config("gpt2")
+    for disabled_weight in (None, 0.0):
+        config = GradMemGPTConfig(base_config=base_config, ivan_loss_weight=disabled_weight)
+        model = GradMemGPT(config)
+        assert config.ivan_loss_weight == 0.0
+        assert model.ivan_loss_weight == 0.0
+
+    invalid_overrides = [
+        {"ivan_loss_weight": -0.1},
+        {"ivan_loss_weight": 0.1, "grad_mode": "first"},
+        {"ivan_loss_weight": 0.1, "K": 0},
+        {"ivan_loss_weight": 0.1, "K": 2, "last_K_second_order": 1},
+    ]
+    for overrides in invalid_overrides:
+        with pytest.raises(ValueError, match="ivan_loss_weight"):
+            GradMemGPTConfig(base_config=base_config, **overrides)
+
+    config = GradMemGPTConfig(
+        base_config=base_config,
+        K=2,
+        grad_mode="second",
+        ivan_loss_weight=0.25,
+    )
+    config.save_pretrained(tmp_path)
+    restored = GradMemGPTConfig.from_pretrained(tmp_path)
+    assert restored.ivan_loss_weight == pytest.approx(0.25)
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_zero_weight_orthogonal_loss_trains_only_alpha():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_memory_alignment_model(
+        memory_alignment_weight=0.0,
+        orthogonal_loss_weight=0.0,
+    )
+    model.train()
+
+    output = model(inputs, labels=labels)
+    target_loss = torch.nn.functional.cross_entropy(
+        output["predictions"][:, :-1].reshape(-1, output["predictions"].size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
+    target_mem_grad = torch.autograd.grad(target_loss, model.mem, retain_graph=True)[0]
+    outer_mem_grad = torch.autograd.grad(output["loss"], model.mem, retain_graph=True)[0]
+    alpha_grad = torch.autograd.grad(output["loss"], model.orthogonal_alpha_raw)[0]
+
+    assert torch.allclose(output["loss"].detach(), target_loss.detach())
+    assert torch.allclose(outer_mem_grad, target_mem_grad)
+    assert torch.isfinite(alpha_grad).item()
+    assert alpha_grad.abs().item() > 0.0
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_intermediate_read_uses_reverse_harmonic_weights_and_backpropagates():
+    torch.manual_seed(0)
     base_config = _build_base_config("gpt2")
     model = GradMemGPT(GradMemGPTConfig(
-        base_config=base_config, memory_backend="prefix", write_objective="energy", use_layerwise_energy=True
+        base_config=base_config,
+        memory_backend="prefix",
+        n_mem_tokens=4,
+        K=4,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="second",
+        attn_implementation="eager",
+        intermediate_read_weight=0.4,
     ))
-    hidden = tuple(torch.randn(2, 7, base_config.n_embd) for _ in range(base_config.n_layer))
-    energy = model._compute_write_energy(hidden, {"context_start": 3, "mask": torch.ones(2, 4)})
-    assert energy.shape == (2,)
-    assert torch.isfinite(energy).all()
+    model.train()
+    inputs = {
+        "context_input_ids": torch.randint(0, base_config.vocab_size, (2, 6)),
+        "query_input_ids": torch.randint(0, base_config.vocab_size, (2, 4)),
+    }
+    labels = torch.randint(0, base_config.vocab_size, (2, 4))
+
+    recorded_read_losses = []
+    original_compute_read_target_loss = model._compute_read_target_loss
+
+    def _record_read_loss(predictions, read_batch, target_labels):
+        loss = original_compute_read_target_loss(predictions, read_batch, target_labels)
+        recorded_read_losses.append(loss)
+        return loss
+
+    model._compute_read_target_loss = _record_read_loss
+    output = model(inputs, labels=labels)
+
+    assert len(recorded_read_losses) == model.K
+    expected_weights = torch.tensor([1 / 4, 1 / 3, 1 / 2], dtype=recorded_read_losses[0].dtype)
+    expected_weights = expected_weights / expected_weights.sum()
+    assert torch.allclose(
+        model._intermediate_read_weights(model.K, expected_weights.device, expected_weights.dtype),
+        expected_weights,
+    )
+    expected_intermediate_loss = (
+        expected_weights * torch.stack(recorded_read_losses[1:])
+    ).sum()
+    stats = output["inner_loop_stats"]
+    assert torch.allclose(
+        output["loss"].detach(),
+        stats["target_loss"] + model.intermediate_read_weight * expected_intermediate_loss.detach(),
+    )
+    assert "intermediate_read_loss" in stats
+
+    output["loss"].backward()
+    assert model.mem.grad is not None
+    assert torch.isfinite(model.mem.grad).all().item()
+    assert model.mem.grad.norm().item() > 0.0
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_intermediate_read_includes_full_depth_auxiliary_objective():
+    torch.manual_seed(0)
+    base_config = _build_base_config("gpt2")
+    model = GradMemGPT(GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        n_mem_tokens=4,
+        K=3,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="second",
+        attn_implementation="eager",
+        write_objective="energy",
+        energy_rank_weight=0.1,
+        energy_traj_weight=0.01,
+        energy_anchor_weight=0.001,
+        add_inner_loss_to_outer=True,
+        inner_loss_weight=0.2,
+        memory_alignment_weight=0.3,
+        orthogonal_loss_weight=0.4,
+        intermediate_read_weight=0.5,
+    ))
+    model.train()
+    inputs = {
+        "context_input_ids": torch.randint(0, base_config.vocab_size, (2, 6)),
+        "query_input_ids": torch.randint(0, base_config.vocab_size, (2, 4)),
+    }
+    labels = torch.randint(0, base_config.vocab_size, (2, 4))
+
+    landscape_calls = 0
+    original_landscape = model._compute_energy_landscape_losses
+    recorded_read_losses = []
+    original_read_loss = model._compute_read_target_loss
+    recorded_aux_losses = []
+    original_combine_aux = model._combine_depth_auxiliary_losses
+
+    def _count_landscape(*args, **kwargs):
+        nonlocal landscape_calls
+        landscape_calls += 1
+        return original_landscape(*args, **kwargs)
+
+    def _record_read_loss(*args, **kwargs):
+        loss = original_read_loss(*args, **kwargs)
+        recorded_read_losses.append(loss)
+        return loss
+
+    def _record_aux_loss(*args, **kwargs):
+        loss = original_combine_aux(*args, **kwargs)
+        expected = (
+            model.inner_loss_weight * kwargs["inner_loss"]
+            + model.energy_rank_weight * kwargs["rank_loss"]
+            + model.energy_traj_weight * kwargs["trajectory_loss"]
+            + model.energy_anchor_weight * kwargs["anchor_loss"]
+            + model.memory_alignment_weight * kwargs["memory_alignment_loss"]
+            + model.orthogonal_loss_weight * kwargs["orthogonal_loss"]
+        )
+        assert torch.allclose(loss, expected)
+        recorded_aux_losses.append(loss)
+        return loss
+
+    model._compute_energy_landscape_losses = _count_landscape
+    model._compute_read_target_loss = _record_read_loss
+    model._combine_depth_auxiliary_losses = _record_aux_loss
+    output = model(inputs, labels=labels)
+    stats = output["inner_loop_stats"]
+
+    assert landscape_calls == model.K
+    assert len(recorded_read_losses) == model.K
+    assert len(recorded_aux_losses) == model.K
+    intermediate_weights = model._intermediate_read_weights(
+        model.K,
+        device=recorded_read_losses[0].device,
+        dtype=recorded_read_losses[0].dtype,
+    )
+    expected_intermediate_loss = (
+        intermediate_weights
+        * (torch.stack(recorded_read_losses[1:]) + torch.stack(recorded_aux_losses[:-1]))
+    ).sum()
+    expected_outer_loss = (
+        recorded_read_losses[0]
+        + recorded_aux_losses[-1]
+        + model.intermediate_read_weight * expected_intermediate_loss
+    )
+    assert torch.allclose(output["loss"], expected_outer_loss)
+    assert "intermediate_read_loss" in stats
+
+    output["loss"].backward()
+    assert model.orthogonal_alpha_raw.grad is not None
+    assert torch.isfinite(model.orthogonal_alpha_raw.grad).item()
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_intermediate_read_defaults_validation_and_serialization(tmp_path):
+    base_config = _build_base_config("gpt2")
+    default_config = GradMemGPTConfig(base_config=base_config)
+    assert default_config.intermediate_read_weight == 0.0
+    with pytest.raises(ValueError, match="intermediate_read_weight"):
+        GradMemGPTConfig(base_config=base_config, intermediate_read_weight=-0.1)
+
+    config = GradMemGPTConfig(base_config=base_config, intermediate_read_weight=0.25)
+    config.save_pretrained(tmp_path)
+    restored = GradMemGPTConfig.from_pretrained(tmp_path)
+    assert restored.intermediate_read_weight == pytest.approx(0.25)
 
 
 @pytest.mark.one_batch_train
@@ -1604,25 +2336,27 @@ def test_trainer_and_eval_metrics_preserve_active_only_schema(tmp_path, shaping_
             assert key in exported
             assert torch.isfinite(torch.tensor(exported[key])).item()
 
-    diagnostic_keys = {
+    diagnostic_loss_keys = {
         "memory_alignment_loss",
         "memory_alignment_cosine",
         "step_alignment_loss",
         "step_alignment_cosine",
-        "intermediate_read_loss",
         "orthogonal_loss",
         "orthogonal_residual_dot",
         "orthogonal_alpha",
-        "energy_memory_search_loss",
+        "ivan_loss",
+        "ivan_residual_dot",
+        "intermediate_read_loss",
     }
     for exported in (logged, metrics):
-        assert diagnostic_keys <= exported.keys()
-        assert all(torch.isfinite(torch.tensor(exported[key])).item() for key in diagnostic_keys)
+        assert diagnostic_loss_keys <= exported.keys()
+        assert all(torch.isfinite(torch.tensor(exported[key])).item() for key in diagnostic_loss_keys)
+        assert not any(key.startswith("final_") for key in exported)
 
-    shaping_keys = set(TRAIN_COMPONENT_KEYS) - {"outer_loss", "target_loss"} - diagnostic_keys
+    active_only_keys = set(TRAIN_COMPONENT_KEYS) - {"outer_loss", "target_loss"} - diagnostic_loss_keys
     if not shaping_active:
-        assert shaping_keys.isdisjoint(logged)
-        assert shaping_keys.isdisjoint(metrics)
+        assert active_only_keys.isdisjoint(logged)
+        assert active_only_keys.isdisjoint(metrics)
         return
 
     representative_active_keys = {

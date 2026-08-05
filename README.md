@@ -119,6 +119,51 @@ For full experiment configurations, use scripts in `scripts/`:
 - `scripts/run_energygradmem_on_kv_retrieval.sh`
 - `scripts/run_rmt_on_kv_retrieval.sh`
 - `scripts/run_gpt_on_kv_retrieval.sh`
+
+Enable the training-only EnergyGradMem memory search with environment overrides:
+
+```bash
+ENERGY_MEMORY_SEARCH_WEIGHT=0.1 \
+ENERGY_MEMORY_SEARCH_NUM_SAMPLES=4 \
+ENERGY_MEMORY_SEARCH_RADIUS_SCALE=0.25 \
+ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING=true \
+ENERGY_MEMORY_SEARCH_GAIN_EMA_DECAY=0.99 \
+ENERGY_MEMORY_SEARCH_USE_BEST_FOR_NEXT_STEP=true \
+bash scripts/run_energygradmem_on_kv_retrieval.sh
+```
+
+The search runs around `M_1...M_K`, preserves each memory's global L2 norm,
+and uses a radius equal to `ENERGY_MEMORY_SEARCH_RADIUS_SCALE` times the
+preceding WRITE-step displacement. It requires full second-order SGD WRITE.
+Gain weighting uses each selected candidate's relative READ-loss reduction and
+normalizes positive gains with a persistent EMA updated once per microbatch.
+The optional best-for-next-step mode performs search inline and starts the next
+training WRITE step from a straight-through copy of the selected memory. This
+makes training target-guided; inference still follows the ordinary SGD trajectory.
+
+### Cached checkpoint evaluation
+
+`evaluate_energy_shaping.py` stores expensive task and landscape measurements in
+`checkpoint-*/energy_shaping_metrics/`. Run it once with `--cache-only` to
+precompute checkpoint data, then run later comparisons with the same evaluation
+settings and a new `--output-dir`; model and dataset loading are skipped when all
+requested caches exist. Use `--recompute-metrics task radial` (or `all`) to
+selectively refresh metric families.
+
+Metric families have independent versions in `METRIC_FAMILY_VERSIONS`. When a
+stored metric changes, bump only that family's version; adding another family
+does not invalidate existing task or landscape measurements.
+
+Precompute every supported checkpoint under `runs/` with:
+
+```bash
+conda run -n rmt python scripts/cache_all_energy_shaping_checkpoints.py \
+  --runs-dir runs -- --device cpu
+```
+
+Arguments after `--` are forwarded to `evaluate_energy_shaping.py`. Use
+`--dry-run` before a large sweep, and pass the same evaluation settings that
+will be used for later comparisons.
 - `scripts/run_gradmemgpt_on_babi.sh`
 - `scripts/run_gradmemgpt_on_squad.sh`
 

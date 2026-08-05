@@ -43,16 +43,19 @@ LOSS_COMPONENT_KEYS = [
     "energy_rank_random_loss",
     "energy_traj_loss",
     "energy_anchor_loss",
+    "energy_memory_search_loss",
+    "energy_memory_search_unweighted_loss",
     "energy_aux_loss",
     "memory_alignment_loss",
     "memory_alignment_cosine",
     "step_alignment_loss",
     "step_alignment_cosine",
-    "intermediate_read_loss",
     "orthogonal_loss",
     "orthogonal_residual_dot",
     "orthogonal_alpha",
-    "energy_memory_search_loss",
+    "ivan_loss",
+    "ivan_residual_dot",
+    "intermediate_read_loss",
 ]
 
 ENERGY_LANDSCAPE_STAT_KEYS = [
@@ -66,6 +69,16 @@ ENERGY_LANDSCAPE_STAT_KEYS = [
     "energy_margin_violation_deranged",
     "energy_margin_violation_interpolated",
     "energy_margin_violation_random",
+    "energy_memory_search_improvement_rate",
+    "energy_memory_search_target_gain",
+    "energy_memory_search_max_target_gain",
+    "energy_memory_search_relative_target_gain",
+    "energy_memory_search_mean_relative_target_gain",
+    "energy_memory_search_max_relative_target_gain",
+    "energy_memory_search_gain_weight_mean",
+    "energy_memory_search_gain_weight_max",
+    "energy_memory_search_gain_ema",
+    "energy_memory_search_selected_distance",
 ]
 
 TRAIN_COMPONENT_KEYS = LOSS_COMPONENT_KEYS + ENERGY_LANDSCAPE_STAT_KEYS
@@ -310,6 +323,7 @@ class ExperimentArgs:
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
     init_checkpoint: Optional[str] = field(default=None)
+    resume_from_checkpoint: Optional[str] = field(default=None)
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
@@ -355,6 +369,12 @@ class ExperimentArgs:
     energy_rank_temperature: Optional[float] = field(default=1.0)
     energy_mix_alpha: Optional[float] = field(default=0.75)
     energy_anchor_weight: Optional[float] = field(default=0.0)
+    energy_memory_search_weight: Optional[float] = field(default=0.0)
+    energy_memory_search_num_samples: Optional[int] = field(default=4)
+    energy_memory_search_radius_scale: Optional[float] = field(default=0.25)
+    energy_memory_search_use_gain_weighting: Optional[bool] = field(default=False)
+    energy_memory_search_gain_ema_decay: Optional[float] = field(default=0.99)
+    energy_memory_search_use_best_for_next_step: Optional[bool] = field(default=False)
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
     inner_loss_weight: Optional[float] = field(default=None)
     memory_alignment_weight: Optional[float] = field(default=0.0)
@@ -362,16 +382,26 @@ class ExperimentArgs:
     grad_align_norm: Optional[str] = field(default="none")
     intermediate_read_weight: Optional[float] = field(default=0.0)
     orthogonal_loss_weight: Optional[float] = field(default=0.0)
-    energy_memory_search_weight: Optional[float] = field(default=0.0)
-    energy_memory_search_num_samples: Optional[int] = field(default=4)
-    energy_memory_search_radius_scale: Optional[float] = field(default=0.25)
-    energy_memory_search_use_gain_weighting: Optional[bool] = field(default=False)
-    energy_memory_search_gain_ema_decay: Optional[float] = field(default=0.99)
+    ivan_loss_weight: Optional[float] = field(default=0.0)
 
 
 if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
     args = parser.parse_args_into_dataclasses()[0]
+
+    if args.init_checkpoint is not None and args.resume_from_checkpoint is not None:
+        raise ValueError('--init_checkpoint and --resume_from_checkpoint are mutually exclusive')
+    if args.resume_from_checkpoint is not None:
+        resume_path = Path(args.resume_from_checkpoint).resolve()
+        output_path = Path(args.exp_path).resolve()
+        if not resume_path.is_dir():
+            raise ValueError(f'Resume checkpoint directory does not exist: {resume_path}')
+        if resume_path.parent != output_path:
+            raise ValueError(
+                '--resume_from_checkpoint must be a checkpoint directly inside --exp_path so logs continue '
+                f'in the same run: checkpoint={resume_path}, exp_path={output_path}'
+            )
+        args.resume_from_checkpoint = str(resume_path)
 
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
@@ -390,7 +420,7 @@ if __name__ == '__main__':
             'cli_args': dict(vars(args)),
         }
         logger.info(f'saving experiment configuration to {args.exp_path}')
-        Path(args.exp_path).mkdir(parents=True)
+        Path(args.exp_path).mkdir(parents=True, exist_ok=True)
         json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
 
     if args.pretrained_model is None:
@@ -409,7 +439,7 @@ if __name__ == '__main__':
             config.hidden_size = args.n_embd
             config.intermediate_size = config.hidden_size * 4
         elif args.base_model == 'llama':
-            config = AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B')
+            config = AutoConfig.from_pretrained('unsloth/Llama-3.2-1B')
             config.num_hidden_layers = args.n_layer
             config.num_attention_heads = args.n_head
             config.num_key_value_heads = args.n_head
@@ -456,8 +486,8 @@ if __name__ == '__main__':
                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
                                       attn_implementation=args.attn_implementation,
                                       write_objective=args.write_objective,
-                                       energy_head_hidden_dim=args.energy_head_hidden_dim,
-                                       use_layerwise_energy=args.use_layerwise_energy,
+                                      energy_head_hidden_dim=args.energy_head_hidden_dim,
+                                      use_layerwise_energy=args.use_layerwise_energy,
                                       write_reconstruction_weight=args.write_reconstruction_weight,
                                       write_energy_weight=args.write_energy_weight,
                                       energy_rank_weight=args.energy_rank_weight,
@@ -465,20 +495,28 @@ if __name__ == '__main__':
                                       energy_margin=args.energy_margin,
                                       energy_traj_margin=args.energy_traj_margin,
                                       energy_rank_temperature=args.energy_rank_temperature,
-                                      energy_mix_alpha=args.energy_mix_alpha,
-                                      energy_anchor_weight=args.energy_anchor_weight,
-                                       add_inner_loss_to_outer=args.add_inner_loss_to_outer,
-                                       inner_loss_weight=args.inner_loss_weight,
-                                       memory_alignment_weight=args.memory_alignment_weight,
-                                       step_alignment_weight=args.step_alignment_weight,
-                                       grad_align_norm=args.grad_align_norm,
-                                       intermediate_read_weight=args.intermediate_read_weight,
-                                       orthogonal_loss_weight=args.orthogonal_loss_weight,
+                                       energy_mix_alpha=args.energy_mix_alpha,
+                                       energy_anchor_weight=args.energy_anchor_weight,
                                        energy_memory_search_weight=args.energy_memory_search_weight,
                                        energy_memory_search_num_samples=args.energy_memory_search_num_samples,
                                        energy_memory_search_radius_scale=args.energy_memory_search_radius_scale,
-                                       energy_memory_search_use_gain_weighting=args.energy_memory_search_use_gain_weighting,
-                                       energy_memory_search_gain_ema_decay=args.energy_memory_search_gain_ema_decay)
+                                       energy_memory_search_use_gain_weighting=(
+                                           args.energy_memory_search_use_gain_weighting
+                                       ),
+                                       energy_memory_search_gain_ema_decay=(
+                                           args.energy_memory_search_gain_ema_decay
+                                       ),
+                                       energy_memory_search_use_best_for_next_step=(
+                                           args.energy_memory_search_use_best_for_next_step
+                                       ),
+                                       add_inner_loss_to_outer=args.add_inner_loss_to_outer,
+                                       inner_loss_weight=args.inner_loss_weight,
+                                        memory_alignment_weight=args.memory_alignment_weight,
+                                        step_alignment_weight=args.step_alignment_weight,
+                                       grad_align_norm=args.grad_align_norm,
+                                        intermediate_read_weight=args.intermediate_read_weight,
+                                       orthogonal_loss_weight=args.orthogonal_loss_weight,
+                                       ivan_loss_weight=args.ivan_loss_weight)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
@@ -583,7 +621,7 @@ if __name__ == '__main__':
                    ],
     )
     # Train the model
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     logger.info('training done. running final evaluation...')
     metrics = trainer.evaluate(dataset['valid'])
     logger.info(f'{metrics}')
