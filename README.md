@@ -116,6 +116,7 @@ accelerate launch --config_file accelerate.yaml \
 
 For full experiment configurations, use scripts in `scripts/`:
 - `scripts/run_gradmemgpt_on_kv_retrieval.sh`
+- `scripts/run_energygradmem_on_kv_retrieval.sh`
 - `scripts/run_rmt_on_kv_retrieval.sh`
 - `scripts/run_gpt_on_kv_retrieval.sh`
 - `scripts/run_gradmemgpt_on_babi.sh`

@@ -52,6 +52,7 @@ LOSS_COMPONENT_KEYS = [
     "orthogonal_loss",
     "orthogonal_residual_dot",
     "orthogonal_alpha",
+    "energy_memory_search_loss",
 ]
 
 ENERGY_LANDSCAPE_STAT_KEYS = [
@@ -360,6 +361,9 @@ class ExperimentArgs:
     grad_align_norm: Optional[str] = field(default="none")
     intermediate_read_weight: Optional[float] = field(default=0.0)
     orthogonal_loss_weight: Optional[float] = field(default=0.0)
+    energy_memory_search_weight: Optional[float] = field(default=0.0)
+    energy_memory_search_num_samples: Optional[int] = field(default=4)
+    energy_memory_search_radius_scale: Optional[float] = field(default=0.25)
 
 
 if __name__ == '__main__':
@@ -465,7 +469,10 @@ if __name__ == '__main__':
                                        step_alignment_weight=args.step_alignment_weight,
                                        grad_align_norm=args.grad_align_norm,
                                        intermediate_read_weight=args.intermediate_read_weight,
-                                       orthogonal_loss_weight=args.orthogonal_loss_weight)
+                                       orthogonal_loss_weight=args.orthogonal_loss_weight,
+                                       energy_memory_search_weight=args.energy_memory_search_weight,
+                                       energy_memory_search_num_samples=args.energy_memory_search_num_samples,
+                                       energy_memory_search_radius_scale=args.energy_memory_search_radius_scale)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)

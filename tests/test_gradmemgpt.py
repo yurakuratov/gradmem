@@ -1328,6 +1328,26 @@ def test_orthogonal_loss_is_added_to_outer_objective():
 
 @pytest.mark.one_batch_train
 @pytest.mark.all
+def test_memory_search_matches_best_read_candidate():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_shaped_energy_model(
+        energy_memory_search_weight=0.1,
+        energy_memory_search_num_samples=2,
+        energy_memory_search_radius_scale=0.25,
+        add_inner_loss_to_outer=False,
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+    )
+    model.train()
+    output = model(inputs, labels=labels)
+    stats = output["inner_loop_stats"]
+    assert torch.isfinite(stats["energy_memory_search_loss"])
+    assert torch.isfinite(stats["energy_memory_search_target_gain"])
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
 @pytest.mark.parametrize("shaping_active", [False, True])
 def test_trainer_and_eval_metrics_preserve_active_only_schema(tmp_path, shaping_active):
     from transformers import EvalPrediction, TrainingArguments
