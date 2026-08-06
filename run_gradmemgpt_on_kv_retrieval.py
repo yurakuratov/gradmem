@@ -515,18 +515,17 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
                 seg_sz = max(1, math.ceil(padded_len / n_seg))
             sample_pairs = []
             for ts, te, k, v in pairs:
-                # right-padding: padded position == real position (pads are past the '|')
-                pad_ts = ts
-                pad_te = te
-                src_seg = None
-                for si in range(n_seg):
-                    sstart = si * seg_sz
-                    send = min((si + 1) * seg_sz, padded_len)
-                    if sstart <= pad_ts and (pad_te - 1) < send:
-                        src_seg = si
-                        break
-                if src_seg is None:
-                    src_seg = min(pad_ts // seg_sz, n_seg - 1)
+                # Attribute the KV to the segment containing its LAST token (the
+                # closing '!' of !K:V!). A KV is only fully written -- and thus
+                # retrievable -- once the model has processed the segment that
+                # contains the END of its span. Using the end position (not the
+                # start) is what makes this correct when a KV straddles a segment
+                # boundary: ~37% of KVs straddle at typical seg_sz (e.g. seg_sz=15
+                # vs 7-char KVs), and start-position attribution would (a) starve
+                # the last segment of any KV and (b) depress the matrix diagonal
+                # (a straddling KV is incomplete at its start-segment's write).
+                # Right-padding: padded position == real position (pads past '|').
+                src_seg = min((te - 1) // seg_sz, n_seg - 1)
                 # teacher-forced query: '?!K:' + target 'V!|'
                 q_str = f'?!{k}:'
                 t_str = f'{v}!|'

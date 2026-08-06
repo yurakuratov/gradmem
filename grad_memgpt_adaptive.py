@@ -744,16 +744,11 @@ class GradMemGPT(PreTrainedModel):
             # attribute each KV to the model-segment fully containing it
             sample_pairs = []
             for k, v, ts, te in spans:
-                # find the segment whose [start,end) contains [ts,te-1] (last KV token)
-                src_seg = None
-                for si, (sstart, send) in enumerate(
-                        self._segment_bounds(len(real_ids), n_segments, segment_size)[2]):
-                    if sstart <= ts and (te - 1) < send:
-                        src_seg = si
-                        break
-                if src_seg is None:
-                    # straddles a boundary -> the later (writing-completing) segment
-                    src_seg = min(ts // segment_size, n_segments - 1) if segment_size else 0
+                # Attribute to the segment containing the KV's LAST token (closing
+                # '!'): a KV is only retrievable once its whole !K:V! span is
+                # written, i.e. when the segment containing the span's END is
+                # processed. End-position (not start) is correct under straddling.
+                src_seg = min((te - 1) // segment_size, n_segments - 1) if segment_size else 0
                 query = f'?!{k}:'
                 target = f'{v}!|'
                 q_ids = tokenizer(query, add_special_tokens=False).input_ids
