@@ -1135,20 +1135,39 @@ def test_energy_memory_search_gain_weight_ema_uses_positive_relative_gains():
     )
     first_gains = torch.tensor([[0.0, 0.1], [0.2, 0.3]])
     first_weights = model._compute_energy_memory_search_gain_weights(first_gains)
-    assert model.energy_memory_search_gain_ema_initialized.item()
-    assert model.energy_memory_search_gain_ema.item() == pytest.approx(0.2)
-    assert torch.allclose(first_weights, torch.tensor([[0.0, 0.5], [1.0, 1.5]]))
+    assert model.energy_memory_search_gain_ema_initialized.all().item()
+    assert torch.allclose(model.energy_memory_search_gain_ema, torch.tensor([0.1, 0.25]))
+    assert torch.allclose(first_weights, torch.tensor([[0.0, 1.0], [0.8, 1.2]]))
     assert first_weights[first_gains > 0.0].mean().item() == pytest.approx(1.0)
 
-    second_gains = torch.tensor([[0.4, 0.0]])
+    second_gains = torch.tensor([[0.4, 0.0], [0.0, 0.0]])
     second_weights = model._compute_energy_memory_search_gain_weights(second_gains)
-    expected_ema = 0.99 * 0.2 + 0.01 * 0.4
-    assert model.energy_memory_search_gain_ema.item() == pytest.approx(expected_ema)
-    assert second_weights[0, 0].item() == pytest.approx(0.4 / expected_ema)
+    expected_ema = torch.tensor([0.99 * 0.1 + 0.01 * 0.4, 0.25])
+    assert torch.allclose(model.energy_memory_search_gain_ema, expected_ema)
+    assert second_weights[0, 0].item() == pytest.approx(1.0)
     ema_before_zero_batch = model.energy_memory_search_gain_ema.clone()
     zero_weights = model._compute_energy_memory_search_gain_weights(torch.zeros(2, 2))
     assert torch.equal(zero_weights, torch.zeros_like(zero_weights))
     assert torch.equal(model.energy_memory_search_gain_ema, ema_before_zero_batch)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_energy_memory_search_gain_weight_ema_does_not_amplify_gain_scale_increase():
+    model, _, _ = _build_shaped_energy_model(
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        energy_memory_search_use_gain_weighting=True,
+        energy_memory_search_gain_ema_decay=0.99,
+    )
+    model._compute_energy_memory_search_gain_weights(torch.full((2, 2), 1e-8))
+
+    gains = torch.tensor([[0.0, 0.0], [0.0, 0.4]])
+    weights = model._compute_energy_memory_search_gain_weights(gains)
+
+    assert weights[-1, -1].item() == pytest.approx(1.0)
+    assert weights.max().item() <= gains.gt(0.0).sum().item()
 
 
 def _build_shaped_energy_model(batch_size=2, **config_overrides):
@@ -1355,15 +1374,15 @@ def test_energy_memory_search_applies_gain_weights_across_all_write_states():
     stats = output["inner_loop_stats"]
 
     assert calls == model.K
-    assert model.energy_memory_search_gain_ema.item() == pytest.approx(0.2)
-    assert stats["energy_memory_search_unweighted_loss"].item() == pytest.approx(2.5)
-    assert stats["energy_memory_search_loss"].item() == pytest.approx(2.125)
-    assert stats["energy_memory_search_relative_target_gain"].item() == pytest.approx(0.15)
+    assert torch.allclose(model.energy_memory_search_gain_ema, torch.tensor([0.15, 0.3]))
+    assert stats["energy_memory_search_loss"].item() == pytest.approx(11.0 / 6.0)
     assert stats["energy_memory_search_mean_relative_target_gain"].item() == pytest.approx(0.15)
     assert stats["energy_memory_search_max_relative_target_gain"].item() == pytest.approx(0.3)
-    assert stats["energy_memory_search_gain_weight_mean"].item() == pytest.approx(1.0)
-    assert stats["energy_memory_search_gain_weight_max"].item() == pytest.approx(1.5)
-    assert stats["energy_memory_search_gain_ema"].item() == pytest.approx(0.2)
+    assert "energy_memory_search_unweighted_loss" not in stats
+    assert "energy_memory_search_relative_target_gain" not in stats
+    assert "energy_memory_search_gain_weight_mean" not in stats
+    assert "energy_memory_search_gain_weight_max" not in stats
+    assert "energy_memory_search_gain_ema" not in stats
     assert torch.allclose(
         stats["outer_loss"],
         stats["target_loss"] + model.energy_memory_search_weight * stats["energy_memory_search_loss"],
@@ -1671,8 +1690,19 @@ def test_energy_memory_search_defaults_validation_and_serialization(tmp_path):
     model.energy_memory_search_gain_ema.fill_(0.3)
     model.energy_memory_search_gain_ema_initialized.fill_(True)
     state_dict = model.state_dict()
-    assert state_dict["energy_memory_search_gain_ema"].item() == pytest.approx(0.3)
-    assert state_dict["energy_memory_search_gain_ema_initialized"].item()
+    assert torch.allclose(state_dict["energy_memory_search_gain_ema"], torch.full((config.K,), 0.3))
+    assert state_dict["energy_memory_search_gain_ema_initialized"].all().item()
+
+    legacy_state_dict = model.state_dict()
+    legacy_state_dict["energy_memory_search_gain_ema"] = torch.tensor(0.4)
+    legacy_state_dict["energy_memory_search_gain_ema_initialized"] = torch.tensor(True)
+    restored_model = GradMemGPT(config)
+    restored_model.load_state_dict(legacy_state_dict)
+    assert torch.allclose(
+        restored_model.energy_memory_search_gain_ema,
+        torch.full((config.K,), 0.4),
+    )
+    assert restored_model.energy_memory_search_gain_ema_initialized.all().item()
 
 
 def _build_memory_alignment_model(**config_overrides):
@@ -2083,7 +2113,7 @@ def test_ivan_loss_defaults_validation_and_serialization(tmp_path):
 
 @pytest.mark.one_batch_train
 @pytest.mark.all
-def test_zero_weight_orthogonal_loss_trains_only_alpha():
+def test_zero_weight_orthogonal_loss_does_not_train_alpha():
     torch.manual_seed(0)
     model, inputs, labels = _build_memory_alignment_model(
         memory_alignment_weight=0.0,
@@ -2099,12 +2129,15 @@ def test_zero_weight_orthogonal_loss_trains_only_alpha():
     )
     target_mem_grad = torch.autograd.grad(target_loss, model.mem, retain_graph=True)[0]
     outer_mem_grad = torch.autograd.grad(output["loss"], model.mem, retain_graph=True)[0]
-    alpha_grad = torch.autograd.grad(output["loss"], model.orthogonal_alpha_raw)[0]
+    alpha_grad = torch.autograd.grad(
+        output["loss"],
+        model.orthogonal_alpha_raw,
+        allow_unused=True,
+    )[0]
 
     assert torch.allclose(output["loss"].detach(), target_loss.detach())
     assert torch.allclose(outer_mem_grad, target_mem_grad)
-    assert torch.isfinite(alpha_grad).item()
-    assert alpha_grad.abs().item() > 0.0
+    assert alpha_grad is None
 
 
 @pytest.mark.one_batch_train

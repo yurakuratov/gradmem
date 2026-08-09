@@ -171,8 +171,8 @@ class GradMemGPTConfig(PretrainedConfig):
                 preceding WRITE-step displacement
             energy_memory_search_use_gain_weighting: bool, weight selected-memory matching by its
                 detached relative READ-loss improvement
-            energy_memory_search_gain_ema_decay: float, decay for the positive-gain mean used to
-                normalize memory-search gain weights
+            energy_memory_search_gain_ema_decay: float, decay for the per-WRITE-depth positive-gain
+                means used to normalize memory-search gain weights
             energy_memory_search_use_best_for_next_step: bool, use a straight-through copy of the
                 selected target-guided memory as the starting point for the next WRITE step
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
@@ -953,10 +953,10 @@ class GradMemGPT(PreTrainedModel):
             raise ValueError(
                 "energy_memory_search_use_best_for_next_step requires energy_memory_search_weight > 0"
             )
-        self.register_buffer("energy_memory_search_gain_ema", torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer("energy_memory_search_gain_ema", torch.zeros(self.K, dtype=torch.float32))
         self.register_buffer(
             "energy_memory_search_gain_ema_initialized",
-            torch.tensor(False, dtype=torch.bool),
+            torch.zeros(self.K, dtype=torch.bool),
         )
         if self.write_objective in ("energy", "energy_with_reconstruction") and self.memory_backend != "prefix":
             raise ValueError(
@@ -1048,6 +1048,36 @@ class GradMemGPT(PreTrainedModel):
         n_memory_params = self._count_memory_parameters()
         if _is_main_process():
             logger.info(f"GradMemGPT memory params (backend={self.memory_backend}): total={n_memory_params}")
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Checkpoints created before per-depth gain tracking stored scalar buffers.
+        for name in (
+            "energy_memory_search_gain_ema",
+            "energy_memory_search_gain_ema_initialized",
+        ):
+            key = prefix + name
+            value = state_dict.get(key)
+            target = getattr(self, name)
+            if value is not None and value.numel() == 1 and value.shape != target.shape:
+                state_dict[key] = value.reshape(1).expand_as(target).clone()
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def floating_point_ops(self, inputs):
         # dummy method to satisfy base class and it's invocation by trainer:
@@ -1959,28 +1989,39 @@ class GradMemGPT(PreTrainedModel):
     @torch.no_grad()
     def _compute_energy_memory_search_gain_weights(self, relative_target_gains):
         gains = relative_target_gains.detach().float().clamp_min(0.0)
+        if gains.ndim != 2 or gains.size(0) != self.K:
+            raise ValueError(
+                f"relative_target_gains must have shape [K, batch], got {tuple(gains.shape)} for K={self.K}"
+            )
         positive = gains.gt(0.0)
-        gain_sum = gains.masked_select(positive).sum()
-        positive_count = positive.sum().to(dtype=torch.float32)
+        gain_sum = (gains * positive).sum(dim=1)
+        positive_count = positive.sum(dim=1).to(dtype=torch.float32)
         if dist.is_available() and dist.is_initialized():
             dist.all_reduce(gain_sum, op=dist.ReduceOp.SUM)
             dist.all_reduce(positive_count, op=dist.ReduceOp.SUM)
 
-        if positive_count.item() > 0.0:
-            batch_positive_mean = gain_sum / positive_count
-            if not self.energy_memory_search_gain_ema_initialized.item():
-                updated_ema = batch_positive_mean
-                self.energy_memory_search_gain_ema_initialized.fill_(True)
-            else:
-                decay = self.energy_memory_search_gain_ema_decay
-                updated_ema = (
-                    decay * self.energy_memory_search_gain_ema
-                    + (1.0 - decay) * batch_positive_mean
-                )
-            self.energy_memory_search_gain_ema.copy_(updated_ema)
+        batch_positive_mean = gain_sum / positive_count.clamp_min(1.0)
+        decay = self.energy_memory_search_gain_ema_decay
+        updated_ema = torch.where(
+            self.energy_memory_search_gain_ema_initialized,
+            decay * self.energy_memory_search_gain_ema + (1.0 - decay) * batch_positive_mean,
+            batch_positive_mean,
+        )
+        has_positive = positive_count.gt(0.0)
+        self.energy_memory_search_gain_ema.copy_(torch.where(
+            has_positive,
+            updated_ema,
+            self.energy_memory_search_gain_ema,
+        ))
+        self.energy_memory_search_gain_ema_initialized.logical_or_(has_positive)
 
-        normalizer = self.energy_memory_search_gain_ema.clamp_min(torch.finfo(torch.float32).eps)
-        return gains / normalizer
+        # Let the normalizer rise immediately but decay smoothly. Otherwise a
+        # stale, near-zero EMA can amplify a sudden positive gain by 1 / (1 - decay).
+        normalizer = torch.maximum(
+            self.energy_memory_search_gain_ema,
+            batch_positive_mean,
+        ).clamp_min(torch.finfo(torch.float32).eps)
+        return gains / normalizer.unsqueeze(1)
 
     def _combine_depth_auxiliary_losses(
         self,
@@ -1992,13 +2033,18 @@ class GradMemGPT(PreTrainedModel):
         orthogonal_loss,
     ):
         weighted_inner_loss = self.inner_loss_weight * inner_loss if self.add_inner_loss_to_outer else 0.0
+        weighted_orthogonal_loss = (
+            self.orthogonal_loss_weight * orthogonal_loss
+            if self.orthogonal_loss_weight > 0.0
+            else 0.0
+        )
         return (
             weighted_inner_loss
             + self.energy_rank_weight * rank_loss
             + self.energy_traj_weight * trajectory_loss
             + self.energy_anchor_weight * anchor_loss
             + self.memory_alignment_weight * memory_alignment_loss
-            + self.orthogonal_loss_weight * orthogonal_loss
+            + weighted_orthogonal_loss
         )
 
     def _compute_memory_state_auxiliary_losses(
@@ -2374,9 +2420,6 @@ class GradMemGPT(PreTrainedModel):
         memory_search_max_target_gain = zero
         memory_search_relative_target_gain = zero
         memory_search_max_relative_target_gain = zero
-        memory_search_gain_weight_mean = zero
-        memory_search_gain_weight_max = zero
-        memory_search_gain_ema = zero
         memory_search_selected_distance = zero
         if memory_search_active:
             if inline_memory_search_active:
@@ -2408,11 +2451,6 @@ class GradMemGPT(PreTrainedModel):
             if self.energy_memory_search_use_gain_weighting:
                 gain_weights = self._compute_energy_memory_search_gain_weights(relative_target_gains)
                 memory_search_loss = (gain_weights * per_example_search_losses).mean()
-                positive_weights = gain_weights.masked_select(relative_target_gains.gt(0.0))
-                if positive_weights.numel() > 0:
-                    memory_search_gain_weight_mean = positive_weights.mean()
-                    memory_search_gain_weight_max = positive_weights.max()
-                memory_search_gain_ema = self.energy_memory_search_gain_ema
             else:
                 memory_search_loss = memory_search_unweighted_loss
             memory_search_improvement_rate = torch.stack(
@@ -2671,10 +2709,6 @@ class GradMemGPT(PreTrainedModel):
             + weighted_step_alignment_loss
             + weighted_intermediate_read_loss
         )
-        if self.orthogonal_loss_weight == 0.0 and self.orthogonal_alpha_raw is not None:
-            # Train alpha from the detached diagnostic without changing the loss value or other parameters.
-            outer_loss = outer_loss + orthogonal_loss - orthogonal_loss.detach()
-
         loss_stats.update({
             "outer_loss": outer_loss,
             "target_loss": target_loss,
@@ -2692,21 +2726,13 @@ class GradMemGPT(PreTrainedModel):
         if memory_search_active:
             loss_stats.update({
                 "energy_memory_search_loss": memory_search_loss,
-                "energy_memory_search_unweighted_loss": memory_search_unweighted_loss,
                 "energy_memory_search_improvement_rate": memory_search_improvement_rate,
                 "energy_memory_search_target_gain": memory_search_target_gain,
                 "energy_memory_search_max_target_gain": memory_search_max_target_gain,
-                "energy_memory_search_relative_target_gain": memory_search_relative_target_gain,
                 "energy_memory_search_mean_relative_target_gain": memory_search_relative_target_gain,
                 "energy_memory_search_max_relative_target_gain": memory_search_max_relative_target_gain,
                 "energy_memory_search_selected_distance": memory_search_selected_distance,
             })
-            if self.energy_memory_search_use_gain_weighting:
-                loss_stats.update({
-                    "energy_memory_search_gain_weight_mean": memory_search_gain_weight_mean,
-                    "energy_memory_search_gain_weight_max": memory_search_gain_weight_max,
-                    "energy_memory_search_gain_ema": memory_search_gain_ema,
-                })
         if rank_active or trajectory_active or anchor_active or memory_search_active:
             loss_stats["energy_aux_loss"] = energy_aux_loss
         for name, value in {**loss_stats, **landscape_stats}.items():

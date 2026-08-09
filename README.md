@@ -138,8 +138,11 @@ preceding WRITE-step displacement. It requires full second-order SGD WRITE.
 Gain weighting uses each selected candidate's relative READ-loss reduction and
 normalizes positive gains with a persistent EMA updated once per microbatch.
 The optional best-for-next-step mode performs search inline and starts the next
-training WRITE step from a straight-through copy of the selected memory. This
-makes training target-guided; inference still follows the ordinary SGD trajectory.
+training WRITE step from a straight-through copy of the selected memory. After
+the final SGD step, READ uses the selected perturbation as its forward memory;
+the search loss still attracts the SGD-derived state toward that detached target.
+The full training rollout is target-guided, while inference follows the ordinary
+query-independent SGD trajectory.
 
 ### Cached checkpoint evaluation
 

@@ -44,7 +44,6 @@ LOSS_COMPONENT_KEYS = [
     "energy_traj_loss",
     "energy_anchor_loss",
     "energy_memory_search_loss",
-    "energy_memory_search_unweighted_loss",
     "energy_aux_loss",
     "memory_alignment_loss",
     "memory_alignment_cosine",
@@ -72,12 +71,8 @@ ENERGY_LANDSCAPE_STAT_KEYS = [
     "energy_memory_search_improvement_rate",
     "energy_memory_search_target_gain",
     "energy_memory_search_max_target_gain",
-    "energy_memory_search_relative_target_gain",
     "energy_memory_search_mean_relative_target_gain",
     "energy_memory_search_max_relative_target_gain",
-    "energy_memory_search_gain_weight_mean",
-    "energy_memory_search_gain_weight_max",
-    "energy_memory_search_gain_ema",
     "energy_memory_search_selected_distance",
 ]
 
