@@ -1,0 +1,32 @@
+# Example scheduler manifest: a small GradMemGPT grid on KV-retrieval.
+#
+# The scheduler emits one `python run_from_config.py --config <base_config>
+# <positional overrides>` command per grid combination. See the docstring at
+# the top of run_scheduler.py for the full schema.
+#
+# Dry run (print commands, execute nothing):
+#   python run_scheduler.py manifests/kv_retrieval_grid.yaml --dry-run
+#
+# Run for real:
+#   python run_scheduler.py manifests/kv_retrieval_grid.yaml
+
+max_parallel: 1          # only one run holds the GPU at a time
+schedule: sequential     # finish experiment 1 before starting experiment 2
+
+experiments:
+  - name: gradmem_K_grid
+    command: "python run_from_config.py"
+    base_config: "configs/gradmemgpt/kv_retrieval/default.yaml"
+    overrides:
+      gradmem.use_write_head: true
+      gradmem.grad_mode: second
+    grid:
+      # Cartesian product -> one run per combination (3 x 2 = 6 runs here).
+      gradmem.K: [1, 2, 4]
+      gradmem.inner_lr: [0.02, 0.04]
+
+  - name: frozen_baseline
+    command: "python run_from_config.py"
+    base_config: "configs/gradmemgpt/kv_retrieval/frozen.yaml"
+    grid:
+      training.seed: [143, 144]

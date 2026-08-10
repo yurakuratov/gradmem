@@ -77,7 +77,39 @@ The output dir layout is `<runs_dir>/<data_name>/<run_name>/run_<seed>_<uid8>`:
 - `run_gradmemgpt_on_squad.py` - SQuAD question answering
 - `run_rmt_on_kv_retrieval.py` - recurrent memory transformer
 - `run_from_config.py` - YAML config entry point (new)
+- `run_scheduler.py` - batch many `run_from_config.py` runs from a YAML manifest (see below)
 - `generate_run_name.py` - utility for run name generation
+
+## Batch scheduling (`run_scheduler.py`)
+Runs a grid of experiments from one manifest YAML with checkpointing, optional
+parallelism, auto-retry, and resume-after-interrupt. Each run is launched as
+`<command> <base_config> <positional key=value overrides>` — the overrides are
+**positional** (no `--`), exactly as `run_from_config.py` accepts them.
+```bash
+python run_scheduler.py manifests/kv_retrieval_grid.yaml --dry-run   # show commands
+python run_scheduler.py manifests/kv_retrieval_grid.yaml             # run for real
+```
+Manifest schema (`experiments[]` each need `name`, `command`, `base_config`;
+optional `overrides`, `grid` (cartesian product), `max_parallel`; top-level
+`max_parallel`, `schedule: sequential|interleaved`, `spawn_delay`, `max_retries`):
+```yaml
+max_parallel: 1
+experiments:
+  - name: gradmem_K_grid
+    command: "python run_from_config.py"
+    base_config: "configs/gradmemgpt/kv_retrieval/default.yaml"
+    overrides: {gradmem.use_write_head: true}
+    grid: {gradmem.K: [1, 2, 4], gradmem.inner_lr: [0.02, 0.04]}
+```
+- Flags like `--debug` are passed by listing them in `command`, not `overrides`
+  (an override is always `key=value`).
+- Per-run state lives in `<manifest>.checkpoint.json` next to the manifest
+  (gitignored). Re-running the same command resumes: `ok` runs skip, `running`
+  runs with a live PID are polled, others re-queue. Ctrl-C / SIGTERM prompts
+  whether to terminate or leave children running (resumable via stored PID).
+- Useful flags: `--restart-failed`, `--restart-unknown`, `--max-retries=N`
+  (auto-respawn on failure), `--on-interrupt=terminate|leave`, `--force`
+  (merge when the manifest changed). See `python run_scheduler.py` for usage.
 
 ## Config Locations
 - `configs/gpt2/kv_retrieval/` - GPT2 baselines
