@@ -17,7 +17,11 @@ is required):
     max_retries: 0             # auto-retry budget per run (default 0 = off)
     experiments:
       - name: my_grid          # required, used in checkpoint keys / logs
-        command: "python run_from_config.py"   # required, the launch binary
+        # `command` is the launch prefix; `base_config` is appended right
+        # after it as a bare token. run_from_config.py needs `--config <path>`
+        # (a bare positional is rejected), so `command` must END with
+        # `--config` -- then base_config becomes its value:
+        command: "python run_from_config.py --config"
         base_config: "configs/gradmemgpt/kv_retrieval/default.yaml"  # required
         max_parallel: 1        # per-experiment cap (default = global max_parallel)
         overrides:             # applied to every run in this experiment
@@ -33,14 +37,22 @@ For each grid combination the scheduler emits::
 
     <command> <base_config> <key>=<val> <key>=<val> ...
 
-The ``key=val`` tokens are **positional** overrides consumed by
+i.e. ``python run_from_config.py --config <base_config> <key>=<val> ...``. The
+``key=val`` tokens are **positional** overrides consumed by
 ``run_from_config.py``'s ``overrides`` nargs collector (which ``eval()``s the
 value). Dotted keys (``section.subkey``) route into a config section; bare keys
 are matched against any section. Booleans/numbers/strings are formatted so they
 round-trip through that ``eval()``. There is intentionally **no** ``--`` prefix
-— that is what distinguishes an override from a flag like ``--debug`` or
-``--config`` here. To pass a flag through verbatim, list it in ``command``
-(e.g. ``command: "python run_from_config.py --debug"``).
+— that is what distinguishes an override from a flag.
+
+Forwarding flags (e.g. ``--debug``)
+-----------------------------------
+Flags are part of the launch prefix, so list them in ``command`` **before** the
+trailing ``--config`` (so base_config still lands as ``--config``'s value)::
+
+    command: "python run_from_config.py --debug --config"
+
+emits ``python run_from_config.py --debug --config <base_config> <overrides>``.
 
 See the bottom of ``--help`` output and ``manifests/`` for examples.
 """

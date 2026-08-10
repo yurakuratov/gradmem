@@ -29,14 +29,24 @@ Our goal is to compress those prompts into a **small, writable parameter block `
 ## Prerequisites
 
 * Python 3.11
-* [conda](https://docs.conda.io/en/latest/) for environment management
+* [uv](https://docs.astral.sh/uv/) for environment & dependency management
+* An NVIDIA GPU with CUDA 12.4+ (PyTorch is pinned to the `cu124` wheels)
 
-Create an environment using the provided YAML file:
+Create and activate the environment with uv (it reads `pyproject.toml` + `uv.lock`):
 
 ```bash
-conda env create -f conda_env.yaml
-conda activate /home/jovyan/kuratov/envs/py311_pt2.6_cu12.4  # or the path printed by conda
+uv sync                      # creates .venv with the locked dependencies
+uv run python run_from_config.py --config configs/gradmemgpt/kv_retrieval/default.yaml
 ```
+
+Notebook / data-prep extras (used only by `notebooks/`, not by training):
+
+```bash
+uv sync --extra notebooks    # matplotlib, seaborn, ipykernel, ipywidgets
+```
+
+Dependencies, versions, and the PyTorch CUDA index all live in `pyproject.toml`;
+`uv.lock` pins the fully resolved graph (including the CUDA wheels) for reproducibility.
 
 Accelerate is configured via `accelerate.yaml`. The default configuration uses BF16 precision and a single process.
 
