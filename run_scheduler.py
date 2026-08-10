@@ -55,6 +55,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from pathlib import Path
 
 import yaml
@@ -156,6 +157,8 @@ class _Child:
         proc: subprocess.Popen | None,
         pid: int,
         attempts: int = 0,
+        log_path: Path | None = None,
+        log_handle=None,
     ):
         self.name = name
         self.idx = idx
@@ -167,6 +170,37 @@ class _Child:
         # How many retries preceded this launch (0 = first attempt). Used for
         # the auto-respawn budget and recorded in the checkpoint on finalize.
         self.attempts = attempts
+        # Per-run capture file for this child's combined stdout/stderr. Owned
+        # only when we launched the proc this session (log_handle is not None);
+        # for a resumed child (proc is None) log_path may still be set (read
+        # back from the checkpoint) so a resumed-then-failed run's backtrace is
+        # still recoverable.
+        self.log_path = log_path
+        self.log_handle = log_handle
+
+    def close_log(self, delete: bool = False) -> None:
+        """Close the capture-file handle we hold in this process.
+
+        Closing here does not stop a live child from writing: the child holds
+        its own inherited fd (dup'd at fork), so `start_new_session=True`
+        children — and their grandchildren — keep flushing to the file. With
+        `delete=True` the file is removed too (used on success / user-terminate
+        to keep the logs dir tidy); failures keep it so the full output stays
+        inspectable.
+        """
+        if self.log_handle is not None:
+            try:
+                self.log_handle.close()
+            except OSError:
+                pass
+            self.log_handle = None
+        if delete and self.log_path is not None:
+            try:
+                self.log_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
 
     def poll(self) -> int | None | str:
         """None if still running; an int exit code if we own the proc and it
@@ -196,18 +230,27 @@ class _Child:
             entry["exit_code"] = exit_code
         if self.attempts > 0:
             entry["attempts"] = self.attempts
+        # Record where the failure/unknown output was captured so the user (or
+        # a future session) can find the backtrace. Not stored for ok runs.
+        if status != "ok" and self.log_path is not None:
+            entry["log_path"] = str(self.log_path)
         key = f"{self.name}/{self.idx}"
         checkpoint["runs"][key] = entry
 
     def leave(self, checkpoint: dict, command: list[str]) -> None:
         """On 'leave', persist the pid so a restarted scheduler can resume
         polling; keep status 'running'."""
-        checkpoint["runs"][f"{self.name}/{self.idx}"] = {
+        entry: dict = {
             "command": command,
             "status": "running",
             "pid": self.pid,
             "start_time": self.start_iso,
         }
+        # Keep the capture path on disk so the resumed session can read the
+        # backtrace if the left-running child eventually crashes.
+        if self.log_path is not None:
+            entry["log_path"] = str(self.log_path)
+        checkpoint["runs"][f"{self.name}/{self.idx}"] = entry
 
     def terminate(self) -> int | None:
         """SIGTERM the whole process group, wait up to ~5s, then SIGKILL.
@@ -254,6 +297,9 @@ def _handle_interrupt(
         for child in running.values():
             command = checkpoint["runs"][f"{child.name}/{child.idx}"]["command"]
             code = child.terminate()
+            # User-initiated kill, not a crash: keep the capture file (no
+            # backtrace to print) and release our handle.
+            child.close_log(delete=False)
             if code is None:
                 # Resumed child we don't own: signaled but exit code unrecoverable.
                 child.finalize(checkpoint, command, None, "unknown")
@@ -270,6 +316,9 @@ def _handle_interrupt(
         for child in running.values():
             command = checkpoint["runs"][f"{child.name}/{child.idx}"]["command"]
             child.leave(checkpoint, command)
+            # Release our handle; the child keeps its inherited fd and keeps
+            # writing, so the file on disk continues to grow until it exits.
+            child.close_log(delete=False)
             print(f"  [{child.name} {child.idx + 1}] left running (PID {child.pid})")
 
     save_checkpoint(checkpoint, cp_path)
@@ -457,6 +506,53 @@ def merge_checkpoint(
 
 # ==================== Execution ====================
 
+def _open_run_log(log_dir: Path | None, name: str, idx: int):
+    """Open the per-run capture file for `name`/`idx`.
+
+    Returns ``(path, file_handle)`` opened for writing, or ``None`` when output
+    capture is disabled (``log_dir is None``). The child's combined
+    stdout/stderr is redirected here via a real file descriptor (not a pipe),
+    so there is no buffer-fill deadlock risk for chatty runs. Opened with
+    ``'w'`` so a retried run (same idx) truncates the previous attempt's log.
+    """
+    if log_dir is None:
+        return None
+    path = log_dir / f"{name.replace('/', '_')}__{idx}.log"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path, path.open("w")
+
+
+def _print_log_tail(log_path, log_lines: int) -> None:
+    """Print up to ``log_lines`` trailing lines of the capture file at ``log_path``.
+
+    A crashing process writes its Python/accelerate traceback last, so the file
+    tail is what surfaces the exception. Read with a bounded ``deque`` so even a
+    multi-GB log costs O(log_lines) memory. No-op when printing is disabled
+    (``log_lines <= 0``) or the path is missing/unreadable/empty.
+    """
+    if log_lines <= 0 or log_path is None:
+        return
+    try:
+        with Path(log_path).open("r", errors="replace") as f:
+            tail = deque(f, maxlen=log_lines)
+    except OSError:
+        return
+    if not tail:
+        return
+    print(
+        f"    ----- last {len(tail)} log line(s) "
+        f"(full file: {log_path}) -----"
+    )
+    for line in tail:
+        print("    " + line.rstrip("\n"))
+    print("    " + "-" * 28)
+
+
+def _print_failure_tail(child: _Child, log_lines: int) -> None:
+    """Print the tail of a failed run's captured log (where its traceback lives)."""
+    _print_log_tail(child.log_path, log_lines)
+
+
 def run_experiment(
     name: str,
     commands: list[list[str]],
@@ -468,6 +564,8 @@ def run_experiment(
     on_interrupt: str = "prompt",
     spawn_delay: float = 0.0,
     max_retries: int = 0,
+    log_dir: Path | None = None,
+    log_lines: int = 50,
 ) -> None:
     total = len(commands)
     skip_ok = 0
@@ -501,10 +599,12 @@ def run_experiment(
                 # Resume a child left running by a previous session: track it
                 # without relaunching. Its exit code is unrecoverable (we are
                 # not its parent), so on disappearance we mark it 'unknown'.
+                lp = entry.get("log_path")
                 resumed.append(
                     _Child(
                         name=name, idx=i, start_iso=entry.get("start_time", ""),
                         start=time.time(), exp_i=None, proc=None, pid=pid,
+                        log_path=Path(lp) if lp else None,
                     )
                 )
             else:
@@ -513,6 +613,14 @@ def run_experiment(
                     queue.append(i)
                 else:
                     skip_unknown += 1
+                # The left-running child died while the scheduler was down;
+                # surface its captured backtrace if we have one.
+                if entry.get("log_path"):
+                    print(
+                        f"  [{name} {i+1}/{total}] resumed PID gone; "
+                        f"showing captured tail:"
+                    )
+                    _print_log_tail(entry.get("log_path"), log_lines)
         else:
             queue.append(i)
 
@@ -562,21 +670,32 @@ def run_experiment(
                 key = f"{name}/{idx}"
                 _wait_for_spawn_slot(last_spawn_time, spawn_delay)
                 start_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
-                checkpoint["runs"][key] = {
+                log = _open_run_log(log_dir, name, idx)
+                log_path = log[0] if log is not None else None
+                log_handle = log[1] if log is not None else None
+                run_entry: dict = {
                     "command": cmd,
                     "status": "running",
                     "start_time": start_iso,
                 }
+                if log_path is not None:
+                    run_entry["log_path"] = str(log_path)
+                checkpoint["runs"][key] = run_entry
                 save_checkpoint(checkpoint, cp_path)
                 proc = subprocess.Popen(
-                    cmd, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL, start_new_session=True,
+                    cmd,
+                    stdout=log_handle if log_handle is not None
+                    else subprocess.DEVNULL,
+                    stderr=subprocess.STDOUT if log_handle is not None
+                    else subprocess.DEVNULL,
+                    start_new_session=True,
                 )
                 last_spawn_time = time.time()
                 running[proc.pid] = _Child(
                     name=name, idx=idx, start_iso=start_iso,
                     start=time.time(), exp_i=None, proc=proc, pid=proc.pid,
                     attempts=attempts.get(idx, 0),
+                    log_path=log_path, log_handle=log_handle,
                 )
                 print(
                     f"  [{idx+1}/{total}] Started (PID {proc.pid})"
@@ -605,6 +724,10 @@ def run_experiment(
                             f"({elapsed:.1f}s) (PID {pid}) -> "
                             f"retrying ({n_attempts + 1}/{max_retries})"
                         )
+                        # Surface why it's retrying (the attempt's backtrace),
+                        # then release the handle; the retry truncates the file.
+                        child.close_log(delete=False)
+                        _print_failure_tail(child, log_lines)
                         finished.append(pid)
                         continue
                     if ret == "unknown":
@@ -628,6 +751,11 @@ def run_experiment(
                         f"  [{child.idx+1}/{total}] {label} "
                         f"({elapsed:.1f}s) (PID {pid})"
                     )
+                    # On success drop the (uninteresting) log; on failure keep
+                    # it and print the tail so the backtrace is visible inline.
+                    child.close_log(delete=(ret == 0))
+                    if ret != 0:
+                        _print_failure_tail(child, log_lines)
                     finished.append(pid)
 
             for pid in finished:
@@ -651,6 +779,8 @@ def run_interleaved(
     on_interrupt: str = "prompt",
     spawn_delay: float = 0.0,
     max_retries: int = 0,
+    log_dir: Path | None = None,
+    log_lines: int = 50,
 ) -> None:
     total_runs = sum(len(cmds) for _, cmds, _ in experiments)
 
@@ -687,6 +817,14 @@ def run_interleaved(
                         run_total += 1
                     else:
                         skip_unknown_total += 1
+                    # Left-running child died while the scheduler was down;
+                    # surface its captured backtrace if we have one.
+                    if entry.get("log_path"):
+                        print(
+                            f"  [{name} {i+1}/{len(cmds)}] resumed PID gone; "
+                            f"showing captured tail:"
+                        )
+                        _print_log_tail(entry.get("log_path"), log_lines)
             else:
                 run_total += 1
 
@@ -766,9 +904,11 @@ def run_interleaved(
             pid = entry.get("pid")
             if pid is None or not _pid_alive(pid):
                 continue
+            lp = entry.get("log_path")
             running[pid] = _Child(
                 name=name, idx=i, start_iso=entry.get("start_time", ""),
                 start=time.time(), exp_i=exp_i, proc=None, pid=pid,
+                log_path=Path(lp) if lp else None,
             )
             per_exp_running[exp_i] += 1
             print(f"  [{name} {i+1}/{len(cmds)}] Resumed (PID {pid})")
@@ -788,21 +928,31 @@ def run_interleaved(
             n_attempts = attempts.get((i, idx), 0)
             _wait_for_spawn_slot(last_spawn_time, spawn_delay)
             start_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
-            checkpoint["runs"][key] = {
+            log = _open_run_log(log_dir, name, idx)
+            log_path = log[0] if log is not None else None
+            log_handle = log[1] if log is not None else None
+            run_entry: dict = {
                 "command": cmd,
                 "status": "running",
                 "start_time": start_iso,
             }
+            if log_path is not None:
+                run_entry["log_path"] = str(log_path)
+            checkpoint["runs"][key] = run_entry
             save_checkpoint(checkpoint, cp_path)
             proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True,
+                cmd,
+                stdout=log_handle if log_handle is not None
+                else subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if log_handle is not None
+                else subprocess.DEVNULL,
+                start_new_session=True,
             )
             last_spawn_time = time.time()
             running[proc.pid] = _Child(
                 name=name, idx=idx, start_iso=start_iso,
                 start=time.time(), exp_i=i, proc=proc, pid=proc.pid,
-                attempts=n_attempts,
+                attempts=n_attempts, log_path=log_path, log_handle=log_handle,
             )
             per_exp_running[i] += 1
             print(
@@ -849,6 +999,8 @@ def run_interleaved(
                             f"({elapsed:.1f}s) (PID {pid}) -> "
                             f"retrying ({n_attempts + 1}/{max_retries})"
                         )
+                        child.close_log(delete=False)
+                        _print_failure_tail(child, log_lines)
                         finished.append(pid)
                         continue
                     if ret == "unknown":
@@ -874,6 +1026,9 @@ def run_interleaved(
                         f"  [{name} {child.idx+1}/{len(cmds)}] {label} "
                         f"({elapsed:.1f}s) (PID {pid})"
                     )
+                    child.close_log(delete=(ret == 0))
+                    if ret != 0:
+                        _print_failure_tail(child, log_lines)
                     finished.append(pid)
 
             for pid in finished:
@@ -930,7 +1085,8 @@ def main():
             "Usage: python run_scheduler.py <manifest.yaml> [--dry-run] "
             "[--restart-failed] [--restart-unknown] "
             "[--on-interrupt=prompt|terminate|leave] "
-            "[--spawn-delay=SECONDS] [--max-retries=N] [--force]"
+            "[--spawn-delay=SECONDS] [--max-retries=N] [--force] "
+            "[--log-dir=DIR] [--log-lines=N] [--no-log]"
         )
         sys.exit(1)
 
@@ -938,6 +1094,7 @@ def main():
     restart_failed = "--restart-failed" in sys.argv
     restart_unknown = "--restart-unknown" in sys.argv
     force = "--force" in sys.argv
+    no_log = "--no-log" in sys.argv
 
     on_interrupt = "prompt"
     for a in sys.argv[1:]:
@@ -980,6 +1137,26 @@ def main():
                 print("Error: --max-retries must not be negative")
                 sys.exit(1)
 
+    log_dir_cli = None
+    for a in sys.argv[1:]:
+        if a.startswith("--log-dir="):
+            log_dir_cli = a.split("=", 1)[1]
+
+    log_lines = None
+    for a in sys.argv[1:]:
+        if a.startswith("--log-lines="):
+            try:
+                log_lines = int(a.split("=", 1)[1])
+            except ValueError:
+                print(
+                    f"Error: --log-lines must be a non-negative integer, "
+                    f"got '{a.split('=', 1)[1]}'"
+                )
+                sys.exit(1)
+            if log_lines < 0:
+                print("Error: --log-lines must not be negative (0 = no tail)")
+                sys.exit(1)
+
     # Treat SIGTERM like Ctrl-C so `kill <scheduler_pid>` unwinds cleanly.
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
@@ -1000,6 +1177,21 @@ def main():
     # CLI --max-retries overrides the manifest's max_retries (if any).
     if max_retries is None:
         max_retries = int(manifest.get("max_retries", 0))
+
+    # Per-run output capture so a crashing run's backtrace is recoverable.
+    # `--no-log` disables capture entirely (pure DEVNULL, old behaviour).
+    # Otherwise: explicit `--log-dir`, else manifest `log_dir`, else a default
+    # `<manifest>.logs/` dir next to the checkpoint.
+    if no_log:
+        log_dir: Path | None = None
+    elif log_dir_cli is not None:
+        log_dir = Path(log_dir_cli)
+    elif manifest.get("log_dir") is not None:
+        log_dir = Path(manifest["log_dir"])
+    else:
+        log_dir = Path(str(manifest_path) + ".logs")
+    if log_lines is None:
+        log_lines = int(manifest.get("log_lines", 50))
 
     if schedule not in ("sequential", "interleaved"):
         raise ValueError(
@@ -1148,6 +1340,7 @@ def main():
                     name, commands, max_parallel,
                     checkpoint, cp_path, restart_failed, restart_unknown,
                     on_interrupt, spawn_delay, max_retries,
+                    log_dir, log_lines,
                 )
             print_summary(experiments, checkpoint)
         elif schedule == "interleaved":
@@ -1155,6 +1348,7 @@ def main():
                 experiments, global_max_parallel,
                 checkpoint, cp_path, restart_failed, restart_unknown,
                 on_interrupt, spawn_delay, max_retries,
+                log_dir, log_lines,
             )
     except SchedulerInterrupted:
         print(
