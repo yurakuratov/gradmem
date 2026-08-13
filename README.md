@@ -1,3 +1,5 @@
+
+
 # GradMem: Learning to Write Context into Memory with Test-Time Gradient Descent
 
 This repository contains code for **GradMem**, a memory mechanism where the model compresses a context into a small writable memory state using **test-time gradient descent**.
@@ -118,7 +120,7 @@ For full experiment configurations, use scripts in `scripts/`:
 - `scripts/run_gradmemgpt_on_kv_retrieval.sh`
 - `scripts/run_rmt_on_kv_retrieval.sh`
 - `scripts/run_gpt_on_kv_retrieval.sh`
-- `scripts/run_gradmemgpt_on_babi.sh`
+- `scripts/run_gpt_on_babi.sh`
 - `scripts/run_gradmemgpt_on_squad.sh`
 
 For text-compression experiments, prepare PG19 chunks with
