@@ -378,7 +378,14 @@ if __name__ == '__main__':
         # create tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
         # create base model config
-        if args.base_model == 'gpt2':
+        if args.init_base_checkpoint is not None:
+            checkpoint_dir = Path(args.init_base_checkpoint).resolve().parent
+            checkpoint_config = checkpoint_dir / 'config.json'
+            if not checkpoint_config.is_file():
+                raise FileNotFoundError(f'Base checkpoint config does not exist: {checkpoint_config}')
+            config = AutoConfig.from_pretrained(checkpoint_dir)
+            logger.info(f'Building the base model from checkpoint config: {checkpoint_config}')
+        elif args.base_model == 'gpt2':
             config = AutoConfig.from_pretrained('gpt2')
             config.n_layer = args.n_layer
             config.n_head = args.n_head
