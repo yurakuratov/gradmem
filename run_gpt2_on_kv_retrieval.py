@@ -178,12 +178,8 @@ class CustomTrainer(Trainer):
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(
-        default='./data/N2-K4V4-S4(32-64)_1M',
-    )
-    tokenizer_path: str = field(
-        default='./tokenizers/kv_alphabet_62/',
-    )
+    data_path: str = field(default='./data/N8-K2V2-V62_1M')
+    tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -196,8 +192,10 @@ class ExperimentArgs:
     adam_beta1: Optional[float] = field(default=0.9)
     adam_beta2: Optional[float] = field(default=0.999)
     adam_epsilon: Optional[float] = field(default=1e-8)
+    max_grad_norm: Optional[float] = field(default=1.0)
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
+    stop_on_metric_value: Optional[float] = field(default=1.0)
     seed: Optional[int] = field(default=142)
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
@@ -208,6 +206,7 @@ class ExperimentArgs:
     max_position_embeddings: Optional[int] = field(default=None)
     max_input_length: Optional[int] = field(default=None)
     attn_implementation: Optional[str] = field(default=None)
+    attention_dropout: Optional[float] = field(default=0.0)
 
     # allow writing to existing folder & resume
     overwrite_output_dir: Optional[bool] = field(default=False)
@@ -267,6 +266,7 @@ if __name__ == '__main__':
             config.n_layer = args.n_layer
             config.n_head = args.n_head
             config.n_embd = args.n_embd
+            config.attn_pdrop = args.attention_dropout
             if args.max_position_embeddings is not None:
                 config.n_positions = args.max_position_embeddings
         elif args.base_model == 'pythia':
@@ -275,6 +275,7 @@ if __name__ == '__main__':
             config.num_attention_heads = args.n_head
             config.hidden_size = args.n_embd
             config.intermediate_size = config.hidden_size * 4
+            config.attention_dropout = args.attention_dropout
             if args.max_position_embeddings is not None:
                 config.max_position_embeddings = args.max_position_embeddings
         elif args.base_model == 'llama':
@@ -285,6 +286,7 @@ if __name__ == '__main__':
             config.hidden_size = args.n_embd
             config.head_dim = config.hidden_size // config.num_attention_heads
             config.intermediate_size = config.hidden_size * 4
+            config.attention_dropout = args.attention_dropout
             if args.max_position_embeddings is not None:
                 config.rope_scaling = None
                 config.rope_theta = 10000.0
@@ -359,6 +361,7 @@ if __name__ == '__main__':
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
+        max_grad_norm=args.max_grad_norm,
         learning_rate=args.learning_rate,
         adam_beta1=args.adam_beta1,
         adam_beta2=args.adam_beta2,
@@ -395,7 +398,7 @@ if __name__ == '__main__':
         compute_metrics=compute_metrics,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   StopOnMetricValue(metric_name='exact_match', value=1.0, higher_is_better=True),
+                   StopOnMetricValue(metric_name='exact_match', value=args.stop_on_metric_value, higher_is_better=True),
                    ],
     )
 
