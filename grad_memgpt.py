@@ -99,6 +99,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  energy_anchor_weight=0.0,
                  add_inner_loss_to_outer=False,
                  inner_loss_weight=None,
+                 read_loss_alignment="causal",
                  **kwargs):
         """
         Args:
@@ -152,6 +153,8 @@ class GradMemGPTConfig(PretrainedConfig):
             energy_anchor_weight: float, optional energy-magnitude anchoring loss weight
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
+            read_loss_alignment: "causal" for ordinary next-token labels or
+                "query_position" for answers labeled on their query tokens
         """
         super().__init__(**kwargs)
 
@@ -207,6 +210,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.energy_anchor_weight = energy_anchor_weight
         self.add_inner_loss_to_outer = add_inner_loss_to_outer
         self.inner_loss_weight = inner_loss_weight
+        self.read_loss_alignment = read_loss_alignment
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
@@ -217,6 +221,8 @@ class GradMemGPTConfig(PretrainedConfig):
         assert self.write_objective in ["reconstruction", "energy", "energy_with_reconstruction"], (
             "write_objective must be one of: reconstruction, energy, energy_with_reconstruction"
         )
+        if self.read_loss_alignment not in ("causal", "query_position"):
+            raise ValueError("read_loss_alignment must be one of: causal, query_position")
         if self.write_objective in ("energy", "energy_with_reconstruction") and self.memory_backend != "prefix":
             raise ValueError(
                 "write_objective='energy' and 'energy_with_reconstruction' are currently supported only "
@@ -1687,10 +1693,11 @@ class GradMemGPT(PreTrainedModel):
             inner_loss_write_delta = inner_loss_after_write - inner_loss_initial
             inner_loop_stats['inner_loss_initial'] = inner_loss_initial.detach().mean()
             inner_loop_stats['inner_loss_write_delta'] = inner_loss_write_delta.detach().mean()
-        inner_loop_stats['write_reconstruction_weight'] = torch.tensor(
-            self.write_reconstruction_weight, device=device
-        )
-        inner_loop_stats['write_energy_weight'] = torch.tensor(self.write_energy_weight, device=device)
+        if self.write_objective == "energy_with_reconstruction":
+            inner_loop_stats['write_reconstruction_weight'] = torch.tensor(
+                self.write_reconstruction_weight, device=device
+            )
+            inner_loop_stats['write_energy_weight'] = torch.tensor(self.write_energy_weight, device=device)
 
         mem_norm, delta_mem_norm = backend.compute_memory_stats(memory_state, memory_state_initial)
         inner_loop_stats['mem_norm_mean'] = mem_norm.mean()
@@ -1746,12 +1753,20 @@ class GradMemGPT(PreTrainedModel):
         if labels is None:
             return output
 
-        target_logits = output['predictions'][:, :-1]
-        target_label_shift = read_batch.get('label_shift', 0)
-        # Prefix memory can predict the first target token from memory itself (label_shift=0),
-        # while LoRA/KV-cache memory without a prepended seed token cannot (label_shift=1).
-        # Backends should produce exactly aligned lengths after this shift.
-        target_labels = labels[:, target_label_shift:]
+        if self.config.read_loss_alignment == "query_position":
+            # Labels are attached to query tokens and scored by the logits after
+            # those tokens. Prefix memory has one additional pre-query logit;
+            # LoRA/KV-cache outputs already start at the first query position.
+            target_logits = (output["predictions"][:, 1:] if self.memory_backend == "prefix" else output["predictions"])
+            target_labels = labels
+            target_label_shift = "query_position"
+        else:
+            target_logits = output["predictions"][:, :-1]
+            target_label_shift = read_batch.get("label_shift", 0)
+            # Prefix memory can predict the first target token from memory itself
+            # (label_shift=0), while LoRA/KV-cache cannot predict the first token
+            # without a prepended seed token (label_shift=1).
+            target_labels = labels[:, target_label_shift:]
         if target_logits.size(1) != target_labels.size(1):
             raise ValueError(
                 f"Mismatched target lengths after alignment: logits_len={target_logits.size(1)}, "
