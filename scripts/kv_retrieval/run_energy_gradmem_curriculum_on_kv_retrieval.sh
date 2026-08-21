@@ -1,5 +1,5 @@
 #!/bin/bash
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=0
 
 set -euo pipefail
 shopt -s nullglob
@@ -15,7 +15,7 @@ MODEL=energy_gradmem
 BASE_MODEL=llama
 L=4
 H=4
-D=256
+D=128
 
 K_SIZE=2
 V_SIZE=2
@@ -26,7 +26,7 @@ N_PAIRSS_IN_SEGMENT=(8 8 8 8 8)
 N_SEGMENTSS_IN_CONTEXT=(1 2 2 4 8)
 INNER_LRS=(1.0 0.1 0.1 0.1 0.03)
 CE_WEIGHTS=(1.0 1.0 0.0 0.0 0.0)
-N_VALUES=(3)
+N_VALUES=(4 5 6)
 
 MEMORY_ROTATION_ANGLES=(None None None None None)
 # N_PAIRSS_IN_SEGMENT=(8 8 8)
@@ -101,7 +101,7 @@ latest_checkpoint() {
   printf '%s\n' "$next_init_ckpt"
 }
 
-for N in $N_VALUES; do
+for N in ${N_VALUES[@]}; do
   SEED=$((N + 42))
   INIT_CKPT=$INIT_CHECKPOINT
   STAGE=0

@@ -25,7 +25,7 @@ INNER_CLIP_NORM=1.0
 GRAD_MODE=second
 TBS=64
 LR=1e-04
-N_VALUES=1
+N_VALUES=(4 5 6)
 INIT_CHECKPOINT=""
 STOP_EXACT_MATCH_VALUE=0.99
 MEMORY_ROTATION=none
@@ -79,7 +79,7 @@ latest_checkpoint() {
   printf '%s\n' "$next_init_ckpt"
 }
 
-for N in $N_VALUES; do
+for N in ${N_VALUES[@]}; do
   SEED=$((N + 42))
   INIT_CKPT=$INIT_CHECKPOINT
   STAGE=0
