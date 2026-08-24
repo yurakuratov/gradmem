@@ -48,6 +48,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-context-length", type=int, help="Override each run's max_context_length.")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, cuda:0, or mps")
+    parser.add_argument(
+        "--estimate-local-lipschitz",
+        action="store_true",
+        help="Estimate the WRITE objective's local memory-space Lipschitz coefficient at every WRITE step.",
+    )
+    parser.add_argument(
+        "--lipschitz-max-examples",
+        type=int,
+        help="Use only the first N validation examples for the Lipschitz probe (default: all).",
+    )
     parser.add_argument("--output-xlsx", type=Path, required=True)
     parser.add_argument("--fail-fast", action="store_true", help="Stop instead of writing an error row.")
     args = parser.parse_args()
@@ -65,6 +75,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("provide at least one --checkpoint, --checkpoints-file, --run, or --runs-file")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.lipschitz_max_examples is not None and args.lipschitz_max_examples <= 0:
+        parser.error("--lipschitz-max-examples must be positive")
     return args
 
 
@@ -191,6 +203,7 @@ def load_model(checkpoint: Path, device: torch.device) -> tuple[GradMemGPT, Path
     config = GradMemGPTConfig.from_pretrained(checkpoint_dir, local_files_only=True)
     reconstruct_base_config(config)
     config.energy_memory_search_weight = 0.0
+    config.lipschitz_weight = 0.0
     model = GradMemGPT(config)
     if weights_path.suffix == ".safetensors":
         state_dict = load_file(str(weights_path), device="cpu")
@@ -221,6 +234,159 @@ def scalar(value: Any) -> float:
     if isinstance(value, torch.Tensor):
         return float(value.detach().float().mean().cpu())
     return float(value)
+
+
+def _write_objective_for_state(
+    model: GradMemGPT,
+    backend: Any,
+    memory_state: dict[str, Any],
+    batch_ctx: dict[str, Any],
+) -> torch.Tensor:
+    write_batch = backend.build_write_inputs(memory_state, batch_ctx)
+    with backend.activation_context(memory_state):
+        if model.write_objective == "reconstruction":
+            outputs, reconstruction = model._run_reconstruction_write_forward(write_batch)
+            objective = reconstruction
+        else:
+            outputs, reconstruction, energy = model._run_energy_reconstruction_write_forward(write_batch)
+            if model.write_objective == "energy":
+                objective = energy
+            elif model.write_objective == "energy_with_reconstruction":
+                objective = (
+                    model.write_reconstruction_weight * reconstruction
+                    + model.write_energy_weight * energy
+                )
+            else:
+                raise ValueError(f"Unsupported write objective: {model.write_objective}")
+    del outputs
+    return objective
+
+
+def local_lipschitz_trajectory_batch(
+    model: GradMemGPT,
+    input_ids: Mapping[str, torch.Tensor],
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Replay WRITE and return pointwise gradient norms and trajectory secants.
+
+    For scalar WRITE objective f_C(M), ||grad_M f_C(M_k)||_2 is its pointwise
+    local Lipschitz coefficient under the Frobenius/L2 memory norm. Secants are
+    observed lower bounds on a Lipschitz constant over each traversed segment.
+    """
+    if model.memory_backend != "prefix":
+        raise ValueError("Local Lipschitz estimation currently requires memory_backend='prefix'")
+
+    context_input_ids = input_ids["context_input_ids"]
+    query_input_ids = input_ids["query_input_ids"]
+    batch_size = context_input_ids.size(0)
+    backend = model.memory_backend_impl
+    batch_ctx = backend.prepare_batch(
+        context_input_ids,
+        query_input_ids,
+        model.model.config.pad_token_id,
+    )
+    memory_state, _ = backend.init_memory_state(batch_size)
+    opt_state: dict[str, dict[str, torch.Tensor]] = {}
+    gradient_norms: list[np.ndarray] = []
+    secants: list[np.ndarray] = []
+    previous_objective: torch.Tensor | None = None
+    previous_memory: torch.Tensor | None = None
+
+    for step in range(model.K + 1):
+        # Leaf states keep the diagnostic independent of training-time graph mode.
+        for name, value in list(memory_state.items()):
+            if isinstance(value, torch.Tensor):
+                memory_state[name] = value.detach().requires_grad_(True)
+
+        with torch.enable_grad():
+            objective = _write_objective_for_state(model, backend, memory_state, batch_ctx)
+            inner_params = backend.inner_params(memory_state)
+            grads = torch.autograd.grad(objective.sum(), inner_params)
+
+        memory = memory_state["mem_batch"]
+        memory_grad = grads[0]
+        gradient_norms.append(memory_grad.detach().float().flatten(1).norm(dim=1).cpu().numpy())
+        if previous_objective is not None and previous_memory is not None:
+            objective_delta = (objective.detach() - previous_objective).abs().float()
+            memory_delta = (memory.detach() - previous_memory).float().flatten(1).norm(dim=1)
+            eps = torch.finfo(memory_delta.dtype).eps
+            secants.append((objective_delta / memory_delta.clamp_min(eps)).cpu().numpy())
+
+        if step == model.K:
+            break
+        previous_objective = objective.detach()
+        previous_memory = memory.detach()
+        new_params = []
+        for index, (parameter, gradient) in enumerate(zip(inner_params, grads)):
+            if model.use_adam:
+                updated = model._adam_step(
+                    parameter,
+                    gradient,
+                    opt_state.setdefault(str(index), {}),
+                    step + 1,
+                    model.lr,
+                )
+            else:
+                updated = model._sgd_step(
+                    parameter,
+                    gradient,
+                    clip_value=model.inner_clip_value,
+                    clip_norm=model.inner_clip_norm,
+                )
+            new_params.append(updated.detach())
+        backend.assign_inner_params(memory_state, new_params)
+
+    return gradient_norms, secants
+
+
+def summarize_local_lipschitz(
+    gradient_norms: list[list[np.ndarray]],
+    secants: list[list[np.ndarray]],
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for step, batches in enumerate(gradient_norms):
+        values = np.concatenate(batches).astype(np.float64)
+        metrics.update({
+            f"lipschitz_grad_k{step}_mean": float(values.mean()),
+            f"lipschitz_grad_k{step}_median": float(np.median(values)),
+            f"lipschitz_grad_k{step}_p95": float(np.quantile(values, 0.95)),
+            f"lipschitz_grad_k{step}_max": float(values.max()),
+        })
+    for step, batches in enumerate(secants, start=1):
+        values = np.concatenate(batches).astype(np.float64)
+        metrics[f"lipschitz_secant_k{step}_mean"] = float(values.mean())
+        metrics[f"lipschitz_secant_k{step}_max"] = float(values.max())
+    return metrics
+
+
+def estimate_local_lipschitz(
+    model: GradMemGPT,
+    dataset: Any,
+    tokenizer: Any,
+    batch_size: int,
+    max_context_length: int | None,
+    device: torch.device,
+    max_examples: int | None,
+) -> dict[str, float]:
+    if model.memory_backend != "prefix":
+        raise ValueError("Local Lipschitz estimation currently requires memory_backend='prefix'")
+    count = len(dataset) if max_examples is None else min(len(dataset), max_examples)
+    if count == 0:
+        raise ValueError("Validation dataset is empty")
+    collator = partial(collate_fn, tokenizer=tokenizer, max_context_length=max_context_length)
+    loader = DataLoader(dataset.select(range(count)), batch_size=batch_size, collate_fn=collator, shuffle=False)
+    gradient_norms: list[list[np.ndarray]] = [[] for _ in range(model.K + 1)]
+    secants: list[list[np.ndarray]] = [[] for _ in range(model.K)]
+    for batch in loader:
+        batch = move_to_device(batch, device)
+        batch_gradients, batch_secants = local_lipschitz_trajectory_batch(model, batch["input_ids"])
+        for step, values in enumerate(batch_gradients):
+            gradient_norms[step].append(values)
+        for step, values in enumerate(batch_secants):
+            secants[step].append(values)
+    return {
+        "lipschitz_num_examples": float(count),
+        **summarize_local_lipschitz(gradient_norms, secants),
+    }
 
 
 def evaluate_checkpoint(
@@ -417,6 +583,16 @@ def main() -> None:
             row.update(evaluate_checkpoint(
                 model, dataset, tokenizer, args.batch_size, max_context_length, device
             ))
+            if args.estimate_local_lipschitz:
+                row.update(estimate_local_lipschitz(
+                    model,
+                    dataset,
+                    tokenizer,
+                    args.batch_size,
+                    max_context_length,
+                    device,
+                    args.lipschitz_max_examples,
+                ))
             del model
             if device.type == "cuda":
                 torch.cuda.empty_cache()
