@@ -1,0 +1,10 @@
+initialization,intervention,run,best_exact_match
+scratch,Lipschitz,run_1,0.1072
+scratch,Lipschitz,run_2,0.1238
+scratch,Lip. + noise,run_1,0.0882
+scratch,Lip. + noise + search,run_1,0.1164
+plateau,Lipschitz,run_1,0.9608
+plateau,Lipschitz,run_2,0.9570
+plateau,Lip. + noise,run_1,0.9566
+plateau,Lip. + search,run_1,0.9810
+plateau,Lip. + search,run_2,0.9492

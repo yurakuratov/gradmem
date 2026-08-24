@@ -1,0 +1,4890 @@
+[
+  {
+    "alias": "10000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-10000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-10000",
+        "alias": "10000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.015,
+        "value_1_ce": 5.406530226421356,
+        "value_2_ce": 4.494423070502282,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.015,
+        "neither_correct": 0.985,
+        "gradient_norm": 16.133867716789247,
+        "memory_norm": 0.8680090309143066,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 12.309503127527236,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 0.003643760188703891,
+        "write_key_2_reconstruction_ce": 5.112978225433826,
+        "write_key_2_reconstruction_accuracy": 0.0002,
+        "write_key_2_energy": 0.0035247691487660633,
+        "write_value_1_reconstruction_ce": 5.903265785962343,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 7.292232170947641,
+        "write_value_2_reconstruction_ce": 4.560224926529825,
+        "write_value_2_reconstruction_accuracy": 0.01385,
+        "write_value_2_energy": 7.3884537254352125,
+        "write_syntax_reconstruction_ce": 6.758001245421777,
+        "write_syntax_reconstruction_accuracy": 0.04,
+        "write_syntax_energy": 0.6062057828728408,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[PAD]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 4925,
+        "value_2_top_error_predictions": [
+          {
+            "token": "V",
+            "count": 920
+          },
+          {
+            "token": "d",
+            "count": 472
+          },
+          {
+            "token": "c",
+            "count": 375
+          },
+          {
+            "token": "w",
+            "count": 272
+          },
+          {
+            "token": "[BOS]",
+            "count": 202
+          },
+          {
+            "token": "x",
+            "count": 164
+          },
+          {
+            "token": "H",
+            "count": 154
+          },
+          {
+            "token": "Q",
+            "count": 100
+          },
+          {
+            "token": "m",
+            "count": 90
+          },
+          {
+            "token": "F",
+            "count": 89
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-10000",
+        "alias": "10000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1056,
+        "value_2_accuracy": 0.1038,
+        "value_1_ce": 2.9623866196870803,
+        "value_2_ce": 2.979559651517868,
+        "exact_match": 0.0094,
+        "only_value_1_correct": 0.0962,
+        "only_value_2_correct": 0.0944,
+        "neither_correct": 0.8,
+        "gradient_norm": 2.5108205148339273,
+        "memory_norm": 6.5111233132362365,
+        "delta_memory_norm": 6.453547185134887,
+        "write_key_1_reconstruction_ce": 13.796584901928902,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 4.172420435845432,
+        "write_key_2_reconstruction_ce": 6.206829544480145,
+        "write_key_2_reconstruction_accuracy": 0.00785,
+        "write_key_2_energy": 3.9389022867387626,
+        "write_value_1_reconstruction_ce": 3.9244214818418026,
+        "write_value_1_reconstruction_accuracy": 0.050625,
+        "write_value_1_energy": 4.96786017487743,
+        "write_value_2_reconstruction_ce": 5.793471261435747,
+        "write_value_2_reconstruction_accuracy": 0.030825,
+        "write_value_2_energy": 6.491737334301835,
+        "write_syntax_reconstruction_ce": 6.771378758963896,
+        "write_syntax_reconstruction_accuracy": 0.269824,
+        "write_syntax_energy": 1.0347864341251627,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4472,
+        "value_1_top_error_predictions": [
+          {
+            "token": "H",
+            "count": 207
+          },
+          {
+            "token": "r",
+            "count": 197
+          },
+          {
+            "token": "Y",
+            "count": 171
+          },
+          {
+            "token": "j",
+            "count": 148
+          },
+          {
+            "token": "s",
+            "count": 131
+          },
+          {
+            "token": "v",
+            "count": 130
+          },
+          {
+            "token": "J",
+            "count": 128
+          },
+          {
+            "token": "S",
+            "count": 126
+          },
+          {
+            "token": "k",
+            "count": 123
+          },
+          {
+            "token": "1",
+            "count": 116
+          }
+        ],
+        "value_2_error_count": 4481,
+        "value_2_top_error_predictions": [
+          {
+            "token": "H",
+            "count": 190
+          },
+          {
+            "token": "r",
+            "count": 189
+          },
+          {
+            "token": "Y",
+            "count": 171
+          },
+          {
+            "token": "s",
+            "count": 143
+          },
+          {
+            "token": "v",
+            "count": 139
+          },
+          {
+            "token": "k",
+            "count": 135
+          },
+          {
+            "token": "j",
+            "count": 133
+          },
+          {
+            "token": "J",
+            "count": 133
+          },
+          {
+            "token": "S",
+            "count": 129
+          },
+          {
+            "token": "e",
+            "count": 127
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-10000",
+        "alias": "10000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1048,
+        "value_2_accuracy": 0.1058,
+        "value_1_ce": 2.9359792079687117,
+        "value_2_ce": 2.950185896599293,
+        "exact_match": 0.0098,
+        "only_value_1_correct": 0.095,
+        "only_value_2_correct": 0.096,
+        "neither_correct": 0.7992,
+        "gradient_norm": 0.9435470853477717,
+        "memory_norm": 6.633033658695221,
+        "delta_memory_norm": 6.57816119852066,
+        "write_key_1_reconstruction_ce": 13.626364654016495,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 2.013690855423501,
+        "write_key_2_reconstruction_ce": 5.430597861753404,
+        "write_key_2_reconstruction_accuracy": 0.012525,
+        "write_key_2_energy": 1.794666511880327,
+        "write_value_1_reconstruction_ce": 3.737801788218319,
+        "write_value_1_reconstruction_accuracy": 0.0641,
+        "write_value_1_energy": 1.790692538914131,
+        "write_value_2_reconstruction_ce": 4.232260960423947,
+        "write_value_2_reconstruction_accuracy": 0.05395,
+        "write_value_2_energy": 3.5699986423443537,
+        "write_syntax_reconstruction_ce": 7.152501422107966,
+        "write_syntax_reconstruction_accuracy": 0.176808,
+        "write_syntax_energy": 0.5986860869258046,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4476,
+        "value_1_top_error_predictions": [
+          {
+            "token": "H",
+            "count": 240
+          },
+          {
+            "token": "r",
+            "count": 235
+          },
+          {
+            "token": "s",
+            "count": 183
+          },
+          {
+            "token": "Y",
+            "count": 152
+          },
+          {
+            "token": "v",
+            "count": 145
+          },
+          {
+            "token": "1",
+            "count": 136
+          },
+          {
+            "token": "k",
+            "count": 129
+          },
+          {
+            "token": "i",
+            "count": 128
+          },
+          {
+            "token": "J",
+            "count": 122
+          },
+          {
+            "token": "d",
+            "count": 116
+          }
+        ],
+        "value_2_error_count": 4471,
+        "value_2_top_error_predictions": [
+          {
+            "token": "H",
+            "count": 235
+          },
+          {
+            "token": "r",
+            "count": 225
+          },
+          {
+            "token": "s",
+            "count": 176
+          },
+          {
+            "token": "Y",
+            "count": 158
+          },
+          {
+            "token": "k",
+            "count": 154
+          },
+          {
+            "token": "v",
+            "count": 149
+          },
+          {
+            "token": "J",
+            "count": 129
+          },
+          {
+            "token": "1",
+            "count": 129
+          },
+          {
+            "token": "i",
+            "count": 112
+          },
+          {
+            "token": "d",
+            "count": 110
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "12500",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-12500",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-12500",
+        "alias": "12500",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0156,
+        "value_1_ce": 5.146754114580155,
+        "value_2_ce": 4.550812874341011,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0156,
+        "neither_correct": 0.9844,
+        "gradient_norm": 30.98871568183899,
+        "memory_norm": 0.8958035111427307,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 13.105458822512627,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 0.002897116646001814,
+        "write_key_2_reconstruction_ce": 5.036701754707098,
+        "write_key_2_reconstruction_accuracy": 0.00045,
+        "write_key_2_energy": 0.0017814569689740892,
+        "write_value_1_reconstruction_ce": 6.12511851580739,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 12.601054389083385,
+        "write_value_2_reconstruction_ce": 4.5360949317589405,
+        "write_value_2_reconstruction_accuracy": 0.0162,
+        "write_value_2_energy": 10.796361601099372,
+        "write_syntax_reconstruction_ce": 7.137710875534421,
+        "write_syntax_reconstruction_accuracy": 0.04,
+        "write_syntax_energy": 0.6499510432119188,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[PAD]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 4922,
+        "value_2_top_error_predictions": [
+          {
+            "token": "d",
+            "count": 1202
+          },
+          {
+            "token": "c",
+            "count": 1084
+          },
+          {
+            "token": "V",
+            "count": 566
+          },
+          {
+            "token": "[BOS]",
+            "count": 183
+          },
+          {
+            "token": "C",
+            "count": 158
+          },
+          {
+            "token": "w",
+            "count": 128
+          },
+          {
+            "token": "F",
+            "count": 89
+          },
+          {
+            "token": "g",
+            "count": 87
+          },
+          {
+            "token": "v",
+            "count": 87
+          },
+          {
+            "token": "R",
+            "count": 87
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-12500",
+        "alias": "12500",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1498,
+        "value_2_accuracy": 0.151,
+        "value_1_ce": 2.6154011619389057,
+        "value_2_ce": 2.5988661724209785,
+        "exact_match": 0.0222,
+        "only_value_1_correct": 0.1276,
+        "only_value_2_correct": 0.1288,
+        "neither_correct": 0.7214,
+        "gradient_norm": 6.11673353395462,
+        "memory_norm": 12.427447762680053,
+        "delta_memory_norm": 12.395486485862731,
+        "write_key_1_reconstruction_ce": 14.903227677059174,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 12.387165399763699,
+        "write_key_2_reconstruction_ce": 7.5285689148440955,
+        "write_key_2_reconstruction_accuracy": 0.002175,
+        "write_key_2_energy": 12.050286317301373,
+        "write_value_1_reconstruction_ce": 5.035262208700925,
+        "write_value_1_reconstruction_accuracy": 0.021,
+        "write_value_1_energy": 14.072161108436156,
+        "write_value_2_reconstruction_ce": 7.006401827153564,
+        "write_value_2_reconstruction_accuracy": 0.021225,
+        "write_value_2_energy": 17.429053685540612,
+        "write_syntax_reconstruction_ce": 6.698349722186343,
+        "write_syntax_reconstruction_accuracy": 0.355672,
+        "write_syntax_energy": 5.927281981043198,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4251,
+        "value_1_top_error_predictions": [
+          {
+            "token": "j",
+            "count": 172
+          },
+          {
+            "token": "0",
+            "count": 158
+          },
+          {
+            "token": "F",
+            "count": 151
+          },
+          {
+            "token": "p",
+            "count": 139
+          },
+          {
+            "token": "T",
+            "count": 136
+          },
+          {
+            "token": "N",
+            "count": 131
+          },
+          {
+            "token": "q",
+            "count": 128
+          },
+          {
+            "token": "D",
+            "count": 124
+          },
+          {
+            "token": "y",
+            "count": 119
+          },
+          {
+            "token": "a",
+            "count": 119
+          }
+        ],
+        "value_2_error_count": 4245,
+        "value_2_top_error_predictions": [
+          {
+            "token": "6",
+            "count": 174
+          },
+          {
+            "token": "0",
+            "count": 171
+          },
+          {
+            "token": "F",
+            "count": 154
+          },
+          {
+            "token": "C",
+            "count": 135
+          },
+          {
+            "token": "5",
+            "count": 131
+          },
+          {
+            "token": "N",
+            "count": 131
+          },
+          {
+            "token": "E",
+            "count": 130
+          },
+          {
+            "token": "f",
+            "count": 125
+          },
+          {
+            "token": "j",
+            "count": 122
+          },
+          {
+            "token": "q",
+            "count": 118
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-12500",
+        "alias": "12500",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1478,
+        "value_2_accuracy": 0.154,
+        "value_1_ce": 2.531252434909344,
+        "value_2_ce": 2.532362285864353,
+        "exact_match": 0.0222,
+        "only_value_1_correct": 0.1256,
+        "only_value_2_correct": 0.1318,
+        "neither_correct": 0.7204,
+        "gradient_norm": 1.3167329163730144,
+        "memory_norm": 12.744598030471801,
+        "delta_memory_norm": 12.708341422271728,
+        "write_key_1_reconstruction_ce": 14.424678225922584,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 3.9113961680672333,
+        "write_key_2_reconstruction_ce": 5.55801308568269,
+        "write_key_2_reconstruction_accuracy": 0.007925,
+        "write_key_2_energy": 3.781413770981191,
+        "write_value_1_reconstruction_ce": 3.668286039432138,
+        "write_value_1_reconstruction_accuracy": 0.05155,
+        "write_value_1_energy": 1.937617729102727,
+        "write_value_2_reconstruction_ce": 4.015669120552391,
+        "write_value_2_reconstruction_accuracy": 0.0334,
+        "write_value_2_energy": 5.202532153189927,
+        "write_syntax_reconstruction_ce": 6.994635393429381,
+        "write_syntax_reconstruction_accuracy": 0.314592,
+        "write_syntax_energy": 1.5757390740607922,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4261,
+        "value_1_top_error_predictions": [
+          {
+            "token": "p",
+            "count": 222
+          },
+          {
+            "token": "j",
+            "count": 200
+          },
+          {
+            "token": "T",
+            "count": 167
+          },
+          {
+            "token": "N",
+            "count": 145
+          },
+          {
+            "token": "K",
+            "count": 135
+          },
+          {
+            "token": "S",
+            "count": 127
+          },
+          {
+            "token": "q",
+            "count": 120
+          },
+          {
+            "token": "E",
+            "count": 116
+          },
+          {
+            "token": "0",
+            "count": 115
+          },
+          {
+            "token": "F",
+            "count": 111
+          }
+        ],
+        "value_2_error_count": 4230,
+        "value_2_top_error_predictions": [
+          {
+            "token": "6",
+            "count": 223
+          },
+          {
+            "token": "y",
+            "count": 182
+          },
+          {
+            "token": "j",
+            "count": 173
+          },
+          {
+            "token": "0",
+            "count": 166
+          },
+          {
+            "token": "q",
+            "count": 147
+          },
+          {
+            "token": "C",
+            "count": 145
+          },
+          {
+            "token": "I",
+            "count": 143
+          },
+          {
+            "token": "5",
+            "count": 134
+          },
+          {
+            "token": "K",
+            "count": 130
+          },
+          {
+            "token": "4",
+            "count": 130
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "15000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-15000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-15000",
+        "alias": "15000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0152,
+        "value_2_accuracy": 0.0154,
+        "value_1_ce": 4.694305453157425,
+        "value_2_ce": 4.556951147127151,
+        "exact_match": 0.0004,
+        "only_value_1_correct": 0.0148,
+        "only_value_2_correct": 0.015,
+        "neither_correct": 0.9698,
+        "gradient_norm": 31.845574951553345,
+        "memory_norm": 0.9300293326377869,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 14.367212943816185,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 0.0002456462379663208,
+        "write_key_2_reconstruction_ce": 4.748514276394248,
+        "write_key_2_reconstruction_accuracy": 0.006,
+        "write_key_2_energy": 0.00018494353277874324,
+        "write_value_1_reconstruction_ce": 5.284437440556288,
+        "write_value_1_reconstruction_accuracy": 2.5e-05,
+        "write_value_1_energy": 16.980658724164964,
+        "write_value_2_reconstruction_ce": 4.522705539384484,
+        "write_value_2_reconstruction_accuracy": 0.01605,
+        "write_value_2_energy": 13.77647370005846,
+        "write_syntax_reconstruction_ce": 7.4626991487896195,
+        "write_syntax_reconstruction_accuracy": 0.04,
+        "write_syntax_energy": 0.6229909097199071,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4924,
+        "value_1_top_error_predictions": [
+          {
+            "token": "o",
+            "count": 4757
+          },
+          {
+            "token": "[PAD]",
+            "count": 167
+          }
+        ],
+        "value_2_error_count": 4923,
+        "value_2_top_error_predictions": [
+          {
+            "token": "d",
+            "count": 2101
+          },
+          {
+            "token": "V",
+            "count": 927
+          },
+          {
+            "token": "c",
+            "count": 523
+          },
+          {
+            "token": "f",
+            "count": 100
+          },
+          {
+            "token": "a",
+            "count": 91
+          },
+          {
+            "token": "F",
+            "count": 89
+          },
+          {
+            "token": "z",
+            "count": 88
+          },
+          {
+            "token": "g",
+            "count": 87
+          },
+          {
+            "token": "0",
+            "count": 87
+          },
+          {
+            "token": "H",
+            "count": 85
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-15000",
+        "alias": "15000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1646,
+        "value_2_accuracy": 0.1622,
+        "value_1_ce": 2.2015688971042633,
+        "value_2_ce": 2.216825711166859,
+        "exact_match": 0.03,
+        "only_value_1_correct": 0.1346,
+        "only_value_2_correct": 0.1322,
+        "neither_correct": 0.7032,
+        "gradient_norm": 5.950583415794372,
+        "memory_norm": 12.77093075428009,
+        "delta_memory_norm": 12.738230199432373,
+        "write_key_1_reconstruction_ce": 16.821062793254853,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 10.356495256501942,
+        "write_key_2_reconstruction_ce": 7.1857299223572015,
+        "write_key_2_reconstruction_accuracy": 0.001925,
+        "write_key_2_energy": 8.75515642870763,
+        "write_value_1_reconstruction_ce": 5.3444560970529915,
+        "write_value_1_reconstruction_accuracy": 0.020425,
+        "write_value_1_energy": 13.205443487974861,
+        "write_value_2_reconstruction_ce": 6.494343109723926,
+        "write_value_2_reconstruction_accuracy": 0.015225,
+        "write_value_2_energy": 19.016302259376925,
+        "write_syntax_reconstruction_ce": 7.229598141750984,
+        "write_syntax_reconstruction_accuracy": 0.358352,
+        "write_syntax_energy": 6.57400949479183,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4177,
+        "value_1_top_error_predictions": [
+          {
+            "token": "s",
+            "count": 224
+          },
+          {
+            "token": "j",
+            "count": 221
+          },
+          {
+            "token": "B",
+            "count": 143
+          },
+          {
+            "token": "d",
+            "count": 139
+          },
+          {
+            "token": "F",
+            "count": 136
+          },
+          {
+            "token": "n",
+            "count": 131
+          },
+          {
+            "token": "p",
+            "count": 122
+          },
+          {
+            "token": "0",
+            "count": 119
+          },
+          {
+            "token": "c",
+            "count": 112
+          },
+          {
+            "token": "Y",
+            "count": 109
+          }
+        ],
+        "value_2_error_count": 4189,
+        "value_2_top_error_predictions": [
+          {
+            "token": "j",
+            "count": 191
+          },
+          {
+            "token": "w",
+            "count": 186
+          },
+          {
+            "token": "d",
+            "count": 184
+          },
+          {
+            "token": "F",
+            "count": 174
+          },
+          {
+            "token": "n",
+            "count": 159
+          },
+          {
+            "token": "c",
+            "count": 151
+          },
+          {
+            "token": "s",
+            "count": 147
+          },
+          {
+            "token": "X",
+            "count": 141
+          },
+          {
+            "token": "q",
+            "count": 138
+          },
+          {
+            "token": "V",
+            "count": 121
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-15000",
+        "alias": "15000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1636,
+        "value_2_accuracy": 0.157,
+        "value_1_ce": 2.1689592745661734,
+        "value_2_ce": 2.1764729483246805,
+        "exact_match": 0.0278,
+        "only_value_1_correct": 0.1358,
+        "only_value_2_correct": 0.1292,
+        "neither_correct": 0.7072,
+        "gradient_norm": 1.492059953057766,
+        "memory_norm": 13.049192443084717,
+        "delta_memory_norm": 13.029091474342346,
+        "write_key_1_reconstruction_ce": 16.48357146859169,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 3.5753575341682313,
+        "write_key_2_reconstruction_ce": 5.719948391902447,
+        "write_key_2_reconstruction_accuracy": 0.0017,
+        "write_key_2_energy": 2.8713354220254157,
+        "write_value_1_reconstruction_ce": 4.129631367936731,
+        "write_value_1_reconstruction_accuracy": 0.0303,
+        "write_value_1_energy": 1.5942060562748461,
+        "write_value_2_reconstruction_ce": 3.833732569719851,
+        "write_value_2_reconstruction_accuracy": 0.031075,
+        "write_value_2_energy": 6.798303719061404,
+        "write_syntax_reconstruction_ce": 7.546799775085125,
+        "write_syntax_reconstruction_accuracy": 0.31256,
+        "write_syntax_energy": 1.7279965190310795,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4182,
+        "value_1_top_error_predictions": [
+          {
+            "token": "s",
+            "count": 260
+          },
+          {
+            "token": "j",
+            "count": 180
+          },
+          {
+            "token": "0",
+            "count": 175
+          },
+          {
+            "token": "d",
+            "count": 155
+          },
+          {
+            "token": "F",
+            "count": 154
+          },
+          {
+            "token": "B",
+            "count": 141
+          },
+          {
+            "token": "t",
+            "count": 127
+          },
+          {
+            "token": "w",
+            "count": 118
+          },
+          {
+            "token": "p",
+            "count": 116
+          },
+          {
+            "token": "6",
+            "count": 108
+          }
+        ],
+        "value_2_error_count": 4215,
+        "value_2_top_error_predictions": [
+          {
+            "token": "w",
+            "count": 246
+          },
+          {
+            "token": "j",
+            "count": 201
+          },
+          {
+            "token": "d",
+            "count": 183
+          },
+          {
+            "token": "s",
+            "count": 181
+          },
+          {
+            "token": "F",
+            "count": 159
+          },
+          {
+            "token": "c",
+            "count": 150
+          },
+          {
+            "token": "H",
+            "count": 144
+          },
+          {
+            "token": "X",
+            "count": 137
+          },
+          {
+            "token": "K",
+            "count": 136
+          },
+          {
+            "token": "n",
+            "count": 123
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "20000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-20000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-20000",
+        "alias": "20000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0156,
+        "value_2_accuracy": 0.0004,
+        "value_1_ce": 4.579429471588135,
+        "value_2_ce": 5.012923554897308,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0156,
+        "only_value_2_correct": 0.0004,
+        "neither_correct": 0.984,
+        "gradient_norm": 44.502009714508056,
+        "memory_norm": 0.976084291934967,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 14.033935938501358,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 1.6903234344795238e-06,
+        "write_key_2_reconstruction_ce": 4.741249069035053,
+        "write_key_2_reconstruction_accuracy": 0.004025,
+        "write_key_2_energy": 1.4068979406715698e-06,
+        "write_value_1_reconstruction_ce": 5.306582779502869,
+        "write_value_1_reconstruction_accuracy": 0.0014,
+        "write_value_1_energy": 27.14151209397316,
+        "write_value_2_reconstruction_ce": 4.819616151598096,
+        "write_value_2_reconstruction_accuracy": 0.004175,
+        "write_value_2_energy": 22.962926382112503,
+        "write_syntax_reconstruction_ce": 7.940074487000105,
+        "write_syntax_reconstruction_accuracy": 0.04,
+        "write_syntax_energy": 1.04708671764466,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4922,
+        "value_1_top_error_predictions": [
+          {
+            "token": "S",
+            "count": 4905
+          },
+          {
+            "token": "7",
+            "count": 15
+          },
+          {
+            "token": "o",
+            "count": 2
+          }
+        ],
+        "value_2_error_count": 4998,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[BOS]",
+            "count": 4920
+          },
+          {
+            "token": "C",
+            "count": 78
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-20000",
+        "alias": "20000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.147,
+        "value_2_accuracy": 0.249,
+        "value_1_ce": 2.165622465646267,
+        "value_2_ce": 1.7963371096208691,
+        "exact_match": 0.042,
+        "only_value_1_correct": 0.105,
+        "only_value_2_correct": 0.207,
+        "neither_correct": 0.646,
+        "gradient_norm": 10.096326933002471,
+        "memory_norm": 17.824482993888854,
+        "delta_memory_norm": 17.80080420856476,
+        "write_key_1_reconstruction_ce": 18.546754607319833,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 18.799659670512625,
+        "write_key_2_reconstruction_ce": 7.209276744934916,
+        "write_key_2_reconstruction_accuracy": 0.001575,
+        "write_key_2_energy": 14.337753931957003,
+        "write_value_1_reconstruction_ce": 6.159399266146123,
+        "write_value_1_reconstruction_accuracy": 0.0209,
+        "write_value_1_energy": 22.750701938276062,
+        "write_value_2_reconstruction_ce": 6.522408752971888,
+        "write_value_2_reconstruction_accuracy": 0.060325,
+        "write_value_2_energy": 35.9378810086821,
+        "write_syntax_reconstruction_ce": 7.18281041012643,
+        "write_syntax_reconstruction_accuracy": 0.355064,
+        "write_syntax_energy": 15.701126125174207,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4265,
+        "value_1_top_error_predictions": [
+          {
+            "token": "b",
+            "count": 218
+          },
+          {
+            "token": "G",
+            "count": 165
+          },
+          {
+            "token": "4",
+            "count": 154
+          },
+          {
+            "token": "q",
+            "count": 152
+          },
+          {
+            "token": "T",
+            "count": 133
+          },
+          {
+            "token": "2",
+            "count": 132
+          },
+          {
+            "token": "l",
+            "count": 130
+          },
+          {
+            "token": "X",
+            "count": 130
+          },
+          {
+            "token": "w",
+            "count": 120
+          },
+          {
+            "token": "D",
+            "count": 120
+          }
+        ],
+        "value_2_error_count": 3755,
+        "value_2_top_error_predictions": [
+          {
+            "token": "b",
+            "count": 212
+          },
+          {
+            "token": "G",
+            "count": 208
+          },
+          {
+            "token": "2",
+            "count": 145
+          },
+          {
+            "token": "L",
+            "count": 142
+          },
+          {
+            "token": "U",
+            "count": 134
+          },
+          {
+            "token": "Q",
+            "count": 119
+          },
+          {
+            "token": "r",
+            "count": 116
+          },
+          {
+            "token": "q",
+            "count": 111
+          },
+          {
+            "token": "1",
+            "count": 107
+          },
+          {
+            "token": "M",
+            "count": 92
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-20000",
+        "alias": "20000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1434,
+        "value_2_accuracy": 0.256,
+        "value_1_ce": 2.1303172076225283,
+        "value_2_ce": 1.7067775296151637,
+        "exact_match": 0.0362,
+        "only_value_1_correct": 0.1072,
+        "only_value_2_correct": 0.2198,
+        "neither_correct": 0.6368,
+        "gradient_norm": 1.9850603939771652,
+        "memory_norm": 18.353565419387817,
+        "delta_memory_norm": 18.350394960021973,
+        "write_key_1_reconstruction_ce": 17.64820684247017,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 5.47421678782452,
+        "write_key_2_reconstruction_ce": 5.692693071555346,
+        "write_key_2_reconstruction_accuracy": 0.002225,
+        "write_key_2_energy": 4.34639761706805,
+        "write_value_1_reconstruction_ce": 5.040287490370869,
+        "write_value_1_reconstruction_accuracy": 0.017425,
+        "write_value_1_energy": 4.457189895635106,
+        "write_value_2_reconstruction_ce": 4.435818592299894,
+        "write_value_2_reconstruction_accuracy": 0.07555,
+        "write_value_2_energy": 8.948632960277278,
+        "write_syntax_reconstruction_ce": 7.815903005552508,
+        "write_syntax_reconstruction_accuracy": 0.212568,
+        "write_syntax_energy": 3.1693004504948714,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4283,
+        "value_1_top_error_predictions": [
+          {
+            "token": "L",
+            "count": 174
+          },
+          {
+            "token": "b",
+            "count": 148
+          },
+          {
+            "token": "X",
+            "count": 138
+          },
+          {
+            "token": "V",
+            "count": 133
+          },
+          {
+            "token": "p",
+            "count": 124
+          },
+          {
+            "token": "T",
+            "count": 123
+          },
+          {
+            "token": "l",
+            "count": 114
+          },
+          {
+            "token": "O",
+            "count": 114
+          },
+          {
+            "token": "2",
+            "count": 113
+          },
+          {
+            "token": "D",
+            "count": 113
+          }
+        ],
+        "value_2_error_count": 3720,
+        "value_2_top_error_predictions": [
+          {
+            "token": "G",
+            "count": 205
+          },
+          {
+            "token": "L",
+            "count": 181
+          },
+          {
+            "token": "b",
+            "count": 160
+          },
+          {
+            "token": "2",
+            "count": 141
+          },
+          {
+            "token": "U",
+            "count": 141
+          },
+          {
+            "token": "S",
+            "count": 118
+          },
+          {
+            "token": "V",
+            "count": 105
+          },
+          {
+            "token": "r",
+            "count": 86
+          },
+          {
+            "token": "p",
+            "count": 85
+          },
+          {
+            "token": "1",
+            "count": 80
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "22500",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-22500",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-22500",
+        "alias": "22500",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 5.325120696544647,
+        "value_2_ce": 5.444952206039429,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 47.10407776794434,
+        "memory_norm": 0.9965653419494629,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 14.046421309828759,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 6.731963156017428e-07,
+        "write_key_2_reconstruction_ce": 5.822266515189409,
+        "write_key_2_reconstruction_accuracy": 0.0,
+        "write_key_2_energy": 4.873377153998604e-07,
+        "write_value_1_reconstruction_ce": 6.202307304668427,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 29.81075194900036,
+        "write_value_2_reconstruction_ce": 5.072089460444451,
+        "write_value_2_reconstruction_accuracy": 0.0007,
+        "write_value_2_energy": 25.20069640233517,
+        "write_syntax_reconstruction_ce": 8.638833678745772,
+        "write_syntax_reconstruction_accuracy": 0.04,
+        "write_syntax_energy": 1.264392065612213,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[BOS]",
+            "count": 3660
+          },
+          {
+            "token": "[UNK]",
+            "count": 1340
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-22500",
+        "alias": "22500",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1596,
+        "value_2_accuracy": 0.2486,
+        "value_1_ce": 2.1296082019209863,
+        "value_2_ce": 1.734826029790938,
+        "exact_match": 0.0404,
+        "only_value_1_correct": 0.1192,
+        "only_value_2_correct": 0.2082,
+        "neither_correct": 0.6322,
+        "gradient_norm": 9.58966941766739,
+        "memory_norm": 18.865268930053713,
+        "delta_memory_norm": 18.841631436157225,
+        "write_key_1_reconstruction_ce": 18.209264958882333,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 29.81573010817972,
+        "write_key_2_reconstruction_ce": 8.587826959054173,
+        "write_key_2_reconstruction_accuracy": 0.002,
+        "write_key_2_energy": 23.53386174234315,
+        "write_value_1_reconstruction_ce": 6.343396970683337,
+        "write_value_1_reconstruction_accuracy": 0.01805,
+        "write_value_1_energy": 28.30562520737364,
+        "write_value_2_reconstruction_ce": 6.976820583935082,
+        "write_value_2_reconstruction_accuracy": 0.055075,
+        "write_value_2_energy": 46.54839924840457,
+        "write_syntax_reconstruction_ce": 7.8441560459837225,
+        "write_syntax_reconstruction_accuracy": 0.358288,
+        "write_syntax_energy": 16.60995063519892,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4202,
+        "value_1_top_error_predictions": [
+          {
+            "token": "n",
+            "count": 276
+          },
+          {
+            "token": "Z",
+            "count": 183
+          },
+          {
+            "token": "f",
+            "count": 183
+          },
+          {
+            "token": "6",
+            "count": 171
+          },
+          {
+            "token": "l",
+            "count": 149
+          },
+          {
+            "token": "A",
+            "count": 129
+          },
+          {
+            "token": "O",
+            "count": 124
+          },
+          {
+            "token": "k",
+            "count": 124
+          },
+          {
+            "token": "z",
+            "count": 110
+          },
+          {
+            "token": "i",
+            "count": 108
+          }
+        ],
+        "value_2_error_count": 3757,
+        "value_2_top_error_predictions": [
+          {
+            "token": "n",
+            "count": 255
+          },
+          {
+            "token": "C",
+            "count": 155
+          },
+          {
+            "token": "l",
+            "count": 141
+          },
+          {
+            "token": "u",
+            "count": 129
+          },
+          {
+            "token": "y",
+            "count": 122
+          },
+          {
+            "token": "f",
+            "count": 122
+          },
+          {
+            "token": "g",
+            "count": 104
+          },
+          {
+            "token": "O",
+            "count": 99
+          },
+          {
+            "token": "k",
+            "count": 92
+          },
+          {
+            "token": "2",
+            "count": 87
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-22500",
+        "alias": "22500",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1536,
+        "value_2_accuracy": 0.255,
+        "value_1_ce": 2.102712111377716,
+        "value_2_ce": 1.660695129339397,
+        "exact_match": 0.0388,
+        "only_value_1_correct": 0.1148,
+        "only_value_2_correct": 0.2162,
+        "neither_correct": 0.6302,
+        "gradient_norm": 1.7244966158509254,
+        "memory_norm": 19.366642919158934,
+        "delta_memory_norm": 19.367952616119386,
+        "write_key_1_reconstruction_ce": 16.8937588991642,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 11.199788672270532,
+        "write_key_2_reconstruction_ce": 7.274856787982583,
+        "write_key_2_reconstruction_accuracy": 0.0019,
+        "write_key_2_energy": 8.151880313743701,
+        "write_value_1_reconstruction_ce": 5.777567919895053,
+        "write_value_1_reconstruction_accuracy": 0.01465,
+        "write_value_1_energy": 7.7590485148644275,
+        "write_value_2_reconstruction_ce": 5.155644109848514,
+        "write_value_2_reconstruction_accuracy": 0.062,
+        "write_value_2_energy": 16.43823091160408,
+        "write_syntax_reconstruction_ce": 8.137654088738485,
+        "write_syntax_reconstruction_accuracy": 0.27552,
+        "write_syntax_energy": 3.540117908052522,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4232,
+        "value_1_top_error_predictions": [
+          {
+            "token": "n",
+            "count": 214
+          },
+          {
+            "token": "Z",
+            "count": 191
+          },
+          {
+            "token": "6",
+            "count": 182
+          },
+          {
+            "token": "K",
+            "count": 173
+          },
+          {
+            "token": "z",
+            "count": 141
+          },
+          {
+            "token": "A",
+            "count": 133
+          },
+          {
+            "token": "k",
+            "count": 132
+          },
+          {
+            "token": "2",
+            "count": 131
+          },
+          {
+            "token": "U",
+            "count": 131
+          },
+          {
+            "token": "f",
+            "count": 129
+          }
+        ],
+        "value_2_error_count": 3725,
+        "value_2_top_error_predictions": [
+          {
+            "token": "n",
+            "count": 186
+          },
+          {
+            "token": "g",
+            "count": 151
+          },
+          {
+            "token": "f",
+            "count": 127
+          },
+          {
+            "token": "2",
+            "count": 116
+          },
+          {
+            "token": "k",
+            "count": 115
+          },
+          {
+            "token": "z",
+            "count": 112
+          },
+          {
+            "token": "K",
+            "count": 112
+          },
+          {
+            "token": "y",
+            "count": 110
+          },
+          {
+            "token": "O",
+            "count": 110
+          },
+          {
+            "token": "x",
+            "count": 101
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "25000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-25000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-25000",
+        "alias": "25000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 5.480920056247712,
+        "value_2_ce": 5.515606054544449,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 50.054762425231935,
+        "memory_norm": 1.0229040384292603,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 12.025428573060037,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 1.372393254555071e-07,
+        "write_key_2_reconstruction_ce": 5.373254664820433,
+        "write_key_2_reconstruction_accuracy": 0.000125,
+        "write_key_2_energy": 9.469112369395738e-08,
+        "write_value_1_reconstruction_ce": 6.222366060209274,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 32.133079105615614,
+        "write_value_2_reconstruction_ce": 5.0130542558789255,
+        "write_value_2_reconstruction_accuracy": 0.000575,
+        "write_value_2_energy": 29.12516063234806,
+        "write_syntax_reconstruction_ce": 7.888201898587651,
+        "write_syntax_reconstruction_accuracy": 0.04,
+        "write_syntax_energy": 1.3916016298643348,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 4997
+          },
+          {
+            "token": "[BOS]",
+            "count": 3
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-25000",
+        "alias": "25000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.146,
+        "value_2_accuracy": 0.3502,
+        "value_1_ce": 2.135068431901932,
+        "value_2_ce": 1.502340131450072,
+        "exact_match": 0.0478,
+        "only_value_1_correct": 0.0982,
+        "only_value_2_correct": 0.3024,
+        "neither_correct": 0.5516,
+        "gradient_norm": 14.752824997043609,
+        "memory_norm": 20.045438162994383,
+        "delta_memory_norm": 20.02190530433655,
+        "write_key_1_reconstruction_ce": 18.18609342162609,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 39.65731000881422,
+        "write_key_2_reconstruction_ce": 9.565508736822382,
+        "write_key_2_reconstruction_accuracy": 0.002075,
+        "write_key_2_energy": 34.09083597879217,
+        "write_value_1_reconstruction_ce": 5.758252863235026,
+        "write_value_1_reconstruction_accuracy": 0.014125,
+        "write_value_1_energy": 29.258394109924648,
+        "write_value_2_reconstruction_ce": 5.325129176907241,
+        "write_value_2_reconstruction_accuracy": 0.073975,
+        "write_value_2_energy": 56.05965202601552,
+        "write_syntax_reconstruction_ce": 8.115706790587577,
+        "write_syntax_reconstruction_accuracy": 0.358304,
+        "write_syntax_energy": 25.361470933825462,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4270,
+        "value_1_top_error_predictions": [
+          {
+            "token": "E",
+            "count": 286
+          },
+          {
+            "token": "g",
+            "count": 197
+          },
+          {
+            "token": "e",
+            "count": 161
+          },
+          {
+            "token": "H",
+            "count": 142
+          },
+          {
+            "token": "9",
+            "count": 138
+          },
+          {
+            "token": "3",
+            "count": 130
+          },
+          {
+            "token": "i",
+            "count": 129
+          },
+          {
+            "token": "l",
+            "count": 128
+          },
+          {
+            "token": "o",
+            "count": 121
+          },
+          {
+            "token": "v",
+            "count": 121
+          }
+        ],
+        "value_2_error_count": 3249,
+        "value_2_top_error_predictions": [
+          {
+            "token": "E",
+            "count": 167
+          },
+          {
+            "token": "g",
+            "count": 154
+          },
+          {
+            "token": "R",
+            "count": 115
+          },
+          {
+            "token": "8",
+            "count": 115
+          },
+          {
+            "token": "0",
+            "count": 105
+          },
+          {
+            "token": "9",
+            "count": 104
+          },
+          {
+            "token": "o",
+            "count": 102
+          },
+          {
+            "token": "l",
+            "count": 102
+          },
+          {
+            "token": "y",
+            "count": 98
+          },
+          {
+            "token": "A",
+            "count": 92
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-25000",
+        "alias": "25000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.152,
+        "value_2_accuracy": 0.3652,
+        "value_1_ce": 2.1060549548864365,
+        "value_2_ce": 1.354607567631267,
+        "exact_match": 0.0566,
+        "only_value_1_correct": 0.0954,
+        "only_value_2_correct": 0.3086,
+        "neither_correct": 0.5394,
+        "gradient_norm": 3.9539252876281736,
+        "memory_norm": 21.049079517745973,
+        "delta_memory_norm": 21.055603593063353,
+        "write_key_1_reconstruction_ce": 17.38004318358898,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 13.29893985687763,
+        "write_key_2_reconstruction_ce": 7.838790535269678,
+        "write_key_2_reconstruction_accuracy": 0.001775,
+        "write_key_2_energy": 9.731764194973776,
+        "write_value_1_reconstruction_ce": 5.9377846154764296,
+        "write_value_1_reconstruction_accuracy": 0.012,
+        "write_value_1_energy": 13.530653320678164,
+        "write_value_2_reconstruction_ce": 4.851305509368516,
+        "write_value_2_reconstruction_accuracy": 0.100975,
+        "write_value_2_energy": 23.30337032267933,
+        "write_syntax_reconstruction_ce": 8.30854644436303,
+        "write_syntax_reconstruction_accuracy": 0.197112,
+        "write_syntax_energy": 8.733868873475311,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4240,
+        "value_1_top_error_predictions": [
+          {
+            "token": "D",
+            "count": 203
+          },
+          {
+            "token": "g",
+            "count": 171
+          },
+          {
+            "token": "6",
+            "count": 150
+          },
+          {
+            "token": "9",
+            "count": 137
+          },
+          {
+            "token": "3",
+            "count": 128
+          },
+          {
+            "token": "E",
+            "count": 128
+          },
+          {
+            "token": "Z",
+            "count": 124
+          },
+          {
+            "token": "M",
+            "count": 119
+          },
+          {
+            "token": "A",
+            "count": 118
+          },
+          {
+            "token": "e",
+            "count": 116
+          }
+        ],
+        "value_2_error_count": 3174,
+        "value_2_top_error_predictions": [
+          {
+            "token": "9",
+            "count": 125
+          },
+          {
+            "token": "A",
+            "count": 114
+          },
+          {
+            "token": "E",
+            "count": 114
+          },
+          {
+            "token": "g",
+            "count": 109
+          },
+          {
+            "token": "y",
+            "count": 103
+          },
+          {
+            "token": "R",
+            "count": 101
+          },
+          {
+            "token": "0",
+            "count": 96
+          },
+          {
+            "token": "l",
+            "count": 93
+          },
+          {
+            "token": "o",
+            "count": 88
+          },
+          {
+            "token": "z",
+            "count": 83
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "30000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-30000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-30000",
+        "alias": "30000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 7.6422142069816585,
+        "value_2_ce": 7.145106603527069,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 62.9184912902832,
+        "memory_norm": 1.0661839246749878,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 10.541206387615205,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 0.023560884979704416,
+        "write_key_2_reconstruction_ce": 5.571252130109071,
+        "write_key_2_reconstruction_accuracy": 0.00035,
+        "write_key_2_energy": 0.04714137576755314,
+        "write_value_1_reconstruction_ce": 5.886222509121895,
+        "write_value_1_reconstruction_accuracy": 2.5e-05,
+        "write_value_1_energy": 47.05598190546036,
+        "write_value_2_reconstruction_ce": 5.371791062802076,
+        "write_value_2_reconstruction_accuracy": 0.0,
+        "write_value_2_energy": 41.043869244480135,
+        "write_syntax_reconstruction_ce": 7.812353209152807,
+        "write_syntax_reconstruction_accuracy": 0.04,
+        "write_syntax_energy": 2.6487577593514198,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-30000",
+        "alias": "30000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1456,
+        "value_2_accuracy": 0.3744,
+        "value_1_ce": 2.1113743552684783,
+        "value_2_ce": 1.3772608922853136,
+        "exact_match": 0.0494,
+        "only_value_1_correct": 0.0962,
+        "only_value_2_correct": 0.325,
+        "neither_correct": 0.5294,
+        "gradient_norm": 9.877536421966553,
+        "memory_norm": 25.186738054275512,
+        "delta_memory_norm": 25.167396966552733,
+        "write_key_1_reconstruction_ce": 17.20297845466137,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 56.978638446874626,
+        "write_key_2_reconstruction_ce": 10.513191084393114,
+        "write_key_2_reconstruction_accuracy": 0.001925,
+        "write_key_2_energy": 51.44441108501089,
+        "write_value_1_reconstruction_ce": 6.801380083167553,
+        "write_value_1_reconstruction_accuracy": 0.015375,
+        "write_value_1_energy": 49.46519869220917,
+        "write_value_2_reconstruction_ce": 7.772148674035445,
+        "write_value_2_reconstruction_accuracy": 0.0642,
+        "write_value_2_energy": 79.02626349853985,
+        "write_syntax_reconstruction_ce": 8.491069654969536,
+        "write_syntax_reconstruction_accuracy": 0.34016,
+        "write_syntax_energy": 30.474036425773306,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4272,
+        "value_1_top_error_predictions": [
+          {
+            "token": "d",
+            "count": 215
+          },
+          {
+            "token": "a",
+            "count": 184
+          },
+          {
+            "token": "D",
+            "count": 163
+          },
+          {
+            "token": "q",
+            "count": 157
+          },
+          {
+            "token": "C",
+            "count": 157
+          },
+          {
+            "token": "G",
+            "count": 155
+          },
+          {
+            "token": "H",
+            "count": 128
+          },
+          {
+            "token": "F",
+            "count": 124
+          },
+          {
+            "token": "K",
+            "count": 121
+          },
+          {
+            "token": "5",
+            "count": 115
+          }
+        ],
+        "value_2_error_count": 3128,
+        "value_2_top_error_predictions": [
+          {
+            "token": "d",
+            "count": 114
+          },
+          {
+            "token": "F",
+            "count": 106
+          },
+          {
+            "token": "q",
+            "count": 105
+          },
+          {
+            "token": "X",
+            "count": 101
+          },
+          {
+            "token": "A",
+            "count": 100
+          },
+          {
+            "token": "V",
+            "count": 99
+          },
+          {
+            "token": "K",
+            "count": 93
+          },
+          {
+            "token": "3",
+            "count": 92
+          },
+          {
+            "token": "Q",
+            "count": 88
+          },
+          {
+            "token": "v",
+            "count": 88
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-30000",
+        "alias": "30000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1476,
+        "value_2_accuracy": 0.3714,
+        "value_1_ce": 2.0907168330669403,
+        "value_2_ce": 1.3139210947724524,
+        "exact_match": 0.049,
+        "only_value_1_correct": 0.0986,
+        "only_value_2_correct": 0.3224,
+        "neither_correct": 0.53,
+        "gradient_norm": 4.555764507913589,
+        "memory_norm": 25.622022973251344,
+        "delta_memory_norm": 25.620476253890992,
+        "write_key_1_reconstruction_ce": 16.832046080040932,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 25.753137121451566,
+        "write_key_2_reconstruction_ce": 9.617700990288332,
+        "write_key_2_reconstruction_accuracy": 0.001775,
+        "write_key_2_energy": 20.496084844814362,
+        "write_value_1_reconstruction_ce": 6.416601524807513,
+        "write_value_1_reconstruction_accuracy": 0.0148,
+        "write_value_1_energy": 17.637680136850186,
+        "write_value_2_reconstruction_ce": 7.083776183511969,
+        "write_value_2_reconstruction_accuracy": 0.0746,
+        "write_value_2_energy": 44.199335349938345,
+        "write_syntax_reconstruction_ce": 8.948555950634193,
+        "write_syntax_reconstruction_accuracy": 0.164952,
+        "write_syntax_energy": 12.152187222506615,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4262,
+        "value_1_top_error_predictions": [
+          {
+            "token": "d",
+            "count": 229
+          },
+          {
+            "token": "F",
+            "count": 169
+          },
+          {
+            "token": "G",
+            "count": 162
+          },
+          {
+            "token": "D",
+            "count": 150
+          },
+          {
+            "token": "q",
+            "count": 138
+          },
+          {
+            "token": "a",
+            "count": 138
+          },
+          {
+            "token": "C",
+            "count": 113
+          },
+          {
+            "token": "H",
+            "count": 105
+          },
+          {
+            "token": "x",
+            "count": 104
+          },
+          {
+            "token": "5",
+            "count": 103
+          }
+        ],
+        "value_2_error_count": 3143,
+        "value_2_top_error_predictions": [
+          {
+            "token": "d",
+            "count": 122
+          },
+          {
+            "token": "F",
+            "count": 116
+          },
+          {
+            "token": "V",
+            "count": 114
+          },
+          {
+            "token": "X",
+            "count": 106
+          },
+          {
+            "token": "q",
+            "count": 105
+          },
+          {
+            "token": "3",
+            "count": 100
+          },
+          {
+            "token": "v",
+            "count": 96
+          },
+          {
+            "token": "Y",
+            "count": 93
+          },
+          {
+            "token": "A",
+            "count": 83
+          },
+          {
+            "token": "I",
+            "count": 83
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "32500",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-32500",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-32500",
+        "alias": "32500",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 7.385180525875092,
+        "value_2_ce": 6.0913294833183285,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 58.64047644500732,
+        "memory_norm": 1.089050054550171,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 10.051124863028527,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 0.010711738439714385,
+        "write_key_2_reconstruction_ce": 5.686475580668449,
+        "write_key_2_reconstruction_accuracy": 0.0,
+        "write_key_2_energy": 0.05760912028822759,
+        "write_value_1_reconstruction_ce": 7.1992872394025325,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 45.41684877707958,
+        "write_value_2_reconstruction_ce": 5.505861869388819,
+        "write_value_2_reconstruction_accuracy": 0.0,
+        "write_value_2_energy": 40.738686815071105,
+        "write_syntax_reconstruction_ce": 8.041066569708466,
+        "write_syntax_reconstruction_accuracy": 0.039352,
+        "write_syntax_energy": 1.9350254872910833,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-32500",
+        "alias": "32500",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1492,
+        "value_2_accuracy": 0.369,
+        "value_1_ce": 2.116211590719223,
+        "value_2_ce": 1.36825469640214,
+        "exact_match": 0.0546,
+        "only_value_1_correct": 0.0946,
+        "only_value_2_correct": 0.3144,
+        "neither_correct": 0.5364,
+        "gradient_norm": 11.9444485830307,
+        "memory_norm": 23.47893746032715,
+        "delta_memory_norm": 23.456190983581543,
+        "write_key_1_reconstruction_ce": 17.614156546497345,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 62.98500782531267,
+        "write_key_2_reconstruction_ce": 11.243650444051251,
+        "write_key_2_reconstruction_accuracy": 0.0017,
+        "write_key_2_energy": 52.784183396209855,
+        "write_value_1_reconstruction_ce": 7.119351853941381,
+        "write_value_1_reconstruction_accuracy": 0.02035,
+        "write_value_1_energy": 59.21039752140961,
+        "write_value_2_reconstruction_ce": 7.901824258895777,
+        "write_value_2_reconstruction_accuracy": 0.06105,
+        "write_value_2_energy": 99.56631464624405,
+        "write_syntax_reconstruction_ce": 8.471504606442652,
+        "write_syntax_reconstruction_accuracy": 0.36208,
+        "write_syntax_energy": 42.228668815125744,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4254,
+        "value_1_top_error_predictions": [
+          {
+            "token": "k",
+            "count": 186
+          },
+          {
+            "token": "L",
+            "count": 171
+          },
+          {
+            "token": "j",
+            "count": 155
+          },
+          {
+            "token": "e",
+            "count": 150
+          },
+          {
+            "token": "A",
+            "count": 149
+          },
+          {
+            "token": "0",
+            "count": 123
+          },
+          {
+            "token": "C",
+            "count": 122
+          },
+          {
+            "token": "6",
+            "count": 120
+          },
+          {
+            "token": "c",
+            "count": 113
+          },
+          {
+            "token": "Y",
+            "count": 105
+          }
+        ],
+        "value_2_error_count": 3155,
+        "value_2_top_error_predictions": [
+          {
+            "token": "c",
+            "count": 147
+          },
+          {
+            "token": "p",
+            "count": 123
+          },
+          {
+            "token": "J",
+            "count": 108
+          },
+          {
+            "token": "k",
+            "count": 107
+          },
+          {
+            "token": "e",
+            "count": 107
+          },
+          {
+            "token": "t",
+            "count": 101
+          },
+          {
+            "token": "b",
+            "count": 100
+          },
+          {
+            "token": "R",
+            "count": 98
+          },
+          {
+            "token": "A",
+            "count": 97
+          },
+          {
+            "token": "E",
+            "count": 88
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-32500",
+        "alias": "32500",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1422,
+        "value_2_accuracy": 0.3766,
+        "value_1_ce": 2.099310929822922,
+        "value_2_ce": 1.3002630865181097,
+        "exact_match": 0.0546,
+        "only_value_1_correct": 0.0876,
+        "only_value_2_correct": 0.322,
+        "neither_correct": 0.5358,
+        "gradient_norm": 4.843963289499283,
+        "memory_norm": 24.148754706192015,
+        "delta_memory_norm": 24.152875574493407,
+        "write_key_1_reconstruction_ce": 16.735092313051222,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 20.726467340524714,
+        "write_key_2_reconstruction_ce": 9.107991316584497,
+        "write_key_2_reconstruction_accuracy": 0.001875,
+        "write_key_2_energy": 15.605758857558921,
+        "write_value_1_reconstruction_ce": 6.582437571394443,
+        "write_value_1_reconstruction_accuracy": 0.01735,
+        "write_value_1_energy": 18.349735869321094,
+        "write_value_2_reconstruction_ce": 6.820994766769092,
+        "write_value_2_reconstruction_accuracy": 0.0975,
+        "write_value_2_energy": 57.073368778595935,
+        "write_syntax_reconstruction_ce": 8.68534845531475,
+        "write_syntax_reconstruction_accuracy": 0.235816,
+        "write_syntax_energy": 14.258706694121573,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4289,
+        "value_1_top_error_predictions": [
+          {
+            "token": "k",
+            "count": 225
+          },
+          {
+            "token": "e",
+            "count": 180
+          },
+          {
+            "token": "y",
+            "count": 177
+          },
+          {
+            "token": "L",
+            "count": 155
+          },
+          {
+            "token": "A",
+            "count": 150
+          },
+          {
+            "token": "x",
+            "count": 143
+          },
+          {
+            "token": "R",
+            "count": 142
+          },
+          {
+            "token": "6",
+            "count": 133
+          },
+          {
+            "token": "c",
+            "count": 131
+          },
+          {
+            "token": "C",
+            "count": 123
+          }
+        ],
+        "value_2_error_count": 3117,
+        "value_2_top_error_predictions": [
+          {
+            "token": "k",
+            "count": 135
+          },
+          {
+            "token": "y",
+            "count": 134
+          },
+          {
+            "token": "p",
+            "count": 124
+          },
+          {
+            "token": "c",
+            "count": 123
+          },
+          {
+            "token": "E",
+            "count": 113
+          },
+          {
+            "token": "R",
+            "count": 111
+          },
+          {
+            "token": "e",
+            "count": 108
+          },
+          {
+            "token": "t",
+            "count": 97
+          },
+          {
+            "token": "J",
+            "count": 96
+          },
+          {
+            "token": "A",
+            "count": 80
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "35000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-35000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-35000",
+        "alias": "35000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 7.268772669506073,
+        "value_2_ce": 7.320372668743134,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 69.43673087997436,
+        "memory_norm": 1.1130815744400024,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 11.486021107661724,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 7.23186340542227e-06,
+        "write_key_2_reconstruction_ce": 5.582404757958651,
+        "write_key_2_reconstruction_accuracy": 0.000525,
+        "write_key_2_energy": 1.7664117772819673e-05,
+        "write_value_1_reconstruction_ce": 6.490665200775862,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 57.62558285899162,
+        "write_value_2_reconstruction_ce": 5.547177351897955,
+        "write_value_2_reconstruction_accuracy": 0.0,
+        "write_value_2_energy": 45.31303696346283,
+        "write_syntax_reconstruction_ce": 8.725934309348732,
+        "write_syntax_reconstruction_accuracy": 0.04,
+        "write_syntax_energy": 2.3868511868129834,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-35000",
+        "alias": "35000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1538,
+        "value_2_accuracy": 0.483,
+        "value_1_ce": 2.096108877015114,
+        "value_2_ce": 1.042664348252304,
+        "exact_match": 0.0718,
+        "only_value_1_correct": 0.082,
+        "only_value_2_correct": 0.4112,
+        "neither_correct": 0.435,
+        "gradient_norm": 10.61806886882782,
+        "memory_norm": 27.79485460510254,
+        "delta_memory_norm": 27.774692845153808,
+        "write_key_1_reconstruction_ce": 17.236221487426757,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 65.55551629902436,
+        "write_key_2_reconstruction_ce": 10.564959027575702,
+        "write_key_2_reconstruction_accuracy": 0.001775,
+        "write_key_2_energy": 59.99900740071312,
+        "write_value_1_reconstruction_ce": 7.0630423711083825,
+        "write_value_1_reconstruction_accuracy": 0.019175,
+        "write_value_1_energy": 51.551537770146076,
+        "write_value_2_reconstruction_ce": 7.710591873099841,
+        "write_value_2_reconstruction_accuracy": 0.058675,
+        "write_value_2_energy": 103.49143598831753,
+        "write_syntax_reconstruction_ce": 8.780491333393554,
+        "write_syntax_reconstruction_accuracy": 0.315056,
+        "write_syntax_energy": 19.293091953928247,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4231,
+        "value_1_top_error_predictions": [
+          {
+            "token": "k",
+            "count": 227
+          },
+          {
+            "token": "S",
+            "count": 211
+          },
+          {
+            "token": "2",
+            "count": 149
+          },
+          {
+            "token": "z",
+            "count": 148
+          },
+          {
+            "token": "o",
+            "count": 137
+          },
+          {
+            "token": "H",
+            "count": 136
+          },
+          {
+            "token": "O",
+            "count": 126
+          },
+          {
+            "token": "U",
+            "count": 123
+          },
+          {
+            "token": "Q",
+            "count": 115
+          },
+          {
+            "token": "b",
+            "count": 113
+          }
+        ],
+        "value_2_error_count": 2585,
+        "value_2_top_error_predictions": [
+          {
+            "token": "M",
+            "count": 76
+          },
+          {
+            "token": "z",
+            "count": 73
+          },
+          {
+            "token": "S",
+            "count": 73
+          },
+          {
+            "token": "b",
+            "count": 70
+          },
+          {
+            "token": "c",
+            "count": 69
+          },
+          {
+            "token": "C",
+            "count": 69
+          },
+          {
+            "token": "2",
+            "count": 69
+          },
+          {
+            "token": "k",
+            "count": 68
+          },
+          {
+            "token": "n",
+            "count": 67
+          },
+          {
+            "token": "y",
+            "count": 64
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-35000",
+        "alias": "35000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1506,
+        "value_2_accuracy": 0.49,
+        "value_1_ce": 2.077500175750256,
+        "value_2_ce": 0.9611888370931614,
+        "exact_match": 0.0702,
+        "only_value_1_correct": 0.0804,
+        "only_value_2_correct": 0.4198,
+        "neither_correct": 0.4296,
+        "gradient_norm": 4.226618191576004,
+        "memory_norm": 28.234547497940063,
+        "delta_memory_norm": 28.23200649032593,
+        "write_key_1_reconstruction_ce": 16.422921480441094,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 26.186676341115454,
+        "write_key_2_reconstruction_ce": 9.511201696117222,
+        "write_key_2_reconstruction_accuracy": 0.00155,
+        "write_key_2_energy": 23.15976875401285,
+        "write_value_1_reconstruction_ce": 6.980470649671554,
+        "write_value_1_reconstruction_accuracy": 0.018125,
+        "write_value_1_energy": 24.119248967500045,
+        "write_value_2_reconstruction_ce": 7.168047141819726,
+        "write_value_2_reconstruction_accuracy": 0.064475,
+        "write_value_2_energy": 60.311820929044764,
+        "write_syntax_reconstruction_ce": 8.88104964673563,
+        "write_syntax_reconstruction_accuracy": 0.14572,
+        "write_syntax_energy": 5.132520024887832,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4247,
+        "value_1_top_error_predictions": [
+          {
+            "token": "k",
+            "count": 262
+          },
+          {
+            "token": "o",
+            "count": 191
+          },
+          {
+            "token": "S",
+            "count": 180
+          },
+          {
+            "token": "z",
+            "count": 176
+          },
+          {
+            "token": "O",
+            "count": 161
+          },
+          {
+            "token": "H",
+            "count": 149
+          },
+          {
+            "token": "2",
+            "count": 136
+          },
+          {
+            "token": "Q",
+            "count": 128
+          },
+          {
+            "token": "U",
+            "count": 120
+          },
+          {
+            "token": "c",
+            "count": 112
+          }
+        ],
+        "value_2_error_count": 2550,
+        "value_2_top_error_predictions": [
+          {
+            "token": "k",
+            "count": 85
+          },
+          {
+            "token": "z",
+            "count": 76
+          },
+          {
+            "token": "M",
+            "count": 74
+          },
+          {
+            "token": "R",
+            "count": 70
+          },
+          {
+            "token": "2",
+            "count": 68
+          },
+          {
+            "token": "A",
+            "count": 67
+          },
+          {
+            "token": "x",
+            "count": 67
+          },
+          {
+            "token": "n",
+            "count": 66
+          },
+          {
+            "token": "y",
+            "count": 64
+          },
+          {
+            "token": "S",
+            "count": 64
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "40000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-40000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-40000",
+        "alias": "40000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 7.160982185077668,
+        "value_2_ce": 7.085158686828613,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 72.45242721405029,
+        "memory_norm": 1.1607882976531982,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 13.602042564570905,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 0.0007929550018695142,
+        "write_key_2_reconstruction_ce": 4.840213849288225,
+        "write_key_2_reconstruction_accuracy": 0.001875,
+        "write_key_2_energy": 0.10782105873960703,
+        "write_value_1_reconstruction_ce": 5.982882296937704,
+        "write_value_1_reconstruction_accuracy": 0.0001,
+        "write_value_1_energy": 51.32162557592392,
+        "write_value_2_reconstruction_ce": 6.102232573062182,
+        "write_value_2_reconstruction_accuracy": 0.0,
+        "write_value_2_energy": 47.961301816129684,
+        "write_syntax_reconstruction_ce": 8.66458629198182,
+        "write_syntax_reconstruction_accuracy": 0.04,
+        "write_syntax_energy": 1.8245559321623166,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-40000",
+        "alias": "40000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.147,
+        "value_2_accuracy": 0.4962,
+        "value_1_ce": 2.0912746645212175,
+        "value_2_ce": 0.939035468367394,
+        "exact_match": 0.0686,
+        "only_value_1_correct": 0.0784,
+        "only_value_2_correct": 0.4276,
+        "neither_correct": 0.4254,
+        "gradient_norm": 10.886786026859284,
+        "memory_norm": 29.00331817626953,
+        "delta_memory_norm": 28.98097139778137,
+        "write_key_1_reconstruction_ce": 18.806412197208406,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 54.966581161368985,
+        "write_key_2_reconstruction_ce": 9.493807611492276,
+        "write_key_2_reconstruction_accuracy": 0.0015,
+        "write_key_2_energy": 54.40664601667623,
+        "write_value_1_reconstruction_ce": 6.690135998678953,
+        "write_value_1_reconstruction_accuracy": 0.018675,
+        "write_value_1_energy": 54.294140793579494,
+        "write_value_2_reconstruction_ce": 6.7992293368012175,
+        "write_value_2_reconstruction_accuracy": 0.068725,
+        "write_value_2_energy": 108.21158331969153,
+        "write_syntax_reconstruction_ce": 8.50957923777093,
+        "write_syntax_reconstruction_accuracy": 0.273536,
+        "write_syntax_energy": 42.26102823386261,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4265,
+        "value_1_top_error_predictions": [
+          {
+            "token": "A",
+            "count": 227
+          },
+          {
+            "token": "U",
+            "count": 162
+          },
+          {
+            "token": "j",
+            "count": 159
+          },
+          {
+            "token": "x",
+            "count": 154
+          },
+          {
+            "token": "w",
+            "count": 140
+          },
+          {
+            "token": "a",
+            "count": 131
+          },
+          {
+            "token": "n",
+            "count": 110
+          },
+          {
+            "token": "S",
+            "count": 103
+          },
+          {
+            "token": "W",
+            "count": 103
+          },
+          {
+            "token": "8",
+            "count": 102
+          }
+        ],
+        "value_2_error_count": 2519,
+        "value_2_top_error_predictions": [
+          {
+            "token": "I",
+            "count": 88
+          },
+          {
+            "token": "z",
+            "count": 71
+          },
+          {
+            "token": "c",
+            "count": 70
+          },
+          {
+            "token": "R",
+            "count": 65
+          },
+          {
+            "token": "W",
+            "count": 65
+          },
+          {
+            "token": "A",
+            "count": 64
+          },
+          {
+            "token": "b",
+            "count": 62
+          },
+          {
+            "token": "q",
+            "count": 62
+          },
+          {
+            "token": "M",
+            "count": 61
+          },
+          {
+            "token": "j",
+            "count": 59
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-40000",
+        "alias": "40000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1484,
+        "value_2_accuracy": 0.4974,
+        "value_1_ce": 2.069048909330368,
+        "value_2_ce": 0.8755607844673912,
+        "exact_match": 0.073,
+        "only_value_1_correct": 0.0754,
+        "only_value_2_correct": 0.4244,
+        "neither_correct": 0.4272,
+        "gradient_norm": 4.4870847864151004,
+        "memory_norm": 29.46658401222229,
+        "delta_memory_norm": 29.46459059638977,
+        "write_key_1_reconstruction_ce": 18.112766297602654,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 23.041794347151964,
+        "write_key_2_reconstruction_ce": 8.519127772219479,
+        "write_key_2_reconstruction_accuracy": 0.001675,
+        "write_key_2_energy": 22.128440387552104,
+        "write_value_1_reconstruction_ce": 6.668098365235329,
+        "write_value_1_reconstruction_accuracy": 0.01685,
+        "write_value_1_energy": 26.485483933063236,
+        "write_value_2_reconstruction_ce": 6.399794709410006,
+        "write_value_2_reconstruction_accuracy": 0.114075,
+        "write_value_2_energy": 64.2943649538394,
+        "write_syntax_reconstruction_ce": 8.843635953611289,
+        "write_syntax_reconstruction_accuracy": 0.14172,
+        "write_syntax_energy": 16.723542087496046,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4258,
+        "value_1_top_error_predictions": [
+          {
+            "token": "A",
+            "count": 221
+          },
+          {
+            "token": "j",
+            "count": 140
+          },
+          {
+            "token": "a",
+            "count": 137
+          },
+          {
+            "token": "F",
+            "count": 135
+          },
+          {
+            "token": "e",
+            "count": 129
+          },
+          {
+            "token": "U",
+            "count": 127
+          },
+          {
+            "token": "w",
+            "count": 126
+          },
+          {
+            "token": "x",
+            "count": 125
+          },
+          {
+            "token": "n",
+            "count": 122
+          },
+          {
+            "token": "o",
+            "count": 117
+          }
+        ],
+        "value_2_error_count": 2513,
+        "value_2_top_error_predictions": [
+          {
+            "token": "I",
+            "count": 99
+          },
+          {
+            "token": "R",
+            "count": 76
+          },
+          {
+            "token": "A",
+            "count": 71
+          },
+          {
+            "token": "z",
+            "count": 66
+          },
+          {
+            "token": "M",
+            "count": 66
+          },
+          {
+            "token": "W",
+            "count": 65
+          },
+          {
+            "token": "c",
+            "count": 64
+          },
+          {
+            "token": "L",
+            "count": 60
+          },
+          {
+            "token": "6",
+            "count": 60
+          },
+          {
+            "token": "q",
+            "count": 58
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "42500",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-42500",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-42500",
+        "alias": "42500",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 8.26538278951645,
+        "value_2_ce": 5.2825631368637085,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 57.35763189468384,
+        "memory_norm": 1.1875122785568237,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 13.010703746426106,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 2.1686553189824256e-08,
+        "write_key_2_reconstruction_ce": 5.649500830316543,
+        "write_key_2_reconstruction_accuracy": 0.0,
+        "write_key_2_energy": 0.09747981348525694,
+        "write_value_1_reconstruction_ce": 7.940193702352047,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 56.214126652097704,
+        "write_value_2_reconstruction_ce": 5.873595613306761,
+        "write_value_2_reconstruction_accuracy": 0.0,
+        "write_value_2_energy": 50.67231567153931,
+        "write_syntax_reconstruction_ce": 8.212895011383802,
+        "write_syntax_reconstruction_accuracy": 0.04,
+        "write_syntax_energy": 1.8854847853004515,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[BOS]",
+            "count": 4133
+          },
+          {
+            "token": "[UNK]",
+            "count": 867
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-42500",
+        "alias": "42500",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1344,
+        "value_2_accuracy": 0.8418,
+        "value_1_ce": 2.0918317479729653,
+        "value_2_ce": 0.5575973017886979,
+        "exact_match": 0.1056,
+        "only_value_1_correct": 0.0288,
+        "only_value_2_correct": 0.7362,
+        "neither_correct": 0.1294,
+        "gradient_norm": 9.988979691123962,
+        "memory_norm": 22.973598880767824,
+        "delta_memory_norm": 22.9430531539917,
+        "write_key_1_reconstruction_ce": 17.914680925416945,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 30.52076567007489,
+        "write_key_2_reconstruction_ce": 7.019278817552328,
+        "write_key_2_reconstruction_accuracy": 0.00415,
+        "write_key_2_energy": 25.72500073841773,
+        "write_value_1_reconstruction_ce": 6.870836624114215,
+        "write_value_1_reconstruction_accuracy": 0.02495,
+        "write_value_1_energy": 65.82342699532512,
+        "write_value_2_reconstruction_ce": 6.851309648827067,
+        "write_value_2_reconstruction_accuracy": 0.0849,
+        "write_value_2_energy": 128.9381042784364,
+        "write_syntax_reconstruction_ce": 7.720716194463096,
+        "write_syntax_reconstruction_accuracy": 0.311704,
+        "write_syntax_energy": 47.608321483697644,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4328,
+        "value_1_top_error_predictions": [
+          {
+            "token": "7",
+            "count": 299
+          },
+          {
+            "token": "w",
+            "count": 287
+          },
+          {
+            "token": "J",
+            "count": 244
+          },
+          {
+            "token": "1",
+            "count": 230
+          },
+          {
+            "token": "i",
+            "count": 171
+          },
+          {
+            "token": "l",
+            "count": 151
+          },
+          {
+            "token": "j",
+            "count": 128
+          },
+          {
+            "token": "N",
+            "count": 124
+          },
+          {
+            "token": "3",
+            "count": 108
+          },
+          {
+            "token": "Q",
+            "count": 104
+          }
+        ],
+        "value_2_error_count": 791,
+        "value_2_top_error_predictions": [
+          {
+            "token": "w",
+            "count": 25
+          },
+          {
+            "token": "n",
+            "count": 22
+          },
+          {
+            "token": "l",
+            "count": 21
+          },
+          {
+            "token": "J",
+            "count": 19
+          },
+          {
+            "token": "S",
+            "count": 18
+          },
+          {
+            "token": "G",
+            "count": 18
+          },
+          {
+            "token": "W",
+            "count": 17
+          },
+          {
+            "token": "8",
+            "count": 16
+          },
+          {
+            "token": "c",
+            "count": 16
+          },
+          {
+            "token": "K",
+            "count": 16
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-42500",
+        "alias": "42500",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1376,
+        "value_2_accuracy": 0.916,
+        "value_1_ce": 2.075734553074837,
+        "value_2_ce": 0.29084557350506945,
+        "exact_match": 0.115,
+        "only_value_1_correct": 0.0226,
+        "only_value_2_correct": 0.801,
+        "neither_correct": 0.0614,
+        "gradient_norm": 5.688546055269241,
+        "memory_norm": 23.396097759628297,
+        "delta_memory_norm": 23.37809013557434,
+        "write_key_1_reconstruction_ce": 17.303655799388885,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 12.320323624491586,
+        "write_key_2_reconstruction_ce": 6.494139779960364,
+        "write_key_2_reconstruction_accuracy": 0.003375,
+        "write_key_2_energy": 9.776871081551302,
+        "write_value_1_reconstruction_ce": 6.352593989914656,
+        "write_value_1_reconstruction_accuracy": 0.0177,
+        "write_value_1_energy": 38.11952637233836,
+        "write_value_2_reconstruction_ce": 6.0329784853107995,
+        "write_value_2_reconstruction_accuracy": 0.119175,
+        "write_value_2_energy": 96.26899062646707,
+        "write_syntax_reconstruction_ce": 7.6916158521859055,
+        "write_syntax_reconstruction_accuracy": 0.258872,
+        "write_syntax_energy": 20.67227260791715,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4312,
+        "value_1_top_error_predictions": [
+          {
+            "token": "7",
+            "count": 284
+          },
+          {
+            "token": "J",
+            "count": 252
+          },
+          {
+            "token": "1",
+            "count": 246
+          },
+          {
+            "token": "w",
+            "count": 242
+          },
+          {
+            "token": "i",
+            "count": 182
+          },
+          {
+            "token": "l",
+            "count": 135
+          },
+          {
+            "token": "a",
+            "count": 133
+          },
+          {
+            "token": "j",
+            "count": 120
+          },
+          {
+            "token": "P",
+            "count": 118
+          },
+          {
+            "token": "N",
+            "count": 115
+          }
+        ],
+        "value_2_error_count": 420,
+        "value_2_top_error_predictions": [
+          {
+            "token": "w",
+            "count": 14
+          },
+          {
+            "token": "K",
+            "count": 13
+          },
+          {
+            "token": "T",
+            "count": 12
+          },
+          {
+            "token": "l",
+            "count": 12
+          },
+          {
+            "token": "Q",
+            "count": 12
+          },
+          {
+            "token": "S",
+            "count": 11
+          },
+          {
+            "token": "n",
+            "count": 11
+          },
+          {
+            "token": "J",
+            "count": 11
+          },
+          {
+            "token": "7",
+            "count": 10
+          },
+          {
+            "token": "1",
+            "count": 10
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "45000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-45000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-45000",
+        "alias": "45000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 9.624221626091003,
+        "value_2_ce": 6.235487671136856,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 60.217639575195314,
+        "memory_norm": 1.2139532566070557,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 13.215099664640427,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 1.0283185521458789e-08,
+        "write_key_2_reconstruction_ce": 5.299262313205004,
+        "write_key_2_reconstruction_accuracy": 0.0,
+        "write_key_2_energy": 0.13358713427673982,
+        "write_value_1_reconstruction_ce": 7.996150279378891,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 55.861310160732266,
+        "write_value_2_reconstruction_ce": 6.308801433634758,
+        "write_value_2_reconstruction_accuracy": 0.0,
+        "write_value_2_energy": 53.65991901426315,
+        "write_syntax_reconstruction_ce": 8.268360181876183,
+        "write_syntax_reconstruction_accuracy": 0.038488,
+        "write_syntax_energy": 1.7560580766732536,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-45000",
+        "alias": "45000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1478,
+        "value_2_accuracy": 0.8696,
+        "value_1_ce": 2.0800026426434517,
+        "value_2_ce": 0.4850416851557369,
+        "exact_match": 0.1154,
+        "only_value_1_correct": 0.0324,
+        "only_value_2_correct": 0.7542,
+        "neither_correct": 0.098,
+        "gradient_norm": 9.472598600482941,
+        "memory_norm": 24.117852258300783,
+        "delta_memory_norm": 24.087056258010865,
+        "write_key_1_reconstruction_ce": 17.817305988264085,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 30.37153167346705,
+        "write_key_2_reconstruction_ce": 6.870810140620917,
+        "write_key_2_reconstruction_accuracy": 0.003825,
+        "write_key_2_energy": 18.520032987029843,
+        "write_value_1_reconstruction_ce": 7.076997372739017,
+        "write_value_1_reconstruction_accuracy": 0.0186,
+        "write_value_1_energy": 61.81152366390771,
+        "write_value_2_reconstruction_ce": 6.493180511041545,
+        "write_value_2_reconstruction_accuracy": 0.09595,
+        "write_value_2_energy": 124.43271835626662,
+        "write_syntax_reconstruction_ce": 7.492979964600156,
+        "write_syntax_reconstruction_accuracy": 0.327072,
+        "write_syntax_energy": 44.2242666818513,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4261,
+        "value_1_top_error_predictions": [
+          {
+            "token": "t",
+            "count": 205
+          },
+          {
+            "token": "C",
+            "count": 187
+          },
+          {
+            "token": "3",
+            "count": 170
+          },
+          {
+            "token": "R",
+            "count": 170
+          },
+          {
+            "token": "G",
+            "count": 148
+          },
+          {
+            "token": "y",
+            "count": 142
+          },
+          {
+            "token": "Z",
+            "count": 141
+          },
+          {
+            "token": "p",
+            "count": 125
+          },
+          {
+            "token": "Q",
+            "count": 125
+          },
+          {
+            "token": "A",
+            "count": 123
+          }
+        ],
+        "value_2_error_count": 652,
+        "value_2_top_error_predictions": [
+          {
+            "token": "Y",
+            "count": 21
+          },
+          {
+            "token": "4",
+            "count": 21
+          },
+          {
+            "token": "G",
+            "count": 20
+          },
+          {
+            "token": "H",
+            "count": 20
+          },
+          {
+            "token": "j",
+            "count": 18
+          },
+          {
+            "token": "M",
+            "count": 16
+          },
+          {
+            "token": "3",
+            "count": 16
+          },
+          {
+            "token": "F",
+            "count": 16
+          },
+          {
+            "token": "V",
+            "count": 15
+          },
+          {
+            "token": "n",
+            "count": 15
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-45000",
+        "alias": "45000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.149,
+        "value_2_accuracy": 0.9282,
+        "value_1_ce": 2.061882934165001,
+        "value_2_ce": 0.2193592376842411,
+        "exact_match": 0.123,
+        "only_value_1_correct": 0.026,
+        "only_value_2_correct": 0.8052,
+        "neither_correct": 0.0458,
+        "gradient_norm": 4.901090946626663,
+        "memory_norm": 24.48398277168274,
+        "delta_memory_norm": 24.469103883361818,
+        "write_key_1_reconstruction_ce": 17.273795198631287,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 10.954235133544778,
+        "write_key_2_reconstruction_ce": 6.39241661132276,
+        "write_key_2_reconstruction_accuracy": 0.003475,
+        "write_key_2_energy": 3.056331872245435,
+        "write_value_1_reconstruction_ce": 6.854325593990088,
+        "write_value_1_reconstruction_accuracy": 0.013925,
+        "write_value_1_energy": 39.80967353093134,
+        "write_value_2_reconstruction_ce": 5.954118296966807,
+        "write_value_2_reconstruction_accuracy": 0.114025,
+        "write_value_2_energy": 90.90821000521304,
+        "write_syntax_reconstruction_ce": 7.459911770962352,
+        "write_syntax_reconstruction_accuracy": 0.300584,
+        "write_syntax_energy": 22.663145198358432,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4255,
+        "value_1_top_error_predictions": [
+          {
+            "token": "R",
+            "count": 223
+          },
+          {
+            "token": "t",
+            "count": 192
+          },
+          {
+            "token": "C",
+            "count": 187
+          },
+          {
+            "token": "Z",
+            "count": 182
+          },
+          {
+            "token": "G",
+            "count": 143
+          },
+          {
+            "token": "A",
+            "count": 132
+          },
+          {
+            "token": "Q",
+            "count": 126
+          },
+          {
+            "token": "y",
+            "count": 125
+          },
+          {
+            "token": "f",
+            "count": 116
+          },
+          {
+            "token": "Y",
+            "count": 112
+          }
+        ],
+        "value_2_error_count": 359,
+        "value_2_top_error_predictions": [
+          {
+            "token": "G",
+            "count": 15
+          },
+          {
+            "token": "H",
+            "count": 13
+          },
+          {
+            "token": "Q",
+            "count": 13
+          },
+          {
+            "token": "4",
+            "count": 12
+          },
+          {
+            "token": "J",
+            "count": 11
+          },
+          {
+            "token": "n",
+            "count": 11
+          },
+          {
+            "token": "I",
+            "count": 10
+          },
+          {
+            "token": "p",
+            "count": 9
+          },
+          {
+            "token": "o",
+            "count": 9
+          },
+          {
+            "token": "8",
+            "count": 8
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "50000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-50000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-50000",
+        "alias": "50000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 8.981090372180939,
+        "value_2_ce": 9.337446855545044,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 63.167196903228756,
+        "memory_norm": 1.2643965482711792,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 12.996805042994023,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 6.888605287423297e-12,
+        "write_key_2_reconstruction_ce": 4.86377592638135,
+        "write_key_2_reconstruction_accuracy": 0.00095,
+        "write_key_2_energy": 0.12105342541065825,
+        "write_value_1_reconstruction_ce": 6.419220535308122,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 60.736331370544434,
+        "write_value_2_reconstruction_ce": 8.462393171274663,
+        "write_value_2_reconstruction_accuracy": 0.0,
+        "write_value_2_energy": 60.56624530277252,
+        "write_syntax_reconstruction_ce": 9.083243716053008,
+        "write_syntax_reconstruction_accuracy": 0.0,
+        "write_syntax_energy": 2.2747406650160458,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-50000",
+        "alias": "50000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1406,
+        "value_2_accuracy": 0.8876,
+        "value_1_ce": 2.085083569765091,
+        "value_2_ce": 0.42059558303814704,
+        "exact_match": 0.1178,
+        "only_value_1_correct": 0.0228,
+        "only_value_2_correct": 0.7698,
+        "neither_correct": 0.0896,
+        "gradient_norm": 13.288406464385986,
+        "memory_norm": 25.298839323425295,
+        "delta_memory_norm": 25.266879206085203,
+        "write_key_1_reconstruction_ce": 18.19102553548813,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 61.20001452500745,
+        "write_key_2_reconstruction_ce": 7.3597583438679575,
+        "write_key_2_reconstruction_accuracy": 0.002075,
+        "write_key_2_energy": 57.242755115494575,
+        "write_value_1_reconstruction_ce": 6.7171697294227775,
+        "write_value_1_reconstruction_accuracy": 0.02575,
+        "write_value_1_energy": 76.40774614669994,
+        "write_value_2_reconstruction_ce": 6.386059709406015,
+        "write_value_2_reconstruction_accuracy": 0.101525,
+        "write_value_2_energy": 157.2330332080841,
+        "write_syntax_reconstruction_ce": 7.709085624217427,
+        "write_syntax_reconstruction_accuracy": 0.348096,
+        "write_syntax_energy": 62.116500012905725,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4297,
+        "value_1_top_error_predictions": [
+          {
+            "token": "3",
+            "count": 207
+          },
+          {
+            "token": "n",
+            "count": 190
+          },
+          {
+            "token": "w",
+            "count": 180
+          },
+          {
+            "token": "W",
+            "count": 173
+          },
+          {
+            "token": "c",
+            "count": 161
+          },
+          {
+            "token": "P",
+            "count": 138
+          },
+          {
+            "token": "G",
+            "count": 132
+          },
+          {
+            "token": "I",
+            "count": 128
+          },
+          {
+            "token": "C",
+            "count": 127
+          },
+          {
+            "token": "8",
+            "count": 126
+          }
+        ],
+        "value_2_error_count": 562,
+        "value_2_top_error_predictions": [
+          {
+            "token": "n",
+            "count": 17
+          },
+          {
+            "token": "I",
+            "count": 17
+          },
+          {
+            "token": "Y",
+            "count": 16
+          },
+          {
+            "token": "5",
+            "count": 14
+          },
+          {
+            "token": "K",
+            "count": 13
+          },
+          {
+            "token": "o",
+            "count": 13
+          },
+          {
+            "token": "C",
+            "count": 13
+          },
+          {
+            "token": "w",
+            "count": 13
+          },
+          {
+            "token": "E",
+            "count": 13
+          },
+          {
+            "token": "l",
+            "count": 12
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-50000",
+        "alias": "50000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1474,
+        "value_2_accuracy": 0.9378,
+        "value_1_ce": 2.0720085534572603,
+        "value_2_ce": 0.18795522890276115,
+        "exact_match": 0.13,
+        "only_value_1_correct": 0.0174,
+        "only_value_2_correct": 0.8078,
+        "neither_correct": 0.0448,
+        "gradient_norm": 6.089384107494355,
+        "memory_norm": 25.95744530067444,
+        "delta_memory_norm": 25.942401514434813,
+        "write_key_1_reconstruction_ce": 17.42130228075981,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 26.53984906306223,
+        "write_key_2_reconstruction_ce": 6.501249797717482,
+        "write_key_2_reconstruction_accuracy": 0.002075,
+        "write_key_2_energy": 22.078761953424358,
+        "write_value_1_reconstruction_ce": 5.874510925734043,
+        "write_value_1_reconstruction_accuracy": 0.01765,
+        "write_value_1_energy": 42.54852067189847,
+        "write_value_2_reconstruction_ce": 5.645558608779725,
+        "write_value_2_reconstruction_accuracy": 0.1243,
+        "write_value_2_energy": 120.61074968745304,
+        "write_syntax_reconstruction_ce": 7.470675133844643,
+        "write_syntax_reconstruction_accuracy": 0.333272,
+        "write_syntax_energy": 26.796664170471693,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4263,
+        "value_1_top_error_predictions": [
+          {
+            "token": "n",
+            "count": 216
+          },
+          {
+            "token": "w",
+            "count": 188
+          },
+          {
+            "token": "3",
+            "count": 183
+          },
+          {
+            "token": "W",
+            "count": 179
+          },
+          {
+            "token": "c",
+            "count": 173
+          },
+          {
+            "token": "V",
+            "count": 151
+          },
+          {
+            "token": "G",
+            "count": 141
+          },
+          {
+            "token": "A",
+            "count": 136
+          },
+          {
+            "token": "a",
+            "count": 127
+          },
+          {
+            "token": "8",
+            "count": 117
+          }
+        ],
+        "value_2_error_count": 311,
+        "value_2_top_error_predictions": [
+          {
+            "token": "n",
+            "count": 13
+          },
+          {
+            "token": "I",
+            "count": 10
+          },
+          {
+            "token": "P",
+            "count": 9
+          },
+          {
+            "token": "T",
+            "count": 8
+          },
+          {
+            "token": "8",
+            "count": 8
+          },
+          {
+            "token": "0",
+            "count": 8
+          },
+          {
+            "token": "f",
+            "count": 8
+          },
+          {
+            "token": "x",
+            "count": 7
+          },
+          {
+            "token": "W",
+            "count": 7
+          },
+          {
+            "token": "E",
+            "count": 7
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "75000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-75000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-75000",
+        "alias": "75000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 9.176488673114777,
+        "value_2_ce": 10.92056053981781,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 108.7069449005127,
+        "memory_norm": 1.447471022605896,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 11.380973698824643,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 1.1861801427490924e-14,
+        "write_key_2_reconstruction_ce": 4.761566684991121,
+        "write_key_2_reconstruction_accuracy": 0.00335,
+        "write_key_2_energy": 3.4373513172456376e-16,
+        "write_value_1_reconstruction_ce": 5.515791956275701,
+        "write_value_1_reconstruction_accuracy": 0.001975,
+        "write_value_1_energy": 92.8223880777359,
+        "write_value_2_reconstruction_ce": 10.866076955258846,
+        "write_value_2_reconstruction_accuracy": 0.0,
+        "write_value_2_energy": 87.60744630656242,
+        "write_syntax_reconstruction_ce": 10.13949775743103,
+        "write_syntax_reconstruction_accuracy": 0.0,
+        "write_syntax_energy": 4.549468159436581,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-75000",
+        "alias": "75000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1428,
+        "value_2_accuracy": 0.9366,
+        "value_1_ce": 2.078928639090061,
+        "value_2_ce": 0.18209291579092515,
+        "exact_match": 0.1174,
+        "only_value_1_correct": 0.0254,
+        "only_value_2_correct": 0.8192,
+        "neither_correct": 0.038,
+        "gradient_norm": 15.545367057228088,
+        "memory_norm": 43.506575602722165,
+        "delta_memory_norm": 43.482778706359866,
+        "write_key_1_reconstruction_ce": 18.363405546140672,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 141.43769504133377,
+        "write_key_2_reconstruction_ce": 6.900924779144302,
+        "write_key_2_reconstruction_accuracy": 0.00205,
+        "write_key_2_energy": 138.87865392259246,
+        "write_value_1_reconstruction_ce": 6.729185953923315,
+        "write_value_1_reconstruction_accuracy": 0.031025,
+        "write_value_1_energy": 115.50808002544515,
+        "write_value_2_reconstruction_ce": 5.5720022816839325,
+        "write_value_2_reconstruction_accuracy": 0.1179,
+        "write_value_2_energy": 295.13667179880144,
+        "write_syntax_reconstruction_ce": 7.023554088754493,
+        "write_syntax_reconstruction_accuracy": 0.359512,
+        "write_syntax_energy": 125.37156640912251,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4286,
+        "value_1_top_error_predictions": [
+          {
+            "token": "Q",
+            "count": 240
+          },
+          {
+            "token": "9",
+            "count": 184
+          },
+          {
+            "token": "k",
+            "count": 170
+          },
+          {
+            "token": "w",
+            "count": 159
+          },
+          {
+            "token": "q",
+            "count": 151
+          },
+          {
+            "token": "A",
+            "count": 143
+          },
+          {
+            "token": "C",
+            "count": 139
+          },
+          {
+            "token": "6",
+            "count": 114
+          },
+          {
+            "token": "W",
+            "count": 113
+          },
+          {
+            "token": "l",
+            "count": 108
+          }
+        ],
+        "value_2_error_count": 317,
+        "value_2_top_error_predictions": [
+          {
+            "token": "K",
+            "count": 17
+          },
+          {
+            "token": "k",
+            "count": 14
+          },
+          {
+            "token": "6",
+            "count": 12
+          },
+          {
+            "token": "J",
+            "count": 11
+          },
+          {
+            "token": "b",
+            "count": 10
+          },
+          {
+            "token": "P",
+            "count": 9
+          },
+          {
+            "token": "q",
+            "count": 8
+          },
+          {
+            "token": "l",
+            "count": 8
+          },
+          {
+            "token": "V",
+            "count": 8
+          },
+          {
+            "token": "F",
+            "count": 8
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-75000",
+        "alias": "75000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1482,
+        "value_2_accuracy": 0.9448,
+        "value_1_ce": 2.0655836764454842,
+        "value_2_ce": 0.12372645998895225,
+        "exact_match": 0.1234,
+        "only_value_1_correct": 0.0248,
+        "only_value_2_correct": 0.8214,
+        "neither_correct": 0.0304,
+        "gradient_norm": 8.17233160686493,
+        "memory_norm": 44.06237405929566,
+        "delta_memory_norm": 44.05354570083618,
+        "write_key_1_reconstruction_ce": 17.09676646516323,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 76.87625476118075,
+        "write_key_2_reconstruction_ce": 6.5340856921155,
+        "write_key_2_reconstruction_accuracy": 0.001725,
+        "write_key_2_energy": 76.07225393496776,
+        "write_value_1_reconstruction_ce": 5.931376481045783,
+        "write_value_1_reconstruction_accuracy": 0.0191,
+        "write_value_1_energy": 65.78531865252383,
+        "write_value_2_reconstruction_ce": 4.856925964720214,
+        "write_value_2_reconstruction_accuracy": 0.1927,
+        "write_value_2_energy": 231.74608327633737,
+        "write_syntax_reconstruction_ce": 6.86742274379756,
+        "write_syntax_reconstruction_accuracy": 0.35748,
+        "write_syntax_energy": 55.290486814828846,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4259,
+        "value_1_top_error_predictions": [
+          {
+            "token": "Q",
+            "count": 223
+          },
+          {
+            "token": "9",
+            "count": 208
+          },
+          {
+            "token": "A",
+            "count": 185
+          },
+          {
+            "token": "q",
+            "count": 157
+          },
+          {
+            "token": "C",
+            "count": 145
+          },
+          {
+            "token": "w",
+            "count": 137
+          },
+          {
+            "token": "k",
+            "count": 133
+          },
+          {
+            "token": "6",
+            "count": 122
+          },
+          {
+            "token": "e",
+            "count": 117
+          },
+          {
+            "token": "i",
+            "count": 114
+          }
+        ],
+        "value_2_error_count": 276,
+        "value_2_top_error_predictions": [
+          {
+            "token": "l",
+            "count": 11
+          },
+          {
+            "token": "K",
+            "count": 9
+          },
+          {
+            "token": "n",
+            "count": 9
+          },
+          {
+            "token": "S",
+            "count": 9
+          },
+          {
+            "token": "k",
+            "count": 9
+          },
+          {
+            "token": "T",
+            "count": 8
+          },
+          {
+            "token": "P",
+            "count": 8
+          },
+          {
+            "token": "b",
+            "count": 8
+          },
+          {
+            "token": "7",
+            "count": 8
+          },
+          {
+            "token": "Q",
+            "count": 7
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "100000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-100000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-100000",
+        "alias": "100000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 8.13718138818741,
+        "value_2_ce": 11.006523618888854,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 138.19542401428222,
+        "memory_norm": 1.603545904159546,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 9.711697766703367,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 1.3575216541727211e-27,
+        "write_key_2_reconstruction_ce": 4.7883518543958665,
+        "write_key_2_reconstruction_accuracy": 2.5e-05,
+        "write_key_2_energy": 1.3018450224370144e-27,
+        "write_value_1_reconstruction_ce": 6.588089840203524,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 147.19250981521606,
+        "write_value_2_reconstruction_ce": 12.558693623173237,
+        "write_value_2_reconstruction_accuracy": 0.0,
+        "write_value_2_energy": 153.03127945404052,
+        "write_syntax_reconstruction_ce": 10.833784878013612,
+        "write_syntax_reconstruction_accuracy": 0.0,
+        "write_syntax_energy": 7.932283172302395,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-100000",
+        "alias": "100000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1388,
+        "value_2_accuracy": 0.9384,
+        "value_1_ce": 2.092999504506588,
+        "value_2_ce": 0.1616011470274663,
+        "exact_match": 0.1168,
+        "only_value_1_correct": 0.022,
+        "only_value_2_correct": 0.8216,
+        "neither_correct": 0.0396,
+        "gradient_norm": 18.466470778465272,
+        "memory_norm": 55.30105473098755,
+        "delta_memory_norm": 55.27817058944702,
+        "write_key_1_reconstruction_ce": 18.215789989972116,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 135.98993767412173,
+        "write_key_2_reconstruction_ce": 7.1819772927395995,
+        "write_key_2_reconstruction_accuracy": 0.001575,
+        "write_key_2_energy": 117.46946337702757,
+        "write_value_1_reconstruction_ce": 9.294072106462718,
+        "write_value_1_reconstruction_accuracy": 0.023475,
+        "write_value_1_energy": 168.91754187984603,
+        "write_value_2_reconstruction_ce": 5.637260242792195,
+        "write_value_2_reconstruction_accuracy": 0.1337,
+        "write_value_2_energy": 385.93029520015716,
+        "write_syntax_reconstruction_ce": 7.3245729284573695,
+        "write_syntax_reconstruction_accuracy": 0.359576,
+        "write_syntax_energy": 152.08539858094503,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4306,
+        "value_1_top_error_predictions": [
+          {
+            "token": "9",
+            "count": 226
+          },
+          {
+            "token": "5",
+            "count": 213
+          },
+          {
+            "token": "O",
+            "count": 206
+          },
+          {
+            "token": "8",
+            "count": 178
+          },
+          {
+            "token": "j",
+            "count": 154
+          },
+          {
+            "token": "d",
+            "count": 146
+          },
+          {
+            "token": "M",
+            "count": 110
+          },
+          {
+            "token": "r",
+            "count": 108
+          },
+          {
+            "token": "A",
+            "count": 103
+          },
+          {
+            "token": "X",
+            "count": 103
+          }
+        ],
+        "value_2_error_count": 308,
+        "value_2_top_error_predictions": [
+          {
+            "token": "j",
+            "count": 13
+          },
+          {
+            "token": "5",
+            "count": 11
+          },
+          {
+            "token": "E",
+            "count": 9
+          },
+          {
+            "token": "4",
+            "count": 9
+          },
+          {
+            "token": "7",
+            "count": 9
+          },
+          {
+            "token": "T",
+            "count": 8
+          },
+          {
+            "token": "H",
+            "count": 8
+          },
+          {
+            "token": "d",
+            "count": 8
+          },
+          {
+            "token": "8",
+            "count": 7
+          },
+          {
+            "token": "l",
+            "count": 7
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-100000",
+        "alias": "100000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.139,
+        "value_2_accuracy": 0.9504,
+        "value_1_ce": 2.0781036930084227,
+        "value_2_ce": 0.11021794809517706,
+        "exact_match": 0.121,
+        "only_value_1_correct": 0.018,
+        "only_value_2_correct": 0.8294,
+        "neither_correct": 0.0316,
+        "gradient_norm": 7.556570019435883,
+        "memory_norm": 56.05603301849365,
+        "delta_memory_norm": 56.04522081298828,
+        "write_key_1_reconstruction_ce": 16.59574990196228,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 40.91560739237467,
+        "write_key_2_reconstruction_ce": 6.74321148936525,
+        "write_key_2_reconstruction_accuracy": 0.001775,
+        "write_key_2_energy": 32.73865572962208,
+        "write_value_1_reconstruction_ce": 9.007375378116965,
+        "write_value_1_reconstruction_accuracy": 0.018325,
+        "write_value_1_energy": 96.39828410160133,
+        "write_value_2_reconstruction_ce": 4.843443230910517,
+        "write_value_2_reconstruction_accuracy": 0.245,
+        "write_value_2_energy": 297.7679417123437,
+        "write_syntax_reconstruction_ce": 7.201217774964625,
+        "write_syntax_reconstruction_accuracy": 0.35732,
+        "write_syntax_energy": 58.30654143248669,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4305,
+        "value_1_top_error_predictions": [
+          {
+            "token": "8",
+            "count": 211
+          },
+          {
+            "token": "O",
+            "count": 189
+          },
+          {
+            "token": "5",
+            "count": 186
+          },
+          {
+            "token": "9",
+            "count": 186
+          },
+          {
+            "token": "d",
+            "count": 150
+          },
+          {
+            "token": "j",
+            "count": 137
+          },
+          {
+            "token": "7",
+            "count": 121
+          },
+          {
+            "token": "M",
+            "count": 116
+          },
+          {
+            "token": "U",
+            "count": 106
+          },
+          {
+            "token": "p",
+            "count": 103
+          }
+        ],
+        "value_2_error_count": 248,
+        "value_2_top_error_predictions": [
+          {
+            "token": "8",
+            "count": 9
+          },
+          {
+            "token": "j",
+            "count": 9
+          },
+          {
+            "token": "T",
+            "count": 7
+          },
+          {
+            "token": "R",
+            "count": 7
+          },
+          {
+            "token": "5",
+            "count": 7
+          },
+          {
+            "token": "l",
+            "count": 7
+          },
+          {
+            "token": "p",
+            "count": 7
+          },
+          {
+            "token": "o",
+            "count": 7
+          },
+          {
+            "token": "V",
+            "count": 7
+          },
+          {
+            "token": "S",
+            "count": 6
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "alias": "125000",
+    "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-125000",
+    "rows": [
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-125000",
+        "alias": "125000",
+        "inner_step": 0,
+        "examples": 5000,
+        "value_1_accuracy": 0.0,
+        "value_2_accuracy": 0.0,
+        "value_1_ce": 6.409676407432556,
+        "value_2_ce": 14.458073234939576,
+        "exact_match": 0.0,
+        "only_value_1_correct": 0.0,
+        "only_value_2_correct": 0.0,
+        "neither_correct": 1.0,
+        "gradient_norm": 173.0847154083252,
+        "memory_norm": 1.7537752389907837,
+        "delta_memory_norm": 0.0,
+        "write_key_1_reconstruction_ce": 9.59239657639265,
+        "write_key_1_reconstruction_accuracy": 0.002,
+        "write_key_1_energy": 6.620739475167331e-13,
+        "write_key_2_reconstruction_ce": 5.00828203882575,
+        "write_key_2_reconstruction_accuracy": 5e-05,
+        "write_key_2_energy": 1.2860672299665177e-20,
+        "write_value_1_reconstruction_ce": 7.068317338520289,
+        "write_value_1_reconstruction_accuracy": 0.0,
+        "write_value_1_energy": 196.15454674530028,
+        "write_value_2_reconstruction_ce": 15.327197837138176,
+        "write_value_2_reconstruction_accuracy": 0.0,
+        "write_value_2_energy": 181.0709422328949,
+        "write_syntax_reconstruction_ce": 12.150052981113435,
+        "write_syntax_reconstruction_accuracy": 0.0,
+        "write_syntax_energy": 8.696114785815835,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 5000,
+        "value_1_top_error_predictions": [
+          {
+            "token": "[BOS]",
+            "count": 5000
+          }
+        ],
+        "value_2_error_count": 5000,
+        "value_2_top_error_predictions": [
+          {
+            "token": "[UNK]",
+            "count": 5000
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-125000",
+        "alias": "125000",
+        "inner_step": 1,
+        "examples": 5000,
+        "value_1_accuracy": 0.1506,
+        "value_2_accuracy": 0.9384,
+        "value_1_ce": 2.0878310937285423,
+        "value_2_ce": 0.13852071299494872,
+        "exact_match": 0.1246,
+        "only_value_1_correct": 0.026,
+        "only_value_2_correct": 0.8138,
+        "neither_correct": 0.0356,
+        "gradient_norm": 21.60261579761505,
+        "memory_norm": 69.25581988220215,
+        "delta_memory_norm": 69.23388741760255,
+        "write_key_1_reconstruction_ce": 18.692753845643995,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 124.25134619731654,
+        "write_key_2_reconstruction_ce": 7.356802246703207,
+        "write_key_2_reconstruction_accuracy": 0.001725,
+        "write_key_2_energy": 113.22020302070634,
+        "write_value_1_reconstruction_ce": 8.866105870468914,
+        "write_value_1_reconstruction_accuracy": 0.0278,
+        "write_value_1_energy": 184.53680712542064,
+        "write_value_2_reconstruction_ce": 5.110550873307383,
+        "write_value_2_reconstruction_accuracy": 0.1578,
+        "write_value_2_energy": 507.2663846077442,
+        "write_syntax_reconstruction_ce": 7.1244727037246545,
+        "write_syntax_reconstruction_accuracy": 0.359888,
+        "write_syntax_energy": 241.39490730385782,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4247,
+        "value_1_top_error_predictions": [
+          {
+            "token": "h",
+            "count": 229
+          },
+          {
+            "token": "q",
+            "count": 145
+          },
+          {
+            "token": "F",
+            "count": 137
+          },
+          {
+            "token": "x",
+            "count": 135
+          },
+          {
+            "token": "8",
+            "count": 125
+          },
+          {
+            "token": "k",
+            "count": 122
+          },
+          {
+            "token": "l",
+            "count": 121
+          },
+          {
+            "token": "d",
+            "count": 120
+          },
+          {
+            "token": "f",
+            "count": 114
+          },
+          {
+            "token": "U",
+            "count": 111
+          }
+        ],
+        "value_2_error_count": 308,
+        "value_2_top_error_predictions": [
+          {
+            "token": "V",
+            "count": 10
+          },
+          {
+            "token": "B",
+            "count": 10
+          },
+          {
+            "token": "x",
+            "count": 9
+          },
+          {
+            "token": "5",
+            "count": 9
+          },
+          {
+            "token": "J",
+            "count": 9
+          },
+          {
+            "token": "S",
+            "count": 9
+          },
+          {
+            "token": "G",
+            "count": 9
+          },
+          {
+            "token": "Q",
+            "count": 8
+          },
+          {
+            "token": "p",
+            "count": 8
+          },
+          {
+            "token": "y",
+            "count": 7
+          }
+        ]
+      },
+      {
+        "checkpoint": "/cephfs/home/mkairov/gradim/energy_shaping/runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_energy_grad_second_stepalign0.1_iread0.1_bs_64_lr_1e-04_fp32_extra_cpt/run_1/checkpoint-125000",
+        "alias": "125000",
+        "inner_step": 2,
+        "examples": 5000,
+        "value_1_accuracy": 0.1476,
+        "value_2_accuracy": 0.946,
+        "value_1_ce": 2.072653065752983,
+        "value_2_ce": 0.10457638377678127,
+        "exact_match": 0.1238,
+        "only_value_1_correct": 0.0238,
+        "only_value_2_correct": 0.8222,
+        "neither_correct": 0.0302,
+        "gradient_norm": 9.507497231483459,
+        "memory_norm": 70.07460855712891,
+        "delta_memory_norm": 70.06257761383057,
+        "write_key_1_reconstruction_ce": 17.323020516133308,
+        "write_key_1_reconstruction_accuracy": 0.0,
+        "write_key_1_energy": 33.15246619072794,
+        "write_key_2_reconstruction_ce": 6.5653464341249315,
+        "write_key_2_reconstruction_accuracy": 0.001925,
+        "write_key_2_energy": 27.85828777021577,
+        "write_value_1_reconstruction_ce": 8.990867475548386,
+        "write_value_1_reconstruction_accuracy": 0.0185,
+        "write_value_1_energy": 112.10596280842819,
+        "write_value_2_reconstruction_ce": 4.603977692339194,
+        "write_value_2_reconstruction_accuracy": 0.259075,
+        "write_value_2_energy": 356.7945019510132,
+        "write_syntax_reconstruction_ce": 7.080658657278492,
+        "write_syntax_reconstruction_accuracy": 0.358464,
+        "write_syntax_energy": 92.90349534506781,
+        "write_filler_reconstruction_ce": null,
+        "write_filler_reconstruction_accuracy": null,
+        "write_filler_energy": null,
+        "value_1_error_count": 4262,
+        "value_1_top_error_predictions": [
+          {
+            "token": "h",
+            "count": 231
+          },
+          {
+            "token": "F",
+            "count": 155
+          },
+          {
+            "token": "x",
+            "count": 151
+          },
+          {
+            "token": "q",
+            "count": 145
+          },
+          {
+            "token": "8",
+            "count": 133
+          },
+          {
+            "token": "l",
+            "count": 126
+          },
+          {
+            "token": "k",
+            "count": 116
+          },
+          {
+            "token": "d",
+            "count": 111
+          },
+          {
+            "token": "2",
+            "count": 108
+          },
+          {
+            "token": "L",
+            "count": 98
+          }
+        ],
+        "value_2_error_count": 270,
+        "value_2_top_error_predictions": [
+          {
+            "token": "Q",
+            "count": 11
+          },
+          {
+            "token": "J",
+            "count": 9
+          },
+          {
+            "token": "B",
+            "count": 9
+          },
+          {
+            "token": "5",
+            "count": 8
+          },
+          {
+            "token": "q",
+            "count": 8
+          },
+          {
+            "token": "T",
+            "count": 7
+          },
+          {
+            "token": "8",
+            "count": 7
+          },
+          {
+            "token": "S",
+            "count": 7
+          },
+          {
+            "token": "x",
+            "count": 7
+          },
+          {
+            "token": "7",
+            "count": 7
+          }
+        ]
+      }
+    ]
+  }
+]
