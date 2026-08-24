@@ -29,13 +29,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 LR=1e-04
+ADAM_BETA1=${ADAM_BETA1:-0.9}
+ADAM_BETA2=${ADAM_BETA2:-0.999}
 TBS=64
 PER_DEVICE_BATCH_SIZE=64
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 
 L=4
 H=4
-D=128
+D=256
 BASE_MODEL=llama
 
 V=62
@@ -46,7 +48,7 @@ V=62
 # DATA_NAME="N0-S1(4-4)_1M"
 # DATA_NAME="N10-K2V2-S4(32-64)_1M"
 # DATA_NAME="N16-K1V1-vocab512_1M"
-DATA_NAME="mix-N8-K2V2-V${V}_1M"
+DATA_NAME="inverse-N4-K2V2-V${V}_1M"
 DATA_PATH="./data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
@@ -58,9 +60,9 @@ MEMORY_BACKEND="prefix"
 # - lora backend ignores n_mem_tokens.
 N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
-K=1
+K=2
 LAST_K_SECOND_ORDER=${K}
-INNER_LR=0.04
+INNER_LR=0.4
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 USE_ADAM=false
@@ -93,16 +95,21 @@ KV_MEM_LAYERS="all"
 # - Does not use LoRA/KV-cache layer settings.
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
+READ_FOCAL_GAMMA=${READ_FOCAL_GAMMA:-0.0}
 MEMORY_ALIGNMENT_WEIGHT=${MEMORY_ALIGNMENT_WEIGHT:-0.0}
 STEP_ALIGNMENT_WEIGHT=${STEP_ALIGNMENT_WEIGHT:-0.0}
+ALIGN_LAST_STEP=${ALIGN_LAST_STEP:-false}
 GRAD_ALIGN_NORM=${GRAD_ALIGN_NORM:-none}
 INTERMEDIATE_READ_WEIGHT=${INTERMEDIATE_READ_WEIGHT:-0.0}
+MEMORY_NOISE_SIGMA=${MEMORY_NOISE_SIGMA:-0.0}
 ORTHOGONAL_LOSS_WEIGHT=${ORTHOGONAL_LOSS_WEIGHT:-0.0}
 IVAN_LOSS_WEIGHT=${IVAN_LOSS_WEIGHT:-0.0}
+LIPSCHITZ_WEIGHT=${LIPSCHITZ_WEIGHT:-0.0}
+LIPSCHITZ_CONSTRAINT=${LIPSCHITZ_CONSTRAINT:-1.0}
 STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
 
 ATTN_IMPL="eager"
-MIXED_PRECISION='bf16'
+MIXED_PRECISION='no'
 
 # INIT_CHECKPOINT=./runs/N16-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.04_whead_grad_second_bs_64_lr_1e-04/run_1/checkpoint-198000/model.safetensors
 # INIT_CHECKPOINT=./runs/N32-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.12_whead_grad_second_bs_64_lr_1e-04/run_1/checkpoint-196500/model.safetensors
@@ -156,6 +163,9 @@ if [ "$USE_WRITE_LORA" = true ]; then
     RUN_NAME=${RUN_NAME}d${WRITE_LORA_DROPOUT}
   fi
 fi
+if [ "$LIPSCHITZ_WEIGHT" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_lip${LIPSCHITZ_WEIGHT}_L${LIPSCHITZ_CONSTRAINT}
+fi
 RUN_NAME=${RUN_NAME}_grad_${GRAD_MODE}
 if [ "$ADD_INNER_LOSS_TO_OUTER" = true ]; then
   RUN_NAME=${RUN_NAME}_add_inner
@@ -163,17 +173,26 @@ if [ "$ADD_INNER_LOSS_TO_OUTER" = true ]; then
     RUN_NAME=${RUN_NAME}_w${INNER_LOSS_WEIGHT}
   fi
 fi
+if [ "$READ_FOCAL_GAMMA" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_focal${READ_FOCAL_GAMMA}
+fi
 if [ "$MEMORY_ALIGNMENT_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_align${MEMORY_ALIGNMENT_WEIGHT}
 fi
 if [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}
+  if [ "$ALIGN_LAST_STEP" = true ]; then
+    RUN_NAME=${RUN_NAME}_last
+  fi
   if [ "$GRAD_ALIGN_NORM" != "none" ]; then
     RUN_NAME=${RUN_NAME}_${GRAD_ALIGN_NORM}
   fi
 fi
 if [ "$INTERMEDIATE_READ_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_iread${INTERMEDIATE_READ_WEIGHT}
+fi
+if [ "$MEMORY_NOISE_SIGMA" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_mnoise${MEMORY_NOISE_SIGMA}
 fi
 if [ "$ORTHOGONAL_LOSS_WEIGHT" != "0.0" ] && [ "$ORTHOGONAL_LOSS_WEIGHT" != "None" ]; then
   RUN_NAME=${RUN_NAME}_orth${ORTHOGONAL_LOSS_WEIGHT}
@@ -185,6 +204,9 @@ if [ "$USE_ADAM" = true ]; then
   RUN_NAME=${RUN_NAME}_with_adam
 fi
 RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
+if [ "$ADAM_BETA1" != "0.9" ] || [ "$ADAM_BETA2" != "0.999" ]; then
+  RUN_NAME=${RUN_NAME}_b1${ADAM_BETA1}_b2${ADAM_BETA2}
+fi
 
 if [ "$MIXED_PRECISION" == "no" ]; then
   RUN_NAME=${RUN_NAME}_fp32
@@ -249,6 +271,8 @@ for N in "${N_VALUES[@]}"; do
     --data_path "$DATA_PATH"
     --tokenizer_path "$TOKENIZER_PATH"
     --learning_rate "$LR"
+    --adam_beta1 "$ADAM_BETA1"
+    --adam_beta2 "$ADAM_BETA2"
     --n_layer "$L"
     --n_head "$H"
     --n_embd "$D"
@@ -260,11 +284,15 @@ for N in "${N_VALUES[@]}"; do
     --inner_lr "$INNER_LR"
     --use_adam "$USE_ADAM"
     --grad_mode "$GRAD_MODE"
+    --read_focal_gamma "$READ_FOCAL_GAMMA"
     --memory_alignment_weight "$MEMORY_ALIGNMENT_WEIGHT"
     --step_alignment_weight "$STEP_ALIGNMENT_WEIGHT"
     --grad_align_norm "$GRAD_ALIGN_NORM"
     --intermediate_read_weight "$INTERMEDIATE_READ_WEIGHT"
+    --memory_noise_sigma "$MEMORY_NOISE_SIGMA"
     --freeze_backbone "$FREEZE_BACKBONE"
+    --lipschitz_weight "$LIPSCHITZ_WEIGHT"
+    --lipschitz_constraint "$LIPSCHITZ_CONSTRAINT"
     --max_steps 1000000
     --eval_steps 500
     --logging_steps 500
@@ -327,6 +355,9 @@ for N in "${N_VALUES[@]}"; do
     if [ "$INNER_LOSS_WEIGHT" != "None" ]; then
       CMD+=( --inner_loss_weight "$INNER_LOSS_WEIGHT" )
     fi
+  fi
+  if [ "$ALIGN_LAST_STEP" = true ]; then
+    CMD+=( --align_last_step )
   fi
   if [ "$ORTHOGONAL_LOSS_WEIGHT" != "0.0" ] && [ "$ORTHOGONAL_LOSS_WEIGHT" != "None" ]; then
     CMD+=( --orthogonal_loss_weight "$ORTHOGONAL_LOSS_WEIGHT" )

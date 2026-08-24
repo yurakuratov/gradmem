@@ -8,6 +8,8 @@ source "$SCRIPT_DIR/collect_env_state.sh"
 # Define arguments for the script
 NP=${NP:-1}
 LR=5e-05
+ADAM_BETA1=${ADAM_BETA1:-0.9}
+ADAM_BETA2=${ADAM_BETA2:-0.999}
 TBS=64
 PER_DEVICE_BATCH_SIZE=64
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
@@ -38,6 +40,7 @@ LAST_K_SECOND_ORDER=${K}
 INNER_LR=0.04
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
+MEMORY_NOISE_SIGMA=${MEMORY_NOISE_SIGMA:-0.0}
 USE_ADAM=false
 GRAD_MODE="second"
 USE_MEM_PROJ=true
@@ -63,6 +66,7 @@ KV_MEM_LAYERS="all"
 
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=None
+READ_FOCAL_GAMMA=${READ_FOCAL_GAMMA:-0.0}
 
 
 ATTN_IMPL="eager"
@@ -112,6 +116,9 @@ fi
 if [ "$FREEZE_BACKBONE" = true ]; then
   RUN_NAME=${RUN_NAME}_frozen
 fi
+if [ "$READ_FOCAL_GAMMA" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_focal${READ_FOCAL_GAMMA}
+fi
 RUN_NAME=${RUN_NAME}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}
 
 if [ "$MIXED_PRECISION" == "no" ]; then
@@ -155,6 +162,8 @@ for N in "${N_VALUES[@]}"; do
     --eval_split "$EVAL_SPLIT"
     --max_context_length "$MAX_CONTEXT_LENGTH"
     --learning_rate "$LR"
+    --adam_beta1 "$ADAM_BETA1"
+    --adam_beta2 "$ADAM_BETA2"
     --pretrained_model "$PRETRAINED_MODEL"
     --n_mem_tokens "$N_MEM_TOKENS"
     --memory_backend "$MEMORY_BACKEND"
@@ -162,7 +171,9 @@ for N in "${N_VALUES[@]}"; do
     --last_K_second_order "$LAST_K_SECOND_ORDER"
     --inner_lr "$INNER_LR"
     --use_adam "$USE_ADAM"
+    --memory_noise_sigma "$MEMORY_NOISE_SIGMA"
     --grad_mode "$GRAD_MODE"
+    --read_focal_gamma "$READ_FOCAL_GAMMA"
     --freeze_backbone "$FREEZE_BACKBONE"
     --max_steps 200000
     --eval_steps 500

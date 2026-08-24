@@ -253,7 +253,7 @@ if __name__ == '__main__':
             if args.max_position_embeddings is not None:
                 config.max_position_embeddings = args.max_position_embeddings
         elif args.base_model == 'llama':
-            config = AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B')
+            config = AutoConfig.from_pretrained('unsloth/Llama-3.2-1B')
             config.num_hidden_layers = args.n_layer
             config.num_attention_heads = args.n_head
             config.num_key_value_heads = args.n_head

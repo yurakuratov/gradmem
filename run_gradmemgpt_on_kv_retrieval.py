@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 from functools import partial
 from pathlib import Path
 
@@ -22,6 +23,7 @@ from transformers import (
 )
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
+from kv_dataset_utils import query_target_spans
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -34,6 +36,10 @@ logger = logging.getLogger('')
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
+def initialize_run_seed(seed):
+    transformers.set_seed(seed)
+
+
 LOSS_COMPONENT_KEYS = [
     "outer_loss",
     "target_loss",
@@ -43,6 +49,7 @@ LOSS_COMPONENT_KEYS = [
     "energy_rank_random_loss",
     "energy_traj_loss",
     "energy_anchor_loss",
+    "lipschitz_loss",
     "energy_memory_search_loss",
     "energy_aux_loss",
     "memory_alignment_loss",
@@ -73,7 +80,10 @@ ENERGY_LANDSCAPE_STAT_KEYS = [
     "energy_memory_search_max_target_gain",
     "energy_memory_search_mean_relative_target_gain",
     "energy_memory_search_max_relative_target_gain",
+    "energy_memory_search_included_rate",
     "energy_memory_search_selected_distance",
+    "lipschitz_grad_norm_mean",
+    "lipschitz_grad_norm_max",
 ]
 
 TRAIN_COMPONENT_KEYS = LOSS_COMPONENT_KEYS + ENERGY_LANDSCAPE_STAT_KEYS
@@ -95,20 +105,12 @@ def collate_fn(batch, tokenizer, max_context_length=None):
     # input_seq: 0, target_seq: 1, seq = input_seq + target_seq
     labels_mask = torch.zeros_like(query_input_ids)
     for i, item in enumerate(batch):
-        query_seq_len = len(item['query'])
-        target_seq_len = len(item['target'])
-        target_st, target_end = query_seq_len, query_seq_len + target_seq_len
-        # find target tokens
-        # since target is closer to the end (context, query, target), search from the end
-        in_target = False
-        for j in range(len(offsets_mapping[i]) - 1, -1, -1):
+        target_spans = query_target_spans(item['query'], item['target'])
+        for j in range(len(offsets_mapping[i])):
             st, end = offsets_mapping[i][j]
-            # if (target_st, target_end) intersects with (st, end), it is a target token
-            if st < target_end and end > target_st:
+            if any(st < target_end and end > target_start
+                   for target_start, target_end in target_spans):
                 labels_mask[i, j] = 1
-                in_target = True
-            elif in_target:
-                break
 
     labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
     return {
@@ -136,6 +138,31 @@ def preprocess_logits_for_metrics(eval_pred, labels):
     logits, inner_loop_stats = eval_pred
     # saves gpu RAM, as HF Trainer accumulates all eval logits on GPU
     return (logits.argmax(dim=-1), inner_loop_stats)
+
+
+def fully_answered_value_metrics(preds, labels, ignore_token_ids):
+    """Measure exact completion of each value span, averaged per sample."""
+    answer_mask = labels != -100
+    for token_id in ignore_token_ids:
+        answer_mask &= labels != token_id
+
+    answered_shares = []
+    for prediction, label, row_mask in zip(preds, labels, answer_mask):
+        positions = np.flatnonzero(row_mask)
+        if len(positions) == 0:
+            continue
+
+        # A gap in the label mask separates adjacent values in an all-pair query.
+        split_points = np.flatnonzero(np.diff(positions) > 1) + 1
+        spans = np.split(positions, split_points)
+        if len(spans) <= 1:
+            continue
+        answered = sum(np.array_equal(prediction[span], label[span]) for span in spans)
+        answered_shares.append(float(answered) / len(spans))
+
+    if not answered_shares:
+        return {}
+    return {"value_exact_match": float(np.mean(answered_shares))}
 
 
 def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
@@ -170,6 +197,7 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         for i, (pred, lab) in enumerate(zip(preds, labels))
         if np.any(mask[i])  # Skip samples that are all masked
     ])
+    answered_metrics = fully_answered_value_metrics(preds, labels, ignore_token_ids)
 
     for pred, label, inp_c, inp_q in zip(preds[:5], labels[:5],
                                          inputs['context_input_ids'][:5], inputs['query_input_ids'][:5]):
@@ -186,6 +214,7 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     metrics = {
         "token_accuracy": float(accuracy),
         "exact_match": float(exact_match),
+        **answered_metrics,
         "inner_loss": float(inner_loop_stats['inner_loss'].mean()),
         "inner_grad_norm": float(inner_loop_stats['inner_grad_norm_mean'].mean()),
         "inner_grad_norm_max": float(inner_loop_stats['inner_grad_norm_max'].max()),
@@ -293,7 +322,9 @@ class CustomTrainer(Trainer):
             if isinstance(cb, EarlyStoppingCallback):
                 logs['patience'] = cb.early_stopping_patience_counter
                 break
-        return super().log(logs, start_time=start_time)
+        result = super().log(logs, start_time=start_time)
+        sys.stdout.flush()
+        return result
 
 
 @dataclass
@@ -309,8 +340,14 @@ class ExperimentArgs:
     max_steps: Optional[int] = field(default=50000)
     logging_steps: Optional[int] = field(default=100)
     eval_steps: Optional[int] = field(default=100)
+    save_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "Save a checkpoint every N optimizer steps; defaults to eval_steps."},
+    )
     weight_decay: Optional[float] = field(default=0.0)
     learning_rate: Optional[float] = field(default=1e-04)
+    adam_beta1: Optional[float] = field(default=0.9)
+    adam_beta2: Optional[float] = field(default=0.999)
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
     stop_on_metric_value: Optional[float] = field(default=1.0)
@@ -364,18 +401,24 @@ class ExperimentArgs:
     energy_rank_temperature: Optional[float] = field(default=1.0)
     energy_mix_alpha: Optional[float] = field(default=0.75)
     energy_anchor_weight: Optional[float] = field(default=0.0)
+    lipschitz_weight: Optional[float] = field(default=0.0)
+    lipschitz_constraint: Optional[float] = field(default=1.0)
     energy_memory_search_weight: Optional[float] = field(default=0.0)
     energy_memory_search_num_samples: Optional[int] = field(default=4)
     energy_memory_search_radius_scale: Optional[float] = field(default=0.25)
     energy_memory_search_use_gain_weighting: Optional[bool] = field(default=False)
     energy_memory_search_gain_ema_decay: Optional[float] = field(default=0.99)
+    energy_memory_search_min_relative_target_gain: Optional[float] = field(default=0.0)
     energy_memory_search_use_best_for_next_step: Optional[bool] = field(default=False)
+    read_focal_gamma: Optional[float] = field(default=0.0)
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
     inner_loss_weight: Optional[float] = field(default=None)
     memory_alignment_weight: Optional[float] = field(default=0.0)
     step_alignment_weight: Optional[float] = field(default=0.0)
+    align_last_step: Optional[bool] = field(default=False)
     grad_align_norm: Optional[str] = field(default="none")
     intermediate_read_weight: Optional[float] = field(default=0.0)
+    memory_noise_sigma: Optional[float] = field(default=0.0)
     orthogonal_loss_weight: Optional[float] = field(default=0.0)
     ivan_loss_weight: Optional[float] = field(default=0.0)
 
@@ -456,6 +499,8 @@ if __name__ == '__main__':
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # Trainer seeds runtime RNG later, after the model has already been built.
+    initialize_run_seed(args.seed)
     gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
                                       memory_backend=args.memory_backend,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
@@ -492,6 +537,8 @@ if __name__ == '__main__':
                                       energy_rank_temperature=args.energy_rank_temperature,
                                        energy_mix_alpha=args.energy_mix_alpha,
                                        energy_anchor_weight=args.energy_anchor_weight,
+                                       lipschitz_weight=args.lipschitz_weight,
+                                       lipschitz_constraint=args.lipschitz_constraint,
                                        energy_memory_search_weight=args.energy_memory_search_weight,
                                        energy_memory_search_num_samples=args.energy_memory_search_num_samples,
                                        energy_memory_search_radius_scale=args.energy_memory_search_radius_scale,
@@ -501,16 +548,22 @@ if __name__ == '__main__':
                                        energy_memory_search_gain_ema_decay=(
                                            args.energy_memory_search_gain_ema_decay
                                        ),
-                                       energy_memory_search_use_best_for_next_step=(
-                                           args.energy_memory_search_use_best_for_next_step
+                                       energy_memory_search_min_relative_target_gain=(
+                                           args.energy_memory_search_min_relative_target_gain
                                        ),
+                                        energy_memory_search_use_best_for_next_step=(
+                                            args.energy_memory_search_use_best_for_next_step
+                                        ),
+                                       read_focal_gamma=args.read_focal_gamma,
                                        add_inner_loss_to_outer=args.add_inner_loss_to_outer,
                                        inner_loss_weight=args.inner_loss_weight,
-                                        memory_alignment_weight=args.memory_alignment_weight,
-                                        step_alignment_weight=args.step_alignment_weight,
-                                       grad_align_norm=args.grad_align_norm,
+                                         memory_alignment_weight=args.memory_alignment_weight,
+                                         step_alignment_weight=args.step_alignment_weight,
+                                        align_last_step=args.align_last_step,
+                                        grad_align_norm=args.grad_align_norm,
                                         intermediate_read_weight=args.intermediate_read_weight,
-                                       orthogonal_loss_weight=args.orthogonal_loss_weight,
+                                        memory_noise_sigma=args.memory_noise_sigma,
+                                        orthogonal_loss_weight=args.orthogonal_loss_weight,
                                        ivan_loss_weight=args.ivan_loss_weight)
 
     # Create gradmemgpt model
@@ -579,12 +632,14 @@ if __name__ == '__main__':
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
         lr_scheduler_type=args.lr_scheduler_type,
         gradient_checkpointing=args.use_gradient_checkpointing,
 
         eval_strategy='steps',
         save_strategy='steps',
-        save_steps=args.eval_steps,
+        save_steps=args.save_steps if args.save_steps is not None else args.eval_steps,
         eval_steps=args.eval_steps,
         logging_steps=args.logging_steps,
         report_to='tensorboard',

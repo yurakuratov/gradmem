@@ -8,6 +8,8 @@ source "$SCRIPT_DIR/collect_env_state.sh"
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
 LR=1e-04
+ADAM_BETA1=${ADAM_BETA1:-0.9}
+ADAM_BETA2=${ADAM_BETA2:-0.999}
 TBS=64
 PER_DEVICE_BATCH_SIZE=8
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
@@ -24,6 +26,7 @@ INNER_LR=0.04
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 USE_ADAM=false
+MEMORY_NOISE_SIGMA=${MEMORY_NOISE_SIGMA:-0.0}
 GRAD_MODE="second"
 USE_MEM_PROJ=true
 MEM_PROJ_MODE="proj"
@@ -99,11 +102,14 @@ for task_name in "qa2"; do
         --total_batch_size "$TBS"
         --data_path "$DATA_PATH"
         --learning_rate "$LR"
+        --adam_beta1 "$ADAM_BETA1"
+        --adam_beta2 "$ADAM_BETA2"
         --pretrained_model "$PRETRAINED_MODEL"
         --n_mem_tokens "$N_MEM_TOKENS"
         --K "$K"
         --inner_lr "$INNER_LR"
         --use_adam "$USE_ADAM"
+        --memory_noise_sigma "$MEMORY_NOISE_SIGMA"
         --grad_mode "$GRAD_MODE"
         --max_steps 200000
         --eval_steps 500

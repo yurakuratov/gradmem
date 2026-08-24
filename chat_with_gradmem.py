@@ -183,6 +183,7 @@ def build_model_config(cli_args, base_config=None):
         n_ctrl_tokens=cli_args["n_ctrl_tokens"],
         inner_clip_value=cli_args.get("inner_clip_value"),
         inner_clip_norm=cli_args.get("inner_clip_norm"),
+        memory_noise_sigma=cli_args.get("memory_noise_sigma", 0.0),
         use_mem_proj=cli_args["use_mem_proj"],
         mem_proj_mode=cli_args["mem_proj_mode"],
         use_write_head=cli_args["use_write_head"],
@@ -202,7 +203,9 @@ def build_model_config(cli_args, base_config=None):
         use_gradient_checkpointing=cli_args["use_gradient_checkpointing"],
         attn_implementation=cli_args.get("attn_implementation", "eager"),
         add_inner_loss_to_outer=cli_args.get("add_inner_loss_to_outer", False),
+        read_focal_gamma=cli_args.get("read_focal_gamma", 0.0),
         inner_loss_weight=cli_args.get("inner_loss_weight"),
+        align_last_step=cli_args.get("align_last_step", False),
         grad_align_norm=cli_args.get("grad_align_norm", "none"),
         ivan_loss_weight=cli_args.get("ivan_loss_weight", 0.0),
     )

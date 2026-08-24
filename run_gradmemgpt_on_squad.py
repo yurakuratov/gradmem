@@ -196,6 +196,8 @@ class ExperimentArgs:
     eval_steps: Optional[int] = field(default=100)
     weight_decay: Optional[float] = field(default=0.0)
     learning_rate: Optional[float] = field(default=1e-04)
+    adam_beta1: Optional[float] = field(default=0.9)
+    adam_beta2: Optional[float] = field(default=0.999)
     lr_scheduler_type: Optional[str] = field(default='constant_with_warmup')
     early_stopping_patience: Optional[int] = field(default=50)
     seed: Optional[int] = field(default=142)
@@ -216,6 +218,7 @@ class ExperimentArgs:
     n_ctrl_tokens: Optional[int] = field(default=0)
     inner_clip_value: Optional[float] = field(default=None)
     inner_clip_norm: Optional[float] = field(default=None)
+    memory_noise_sigma: Optional[float] = field(default=0.0)
     use_mem_proj: Optional[bool] = field(default=False)
     mem_proj_mode: Optional[str] = field(default="none")
     use_write_head: Optional[bool] = field(default=False)
@@ -228,6 +231,7 @@ class ExperimentArgs:
     kv_mem_layers: Optional[str] = field(default="all")
     use_gradient_checkpointing: Optional[bool] = field(default=False)
     attn_implementation: Optional[str] = field(default="eager")
+    read_focal_gamma: Optional[float] = field(default=0.0)
 
 
 if __name__ == '__main__':
@@ -298,6 +302,7 @@ if __name__ == '__main__':
                                       lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
                                       n_ctrl_tokens=args.n_ctrl_tokens,
                                       inner_clip_value=args.inner_clip_value, inner_clip_norm=args.inner_clip_norm,
+                                      memory_noise_sigma=args.memory_noise_sigma,
                                       use_mem_proj=args.use_mem_proj, mem_proj_mode=args.mem_proj_mode,
                                       use_write_head=args.use_write_head,
                                       lora_mem_placement=args.lora_mem_placement,
@@ -306,9 +311,10 @@ if __name__ == '__main__':
                                       lora_mem_dropout=args.lora_mem_dropout,
                                       lora_mem_layers=args.lora_mem_layers,
                                       lora_mem_target_modules=args.lora_mem_target_modules,
-                                      kv_mem_layers=args.kv_mem_layers,
-                                      use_gradient_checkpointing=args.use_gradient_checkpointing,
-                                      attn_implementation=args.attn_implementation)
+                                       kv_mem_layers=args.kv_mem_layers,
+                                       use_gradient_checkpointing=args.use_gradient_checkpointing,
+                                       attn_implementation=args.attn_implementation,
+                                       read_focal_gamma=args.read_focal_gamma)
 
     # Create gradmemgpt model
     model = GradMemGPT(gradmem_config)
@@ -374,6 +380,8 @@ if __name__ == '__main__':
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         learning_rate=args.learning_rate,
+        adam_beta1=args.adam_beta1,
+        adam_beta2=args.adam_beta2,
         lr_scheduler_type=args.lr_scheduler_type,
         gradient_checkpointing=args.use_gradient_checkpointing,
 

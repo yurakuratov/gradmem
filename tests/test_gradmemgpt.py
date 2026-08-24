@@ -2,7 +2,7 @@ from contextlib import nullcontext
 
 import pytest
 import torch
-from transformers import GPT2Config, GPTNeoXConfig, LlamaConfig
+from transformers import AutoModelForCausalLM, GPT2Config, GPTNeoXConfig, LlamaConfig
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig, get_backbone
 
@@ -673,6 +673,73 @@ def test_single_batch_train_prefix_energy_objective():
     assert torch.isfinite(model.energy_ln.weight.grad).all().item()
 
 
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_prefix_energy_objective_supports_write_lora():
+    torch.manual_seed(0)
+
+    base_config = _build_base_config("gpt2")
+    model = GradMemGPT(GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        n_mem_tokens=4,
+        K=1,
+        lr=0.01,
+        use_adam=False,
+        grad_mode="second",
+        use_write_lora=True,
+        write_lora_r=4,
+        write_lora_alpha=8,
+        freeze_backbone=True,
+        write_objective="energy",
+        attn_implementation="eager",
+    ))
+    model.train()
+
+    inputs = {
+        "context_input_ids": torch.randint(0, base_config.vocab_size, (2, 6)),
+        "query_input_ids": torch.randint(0, base_config.vocab_size, (2, 4)),
+    }
+    labels = torch.randint(0, base_config.vocab_size, (2, 4))
+    output = model(inputs, labels=labels)
+
+    assert torch.isfinite(output["loss"]).item()
+    output["loss"].backward()
+    write_lora_grads = [
+        parameter.grad
+        for name, parameter in model.model.named_parameters()
+        if "lora_" in name and parameter.requires_grad and parameter.grad is not None
+    ]
+    assert write_lora_grads
+    assert all(torch.isfinite(gradient).all().item() for gradient in write_lora_grads)
+    assert any(gradient.norm().item() > 0.0 for gradient in write_lora_grads)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_write_lora_loads_plain_backbone_checkpoint():
+    torch.manual_seed(0)
+
+    base_config = _build_base_config("gpt2")
+    plain_model = AutoModelForCausalLM.from_config(base_config)
+    model = GradMemGPT(GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        K=0,
+        use_write_lora=True,
+        write_lora_r=4,
+        write_lora_alpha=8,
+        write_objective="energy",
+    ))
+
+    _, unexpected_keys = model.load_state_dict(plain_model.state_dict(), strict=False)
+
+    source_key = "transformer.h.0.attn.c_attn.weight"
+    target_key = "model.base_model.model.transformer.h.0.attn.c_attn.base_layer.weight"
+    assert unexpected_keys == []
+    assert torch.equal(model.state_dict()[target_key], plain_model.state_dict()[source_key])
+
+
 @pytest.mark.forward
 @pytest.mark.all
 def test_layerwise_energy_sums_transformer_layer_energies():
@@ -844,7 +911,7 @@ def test_energy_with_reconstruction_uses_shared_write_forward():
     )
 
     assert torch.isfinite(output["loss"]).item()
-    assert call_counts["combined"] == model_config.K + 1
+    assert call_counts["combined"] == model_config.K + 2
     assert call_counts["reconstruction"] == 0
     assert call_counts["energy"] == 0
 
@@ -1258,10 +1325,178 @@ def test_energy_shaping_loss_accounting_and_backward():
 
 @pytest.mark.one_batch_train
 @pytest.mark.all
-def test_energy_memory_search_runs_after_each_write_step_and_is_training_only():
+def test_lipschitz_constraint_loss_accounting_and_backward():
     torch.manual_seed(0)
     model, inputs, labels = _build_shaped_energy_model(
         batch_size=2,
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        add_inner_loss_to_outer=False,
+        lipschitz_weight=0.25,
+        lipschitz_constraint=0.0,
+    )
+    model.train()
+
+    output = model(inputs, labels=labels)
+    stats = output["inner_loop_stats"]
+
+    assert stats["lipschitz_grad_norm_mean"].item() > 0.0
+    assert stats["lipschitz_loss"].item() > 0.0
+    expected_outer = stats["target_loss"] + model.lipschitz_weight * stats["lipschitz_loss"]
+    assert torch.allclose(stats["outer_loss"], expected_outer)
+    assert torch.allclose(output["loss"].detach(), expected_outer)
+
+    output["loss"].backward()
+    energy_gradients = [
+        parameter.grad for parameter in model.energy_head.parameters()
+        if parameter.grad is not None
+    ]
+    assert energy_gradients
+    assert all(torch.isfinite(gradient).all().item() for gradient in energy_gradients)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_lipschitz_config_defaults_validation_and_serialization(tmp_path):
+    base_config = _build_base_config("gpt2")
+    defaults = GradMemGPTConfig(base_config=base_config)
+    assert defaults.lipschitz_weight == 0.0
+    assert defaults.lipschitz_constraint == 1.0
+
+    for values in (
+        {"lipschitz_weight": -0.1},
+        {"lipschitz_constraint": -0.1},
+        {"lipschitz_weight": float("inf")},
+    ):
+        with pytest.raises(ValueError, match="lipschitz"):
+            GradMemGPTConfig(base_config=base_config, **values)
+    with pytest.raises(ValueError, match="memory_backend='prefix'"):
+        GradMemGPTConfig(base_config=base_config, memory_backend="lora", lipschitz_weight=0.1)
+
+    config = GradMemGPTConfig(
+        base_config=base_config,
+        lipschitz_weight=0.25,
+        lipschitz_constraint=12.0,
+    )
+    config.save_pretrained(tmp_path)
+    restored = GradMemGPTConfig.from_pretrained(tmp_path)
+    assert restored.lipschitz_weight == pytest.approx(0.25)
+    assert restored.lipschitz_constraint == pytest.approx(12.0)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_read_focal_loss_formula_defaults_validation_and_serialization(tmp_path):
+    base_config = _build_base_config("gpt2")
+    defaults = GradMemGPTConfig(base_config=base_config)
+    assert defaults.read_focal_gamma == 0.0
+
+    for value in (-0.1, float("inf")):
+        with pytest.raises(ValueError, match="read_focal_gamma"):
+            GradMemGPTConfig(base_config=base_config, read_focal_gamma=value)
+
+    config = GradMemGPTConfig(base_config=base_config, read_focal_gamma=2.0)
+    config.save_pretrained(tmp_path)
+    restored = GradMemGPTConfig.from_pretrained(tmp_path)
+    assert restored.read_focal_gamma == pytest.approx(2.0)
+
+    model = GradMemGPT(config)
+    predictions = torch.tensor([
+        [[4.0, 0.0, -1.0], [0.0, 1.0, 2.0], [0.0, 0.0, 0.0]],
+        [[0.5, 1.0, -0.5], [2.0, -1.0, 0.0], [0.0, 0.0, 0.0]],
+    ], requires_grad=True)
+    labels = torch.tensor([[0, 2], [1, -100]])
+    read_batch = {"label_shift": 0}
+
+    token_losses = torch.nn.functional.cross_entropy(
+        predictions[:, :-1].reshape(-1, predictions.size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+        reduction="none",
+    ).reshape_as(labels)
+    valid = labels.ne(-100)
+    expected_tokens = token_losses * (1.0 - token_losses.neg().exp()).square() * valid
+    expected = expected_tokens.sum() / valid.sum()
+    expected_per_example = expected_tokens.sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+
+    loss = model._compute_read_target_loss(predictions, read_batch, labels)
+    per_example = model._compute_per_example_read_target_loss(predictions, read_batch, labels)
+    assert torch.allclose(loss, expected)
+    assert torch.allclose(per_example, expected_per_example)
+    loss.backward()
+    assert torch.isfinite(predictions.grad).all()
+
+    model.read_focal_gamma = 0.0
+    expected_ce = torch.nn.functional.cross_entropy(
+        predictions.detach()[:, :-1].reshape(-1, predictions.size(-1)),
+        labels.reshape(-1),
+        ignore_index=-100,
+    )
+    assert torch.allclose(model._compute_read_target_loss(predictions.detach(), read_batch, labels), expected_ce)
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_memory_noise_perturbs_training_gradient_inputs_but_not_clean_state():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_shaped_energy_model(
+        batch_size=2,
+        K=1,
+        lr=0.0,
+        memory_noise_sigma=0.5,
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        add_inner_loss_to_outer=False,
+    )
+    backend = model.memory_backend_impl
+    original_build_write_inputs = backend.build_write_inputs
+    observed_memories = []
+
+    def _record_memory(memory_state, batch_ctx):
+        observed_memories.append(memory_state["mem_batch"].detach().clone())
+        return original_build_write_inputs(memory_state, batch_ctx)
+
+    backend.build_write_inputs = _record_memory
+    initial = model.mem.detach().unsqueeze(0).expand(2, -1, -1)
+
+    model.train()
+    train_output = model(inputs, labels=labels, return_mem=True)
+    assert not torch.equal(observed_memories[0], initial)
+    assert torch.equal(train_output["mem"].detach(), initial)
+
+    observed_memories.clear()
+    model.eval()
+    model(inputs, labels=labels)
+    assert torch.equal(observed_memories[0], initial)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_memory_noise_defaults_validation_and_serialization(tmp_path):
+    base_config = _build_base_config("gpt2")
+    defaults = GradMemGPTConfig(base_config=base_config)
+    assert defaults.memory_noise_sigma == 0.0
+    with pytest.raises(ValueError, match="memory_noise_sigma"):
+        GradMemGPTConfig(base_config=base_config, memory_noise_sigma=-0.1)
+    with pytest.raises(ValueError, match="memory_backend='prefix'"):
+        GradMemGPTConfig(base_config=base_config, memory_backend="lora", memory_noise_sigma=0.1)
+
+    config = GradMemGPTConfig(base_config=base_config, memory_noise_sigma=0.25)
+    config.save_pretrained(tmp_path)
+    restored = GradMemGPTConfig.from_pretrained(tmp_path)
+    assert restored.memory_noise_sigma == pytest.approx(0.25)
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+@pytest.mark.parametrize("write_objective", ["energy", "reconstruction"])
+def test_energy_memory_search_runs_after_each_write_step_and_is_training_only(write_objective):
+    torch.manual_seed(0)
+    model, inputs, labels = _build_shaped_energy_model(
+        batch_size=2,
+        write_objective=write_objective,
         energy_rank_weight=0.0,
         energy_traj_weight=0.0,
         energy_anchor_weight=0.0,
@@ -1313,12 +1548,15 @@ def test_energy_memory_search_runs_after_each_write_step_and_is_training_only():
         stats["target_loss"] + model.energy_memory_search_weight * stats["energy_memory_search_loss"],
     )
     output["loss"].backward()
-    energy_gradients = [
-        parameter.grad for parameter in model.energy_head.parameters()
-        if parameter.grad is not None
-    ]
-    assert energy_gradients
-    assert all(torch.isfinite(gradient).all().item() for gradient in energy_gradients)
+    if write_objective == "energy":
+        energy_gradients = [
+            parameter.grad for parameter in model.energy_head.parameters()
+            if parameter.grad is not None
+        ]
+        assert energy_gradients
+        assert all(torch.isfinite(gradient).all().item() for gradient in energy_gradients)
+    else:
+        assert model.energy_head is None
 
     def _unexpected_search(*_args, **_kwargs):
         raise AssertionError("memory search must be disabled during evaluation")
@@ -1327,6 +1565,33 @@ def test_energy_memory_search_runs_after_each_write_step_and_is_training_only():
     model.eval()
     evaluation = model(inputs, labels=labels)
     assert "energy_memory_search_loss" not in evaluation["inner_loop_stats"]
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_reconstruction_memory_search_forward_and_backward():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_shaped_energy_model(
+        batch_size=2,
+        write_objective="reconstruction",
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        energy_memory_search_weight=0.2,
+        energy_memory_search_num_samples=1,
+        add_inner_loss_to_outer=False,
+        memory_alignment_weight=0.0,
+        step_alignment_weight=0.0,
+        intermediate_read_weight=0.0,
+    )
+    model.train()
+
+    output = model(inputs, labels=labels)
+    search_loss = output["inner_loop_stats"]["energy_memory_search_loss"]
+
+    assert model.energy_head is None
+    assert torch.isfinite(search_loss).item()
+    output["loss"].backward()
 
 
 @pytest.mark.one_batch_train
@@ -1391,10 +1656,60 @@ def test_energy_memory_search_applies_gain_weights_across_all_write_states():
 
 @pytest.mark.one_batch_train
 @pytest.mark.all
-def test_energy_memory_search_can_roll_best_candidate_into_next_write_step():
+@pytest.mark.parametrize("use_gain_weighting", [False, True])
+def test_energy_memory_search_masks_examples_below_minimum_relative_gain(use_gain_weighting):
     torch.manual_seed(0)
     model, inputs, labels = _build_shaped_energy_model(
         batch_size=2,
+        energy_rank_weight=0.0,
+        energy_traj_weight=0.0,
+        energy_anchor_weight=0.0,
+        energy_memory_search_weight=0.2,
+        energy_memory_search_use_gain_weighting=use_gain_weighting,
+        energy_memory_search_min_relative_target_gain=0.15,
+        add_inner_loss_to_outer=False,
+        memory_alignment_weight=0.0,
+        step_alignment_weight=0.0,
+        intermediate_read_weight=0.0,
+    )
+    calls = 0
+
+    def _fixed_search(_backend, memory_state, _previous_memory, _batch_ctx, _labels):
+        nonlocal calls
+        calls += 1
+        graph_anchor = memory_state["mem_batch"].float().flatten(1).sum(dim=1) * 0.0
+        if calls == 1:
+            per_example_loss = graph_anchor + graph_anchor.new_tensor([1.0, 2.0])
+            relative_gain = graph_anchor.new_tensor([0.1, 0.2])
+        else:
+            per_example_loss = graph_anchor + graph_anchor.new_tensor([3.0, 4.0])
+            relative_gain = graph_anchor.new_tensor([0.0, 0.3])
+        return {
+            "loss": per_example_loss.mean(),
+            "per_example_loss": per_example_loss,
+            "relative_target_gain": relative_gain,
+            "improvement_rate": relative_gain.gt(0.0).float().mean(),
+            "target_gain": relative_gain.mean(),
+            "max_target_gain": relative_gain.max(),
+            "selected_distance": per_example_loss.new_tensor(0.125),
+        }
+
+    model._compute_energy_memory_search_loss = _fixed_search
+    model.train()
+    stats = model(inputs, labels=labels)["inner_loop_stats"]
+
+    assert stats["energy_memory_search_loss"].item() == pytest.approx(3.0)
+    assert stats["energy_memory_search_included_rate"].item() == pytest.approx(0.5)
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+@pytest.mark.parametrize("write_objective", ["energy", "reconstruction"])
+def test_energy_memory_search_can_roll_best_candidate_into_next_write_step(write_objective):
+    torch.manual_seed(0)
+    model, inputs, labels = _build_shaped_energy_model(
+        batch_size=2,
+        write_objective=write_objective,
         energy_rank_weight=0.0,
         energy_traj_weight=0.0,
         energy_anchor_weight=0.0,
@@ -1441,19 +1756,23 @@ def test_energy_memory_search_can_roll_best_candidate_into_next_write_step():
     output = model(inputs, labels=labels, return_mem=True)
 
     assert len(search_students) == model.K
-    assert len(write_memories) == model.K + 1  # K inner forwards plus the post-WRITE diagnostic.
+    # K inner forwards, post-WRITE loss diagnostic, and always-on Lipschitz diagnostic.
+    assert len(write_memories) == model.K + 2
     assert torch.allclose(write_memories[1], search_teachers[0])
     assert torch.allclose(search_previous[1], search_teachers[0])
     assert torch.allclose(write_memories[-1], search_teachers[-1])
     assert torch.allclose(output["mem"].detach(), search_teachers[-1])
     assert output["mem"].grad_fn is not None
     output["loss"].backward()
-    energy_gradients = [
-        parameter.grad for parameter in model.energy_head.parameters()
-        if parameter.grad is not None
-    ]
-    assert energy_gradients
-    assert all(torch.isfinite(gradient).all().item() for gradient in energy_gradients)
+    if write_objective == "energy":
+        energy_gradients = [
+            parameter.grad for parameter in model.energy_head.parameters()
+            if parameter.grad is not None
+        ]
+        assert energy_gradients
+        assert all(torch.isfinite(gradient).all().item() for gradient in energy_gradients)
+    else:
+        assert model.energy_head is None
 
 
 @pytest.mark.one_batch_train
@@ -1618,6 +1937,7 @@ def test_energy_memory_search_defaults_validation_and_serialization(tmp_path):
     assert defaults.energy_memory_search_radius_scale == pytest.approx(0.25)
     assert defaults.energy_memory_search_use_gain_weighting is False
     assert defaults.energy_memory_search_gain_ema_decay == pytest.approx(0.99)
+    assert defaults.energy_memory_search_min_relative_target_gain == pytest.approx(0.0)
     assert defaults.energy_memory_search_use_best_for_next_step is False
 
     invalid_overrides = [
@@ -1626,8 +1946,8 @@ def test_energy_memory_search_defaults_validation_and_serialization(tmp_path):
         {"energy_memory_search_radius_scale": 0.0},
         {"energy_memory_search_gain_ema_decay": -0.1},
         {"energy_memory_search_gain_ema_decay": 1.0},
+        {"energy_memory_search_min_relative_target_gain": -0.1},
         {"energy_memory_search_use_best_for_next_step": True},
-        {"energy_memory_search_weight": 0.1, "write_objective": "reconstruction"},
         {
             "energy_memory_search_weight": 0.1,
             "write_objective": "energy",
@@ -1669,12 +1989,13 @@ def test_energy_memory_search_defaults_validation_and_serialization(tmp_path):
         K=2,
         grad_mode="second",
         use_adam=False,
-        write_objective="energy",
+        write_objective="reconstruction",
         energy_memory_search_weight=0.1,
         energy_memory_search_num_samples=7,
         energy_memory_search_radius_scale=0.4,
         energy_memory_search_use_gain_weighting=True,
         energy_memory_search_gain_ema_decay=0.95,
+        energy_memory_search_min_relative_target_gain=0.05,
         energy_memory_search_use_best_for_next_step=True,
     )
     config.save_pretrained(tmp_path)
@@ -1684,6 +2005,7 @@ def test_energy_memory_search_defaults_validation_and_serialization(tmp_path):
     assert restored.energy_memory_search_radius_scale == pytest.approx(0.4)
     assert restored.energy_memory_search_use_gain_weighting is True
     assert restored.energy_memory_search_gain_ema_decay == pytest.approx(0.95)
+    assert restored.energy_memory_search_min_relative_target_gain == pytest.approx(0.05)
     assert restored.energy_memory_search_use_best_for_next_step is True
 
     model = GradMemGPT(config)
@@ -1814,11 +2136,16 @@ def test_memory_alignment_validation_and_serialization(tmp_path):
 @pytest.mark.one_batch_train
 @pytest.mark.all
 @pytest.mark.parametrize("grad_align_norm", ["none", "norm"])
-def test_step_alignment_uses_each_inner_update_and_resulting_memory_gradient(grad_align_norm):
+@pytest.mark.parametrize("align_last_step", [False, True])
+def test_step_alignment_uses_each_inner_update_and_resulting_memory_gradient(
+    grad_align_norm,
+    align_last_step,
+):
     torch.manual_seed(0)
     model, inputs, labels = _build_memory_alignment_model(
         memory_alignment_weight=0.0,
         step_alignment_weight=0.4,
+        align_last_step=align_last_step,
         grad_align_norm=grad_align_norm,
         intermediate_read_weight=0.0,
     )
@@ -1852,7 +2179,7 @@ def test_step_alignment_uses_each_inner_update_and_resulting_memory_gradient(gra
     output = model(inputs, labels=labels)
     stats = output["inner_loop_stats"]
 
-    assert len(recorded_losses) == model.K + 1
+    assert len(recorded_losses) == model.K + int(align_last_step)
     expected_loss = torch.stack(recorded_losses).mean()
     expected_cosine = torch.stack(recorded_cosines).mean()
     assert torch.allclose(stats["step_alignment_loss"], expected_loss.detach())
@@ -1877,6 +2204,7 @@ def test_step_alignment_uses_each_inner_update_and_resulting_memory_gradient(gra
 def test_step_alignment_defaults_validation_and_serialization(tmp_path):
     base_config = _build_base_config("gpt2")
     assert GradMemGPTConfig(base_config=base_config).step_alignment_weight == 0.0
+    assert GradMemGPTConfig(base_config=base_config).align_last_step is False
     assert GradMemGPTConfig(base_config=base_config).grad_align_norm == "none"
     invalid_overrides = [
         {"step_alignment_weight": -0.1},
@@ -1897,11 +2225,13 @@ def test_step_alignment_defaults_validation_and_serialization(tmp_path):
         K=2,
         grad_mode="second",
         step_alignment_weight=0.25,
+        align_last_step=True,
         grad_align_norm="norm",
     )
     config.save_pretrained(tmp_path)
     restored = GradMemGPTConfig.from_pretrained(tmp_path)
     assert restored.step_alignment_weight == pytest.approx(0.25)
+    assert restored.align_last_step is True
     assert restored.grad_align_norm == "norm"
 
 
@@ -2305,6 +2635,47 @@ def test_intermediate_read_defaults_validation_and_serialization(tmp_path):
     assert restored.intermediate_read_weight == pytest.approx(0.25)
 
 
+@pytest.mark.forward
+@pytest.mark.all
+def test_kv_runner_outer_adam_beta_defaults():
+    from run_gradmemgpt_on_kv_retrieval import ExperimentArgs
+
+    beta1 = ExperimentArgs.__dataclass_fields__["adam_beta1"].default
+    beta2 = ExperimentArgs.__dataclass_fields__["adam_beta2"].default
+    assert beta1 == pytest.approx(0.9)
+    assert beta2 == pytest.approx(0.999)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_kv_runner_seed_controls_parameter_initialization():
+    from run_gradmemgpt_on_kv_retrieval import initialize_run_seed
+
+    base_config = _build_base_config("gpt2")
+
+    def initialize(seed):
+        initialize_run_seed(seed)
+        model = GradMemGPT(GradMemGPTConfig(
+            base_config=base_config,
+            memory_backend="prefix",
+            n_mem_tokens=4,
+            K=1,
+            write_objective="energy",
+        ))
+        return {
+            "memory": model.mem.detach().clone(),
+            "backbone": next(model.model.parameters()).detach().clone(),
+            "energy": next(model.energy_head.parameters()).detach().clone(),
+        }
+
+    first = initialize(123)
+    repeated = initialize(123)
+    different = initialize(124)
+
+    assert all(torch.equal(first[name], repeated[name]) for name in first)
+    assert all(not torch.equal(first[name], different[name]) for name in first)
+
+
 @pytest.mark.one_batch_train
 @pytest.mark.all
 @pytest.mark.parametrize("shaping_active", [False, True])
@@ -2324,10 +2695,14 @@ def test_trainer_and_eval_metrics_preserve_active_only_schema(tmp_path, shaping_
             return ""
 
     torch.manual_seed(0)
-    overrides = {} if shaping_active else {
+    overrides = {
+        "lipschitz_weight": 0.1,
+        "lipschitz_constraint": 0.0,
+    } if shaping_active else {
         "energy_rank_weight": 0.0,
         "energy_traj_weight": 0.0,
         "energy_anchor_weight": 0.0,
+        "lipschitz_weight": 0.0,
         "add_inner_loss_to_outer": False,
     }
     model, inputs, labels = _build_shaped_energy_model(batch_size=2, **overrides)
@@ -2380,6 +2755,8 @@ def test_trainer_and_eval_metrics_preserve_active_only_schema(tmp_path, shaping_
         "ivan_loss",
         "ivan_residual_dot",
         "intermediate_read_loss",
+        "lipschitz_grad_norm_mean",
+        "lipschitz_grad_norm_max",
     }
     for exported in (logged, metrics):
         assert diagnostic_loss_keys <= exported.keys()
@@ -2397,6 +2774,7 @@ def test_trainer_and_eval_metrics_preserve_active_only_schema(tmp_path, shaping_
         "energy_rank_loss",
         "energy_traj_loss",
         "energy_anchor_loss",
+        "lipschitz_loss",
         "energy_positive_mean",
         "energy_negative_deranged_mean",
         "energy_margin_random_mean",

@@ -3,19 +3,19 @@
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
 LR=5e-05
-ADAM_BETA2=0.98
+# ADAM_BETA2=0.98
 TBS=64
 PER_DEVICE_BATCH_SIZE=64
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 
 L=4
 H=4
-D=128
-MAX_POSITION_EMBEDDINGS=1024
+D=256
+# MAX_POSITION_EMBEDDINGS=1024
 BASE_MODEL=llama
 
-INIT_CHECKPOINT=./runs/N64-K2V2-V62_1M/llama_L4H4D128_L1024_bs_64_lr_5e-05_b2_0.98/run_3/checkpoint-168500/model.safetensors
-RUN_NAME_SUFFIX=init_N64
+# INIT_CHECKPOINT=./runs/N64-K2V2-V62_1M/llama_L4H4D128_L1024_bs_64_lr_5e-05_b2_0.98/run_3/checkpoint-168500/model.safetensors
+# RUN_NAME_SUFFIX=init_N64
 
 V=62
 # Dataset parameters
@@ -23,7 +23,7 @@ V=62
 # DATA_NAME="N1-K4V4-S1(16-32)_1M"
 # DATA_NAME="N10-K2V2-S4(32-64)_1M"
 # DATA_NAME="N8-K1V1-vocab512_1M"
-DATA_NAME="N96-K2V2-V${V}_1M"
+DATA_NAME="mix-N8-K2V2-V${V}_1M"
 # DATA_NAME="N4-K1V1-vocab512_1M"
 # copy task
 # DATA_NAME="N0-S1(4-4)_1M"
@@ -57,13 +57,13 @@ for N in "${N_VALUES[@]}"; do
   # RND=$(date +%Y%m%d%H%M%S)
   # EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}_${RND}_DBG/run_$N"
   # EXP_PATH="./runs/${DATA_NAME}/mamba_L4D128_bs_64_lr_3e-04_20251005001255_DBG/run_1"
-  EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
+  EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_${N}"
 
   # Execute the script using accelerate for parallel processing
   accelerate launch \
     --main_process_port $((29500+$TBS+$N+1)) \
     --num_processes $NP \
-    --mixed_precision bf16 \
+    --mixed_precision no \
     --config_file accelerate.yaml \
     run_gpt2_on_kv_retrieval.py \
     --exp_path $EXP_PATH \

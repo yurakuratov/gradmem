@@ -98,18 +98,24 @@ class GradMemGPTConfig(PretrainedConfig):
                  energy_rank_temperature=1.0,
                  energy_mix_alpha=0.75,
                  energy_anchor_weight=0.0,
+                 lipschitz_weight=0.0,
+                 lipschitz_constraint=1.0,
                  energy_memory_search_weight=0.0,
                  energy_memory_search_num_samples=4,
                  energy_memory_search_radius_scale=0.25,
                  energy_memory_search_use_gain_weighting=False,
                  energy_memory_search_gain_ema_decay=0.99,
+                 energy_memory_search_min_relative_target_gain=0.0,
                  energy_memory_search_use_best_for_next_step=False,
+                 read_focal_gamma=0.0,
                  add_inner_loss_to_outer=False,
                  inner_loss_weight=None,
                  memory_alignment_weight=0.0,
                  step_alignment_weight=0.0,
+                 align_last_step=False,
                  grad_align_norm="none",
                  intermediate_read_weight=0.0,
+                 memory_noise_sigma=0.0,
                  orthogonal_loss_weight=0.0,
                  ivan_loss_weight=0.0,
                  **kwargs):
@@ -164,6 +170,8 @@ class GradMemGPTConfig(PretrainedConfig):
             energy_rank_temperature: float, softplus temperature for contrastive ranking losses
             energy_mix_alpha: float, positive-memory coefficient for interpolated negatives
             energy_anchor_weight: float, optional energy-magnitude anchoring loss weight
+            lipschitz_weight: float, weight for the final-state WRITE-objective gradient-norm constraint
+            lipschitz_constraint: float, maximum allowed final-state WRITE-objective gradient norm
             energy_memory_search_weight: float, weight for matching each WRITE state to a locally
                 perturbed memory with lower downstream READ loss
             energy_memory_search_num_samples: int, number of perturbed candidates per WRITE state
@@ -173,17 +181,23 @@ class GradMemGPTConfig(PretrainedConfig):
                 detached relative READ-loss improvement
             energy_memory_search_gain_ema_decay: float, decay for the per-WRITE-depth positive-gain
                 means used to normalize memory-search gain weights
+            energy_memory_search_min_relative_target_gain: float, minimum detached relative READ-loss
+                improvement required for an example to contribute to the memory-search loss
             energy_memory_search_use_best_for_next_step: bool, use a straight-through copy of the
                 selected target-guided memory as the starting point for the next WRITE step
+            read_focal_gamma: float, focal exponent for token-level outer READ loss weighting
             add_inner_loss_to_outer: bool, outer loss = target_loss + inner_loss_weight * inner_loss_mean
             inner_loss_weight: float, weight of inner loss in combined loss
             memory_alignment_weight: float, weight for aligning the cumulative WRITE direction with the
                 stopped READ gradient on the final prefix memory
             step_alignment_weight: float, weight for aligning each inner-loop memory update with the
                 stopped READ gradient at the resulting memory state
+            align_last_step: bool, also align the post-WRITE gradient at M_K, whose update is not applied
             grad_align_norm: str, step-alignment normalization ("none" or "norm"); "norm" weights
                 each per-sample cosine loss by the stopped task-gradient norm
             intermediate_read_weight: float, weight for reverse-harmonic READ supervision on M_1...M_(K-1)
+            memory_noise_sigma: float, training-only per-coordinate WRITE-gradient noise scale relative
+                to the root-mean-square magnitude of the initial prefix memory
             orthogonal_loss_weight: float, weight for enforcing that the scaled stopped outer gradient
                 leaves a residual inner update orthogonal to the outer gradient
             ivan_loss_weight: float, weight for the squared inner product between the outer gradient
@@ -242,18 +256,26 @@ class GradMemGPTConfig(PretrainedConfig):
         self.energy_rank_temperature = energy_rank_temperature
         self.energy_mix_alpha = energy_mix_alpha
         self.energy_anchor_weight = energy_anchor_weight
+        self.lipschitz_weight = float(lipschitz_weight or 0.0)
+        self.lipschitz_constraint = float(lipschitz_constraint)
         self.energy_memory_search_weight = energy_memory_search_weight
         self.energy_memory_search_num_samples = energy_memory_search_num_samples
         self.energy_memory_search_radius_scale = energy_memory_search_radius_scale
         self.energy_memory_search_use_gain_weighting = energy_memory_search_use_gain_weighting
         self.energy_memory_search_gain_ema_decay = energy_memory_search_gain_ema_decay
+        self.energy_memory_search_min_relative_target_gain = float(
+            energy_memory_search_min_relative_target_gain
+        )
         self.energy_memory_search_use_best_for_next_step = energy_memory_search_use_best_for_next_step
+        self.read_focal_gamma = float(read_focal_gamma)
         self.add_inner_loss_to_outer = add_inner_loss_to_outer
         self.inner_loss_weight = inner_loss_weight
         self.memory_alignment_weight = memory_alignment_weight
         self.step_alignment_weight = step_alignment_weight
+        self.align_last_step = align_last_step
         self.grad_align_norm = grad_align_norm
         self.intermediate_read_weight = intermediate_read_weight
+        self.memory_noise_sigma = float(memory_noise_sigma or 0.0)
         self.orthogonal_loss_weight = float(orthogonal_loss_weight or 0.0)
         self.ivan_loss_weight = float(ivan_loss_weight or 0.0)
 
@@ -275,6 +297,14 @@ class GradMemGPTConfig(PretrainedConfig):
             raise ValueError("energy_rank_temperature must be > 0")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
             raise ValueError("energy_mix_alpha must be within [0, 1]")
+        if not math.isfinite(self.lipschitz_weight) or self.lipschitz_weight < 0.0:
+            raise ValueError("lipschitz_weight must be finite and >= 0")
+        if not math.isfinite(self.lipschitz_constraint) or self.lipschitz_constraint < 0.0:
+            raise ValueError("lipschitz_constraint must be finite and >= 0")
+        if not math.isfinite(self.read_focal_gamma) or self.read_focal_gamma < 0.0:
+            raise ValueError("read_focal_gamma must be finite and >= 0")
+        if self.lipschitz_weight > 0.0 and self.memory_backend != "prefix":
+            raise ValueError("lipschitz_weight > 0 requires memory_backend='prefix'")
         if not math.isfinite(self.energy_memory_search_weight) or self.energy_memory_search_weight < 0.0:
             raise ValueError("energy_memory_search_weight must be finite and >= 0")
         if self.energy_memory_search_num_samples < 1:
@@ -289,9 +319,12 @@ class GradMemGPTConfig(PretrainedConfig):
             or not 0.0 <= self.energy_memory_search_gain_ema_decay < 1.0
         ):
             raise ValueError("energy_memory_search_gain_ema_decay must be finite and within [0, 1)")
+        if (
+            not math.isfinite(self.energy_memory_search_min_relative_target_gain)
+            or self.energy_memory_search_min_relative_target_gain < 0.0
+        ):
+            raise ValueError("energy_memory_search_min_relative_target_gain must be finite and >= 0")
         if self.energy_memory_search_weight > 0.0:
-            if self.write_objective not in ("energy", "energy_with_reconstruction"):
-                raise ValueError("energy_memory_search_weight > 0 requires an energy WRITE objective")
             if self.memory_backend != "prefix":
                 raise ValueError("energy_memory_search_weight > 0 requires memory_backend='prefix'")
             if self.K <= 0:
@@ -314,6 +347,10 @@ class GradMemGPTConfig(PretrainedConfig):
             raise ValueError("grad_align_norm must be one of: none, norm")
         if self.intermediate_read_weight < 0.0:
             raise ValueError("intermediate_read_weight must be >= 0")
+        if not math.isfinite(self.memory_noise_sigma) or self.memory_noise_sigma < 0.0:
+            raise ValueError("memory_noise_sigma must be finite and >= 0")
+        if self.memory_noise_sigma > 0.0 and self.memory_backend != "prefix":
+            raise ValueError("memory_noise_sigma > 0 requires memory_backend='prefix'")
         if self.orthogonal_loss_weight < 0.0:
             raise ValueError("orthogonal_loss_weight must be >= 0")
         if self.ivan_loss_weight < 0.0:
@@ -901,6 +938,8 @@ class GradMemGPT(PreTrainedModel):
         self.energy_rank_temperature = float(getattr(config, "energy_rank_temperature", 1.0))
         self.energy_mix_alpha = float(getattr(config, "energy_mix_alpha", 0.75))
         self.energy_anchor_weight = float(getattr(config, "energy_anchor_weight", 0.0) or 0.0)
+        self.lipschitz_weight = float(getattr(config, "lipschitz_weight", 0.0) or 0.0)
+        self.lipschitz_constraint = float(getattr(config, "lipschitz_constraint", 1.0))
         self.energy_memory_search_weight = float(
             getattr(config, "energy_memory_search_weight", 0.0) or 0.0
         )
@@ -916,13 +955,19 @@ class GradMemGPT(PreTrainedModel):
         self.energy_memory_search_gain_ema_decay = float(
             getattr(config, "energy_memory_search_gain_ema_decay", 0.99)
         )
+        self.energy_memory_search_min_relative_target_gain = float(
+            getattr(config, "energy_memory_search_min_relative_target_gain", 0.0)
+        )
         self.energy_memory_search_use_best_for_next_step = bool(
             getattr(config, "energy_memory_search_use_best_for_next_step", False)
         )
+        self.read_focal_gamma = float(getattr(config, "read_focal_gamma", 0.0))
         self.memory_alignment_weight = float(getattr(config, "memory_alignment_weight", 0.0) or 0.0)
         self.step_alignment_weight = float(getattr(config, "step_alignment_weight", 0.0) or 0.0)
+        self.align_last_step = bool(getattr(config, "align_last_step", False))
         self.grad_align_norm = getattr(config, "grad_align_norm", "none")
         self.intermediate_read_weight = float(getattr(config, "intermediate_read_weight", 0.0) or 0.0)
+        self.memory_noise_sigma = float(getattr(config, "memory_noise_sigma", 0.0) or 0.0)
         self.orthogonal_loss_weight = float(getattr(config, "orthogonal_loss_weight", 0.0) or 0.0)
         self.ivan_loss_weight = float(getattr(config, "ivan_loss_weight", 0.0) or 0.0)
         orthogonal_alpha_trainable = self.memory_backend == "prefix" and self.K > 0 and self.lr > 0.0
@@ -933,6 +978,8 @@ class GradMemGPT(PreTrainedModel):
             self.register_parameter("orthogonal_alpha_raw", None)
         if self.energy_rank_temperature <= 0.0:
             raise ValueError("energy_rank_temperature must be > 0")
+        if not math.isfinite(self.read_focal_gamma) or self.read_focal_gamma < 0.0:
+            raise ValueError("read_focal_gamma must be finite and >= 0")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
             raise ValueError("energy_mix_alpha must be within [0, 1]")
         if not math.isfinite(self.energy_memory_search_weight) or self.energy_memory_search_weight < 0.0:
@@ -949,6 +996,11 @@ class GradMemGPT(PreTrainedModel):
             or not 0.0 <= self.energy_memory_search_gain_ema_decay < 1.0
         ):
             raise ValueError("energy_memory_search_gain_ema_decay must be finite and within [0, 1)")
+        if (
+            not math.isfinite(self.energy_memory_search_min_relative_target_gain)
+            or self.energy_memory_search_min_relative_target_gain < 0.0
+        ):
+            raise ValueError("energy_memory_search_min_relative_target_gain must be finite and >= 0")
         if self.energy_memory_search_use_best_for_next_step and self.energy_memory_search_weight <= 0.0:
             raise ValueError(
                 "energy_memory_search_use_best_for_next_step requires energy_memory_search_weight > 0"
@@ -1059,6 +1111,32 @@ class GradMemGPT(PreTrainedModel):
         unexpected_keys,
         error_msgs,
     ):
+        if self.use_write_lora:
+            # PEFT nests the causal LM and wraps targeted weights in base_layer.
+            # Accept both plain causal-LM and unwrapped GradMem checkpoints.
+            wrapped_model_prefix = "model.base_model.model."
+            consumed_keys = set()
+            for relative_target_key in self.state_dict():
+                if not relative_target_key.startswith(wrapped_model_prefix):
+                    continue
+                target_key = prefix + relative_target_key
+                if target_key in state_dict:
+                    continue
+                unwrapped_suffix = relative_target_key[len(wrapped_model_prefix):].replace(
+                    ".base_layer.", "."
+                )
+                source_candidates = (
+                    prefix + unwrapped_suffix,
+                    prefix + "model." + unwrapped_suffix,
+                )
+                for source_key in source_candidates:
+                    if source_key in state_dict:
+                        state_dict[target_key] = state_dict[source_key]
+                        consumed_keys.add(source_key)
+                        break
+            for source_key in consumed_keys:
+                state_dict.pop(source_key)
+
         # Checkpoints created before per-depth gain tracking stored scalar buffers.
         for name in (
             "energy_memory_search_gain_ema",
@@ -1414,6 +1492,40 @@ class GradMemGPT(PreTrainedModel):
             "negative_losses": negative_losses,
         }
 
+    def _compute_lipschitz_constraint_loss(self, backend, memory_state, batch_ctx, *, create_graph):
+        """Measure and optionally constrain the WRITE gradient at detached M_K locations."""
+        candidate_state = {
+            key: value.detach() if isinstance(value, torch.Tensor) else value
+            for key, value in memory_state.items()
+        }
+        candidate_memory = memory_state["mem_batch"].detach().requires_grad_(True)
+        candidate_state["mem_batch"] = candidate_memory
+        write_batch = backend.build_write_inputs(candidate_state, batch_ctx)
+        with backend.activation_context(candidate_state):
+            if self.write_objective == "reconstruction":
+                outs, reconstruction_loss = self._run_reconstruction_write_forward(write_batch)
+                write_objective = reconstruction_loss
+            else:
+                outs, reconstruction_loss, energy_loss = self._run_energy_reconstruction_write_forward(
+                    write_batch
+                )
+                if self.write_objective == "energy":
+                    write_objective = energy_loss
+                else:
+                    write_objective = (
+                        self.write_reconstruction_weight * reconstruction_loss
+                        + self.write_energy_weight * energy_loss
+                    )
+        del outs
+        memory_gradient = torch.autograd.grad(
+            write_objective.sum(),
+            candidate_memory,
+            create_graph=create_graph,
+        )[0]
+        gradient_norm = memory_gradient.float().flatten(1).norm(dim=1)
+        loss = F.relu(gradient_norm - self.lipschitz_constraint).square().mean()
+        return loss, gradient_norm
+
     def _compute_write_reconstruction_loss(self, logits, write_batch):
         logits_loss = logits[:, :-1]
         label_shift = write_batch.get('label_shift', 0)
@@ -1454,10 +1566,15 @@ class GradMemGPT(PreTrainedModel):
             hidden = outs.last_hidden_state[:, write_batch['logits_start']:, :]
             logits = self.write_head(hidden)
         else:
-            outs = self.model(inputs_embeds=write_batch['inputs_embeds'],
-                              return_dict=True,
-                              **model_kwargs)
-            logits = outs.logits[:, write_batch['logits_start']:, :]
+            # outs = self.model(inputs_embeds=write_batch['inputs_embeds'],
+            #                   return_dict=True,
+            #                   **model_kwargs)
+            # logits = outs.logits[:, write_batch['logits_start']:, :]
+            outs = get_backbone(self.model)(inputs_embeds=write_batch['inputs_embeds'],
+                                            return_dict=True,
+                                            **model_kwargs)
+            hidden = outs.last_hidden_state[:, write_batch['logits_start']:, :]
+            logits = self.model.lm_head(hidden)
 
         loss = self._compute_write_reconstruction_loss(logits, write_batch)
         return outs, loss
@@ -1837,8 +1954,7 @@ class GradMemGPT(PreTrainedModel):
         weights = (K - depths + 1).reciprocal()
         return weights / weights.sum()
 
-    @staticmethod
-    def _compute_read_target_loss(predictions, read_batch, labels):
+    def _compute_read_target_loss(self, predictions, read_batch, labels):
         target_logits = predictions[:, :-1]
         target_label_shift = read_batch.get('label_shift', 0)
         # Prefix memory can predict the first target token from memory itself (label_shift=0),
@@ -1849,14 +1965,17 @@ class GradMemGPT(PreTrainedModel):
                 f"Mismatched target lengths after alignment: logits_len={target_logits.size(1)}, "
                 f"labels_len={target_labels.size(1)}, label_shift={target_label_shift}"
             )
-        return nn.functional.cross_entropy(
+        token_losses = F.cross_entropy(
             target_logits.reshape(-1, predictions.size(-1)),
             target_labels.reshape(-1),
             ignore_index=-100,
-        )
+            reduction="none",
+        ).reshape_as(target_labels)
+        valid = target_labels.ne(-100)
+        focal_weights = (1.0 - token_losses.neg().exp()).pow(self.read_focal_gamma)
+        return (token_losses * focal_weights * valid).sum() / valid.sum().clamp_min(1)
 
-    @staticmethod
-    def _compute_per_example_read_target_loss(predictions, read_batch, labels):
+    def _compute_per_example_read_target_loss(self, predictions, read_batch, labels):
         target_logits = predictions[:, :-1]
         target_label_shift = read_batch.get('label_shift', 0)
         target_labels = labels[:, target_label_shift:]
@@ -1872,7 +1991,8 @@ class GradMemGPT(PreTrainedModel):
             reduction="none",
         ).reshape_as(target_labels)
         valid = target_labels.ne(-100)
-        return (token_losses * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
+        focal_weights = (1.0 - token_losses.neg().exp()).pow(self.read_focal_gamma)
+        return (token_losses * focal_weights * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1)
 
     @contextmanager
     def _temporary_model_eval(self):
@@ -2200,7 +2320,6 @@ class GradMemGPT(PreTrainedModel):
             and labels is not None
             and has_write_context
             and self.energy_memory_search_weight > 0.0
-            and self.write_objective in ("energy", "energy_with_reconstruction")
         )
         inline_memory_search_active = (
             memory_search_active and self.energy_memory_search_use_best_for_next_step
@@ -2215,18 +2334,26 @@ class GradMemGPT(PreTrainedModel):
         if self.K and has_write_context:
             with torch.enable_grad():
                 for k in range(self.K):
-                    write_batch = backend.build_write_inputs(memory_state, batch_ctx)
+                    gradient_memory_state = memory_state
+                    if self.training and self.memory_noise_sigma > 0.0:
+                        gradient_memory_state = dict(memory_state)
+                        initial_rms = memory_state_initial["mem_batch"].float().square().mean().sqrt().detach()
+                        noise = torch.randn_like(memory_state["mem_batch"]) * (
+                            self.memory_noise_sigma * initial_rms
+                        )
+                        gradient_memory_state["mem_batch"] = memory_state["mem_batch"] + noise
+                    write_batch = backend.build_write_inputs(gradient_memory_state, batch_ctx)
                     rec_loss = None
                     energy_loss = None
                     if self.write_objective == "energy":
-                        with backend.activation_context(memory_state):
+                        with backend.activation_context(gradient_memory_state):
                             outs, rec_loss, energy_loss = self._run_energy_reconstruction_write_forward(
                                 write_batch
                             )
                         inner_loss_per_sample = energy_loss
                         del outs
                     elif self.write_objective == "energy_with_reconstruction":
-                        with backend.activation_context(memory_state):
+                        with backend.activation_context(gradient_memory_state):
                             outs, rec_loss, energy_loss = self._run_energy_reconstruction_write_forward(write_batch)
                         inner_loss_per_sample = (
                             self.write_reconstruction_weight * rec_loss
@@ -2234,7 +2361,7 @@ class GradMemGPT(PreTrainedModel):
                         )
                         del outs
                     else:
-                        with backend.activation_context(memory_state):
+                        with backend.activation_context(gradient_memory_state):
                             outs, rec_loss = self._run_reconstruction_write_forward(write_batch)
                         inner_loss_per_sample = rec_loss
                         del outs
@@ -2254,8 +2381,9 @@ class GradMemGPT(PreTrainedModel):
                         or intermediate_read_objective_active
                     )
 
-                    inner_params = backend.inner_params(memory_state)
-                    grads = torch.autograd.grad(inner_loss, inner_params,
+                    clean_inner_params = backend.inner_params(memory_state)
+                    gradient_inner_params = backend.inner_params(gradient_memory_state)
+                    grads = torch.autograd.grad(inner_loss, gradient_inner_params,
                                                 create_graph=create_graph, retain_graph=retain_graph)
                     if ivan_loss_active:
                         if inner_grad_sums is None:
@@ -2272,7 +2400,7 @@ class GradMemGPT(PreTrainedModel):
                     inner_loop_stats['inner_grad_norm_min'] = min(inner_loop_stats['inner_grad_norm_min'], g_norm.min())
 
                     new_params = []
-                    for p, g, i in zip(inner_params, grads, range(len(inner_params))):
+                    for p, g, i in zip(clean_inner_params, grads, range(len(clean_inner_params))):
                         if self.use_adam:
                             p_new = self._adam_step(p, g, opt_state.setdefault(str(i), {}), k + 1, self.lr)
                         else:
@@ -2281,14 +2409,14 @@ class GradMemGPT(PreTrainedModel):
                                                    clip_norm=self.inner_clip_norm)
                         new_params.append(p_new)
                     if memory_alignment_active:
-                        inner_memory_updates.append(inner_params[0] - new_params[0])
+                        inner_memory_updates.append(clean_inner_params[0] - new_params[0])
                     backend.assign_inner_params(memory_state, new_params)
                     backend.maybe_detach_after_step(memory_state)
                     if inline_memory_search_active:
                         search_result = self._compute_energy_memory_search_loss(
                             backend,
                             memory_state,
-                            inner_params[0],
+                            clean_inner_params[0],
                             batch_ctx,
                             labels,
                         )
@@ -2420,6 +2548,7 @@ class GradMemGPT(PreTrainedModel):
         memory_search_max_target_gain = zero
         memory_search_relative_target_gain = zero
         memory_search_max_relative_target_gain = zero
+        memory_search_included_rate = zero
         memory_search_selected_distance = zero
         if memory_search_active:
             if inline_memory_search_active:
@@ -2448,11 +2577,19 @@ class GradMemGPT(PreTrainedModel):
             memory_search_unweighted_loss = per_example_search_losses.mean()
             memory_search_relative_target_gain = relative_target_gains.mean()
             memory_search_max_relative_target_gain = relative_target_gains.max()
+            included = relative_target_gains.ge(
+                self.energy_memory_search_min_relative_target_gain
+            )
+            included_float = included.to(dtype=per_example_search_losses.dtype)
+            included_count = included_float.sum()
+            memory_search_included_rate = included_float.mean()
             if self.energy_memory_search_use_gain_weighting:
-                gain_weights = self._compute_energy_memory_search_gain_weights(relative_target_gains)
-                memory_search_loss = (gain_weights * per_example_search_losses).mean()
+                thresholded_gains = relative_target_gains * included
+                gain_weights = self._compute_energy_memory_search_gain_weights(thresholded_gains)
+                weighted_losses = gain_weights * per_example_search_losses
             else:
-                memory_search_loss = memory_search_unweighted_loss
+                weighted_losses = included_float * per_example_search_losses
+            memory_search_loss = weighted_losses.sum() / included_count.clamp_min(1.0)
             memory_search_improvement_rate = torch.stack(
                 [result["improvement_rate"] for result in search_results]
             ).mean()
@@ -2566,6 +2703,8 @@ class GradMemGPT(PreTrainedModel):
         loss_stats = {}
         landscape_stats = {}
         energy_objective_active = self.write_objective in ("energy", "energy_with_reconstruction")
+        lipschitz_active = self.lipschitz_weight > 0.0
+        lipschitz_diagnostic_active = self.memory_backend == "prefix"
         rank_active = energy_objective_active and self.energy_rank_weight > 0.0
         anchor_active = energy_objective_active and self.energy_anchor_weight > 0.0
         trajectory_active = (
@@ -2587,6 +2726,16 @@ class GradMemGPT(PreTrainedModel):
             orthogonal_loss_active=orthogonal_loss_active,
             energy_objective_active=energy_objective_active,
         )
+        lipschitz_loss = zero
+        lipschitz_gradient_norm = zero.expand(B)
+        if lipschitz_diagnostic_active:
+            with torch.enable_grad():
+                lipschitz_loss, lipschitz_gradient_norm = self._compute_lipschitz_constraint_loss(
+                    backend,
+                    memory_state,
+                    batch_ctx,
+                    create_graph=lipschitz_active,
+                )
         if step_alignment_active and inner_memory_updates:
             final_step_alignment_loss, final_step_alignment_cosine = self._compute_step_alignment(
                 target_loss,
@@ -2596,22 +2745,23 @@ class GradMemGPT(PreTrainedModel):
             step_alignment_losses.append(final_step_alignment_loss)
             step_alignment_cosines.append(final_step_alignment_cosine)
 
-            with torch.enable_grad():
-                reconstruction_grad_after_write = torch.autograd.grad(
-                    reconstruction_loss_after_write.sum(),
-                    memory_state["mem_batch"],
-                    create_graph=self.step_alignment_weight > 0.0,
-                    retain_graph=True,
-                )[0]
-            reconstruction_alignment_loss_after_write, reconstruction_alignment_cosine_after_write = (
-                self._compute_step_alignment(
-                    target_loss,
-                    memory_state,
-                    reconstruction_grad_after_write,
+            if self.align_last_step:
+                with torch.enable_grad():
+                    reconstruction_grad_after_write = torch.autograd.grad(
+                        reconstruction_loss_after_write.sum(),
+                        memory_state["mem_batch"],
+                        create_graph=self.step_alignment_weight > 0.0,
+                        retain_graph=True,
+                    )[0]
+                reconstruction_alignment_loss_after_write, reconstruction_alignment_cosine_after_write = (
+                    self._compute_step_alignment(
+                        target_loss,
+                        memory_state,
+                        reconstruction_grad_after_write,
+                    )
                 )
-            )
-            step_alignment_losses.append(reconstruction_alignment_loss_after_write)
-            step_alignment_cosines.append(reconstruction_alignment_cosine_after_write)
+                step_alignment_losses.append(reconstruction_alignment_loss_after_write)
+                step_alignment_cosines.append(reconstruction_alignment_cosine_after_write)
             step_alignment_loss = torch.stack(step_alignment_losses).mean()
             step_alignment_cosine = torch.stack(step_alignment_cosines).mean()
         else:
@@ -2679,6 +2829,7 @@ class GradMemGPT(PreTrainedModel):
         weighted_rank_loss = self.energy_rank_weight * rank_loss if rank_active else zero
         weighted_traj_loss = self.energy_traj_weight * traj_loss if trajectory_active else zero
         weighted_anchor_loss = self.energy_anchor_weight * anchor_loss if anchor_active else zero
+        weighted_lipschitz_loss = self.lipschitz_weight * lipschitz_loss if lipschitz_active else zero
         weighted_memory_search_loss = (
             self.energy_memory_search_weight * memory_search_loss if memory_search_active else zero
         )
@@ -2705,6 +2856,7 @@ class GradMemGPT(PreTrainedModel):
             target_loss
             + auxiliary_loss
             + weighted_memory_search_loss
+            + weighted_lipschitz_loss
             + weighted_ivan_loss
             + weighted_step_alignment_loss
             + weighted_intermediate_read_loss
@@ -2722,7 +2874,11 @@ class GradMemGPT(PreTrainedModel):
             "ivan_loss": ivan_loss,
             "ivan_residual_dot": ivan_residual_dot,
             "intermediate_read_loss": intermediate_read_loss,
+            "lipschitz_grad_norm_mean": lipschitz_gradient_norm.mean(),
+            "lipschitz_grad_norm_max": lipschitz_gradient_norm.max(),
         })
+        if lipschitz_active:
+            loss_stats["lipschitz_loss"] = lipschitz_loss
         if memory_search_active:
             loss_stats.update({
                 "energy_memory_search_loss": memory_search_loss,
@@ -2731,6 +2887,7 @@ class GradMemGPT(PreTrainedModel):
                 "energy_memory_search_max_target_gain": memory_search_max_target_gain,
                 "energy_memory_search_mean_relative_target_gain": memory_search_relative_target_gain,
                 "energy_memory_search_max_relative_target_gain": memory_search_max_relative_target_gain,
+                "energy_memory_search_included_rate": memory_search_included_rate,
                 "energy_memory_search_selected_distance": memory_search_selected_distance,
             })
         if rank_active or trajectory_active or anchor_active or memory_search_active:
