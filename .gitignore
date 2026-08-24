@@ -179,3 +179,7 @@ cython_debug/
 # data
 data
 runs
+
+AGENTS.md
+opencode.json
+gradmem.pdf
