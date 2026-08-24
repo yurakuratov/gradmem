@@ -3,19 +3,18 @@ import logging
 import os
 from pathlib import Path
 import math
-from functools import partial
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from typing import Dict, Optional
 from dataclasses import dataclass, field
-import datasets
 
 import accelerate
 from safetensors.torch import load_file
 import transformers
 from transformers import (
-    AutoConfig, AutoTokenizer,
+    AutoConfig,
     AutoModelForCausalLM,
     Trainer, TrainerState,
     TrainingArguments,
@@ -24,6 +23,7 @@ from transformers import (
 )
 
 from transformers.trainer_utils import get_last_checkpoint
+from zoology_mqar_data import ZOOLOGY_MQAR_SOURCE, build_mqar_datasets
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -35,39 +35,13 @@ logger = logging.getLogger('')
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
-def collate_fn(batch, tokenizer, max_input_length=None):
-    seq = [item['context'] + item['query'] + item['target'] for item in batch]
-    seq_encoded = tokenizer(seq, return_tensors="pt", add_special_tokens=True,
-                            padding=True, pad_to_multiple_of=8, max_length=max_input_length, truncation=True,
-                            return_offsets_mapping=True)
-    input_ids = seq_encoded['input_ids']
-    offsets_mapping = seq_encoded['offset_mapping']
-
-    attn_mask = (input_ids != tokenizer.pad_token_id).to(dtype=torch.long)
-    # add labels_mask
-    # input_seq: 0, target_seq: 1, seq = input_seq + target_seq
-    labels_mask = torch.zeros_like(input_ids)
-    for i, item in enumerate(batch):
-        input_seq_len = len(item['context']) + len(item['query'])
-        target_seq_len = len(item['target'])
-        target_st, target_end = input_seq_len, input_seq_len + target_seq_len
-
-        # find target tokens
-        # since target is closer to the end, search from the end
-        in_target = False
-        for j in range(len(offsets_mapping[i]) - 1, -1, -1):
-            st, end = offsets_mapping[i][j]
-            # if (target_st, target_end) intersects with (st, end), it is a target token
-            if st < target_end and end > target_st:
-                labels_mask[i, j] = 1
-                in_target = True
-            elif in_target:
-                break
-
-    labels = input_ids * labels_mask + (1 - labels_mask) * -100
+def collate_fn(batch):
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    labels = torch.stack([item['labels'] for item in batch])
     return {
         'input_ids': input_ids,
-        'attention_mask': attn_mask,
+        # MQAR examples are fixed-length. Token 0 is data, not padding.
+        'attention_mask': torch.ones_like(input_ids),
         'labels': labels,
     }
 
@@ -80,8 +54,8 @@ def tensor_batch_to_numpy(batch):
     return batch
 
 
-def collate_fn_numpy(batch, tokenizer, max_input_length=None):
-    return tensor_batch_to_numpy(collate_fn(batch, tokenizer, max_input_length=max_input_length))
+def collate_fn_numpy(batch):
+    return tensor_batch_to_numpy(collate_fn(batch))
 
 
 def preprocess_logits_for_metrics(logits, labels):
@@ -89,44 +63,36 @@ def preprocess_logits_for_metrics(logits, labels):
     return logits.argmax(dim=-1)
 
 
-def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
+def compute_metrics_fn(eval_pred):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
-
-    # shift for lm loss
-    predictions = predictions[..., :-1]
-    labels = labels[..., 1:]
-
-    # Create a mask for tokens that are not padding (-100) and ignored tokens (like ! and |)
     mask = (labels != -100)
-    for t_id in ignore_token_ids:
-        mask &= (labels != t_id)
-    # Calculate token-level accuracy only on content tokens
-    masked_predictions = predictions[mask]
-    masked_labels = labels[mask]
+    if not np.all(mask.any(axis=1)):
+        raise ValueError('Every MQAR example must contain at least one supervised query.')
 
-    accuracy = (masked_predictions == masked_labels).mean()
+    correct = predictions[mask] == labels[mask]
+    token_accuracy = float(correct.mean())
+    per_example_token_accuracy = [
+        (prediction[example_mask] == label[example_mask]).mean()
+        for prediction, label, example_mask in zip(predictions, labels, mask)
+    ]
+    all_queries_exact_match = [
+        np.all(prediction[example_mask] == label[example_mask])
+        for prediction, label, example_mask in zip(predictions, labels, mask)
+    ]
 
-    # get exact_match per-sample accuracy, ignore masked tokens
-    # predictions.shape = (batch_size, seq_len)
-    exact_match = np.mean([
-        np.all(pred[mask[i]] == lab[mask[i]])
-        for i, (pred, lab) in enumerate(zip(predictions, labels))
-        if np.any(mask[i])  # Skip samples that are all masked
-    ])
-
-    for pred, label, inp in zip(predictions[:5], labels[:5], inputs[:5]):
-        mask = (label != -100)
-        pred = pred[mask]
-        inp[inp == -100] = tokenizer.pad_token_id
-        label[label == -100] = tokenizer.pad_token_id
-        print('i:', tokenizer.decode(inp, skip_special_tokens=True).strip())
-        print('p:', tokenizer.decode(pred, skip_special_tokens=True).strip())
-        print('t:', tokenizer.decode(label, skip_special_tokens=True).strip())
+    for pred, label, inp, example_mask in zip(predictions[:5], labels[:5], inputs[:5], mask[:5]):
+        print('i:', np.asarray(inp).tolist())
+        print('q:', np.asarray(inp[example_mask]).tolist())
+        print('p:', np.asarray(pred[example_mask]).tolist())
+        print('t:', np.asarray(label[example_mask]).tolist())
         print('-' * 50)
 
     return {
-        "token_accuracy": float(accuracy),
-        "exact_match": float(exact_match),
+        # Every MQAR answer is one token, so per-query EM equals token accuracy.
+        'token_accuracy': token_accuracy,
+        'exact_match': token_accuracy,
+        'all_queries_token_accuracy': float(np.mean(per_example_token_accuracy)),
+        'all_queries_exact_match': float(np.mean(all_queries_exact_match)),
     }
 
 
@@ -174,12 +140,34 @@ class CustomTrainer(Trainer):
         return super().log(logs, start_time=start_time)
 
 
+class MQARTrainer(CustomTrainer):
+    """Use Zoology's same-position masked loss without a causal label shift."""
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        model_inputs = dict(inputs)
+        labels = model_inputs.pop('labels')
+        outputs = model(**model_inputs)
+        logits = outputs.logits
+        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1), ignore_index=-100)
+        return (loss, outputs) if return_outputs else loss
+
+
 @dataclass
 class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
-    data_path: str = field(default='./data/N8-K2V2-V62_1M')
-    tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
+    vocab_size: Optional[int] = field(default=8192)
+    input_seq_len: Optional[int] = field(default=24)
+    num_kv_pairs: Optional[int] = field(default=8)
+    train_num_examples: Optional[int] = field(default=100_000)
+    valid_num_examples: Optional[int] = field(default=3_000)
+    power_a: Optional[float] = field(default=0.01)
+    random_non_queries: Optional[bool] = field(default=False)
+    data_seed: Optional[int] = field(default=123)
+    dense_queries: Optional[bool] = field(default=True)
+    query_sampling: Optional[str] = field(default='uniform',
+                                          metadata={'help': 'Dense query sampling: uniform, power_law, or zoology.'}
+                                          )
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
@@ -204,7 +192,6 @@ class ExperimentArgs:
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
     max_position_embeddings: Optional[int] = field(default=None)
-    max_input_length: Optional[int] = field(default=None)
     attn_implementation: Optional[str] = field(default=None)
     attention_dropout: Optional[float] = field(default=0.0)
 
@@ -221,7 +208,6 @@ if __name__ == '__main__':
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
     logger = get_logger('')
-    # datasets.utils.logging.set_verbosity(logger.log_level)
     transformers.utils.logging.set_verbosity(log_lvl)
 
     logger.info(f'num processes: {accel.num_processes}')
@@ -235,13 +221,48 @@ if __name__ == '__main__':
         raise RuntimeError(f"Output directory already exists: {output_dir}. "
                            f"Pass --overwrite_output_dir to resume/continue here, or choose a new --exp_path.")
 
+    train_dataset, valid_dataset, train_data_seed, valid_data_seed = build_mqar_datasets(
+        vocab_size=args.vocab_size,
+        input_seq_len=args.input_seq_len,
+        num_kv_pairs=args.num_kv_pairs,
+        train_num_examples=args.train_num_examples,
+        valid_num_examples=args.valid_num_examples,
+        power_a=args.power_a,
+        random_non_queries=args.random_non_queries,
+        data_seed=args.data_seed,
+        dense_queries=args.dense_queries,
+        query_sampling=args.query_sampling,
+    )
+
     if accel.is_main_process and not args.do_eval_only:
         config = {
             'cli_args': dict(vars(args)),
+            'task_source': ZOOLOGY_MQAR_SOURCE,
+            'task': 'Zoology MQAR' + (' dense' if args.dense_queries else ' upstream'),
+            'query_layout': (
+                'dense context and contiguous query keys; no fillers'
+                if args.dense_queries else
+                'upstream power-law query placement'
+            ),
+            'query_sampling': train_dataset.slices.get('query_sampling'),
+            'data_generator': train_dataset.slices.get('generator', 'upstream'),
+            'query_distribution': train_dataset.slices.get(
+                'query_distribution', 'power_law_placement'
+            ),
+            'effective_power_a': train_dataset.slices.get('effective_power_a', args.power_a),
+            'loss_alignment': 'same-position masked cross entropy; no causal label shift',
+            'train_data_seed': train_data_seed,
+            'valid_data_seed': valid_data_seed,
+            'metrics': [
+                'token_accuracy',
+                'exact_match',
+                'all_queries_token_accuracy',
+                'all_queries_exact_match',
+            ],
         }
         logger.info('saving experiment configuration..')
-        Path(args.exp_path).mkdir(parents=True, exist_ok=True)
-        json.dump(config, open(os.path.join(args.exp_path, 'config.json'), 'w'), indent=4)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        json.dump(config, open(output_dir / 'config.json', 'w'), indent=4)
 
     if accel.mixed_precision == 'bf16':
         dtype = torch.bfloat16
@@ -252,14 +273,15 @@ if __name__ == '__main__':
         args.attn_implementation = None
 
     if args.pretrained_model is not None:
-        tokenizer = AutoTokenizer.from_pretrained(args.pretrained_model)
-        if tokenizer.pad_token_id is None:
-            tokenizer.pad_token_id = tokenizer.eos_token_id
         model = AutoModelForCausalLM.from_pretrained(args.pretrained_model, torch_dtype=dtype,
                                                      attn_implementation=args.attn_implementation)
+        if model.config.vocab_size != args.vocab_size:
+            logger.info(
+                f'resizing pretrained_model vocabulary from {model.config.vocab_size} '
+                f'to MQAR vocab_size {args.vocab_size}'
+            )
+            model.resize_token_embeddings(args.vocab_size)
     else:
-        # create tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path)
         # create model config
         if args.base_model == 'gpt2':
             config = AutoConfig.from_pretrained('gpt2')
@@ -279,7 +301,7 @@ if __name__ == '__main__':
             if args.max_position_embeddings is not None:
                 config.max_position_embeddings = args.max_position_embeddings
         elif args.base_model == 'llama':
-            config = AutoConfig.from_pretrained('unsloth/Llama-3.2-1B')
+            config = AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B')
             config.num_hidden_layers = args.n_layer
             config.num_attention_heads = args.n_head
             config.num_key_value_heads = args.n_head
@@ -306,15 +328,18 @@ if __name__ == '__main__':
             raise ValueError(f'Unsupported base model: {args.base_model}')
 
         config.torch_dtype = dtype  # weights in float32, at training precision is controlled by accelerate
-        config.vocab_size = tokenizer.vocab_size
-        config.pad_token_id = tokenizer.pad_token_id
-        config.bos_token_id = tokenizer.bos_token_id
-        config.eos_token_id = tokenizer.eos_token_id
-        tokenizer.truncation_side = 'left'  # to truncate context tokens, not query or target
+        config.vocab_size = args.vocab_size
+        config.pad_token_id = None
+        config.bos_token_id = None
+        config.eos_token_id = None
         # create model
         model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype,
                                                  attn_implementation=args.attn_implementation)
 
+    model.config.pad_token_id = None
+    model.config.bos_token_id = None
+    model.config.eos_token_id = None
+    model.get_input_embeddings().padding_idx = None
     model.config.use_cache = False
 
     if args.init_checkpoint is not None:
@@ -328,20 +353,10 @@ if __name__ == '__main__':
     logger.info(f'model: {model}')
     logger.info(f'model.dtype: {model.dtype}')
     logger.info(f'attn_implementation: {args.attn_implementation}')
-
-    dataset = datasets.load_from_disk(args.data_path)
+    logger.info(f'train examples: {len(train_dataset)}; valid examples: {len(valid_dataset)}')
 
     # use collate_fn_numpy if no GPU is available, allows running with 'mps' device on Apple M chips
-    collator_fn = collate_fn if torch.cuda.is_available() else collate_fn_numpy
-    data_collator = partial(collator_fn, tokenizer=tokenizer, max_input_length=args.max_input_length)
-
-    # Target sequence looks like: "XXXX!|"
-    # Let's not count ! and | in the accuracy calculation
-    ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']]
-
-    # Define custom compute metrics function with ignore tokens
-    def compute_metrics(eval_pred):
-        return compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer)
+    data_collator = collate_fn if torch.cuda.is_available() else collate_fn_numpy
 
     if args.total_batch_size is None:
         args.total_batch_size = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
@@ -389,16 +404,17 @@ if __name__ == '__main__':
     )
 
     # Initialize Trainer
-    trainer = CustomTrainer(
+    trainer = MQARTrainer(
         model=model,
         args=training_args,
-        train_dataset=dataset['train'],
-        eval_dataset=dataset['valid'],
+        train_dataset=train_dataset,
+        eval_dataset=valid_dataset,
         data_collator=data_collator,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics_fn,
         preprocess_logits_for_metrics=preprocess_logits_for_metrics,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=args.early_stopping_patience),
-                   StopOnMetricValue(metric_name='exact_match', value=args.stop_on_metric_value, higher_is_better=True),
+                   StopOnMetricValue(metric_name='all_queries_exact_match', value=args.stop_on_metric_value,
+                                     higher_is_better=True),
                    ],
     )
 
@@ -421,7 +437,7 @@ if __name__ == '__main__':
         trainer.train(resume_from_checkpoint=last_ckpt)
         logger.info('training done. running final evaluation...')
     # run final evaluation
-    metrics = trainer.evaluate(dataset['valid'])
+    metrics = trainer.evaluate(valid_dataset)
     logger.info(f'{metrics}')
     trainer.save_metrics(split='all', metrics=metrics)
     if not args.do_eval_only:

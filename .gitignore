@@ -179,6 +179,7 @@ cython_debug/
 # data
 data
 runs
+snapshots
 
 AGENTS.md
 opencode.json

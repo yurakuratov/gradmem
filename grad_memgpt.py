@@ -962,6 +962,7 @@ class GradMemGPT(PreTrainedModel):
             getattr(config, "energy_memory_search_use_best_for_next_step", False)
         )
         self.read_focal_gamma = float(getattr(config, "read_focal_gamma", 0.0))
+        self.read_loss_alignment = getattr(config, "read_loss_alignment", "causal")
         self.memory_alignment_weight = float(getattr(config, "memory_alignment_weight", 0.0) or 0.0)
         self.step_alignment_weight = float(getattr(config, "step_alignment_weight", 0.0) or 0.0)
         self.align_last_step = bool(getattr(config, "align_last_step", False))
@@ -980,6 +981,8 @@ class GradMemGPT(PreTrainedModel):
             raise ValueError("energy_rank_temperature must be > 0")
         if not math.isfinite(self.read_focal_gamma) or self.read_focal_gamma < 0.0:
             raise ValueError("read_focal_gamma must be finite and >= 0")
+        if self.read_loss_alignment not in ("causal", "query_position"):
+            raise ValueError("read_loss_alignment must be one of: causal, query_position")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
             raise ValueError("energy_mix_alpha must be within [0, 1]")
         if not math.isfinite(self.energy_memory_search_weight) or self.energy_memory_search_weight < 0.0:
@@ -1955,11 +1958,18 @@ class GradMemGPT(PreTrainedModel):
         return weights / weights.sum()
 
     def _compute_read_target_loss(self, predictions, read_batch, labels):
-        target_logits = predictions[:, :-1]
-        target_label_shift = read_batch.get('label_shift', 0)
-        # Prefix memory can predict the first target token from memory itself (label_shift=0),
-        # while LoRA/KV-cache memory without a prepended seed token cannot (label_shift=1).
-        target_labels = labels[:, target_label_shift:]
+        if self.read_loss_alignment == "query_position":
+            # MQAR labels are attached to query positions, so score the logits
+            # after each query token rather than the next-token causal shift.
+            target_logits = predictions[:, 1:] if self.memory_backend == "prefix" else predictions
+            target_labels = labels
+            target_label_shift = "query_position"
+        else:
+            target_logits = predictions[:, :-1]
+            target_label_shift = read_batch.get('label_shift', 0)
+            # Prefix memory can predict the first target token from memory itself (label_shift=0),
+            # while LoRA/KV-cache memory without a prepended seed token cannot (label_shift=1).
+            target_labels = labels[:, target_label_shift:]
         if target_logits.size(1) != target_labels.size(1):
             raise ValueError(
                 f"Mismatched target lengths after alignment: logits_len={target_logits.size(1)}, "
@@ -1976,9 +1986,14 @@ class GradMemGPT(PreTrainedModel):
         return (token_losses * focal_weights * valid).sum() / valid.sum().clamp_min(1)
 
     def _compute_per_example_read_target_loss(self, predictions, read_batch, labels):
-        target_logits = predictions[:, :-1]
-        target_label_shift = read_batch.get('label_shift', 0)
-        target_labels = labels[:, target_label_shift:]
+        if self.read_loss_alignment == "query_position":
+            target_logits = predictions[:, 1:] if self.memory_backend == "prefix" else predictions
+            target_labels = labels
+            target_label_shift = "query_position"
+        else:
+            target_logits = predictions[:, :-1]
+            target_label_shift = read_batch.get('label_shift', 0)
+            target_labels = labels[:, target_label_shift:]
         if target_logits.size(1) != target_labels.size(1):
             raise ValueError(
                 f"Mismatched target lengths after alignment: logits_len={target_logits.size(1)}, "

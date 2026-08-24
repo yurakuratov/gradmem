@@ -7,38 +7,55 @@ source "$SCRIPT_DIR/collect_env_state.sh"
 
 # Define arguments for the script
 NP=${NP:-1}  # Default to 1 process if not set
-LR=1e-04
+LR=${LR:-1e-04}
 ADAM_BETA2=${ADAM_BETA2:-}
-# ADAM_BETA2=0.98
-TBS=64
-PER_DEVICE_BATCH_SIZE=64
-GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
-STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
-STOP_ON_METRIC_VALUE=0.99
+TBS=${TBS:-64}
+PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-64}
+STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-0.99}
 MIXED_PRECISION=${MIXED_PRECISION:-no}
+RUN_NAME_SUFFIX=${RUN_NAME_SUFFIX:-$STOP_ON_METRIC_VALUE}
 
 L=4
 H=4
-D=128
+D=256
 MAX_POSITION_EMBEDDINGS=1024
 BASE_MODEL=llama
 
-# INIT_CHECKPOINT=./runs/N64-K2V2-V62_1M/llama_L4H4D128_L1024_bs_64_lr_5e-05_b2_0.98/run_3/checkpoint-168500/model.safetensors
-# RUN_NAME_SUFFIX=init_N64
-RUN_NAME_SUFFIX=0.99
+# Dense MQAR query-order distribution.
+VOCAB_SIZE=8192
+NUM_KV_PAIRS=8
+INPUT_SEQ_LEN=$((3 * NUM_KV_PAIRS))
+# zoology uses power_law with 0.01
+QUERY_SAMPLING=${QUERY_SAMPLING:-uniform}
+POWER_A=${POWER_A:-0.01}
+TRAIN_NUM_EXAMPLES=100000
+VALID_NUM_EXAMPLES=3000
+DATA_SEED=123
 
-V=62
-# Dataset parameters
-# DATA_NAME="N2-K4V4-S4(32-64)_1M"
-# DATA_NAME="N1-K4V4-S1(16-32)_1M"
-# DATA_NAME="N10-K2V2-S4(32-64)_1M"
-# DATA_NAME="N8-K1V1-vocab512_1M"
-DATA_NAME="N8-K2V2-V${V}_1M"
-# DATA_NAME="N4-K1V1-vocab512_1M"
-# copy task
-# DATA_NAME="N0-S1(4-4)_1M"
-DATA_PATH="./data/${DATA_NAME}"
-TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
+case "$QUERY_SAMPLING" in
+  uniform)
+    DATA_NAME="mqar_N${NUM_KV_PAIRS}_V${VOCAB_SIZE}_L${INPUT_SEQ_LEN}"
+    ;;
+  power_law)
+    DATA_NAME="mqar_nonuniform_A${POWER_A}_N${NUM_KV_PAIRS}_V${VOCAB_SIZE}_L${INPUT_SEQ_LEN}"
+    ;;
+  zoology)
+    DATA_NAME="mqar_zoology_A${POWER_A}_N${NUM_KV_PAIRS}_V${VOCAB_SIZE}_L${INPUT_SEQ_LEN}"
+    ;;
+  *)
+    echo "QUERY_SAMPLING must be uniform, power_law, or zoology, got: $QUERY_SAMPLING" >&2
+    exit 2
+    ;;
+esac
+
+# For sparse upstream MQAR, add --dense_queries false and set INPUT_SEQ_LEN to
+# at least 4*NUM_KV_PAIRS. query_sampling only controls dense query ordering.
+
+if (( TBS % (PER_DEVICE_BATCH_SIZE*NP) != 0 )); then
+  echo "TBS must be divisible by PER_DEVICE_BATCH_SIZE*NP" >&2
+  exit 2
+fi
+GRAD_ACC_STEPS=$((TBS/(PER_DEVICE_BATCH_SIZE*NP)))
 
 if [ "$BASE_MODEL" == "mamba" ]; then
   RUN_NAME="${BASE_MODEL}_L${L}D${D}"
@@ -55,18 +72,15 @@ if [ -n "$ADAM_BETA2" ]; then
   RUN_NAME=${RUN_NAME}_b2_${ADAM_BETA2}
 fi
 
-if [ -n "$RUN_NAME_SUFFIX" ]; then
+if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
   RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
 fi
 
 
 # Run ID
-N_VALUES=(1 2)
+N_VALUES=(1 2 3)
 for N in "${N_VALUES[@]}"; do
   # Path to save experiment results
-  # RND=$(date +%Y%m%d%H%M%S)
-  # EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}_${RND}_DBG/run_$N"
-  # EXP_PATH="./runs/${DATA_NAME}/mamba_L4D128_bs_64_lr_3e-04_20251005001255_DBG/run_1"
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
 
   if [ "$MIXED_PRECISION" != "no" ]; then
@@ -85,17 +99,24 @@ for N in "${N_VALUES[@]}"; do
       --num_processes "$NP"
       --mixed_precision "$MIXED_PRECISION"
       --config_file accelerate.yaml
-    run_gpt2_on_kv_retrieval.py
+    run_gpt2_on_mqar.py
       --exp_path "$EXP_PATH"
       --per_device_batch_size "$PER_DEVICE_BATCH_SIZE"
       --gradient_accumulation_steps "$GRAD_ACC_STEPS"
       --total_batch_size "$TBS"
-      --data_path "$DATA_PATH"
-      --tokenizer_path "$TOKENIZER_PATH"
+      --vocab_size "$VOCAB_SIZE"
+      --input_seq_len "$INPUT_SEQ_LEN"
+      --num_kv_pairs "$NUM_KV_PAIRS"
+      --query_sampling "$QUERY_SAMPLING"
+      --power_a "$POWER_A"
+      --train_num_examples "$TRAIN_NUM_EXAMPLES"
+      --valid_num_examples "$VALID_NUM_EXAMPLES"
+      --data_seed "$DATA_SEED"
       --learning_rate "$LR"
       --n_layer "$L"
       --n_head "$H"
       --n_embd "$D"
+      --max_position_embeddings "$MAX_POSITION_EMBEDDINGS"
       --base_model "$BASE_MODEL"
       --max_steps 200000
       --eval_steps 500
@@ -108,9 +129,6 @@ for N in "${N_VALUES[@]}"; do
 
   if [ -n "$ADAM_BETA2" ]; then
     CMD+=(--adam_beta2 "$ADAM_BETA2")
-  fi
-  if [ -n "$MAX_POSITION_EMBEDDINGS" ]; then
-    CMD+=(--max_position_embeddings "$MAX_POSITION_EMBEDDINGS")
   fi
   if [ -n "${INIT_CHECKPOINT:-}" ]; then
     CMD+=(--init_checkpoint "$INIT_CHECKPOINT")
