@@ -2,9 +2,10 @@
 
 ## Environment Setup
 ```bash
-conda env create -f conda_env.yaml
-conda activate /home/jovyan/kuratov/envs/py311_pt2.6_cu12.4  # adjust path as needed
+uv sync                      # creates .venv from pyproject.toml + uv.lock
+uv run python run_from_config.py --config configs/gradmemgpt/kv_retrieval/default.yaml
 ```
+Dependencies, pins, and the PyTorch `cu124` wheel index live in `pyproject.toml`; `uv.lock` is the fully resolved graph (commit it). Use `uv sync --extra notebooks` for notebook/data-prep deps only.
 
 ## Running Training (Two Options)
 
@@ -96,17 +97,31 @@ optional `overrides`, `grid` (cartesian product), `max_parallel`; top-level
 max_parallel: 1
 experiments:
   - name: gradmem_K_grid
-    command: "python run_from_config.py"
+    command: "python run_from_config.py --config"   # must end with --config
     base_config: "configs/gradmemgpt/kv_retrieval/default.yaml"
     overrides: {gradmem.use_write_head: true}
     grid: {gradmem.K: [1, 2, 4], gradmem.inner_lr: [0.02, 0.04]}
 ```
-- Flags like `--debug` are passed by listing them in `command`, not `overrides`
-  (an override is always `key=value`).
+- `command` is the launch prefix and `base_config` is appended as a bare token
+  right after it. `run_from_config.py` requires `--config <path>` (a bare
+  positional is rejected), so `command` **must end with `--config`** — then
+  `base_config` becomes its value.
+- Flags like `--debug` go in `command` **before** the trailing `--config`:
+  `command: "python run_from_config.py --debug --config"`. (Overrides are always
+  `key=value`, never flags.)
 - Per-run state lives in `<manifest>.checkpoint.json` next to the manifest
   (gitignored). Re-running the same command resumes: `ok` runs skip, `running`
   runs with a live PID are polled, others re-queue. Ctrl-C / SIGTERM prompts
   whether to terminate or leave children running (resumable via stored PID).
+- **Failed-run backtraces:** each run's combined stdout/stderr is captured to
+  `<manifest>.logs/<exp>__<idx>.log` (gitignored). On a non-zero exit the
+  scheduler prints the last `--log-lines` (default 50) lines inline — the
+  Python/accelerate traceback is the last thing a crashing run writes, so this
+  surfaces it. Success logs are deleted; failure logs are kept (path also
+  recorded in the checkpoint). `--no-log` disables capture; `--log-dir=` and
+  `--log-lines=` (0 = capture but don't print) tune it. A resumed child left
+  running keeps writing to its log; a resumed scheduler reads it back via the
+  stored path if that child later fails.
 - Useful flags: `--restart-failed`, `--restart-unknown`, `--max-retries=N`
   (auto-respawn on failure), `--on-interrupt=terminate|leave`, `--force`
   (merge when the manifest changed). See `python run_scheduler.py` for usage.
@@ -127,14 +142,12 @@ experiments:
 - Config file `accelerate.yaml` uses BF16 precision, single process
 
 ## Local Environment (this machine)
-The `conda` paths in the block above are from a different host. On **this** machine:
+Dependencies are managed by uv (see "Environment Setup" above). The `pyenv`-based `gradmem` env previously used here has been superseded by the project's uv-managed `.venv`:
 ```bash
-export PATH="$HOME/.pyenv/bin:$PATH"
-eval "$(pyenv init -)"
-pyenv activate gradmem          # Python 3.11.2, torch 2.11.0+cu130
+uv sync                       # Python 3.11, torch 2.6.0+cu124, pinned in pyproject.toml
+uv run python <script>.py     # or activate .venv: source .venv/bin/activate
 ```
-- `pyenv` lives at `~/.pyenv/bin/pyenv`; plain `pyenv activate` fails unless `~/.pyenv/bin` is on PATH first.
-- Other envs available: `dhtm`, `dhtm310`, `belief`, `chicken`, etc. `gradmem` is the one for this repo.
+- `uv` is at `~/.local/bin/uv`; `uv sync` creates `.venv/` in the repo root and installs the locked graph.
 - Smoke-testing without a GPU: a tiny `GradMemGPT` (n_layer=2, n_head=2, n_embd=32, vocab 64) instantiates and does forward+backward in a few seconds — use it to validate edits to `grad_memgpt.py` before launching real runs.
 
 ## Tokenizer / model selection (IMPORTANT — easy to get wrong)
@@ -205,4 +218,4 @@ A variant of associative retrieval on natural English text. Given a PG19 excerpt
 ## Notes
 - No lint/typecheck commands - Python-only research codebase
 - Uses transformers + torch with custom meta-learning logic
-- conda_env.yaml contains hardcoded path prefix - adjust for local environment
+- Dependencies live in `pyproject.toml`; `uv.lock` pins the resolved graph. PyTorch CUDA wheels come from the pinned `cu124` index (`[tool.uv.sources]` in `pyproject.toml`) — adjust the index URL there to switch CUDA versions.

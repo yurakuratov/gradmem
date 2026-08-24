@@ -186,3 +186,5 @@ notebooks/tasks_1-20_v1-2
 
 # run_scheduler.py per-run checkpoint state (sits next to each manifest)
 *.checkpoint.json
+# run_scheduler.py per-run captured output (failure backtraces land here)
+*.logs/

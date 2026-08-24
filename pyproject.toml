@@ -1,0 +1,63 @@
+[project]
+name = "test-time-gd"
+version = "0"
+description = "Test-time gradient descent for memory updates (GradMemGPT)."
+requires-python = ">=3.11,<3.13"
+
+# Core runtime dependencies — only what the project code actually imports.
+# Versions are pinned to the validated, known-working set.
+dependencies = [
+    # PyTorch (CUDA wheels pulled from the pytorch index below)
+    "torch==2.6.0",
+    "triton==3.2.0",
+    # triton imports setuptools at load time; modern uv venvs don't bundle it.
+    "setuptools",
+    # Hugging Face stack
+    "transformers==4.53.0",
+    "datasets==3.4.1",
+    "accelerate==1.5.2",
+    "peft==0.18.1",
+    "tokenizers==0.21.1",
+    "safetensors==0.5.3",
+    # Numerics
+    "numpy==1.26.4",
+    "pandas==2.2.3",
+    # NLP / tokenization
+    "nltk==3.9.1",
+    "sentencepiece==0.2.0",
+    "einops==0.8.1",
+    "dahuffman==0.4.2",
+    # Experiment tracking & misc
+    "comet-ml==3.49.8",
+    "pyyaml==6.0.2",
+    "tqdm==4.67.1",
+]
+
+[project.optional-dependencies]
+# Used only by notebooks/ (plotting, Jupyter). `babilong` is not on PyPI —
+# install it separately (e.g. from git) if you run notebooks/create_tasks.py.
+notebooks = [
+    "matplotlib",
+    "seaborn",
+    "ipykernel",
+    "ipywidgets",
+]
+# Local development / tests.
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+# This is an application, not an installable package: do not try to build it.
+package = false
+
+# Pull torch (and only torch) from the PyTorch CUDA wheel index. `explicit = true`
+# means this index is used solely for packages listed in [tool.uv.sources]; every
+# other dependency continues to resolve from PyPI.
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
