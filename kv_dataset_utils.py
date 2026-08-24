@@ -1,4 +1,5 @@
 import random
+import re
 import string
 import unicodedata as ud
 
@@ -13,6 +14,20 @@ from transformers import PreTrainedTokenizerFast
 # Define alphabets for character generation
 STRUCT = "!?:|"  # keep these reserved for syntax
 BASE_KV_ALPHABET = string.ascii_letters + string.digits
+QUERY_PAIR_RE = re.compile(r"!([^:]+):([^!]+)!")
+
+
+def query_target_spans(query, target):
+    """Return character spans that should be trained as query answers.
+
+    The original format stores one prompt in ``query`` and its answer in
+    ``target``.  The multi-pair format stores complete ``?!K:V!`` records in
+    ``query`` and leaves ``target`` empty; in that format only each value is a
+    label, while the keys and delimiters remain conditioning input.
+    """
+    if target:
+        return [(len(query), len(query) + len(target))]
+    return [(match.start(2), match.end(2)) for match in QUERY_PAIR_RE.finditer(query)]
 
 # Add pool of extra chars to choose from (if vocab size > 62 is needed)
 RANGES = [
@@ -29,7 +44,8 @@ RANGES = [
 
 
 def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
-                      min_segment_len=32, max_segment_len=64, kv_alphabet=BASE_KV_ALPHABET):
+                      min_segment_len=32, max_segment_len=64, kv_alphabet=BASE_KV_ALPHABET,
+                      query_all_pairs=False):
     """
     Generate a sequence with random text, key-value pairs, and a query.
 
@@ -38,6 +54,8 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
     Each message can contain random sequence of characters along with key-value pairs in format !K:V!.
     Total number of key-value pairs in the full sequence (all messages/segments) is set by num_kv_pairs.
     The last segment requests one of the previous values by key: ?!K:
+    When query_all_pairs is true, it contains every key/value pair in random
+    key order, using adjacent ``?!K:V!`` records.
 
     ...!K:V!...|?!K_i:V_i!|
     ..context..|query:target|
@@ -57,13 +75,14 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
         n_segments: Number of segments/messages in the sequence
         min_segment_len: Minimum length of each segment
         max_segment_len: Maximum length of each segment
+        query_all_pairs: Put every key/value entry next to each other in the query
 
     Returns:
         Dictionary containing:
         - kv_pairs: List of key-value pairs in format !K:V!
         - segment_ids_to_kv_ids: Mapping from segment IDs to key-value pair indices
         - context: Complete context string (all segments concatenated)
-        - query: Query string in format ?!K:
+        - query: Query string in format ?!K: (or adjacent ?!K:V! records)
         - input_sequence: Complete sequence string (context + query)
         - target: Target value for the query in format V!|
     """
@@ -116,10 +135,15 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
         segments += [random_chars + '|']
     context = ''.join(segments)
     if num_kv_pairs > 0:
-        # sample random k for query:
-        k_for_query = random.choice(keys)
-        query = f'?!{k_for_query}:'
-        target = f'{kv_pairs_dict[k_for_query]}!|'
+        query_keys = keys.copy()
+        if query_all_pairs:
+            random.shuffle(query_keys)
+            query = '?' + ''.join(f'!{key}:{kv_pairs_dict[key]}!' for key in query_keys)
+            target = ''
+        else:
+            query_keys = [random.choice(keys)]
+            query = f'?!{query_keys[0]}:'
+            target = f'{kv_pairs_dict[query_keys[0]]}!|'
     else:
         query = '?!:'
         target = ''

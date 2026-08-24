@@ -34,6 +34,7 @@ from safetensors.torch import load_file
 from transformers import AutoConfig, AutoTokenizer
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
+from kv_dataset_utils import query_target_spans
 
 
 EXPECTED_MISSING_CHECKPOINT_KEYS = {
@@ -527,6 +528,7 @@ def load_frozen_model(
     config.energy_rank_weight = 0.0
     config.energy_traj_weight = 0.0
     config.energy_anchor_weight = 0.0
+    config.lipschitz_weight = 0.0
     config.energy_memory_search_weight = 0.0
     config.ivan_loss_weight = 0.0
     config.add_inner_loss_to_outer = False
@@ -590,16 +592,12 @@ def collate_kv_batch(batch: Sequence[Mapping[str, str]], tokenizer: Any) -> dict
 
     labels_mask = torch.zeros_like(query_input_ids)
     for row, item in enumerate(batch):
-        target_start = len(item["query"])
-        target_end = target_start + len(item["target"])
-        in_target = False
-        for column in range(len(offsets_mapping[row]) - 1, -1, -1):
+        target_spans = query_target_spans(item["query"], item["target"])
+        for column in range(len(offsets_mapping[row])):
             start, end = offsets_mapping[row][column]
-            if start < target_end and end > target_start:
+            if any(start < target_end and end > target_start
+                   for target_start, target_end in target_spans):
                 labels_mask[row, column] = 1
-                in_target = True
-            elif in_target:
-                break
 
     labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
     return {
