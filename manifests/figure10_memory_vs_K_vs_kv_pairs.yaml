@@ -1,0 +1,96 @@
+# Figure 10 (gradmem paper, Appendix F): Memory Size vs. WRITE Steps (K)
+# vs. Number of KV-pairs.
+#
+# Protocol (from the paper):
+#   * datasets: associative retrieval with 8 and 16 KV-pairs
+#     (data/N8-K2V2-V62_1M, data/N16-K2V2-V62_1M);
+#   * sweep memory tokens m in {1, 2, 4, 8} x WRITE steps K in {1, 2};
+#   * every run starts from the checkpoint trained with 8 memory tokens on the
+#     SAME dataset and is further trained after reducing the memory to the
+#     target size m, "using the first m vectors from the checkpoint".
+#   * plotted metric: eval exact_match.
+#
+# How this maps onto the machinery here:
+#   * Phase 1 trains the two m=8 base checkpoints (K=2, the paper's main
+#     KV-retrieval hyperparameters, seed 143 = the paper's run_1 seed).
+#   * Phase 2 fine-tunes from each base. `init_checkpoint` points at the base
+#     run-NAME dir (runs/<data>/fig10_base_m8); the runner resolves it through
+#     run_<seed>_<uid8>/ -> best/newest checkpoint-*/model.safetensors, and
+#     slices the checkpoint `mem` to the model's first n_mem_tokens vectors on
+#     shape mismatch (exactly the "first m vectors" reduction).
+#   * Keep schedule: sequential — the sweeps must not start before BOTH base
+#     runs have finished. Do not switch to interleaved for this manifest.
+#   * last_K_second_order is nulled in the sweeps so it follows K (second-order
+#     on all K steps); default.yaml pins it to 2, which would be wrong for K=1.
+#
+# Notes:
+#   * The paper used a llama L4H4D128 backbone; this manifest inherits gpt2
+#     L4H4D128 from configs/gradmemgpt/kv_retrieval/default.yaml (llama requires
+#     gated HF access). To match the paper exactly, add `model.base_model:
+#     llama` to every experiment's overrides.
+#   * Runs stop at eval exact_match = 1.0 or after early_stopping_patience=500
+#     evaluations without improvement (both from default.yaml, as in the paper
+#     script).
+#   * Figure 10 has a single run per point. For mean±std, extend the grids with
+#     `training.seed: [143, 144, 145]` (the paper's run_1..run_3 seeds) — with
+#     the runner's set_seed fix the seeds now control initialization too.
+#   * Results land in runs/<data_name>/<run_name>/run_143_<uid8>/ (exact_match
+#     in all_results.json / trainer_state.json; comet_ml if configured).
+#
+# Usage:
+#   python run_scheduler.py manifests/figure10_memory_vs_K_vs_kv_pairs.yaml --dry-run
+#   python run_scheduler.py manifests/figure10_memory_vs_K_vs_kv_pairs.yaml
+
+max_parallel: 1          # one run holds the GPU at a time
+schedule: sequential     # bases (exp 1-2) must finish before the sweeps (exp 3-4)
+
+experiments:
+  # ---- Phase 1: base checkpoints, m = 8 memory tokens, K = 2 ---- #
+
+  - name: fig10_base_n8
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/default.yaml"
+    overrides:
+      dataset.data_name: N8-K2V2-V62_1M          # exp dir: runs/<data_name>/...
+      dataset.data_path: ./data/N8-K2V2-V62_1M
+      run_name: fig10_base_m8                    # fixed name the sweeps reference
+      training.seed: 143                         # paper run_1 seed
+
+  - name: fig10_base_n16
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/default.yaml"
+    overrides:
+      dataset.data_name: N16-K2V2-V62_1M
+      dataset.data_path: ./data/N16-K2V2-V62_1M
+      run_name: fig10_base_m8
+      training.seed: 143
+
+  # ---- Phase 2: fine-tune sweeps, m x K, warm-started from the bases ---- #
+  # Auto run-names encode the grid point (gradmem_gpt2_L4H4D128_mem{m}_K{k}_...),
+  # so the 8 runs per dataset never collide.
+
+  - name: fig10_sweep_n8
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/default.yaml"
+    overrides:
+      dataset.data_name: N8-K2V2-V62_1M
+      dataset.data_path: ./data/N8-K2V2-V62_1M
+      init_checkpoint: "runs/N8-K2V2-V62_1M/fig10_base_m8"   # resolved to newest run's best checkpoint; mem sliced to first m
+      gradmem.last_K_second_order: null                      # follow K (=2 in default.yaml would be wrong for K=1)
+      training.seed: 143
+    grid:
+      gradmem.n_mem_tokens: [1, 2, 4, 8]
+      gradmem.K: [1, 2]
+
+  - name: fig10_sweep_n16
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/default.yaml"
+    overrides:
+      dataset.data_name: N16-K2V2-V62_1M
+      dataset.data_path: ./data/N16-K2V2-V62_1M
+      init_checkpoint: "runs/N16-K2V2-V62_1M/fig10_base_m8"
+      gradmem.last_K_second_order: null
+      training.seed: 143
+    grid:
+      gradmem.n_mem_tokens: [1, 2, 4, 8]
+      gradmem.K: [1, 2]
