@@ -1,0 +1,16 @@
+max_parallel: 1          # one run holds the GPU at a time
+schedule: sequential     # bases (exp 1-2) must finish before the sweeps (exp 3-4)
+
+experiments:
+  - name: sweep_n8
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/default.yaml"
+    overrides:
+      model.base_model: llama
+      dataset.data_name: N8-K2V2-V62_1M
+      dataset.data_path: ./data/N8-K2V2-V62_1M
+      gradmem.last_K_second_order: null                      # follow K (=2 in default.yaml would be wrong for K=1)
+    grid:
+      gradmem.n_mem_tokens: [1, 2, 4, 8]
+      gradmem.K: [1, 2]
+      training.seed: [4378, 43894, 2343]
