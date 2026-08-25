@@ -18,7 +18,8 @@ from transformers import (
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback, TrainerCallback,
-    HfArgumentParser
+    HfArgumentParser,
+    set_seed,
 )
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
@@ -222,6 +223,12 @@ class ExperimentArgs:
 if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
     args = parser.parse_args_into_dataclasses()[0]
+
+    # Seed torch/numpy/random BEFORE any model construction so --seed controls
+    # the initialization (mem tokens / from-config backbone), not just the data
+    # order: TrainingArguments' seed only takes effect in Trainer.__init__,
+    # after the model already exists.
+    set_seed(args.seed)
 
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger

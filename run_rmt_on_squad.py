@@ -18,7 +18,8 @@ from transformers import (
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback, TrainerCallback,
-    HfArgumentParser
+    HfArgumentParser,
+    set_seed,
 )
 
 from rmt import RMT2Segm, RMT2SegmConfig
@@ -270,6 +271,12 @@ def main(config_path: Optional[str] = None):
         if args.run_name is None:
             from generate_run_name import generate_run_name
             args.run_name = cfg.get('run_name') or generate_run_name(cfg)
+
+    # Seed torch/numpy/random BEFORE any model construction so --seed controls
+    # the initialization (mem tokens / from-config backbone), not just the data
+    # order: TrainingArguments' seed only takes effect in Trainer.__init__,
+    # after the model already exists.
+    set_seed(args.seed)
 
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger

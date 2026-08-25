@@ -1,3 +1,4 @@
+import glob
 import json
 import logging
 import math
@@ -19,7 +20,8 @@ from transformers import (
     Trainer,
     TrainingArguments,
     EarlyStoppingCallback, TrainerCallback,
-    HfArgumentParser
+    HfArgumentParser,
+    set_seed,
 )
 import yaml
 
@@ -964,6 +966,48 @@ class ExperimentArgs:
     mem_prior_anneal_steps: Optional[int] = field(default=0)
 
 
+def _resolve_init_checkpoint(spec: str) -> Path:
+    """Resolve an --init_checkpoint spec to a concrete model.safetensors file.
+
+    Accepted forms (chaining runs whose on-disk name contains the per-process
+    run_<seed>_<uid8> postfix that cannot be known in advance):
+      * a model.safetensors file -- used as-is;
+      * a glob pattern -- expanded; several matches resolve to the most
+        recently modified one (e.g. ``.../fig10_base/run_143*``);
+      * a run-name directory containing run_<seed>[_<uid8>] subdirs -- the most
+        recently modified run dir is selected;
+      * a run directory -- best_model/model.safetensors if present, else the
+        highest-numbered checkpoint-*/model.safetensors.
+    """
+    p = Path(spec)
+    if not p.exists() and ('*' in spec or '?' in spec):
+        matches = [Path(m) for m in glob.glob(spec)]
+        if not matches:
+            raise FileNotFoundError(
+                f'init_checkpoint path does not exist and the glob matched nothing: {spec}')
+        p = max(matches, key=lambda q: q.stat().st_mtime)
+    if p.is_file():
+        return p
+    if not p.is_dir():
+        raise FileNotFoundError(f'init_checkpoint path not found: {spec}')
+
+    run_dirs = [d for d in p.glob('run_*') if d.is_dir()]
+    if run_dirs:
+        p = max(run_dirs, key=lambda d: d.stat().st_mtime)
+
+    best = p / 'best_model' / 'model.safetensors'
+    if best.is_file():
+        return best
+    ckpts = [d for d in p.glob('checkpoint-*')
+             if d.is_dir() and (d / 'model.safetensors').is_file()]
+    if ckpts:
+        return max(ckpts, key=lambda d: int(d.name.split('-')[-1])) / 'model.safetensors'
+    direct = p / 'model.safetensors'
+    if direct.is_file():
+        return direct
+    raise FileNotFoundError(f'no model.safetensors found under init_checkpoint dir: {p}')
+
+
 def main(config_path: Optional[str] = None):
     parser = HfArgumentParser(ExperimentArgs)
     # When called programmatically (config_path provided), skip sys.argv parsing
@@ -1009,6 +1053,13 @@ def main(config_path: Optional[str] = None):
         if args.run_name is None:
             from generate_run_name import generate_run_name
             args.run_name = cfg.get('run_name') or generate_run_name(cfg)
+
+    # Seed torch/numpy/random BEFORE any model construction. GradMemGPT.__init__
+    # draws self.mem and the from-config backbone from the global RNG, while the
+    # TrainingArguments seed only takes effect inside Trainer.__init__ (after
+    # the model already exists) -- without this call, --seed changed the data
+    # order but never the initialization.
+    set_seed(args.seed)
 
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
@@ -1189,11 +1240,26 @@ def main(config_path: Optional[str] = None):
         model = GradMemGPT(gradmem_config)
 
     if args.init_checkpoint is not None:
-        missing_k, unexpected_k = model.load_state_dict(load_file(args.init_checkpoint), strict=False)
+        ckpt_path = _resolve_init_checkpoint(args.init_checkpoint)
+        state = load_file(ckpt_path)
+        # "First m vectors" memory reduction (paper App. F, Fig. 10): when the
+        # checkpoint holds more memory tokens than this model (n_mem_tokens=m),
+        # keep the checkpoint's first m vectors instead of failing on the shape
+        # mismatch, so a run can be warm-started into a smaller memory.
+        mem_init = None
+        if 'mem' in state and state['mem'].shape[0] != model.mem.shape[0]:
+            ckpt_m = state['mem'].shape[0]
+            mem_init = state.pop('mem')[:model.mem.shape[0]]
+            logger.info(f'slicing checkpoint mem {ckpt_m} -> first {model.mem.shape[0]} vectors')
+        missing_k, unexpected_k = model.load_state_dict(state, strict=False)
+        if mem_init is not None:
+            with torch.no_grad():
+                model.mem.copy_(mem_init)
         if len(missing_k) != 0:
             logger.info(f'{missing_k} were not loaded from checkpoint! These parameters were randomly initialized.')
         if len(unexpected_k) != 0:
             logger.info(f'{unexpected_k} were found in checkpoint, but model is not expecting them!')
+        logger.info(f'loaded init checkpoint: {ckpt_path}')
 
     if accel.mixed_precision == 'bf16':
         model.to(torch.bfloat16)
