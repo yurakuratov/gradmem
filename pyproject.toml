@@ -2,14 +2,17 @@
 name = "test-time-gd"
 version = "0"
 description = "Test-time gradient descent for memory updates (GradMemGPT)."
-requires-python = ">=3.11,<3.13"
+# Target: remote GPU machine (CUDA 12.3 driver, Python 3.10). cu121 is the
+# newest prebuilt wheel index that does not exceed a 12.3 driver; torch dropped
+# cu121 after 2.5.1, hence the pin below 2.6.
+requires-python = ">=3.10,<3.13"
 
 # Core runtime dependencies — only what the project code actually imports.
 # Versions are pinned to the validated, known-working set.
 dependencies = [
     # PyTorch (CUDA wheels pulled from the pytorch index below)
-    "torch==2.6.0",
-    "triton==3.2.0",
+    "torch==2.5.1",
+    "triton==3.1.0",
     # triton imports setuptools at load time; modern uv venvs don't bundle it.
     "setuptools",
     # Hugging Face stack
@@ -56,7 +59,7 @@ package = false
 # other dependency continues to resolve from PyPI.
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cu124"
+url = "https://download.pytorch.org/whl/cu121"
 explicit = true
 
 [tool.uv.sources]

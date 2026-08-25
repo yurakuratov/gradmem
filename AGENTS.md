@@ -5,7 +5,7 @@
 uv sync                      # creates .venv from pyproject.toml + uv.lock
 uv run python run_from_config.py --config configs/gradmemgpt/kv_retrieval/default.yaml
 ```
-Dependencies, pins, and the PyTorch `cu124` wheel index live in `pyproject.toml`; `uv.lock` is the fully resolved graph (commit it). Use `uv sync --extra notebooks` for notebook/data-prep deps only.
+Dependencies, pins, and the PyTorch `cu121` wheel index live in `pyproject.toml`; `uv.lock` is the fully resolved graph (commit it). Use `uv sync --extra notebooks` for notebook/data-prep deps only.
 
 ## Running Training (Two Options)
 
@@ -144,7 +144,7 @@ experiments:
 ## Local Environment (this machine)
 Dependencies are managed by uv (see "Environment Setup" above). The `pyenv`-based `gradmem` env previously used here has been superseded by the project's uv-managed `.venv`:
 ```bash
-uv sync                       # Python 3.11, torch 2.6.0+cu124, pinned in pyproject.toml
+uv sync                       # torch 2.5.1+cu121, Python >=3.10,<3.13, pinned in pyproject.toml
 uv run python <script>.py     # or activate .venv: source .venv/bin/activate
 ```
 - `uv` is at `~/.local/bin/uv`; `uv sync` creates `.venv/` in the repo root and installs the locked graph.
@@ -218,4 +218,4 @@ A variant of associative retrieval on natural English text. Given a PG19 excerpt
 ## Notes
 - No lint/typecheck commands - Python-only research codebase
 - Uses transformers + torch with custom meta-learning logic
-- Dependencies live in `pyproject.toml`; `uv.lock` pins the resolved graph. PyTorch CUDA wheels come from the pinned `cu124` index (`[tool.uv.sources]` in `pyproject.toml`) — adjust the index URL there to switch CUDA versions.
+- Dependencies live in `pyproject.toml`; `uv.lock` pins the resolved graph. PyTorch CUDA wheels come from the pinned `cu121` index (`[tool.uv.sources]` in `pyproject.toml`) — adjust the index URL there to switch CUDA versions. `cu121` + torch 2.5.1 targets the remote GPU machine (CUDA 12.3 driver, Python 3.10); cu121 wheels run on any 12.x driver, so the local machine is unaffected.
