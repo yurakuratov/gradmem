@@ -143,7 +143,7 @@ class MQARGradMemGPT(GradMemGPT):
                 f'MQAR vocab_size {expected_vocab_size}.'
             )
 
-        # MQAR uses token 0 as the visible left frame for every KV pair.
+        # Noisy MQAR uses token 0 as the visible left frame for each KV pair.
         embeddings = self.model.get_input_embeddings()
         if embeddings.padding_idx == 0:
             embeddings.padding_idx = None
@@ -340,7 +340,7 @@ class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
     vocab_size: Optional[int] = field(default=8192)
-    input_seq_len: Optional[int] = field(default=40)
+    input_seq_len: Optional[int] = field(default=24)
     num_kv_pairs: Optional[int] = field(default=8)
     train_num_examples: Optional[int] = field(default=100_000)
     valid_num_examples: Optional[int] = field(default=3_000)
@@ -552,8 +552,8 @@ if __name__ == '__main__':
             'context_noise': {
                 'level': args.mqar_noise_lvl,
                 'tokens': dataset_metadata.get('noise_tokens', 0),
-                'pair_open_token': dataset_metadata.get('pair_open_token', 0),
-                'pair_close_token': dataset_metadata.get('pair_close_token', 1),
+                'pair_open_token': dataset_metadata.get('pair_open_token'),
+                'pair_close_token': dataset_metadata.get('pair_close_token'),
             },
             'train_data_seed': train_data_seed,
             'valid_data_seed': valid_data_seed,

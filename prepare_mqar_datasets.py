@@ -54,7 +54,7 @@ def main():
     output_root.mkdir(parents=True, exist_ok=True)
 
     for num_kv_pairs in args.pair_counts:
-        input_seq_len = 5 * num_kv_pairs
+        input_seq_len = 3 * num_kv_pairs
         for noise_level in args.noise_levels:
             train_dataset, valid_dataset, train_seed, valid_seed = build_mqar_datasets(
                 vocab_size=args.vocab_size,
@@ -91,8 +91,9 @@ def main():
                 'power_a': 0.01,
                 'random_non_queries': False,
                 'mqar_noise_lvl': noise_level,
-                'pair_open_token': 0,
-                'pair_close_token': 1,
+                'noise_tokens': train_dataset.slices.get('noise_tokens', 0),
+                'pair_open_token': 0 if noise_level > 0.0 else None,
+                'pair_close_token': 1 if noise_level > 0.0 else None,
                 'context_size': train_dataset.slices['context_size'],
                 'query_size': train_dataset.inputs.shape[1] - train_dataset.slices['context_size'],
             }

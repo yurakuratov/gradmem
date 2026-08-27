@@ -5,11 +5,11 @@ https://github.com/HazyResearch/zoology/blob/main/zoology/data/multiquery_ar.py
 
 Upstream commit: 1ad20d193b6113cae1e8f3c655c300d7b4b3f4bb
 
-``multiquery_ar`` follows the upstream task layout while adding explicit
-four-token framing around each KV pair. ``dense_multiquery_ar`` defaults to a
-local vectorized, uniformly permuted dense implementation. It also provides a
-vectorized power-law mode and a ``zoology`` mode that preserves the upstream
-query-ordering behavior.
+``multiquery_ar`` follows the upstream task layout. When noise is enabled,
+each useful KV pair is explicitly framed with four tokens. ``dense_multiquery_ar``
+defaults to a local vectorized, uniformly permuted dense implementation. It
+also provides a vectorized power-law mode and a ``zoology`` mode that preserves
+the upstream query-ordering behavior.
 """
 
 import json
@@ -35,7 +35,9 @@ QUERY_SAMPLING_CHOICES = (
 PAIR_OPEN_TOKEN = 0
 PAIR_CLOSE_TOKEN = 1
 FIRST_DATA_TOKEN = 2
-PAIR_WIDTH = 4
+CLEAN_PAIR_WIDTH = 2
+FRAMED_PAIR_WIDTH = 4
+PAIR_WIDTH = FRAMED_PAIR_WIDTH
 
 
 class MQARDataset(torch.utils.data.Dataset):
@@ -90,20 +92,26 @@ def _add_context_noise(
 ) -> MQARDataset:
     """Insert independent key/value noise between useful KV pairs.
 
-    ``noise_lvl`` is the number of added noise tokens relative to the clean
-    context length, rounded to the nearest token. A positive level always
-    adds at least one noise token. Noise is inserted between framed KV pairs.
+    ``noise_lvl`` is the fraction of non-frame tokens in the final context
+    that are noise. A positive level always adds at least one noise token.
+    Noise is inserted between framed KV pairs.
     """
-    if not np.isfinite(noise_lvl) or not 0.0 <= noise_lvl <= 1.0:
-        raise ValueError(f"mqar_noise_lvl must be finite and in [0, 1], got {noise_lvl!r}.")
+    if not np.isfinite(noise_lvl) or not 0.0 <= noise_lvl < 1.0:
+        raise ValueError(f"mqar_noise_lvl must be finite and in [0, 1), got {noise_lvl!r}.")
 
     context_size = int(dataset.slices.get("context_size", 0))
     if context_size <= 0 or context_size >= dataset.inputs.shape[1]:
         raise ValueError(f"Invalid MQAR context_size={context_size} for generated data.")
-    if context_size % PAIR_WIDTH:
-        raise ValueError(f"MQAR context_size must be divisible by {PAIR_WIDTH}.")
+    if context_size % CLEAN_PAIR_WIDTH:
+        raise ValueError(f"MQAR context_size must be divisible by {CLEAN_PAIR_WIDTH}.")
 
-    noise_tokens = 0 if noise_lvl == 0.0 else max(1, int(round(context_size * noise_lvl)))
+    noise_tokens = (
+        0
+        if noise_lvl == 0.0 else
+        max(1, int(np.ceil(np.round(
+            context_size * noise_lvl / (1.0 - noise_lvl), decimals=12
+        ))))
+    )
     slices = {
         **dataset.slices,
         "clean_context_size": context_size,
@@ -111,8 +119,6 @@ def _add_context_noise(
         "noise_tokens": noise_tokens,
         "mqar_noise_lvl": float(noise_lvl),
         "noise_layout": "noise|< K V >|noise|< K V >|...|noise",
-        "pair_open_token": PAIR_OPEN_TOKEN,
-        "pair_close_token": PAIR_CLOSE_TOKEN,
     }
     if noise_tokens == 0:
         return MQARDataset(dataset.inputs, dataset.labels, slices=slices)
@@ -141,8 +147,17 @@ def _add_context_noise(
     clean_context = dataset.inputs[:, :context_size]
     query_inputs = dataset.inputs[:, context_size:]
     query_labels = dataset.labels[:, context_size:]
-    num_pairs = context_size // PAIR_WIDTH
+    num_pairs = context_size // CLEAN_PAIR_WIDTH
     num_gaps = num_pairs + 1
+    framed_context_parts = []
+    for pair_index in range(num_pairs):
+        pair_start = pair_index * CLEAN_PAIR_WIDTH
+        framed_context_parts.extend((
+            torch.full((num_examples, 1), PAIR_OPEN_TOKEN, dtype=dataset.inputs.dtype),
+            clean_context[:, pair_start:pair_start + CLEAN_PAIR_WIDTH],
+            torch.full((num_examples, 1), PAIR_CLOSE_TOKEN, dtype=dataset.inputs.dtype),
+        ))
+    framed_context = torch.cat(framed_context_parts, dim=1)
     if noise_tokens == 1:
         gap_indices = np.array([rng.integers(num_gaps)])
     else:
@@ -164,8 +179,8 @@ def _add_context_noise(
     for pair_index in range(num_pairs):
         gap_count = int(gap_counts[pair_index])
         context_parts.append(sorted_noise[:, noise_offset:noise_offset + gap_count])
-        pair_start = pair_index * PAIR_WIDTH
-        context_parts.append(clean_context[:, pair_start:pair_start + PAIR_WIDTH])
+        pair_start = pair_index * FRAMED_PAIR_WIDTH
+        context_parts.append(framed_context[:, pair_start:pair_start + FRAMED_PAIR_WIDTH])
         noise_offset += gap_count
     final_gap_count = int(gap_counts[-1])
     context_parts.append(sorted_noise[:, noise_offset:noise_offset + final_gap_count])
@@ -200,19 +215,23 @@ def multiquery_ar(
     random_non_queries: bool = True,
     include_slices: bool = True,
     mqar_noise_lvl: float = 0.0,
+    reserve_frame_tokens: bool = False,
     **kwargs,
 ) -> MQARDataset:
     """Generate the synthetic MQAR task from the Zoology paper."""
     assert input_seq_len % 2 == 0, "input_seq_len must be even"
     assert vocab_size > input_seq_len
-    context_size = num_kv_pairs * PAIR_WIDTH * num_passes
+    context_size = num_kv_pairs * CLEAN_PAIR_WIDTH * num_passes
     assert context_size + num_kv_pairs * 2 <= input_seq_len
 
     np.random.seed(seed)
 
     # create keys so that each key is present exactly once in each example
     key_vocab_size = vocab_size // 2
-    key_choices = np.arange(FIRST_DATA_TOKEN, key_vocab_size)
+    key_choices = np.arange(
+        FIRST_DATA_TOKEN if reserve_frame_tokens or mqar_noise_lvl > 0.0 else 1,
+        key_vocab_size,
+    )
     value_choices = np.arange(key_vocab_size, vocab_size)
 
     keys_unshuffled = np.tile(key_choices, (num_examples, 1))
@@ -226,11 +245,9 @@ def multiquery_ar(
     )
 
     # create sequences
-    kvs = np.empty((num_examples, num_kv_pairs * PAIR_WIDTH), dtype=np.int64)
-    kvs[:, 0::PAIR_WIDTH] = PAIR_OPEN_TOKEN
-    kvs[:, 1::PAIR_WIDTH] = keys
-    kvs[:, 2::PAIR_WIDTH] = values
-    kvs[:, 3::PAIR_WIDTH] = PAIR_CLOSE_TOKEN
+    kvs = np.empty((num_examples, num_kv_pairs * CLEAN_PAIR_WIDTH), dtype=np.int64)
+    kvs[:, 0::CLEAN_PAIR_WIDTH] = keys
+    kvs[:, 1::CLEAN_PAIR_WIDTH] = values
     kvs = np.tile(kvs, (1, num_passes))
 
     # compute power law
@@ -262,12 +279,14 @@ def multiquery_ar(
 
     inputs, labels = torch.tensor(examples[:, :-1]), torch.tensor(labels[:, 1:])
 
-    # Replace only query filler zeros; preserve the pair-open framing tokens.
+    # Replace only query filler zeros; use reserved data tokens in noisy mode.
     if random_non_queries:
         non_query_mask = torch.zeros_like(inputs, dtype=torch.bool)
         non_query_mask[:, context_size:] = inputs[:, context_size:] == PAIR_OPEN_TOKEN
         inputs[non_query_mask] = torch.randint(
-            FIRST_DATA_TOKEN, vocab_size, size=inputs.shape
+            FIRST_DATA_TOKEN if reserve_frame_tokens or mqar_noise_lvl > 0.0 else 0,
+            vocab_size,
+            size=inputs.shape,
         )[non_query_mask]
     dataset = MQARDataset(
         inputs,
@@ -297,6 +316,7 @@ def _validate_dense_args(
     random_non_queries: bool,
     query_sampling: str,
     power_a: float,
+    reserve_frame_tokens: bool,
 ):
     if query_sampling not in QUERY_SAMPLING_CHOICES:
         raise ValueError(
@@ -321,16 +341,16 @@ def _validate_dense_args(
             f"got {power_a!r}."
         )
 
-    context_size = num_kv_pairs * PAIR_WIDTH
+    context_size = num_kv_pairs * CLEAN_PAIR_WIDTH
     dense_seq_len = context_size + num_kv_pairs
     if input_seq_len != dense_seq_len:
         raise ValueError(
-            "Dense MQAR input_seq_len must equal 5 * num_kv_pairs: "
+            "Dense MQAR input_seq_len must equal 3 * num_kv_pairs: "
             f"input_seq_len={input_seq_len}, expected={dense_seq_len}."
         )
 
     key_vocab_size = vocab_size // 2
-    num_key_choices = key_vocab_size - FIRST_DATA_TOKEN
+    num_key_choices = key_vocab_size - (2 if reserve_frame_tokens else 1)
     num_value_choices = vocab_size - key_vocab_size
     if num_kv_pairs > num_key_choices:
         raise ValueError(
@@ -392,11 +412,12 @@ def _sample_vectorized_key_values(
     vocab_size: int,
     num_examples: int,
     num_kv_pairs: int,
+    reserve_frame_tokens: bool,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     key_vocab_size = vocab_size // 2
     keys = _sample_uniform_unique_rows(
         rng,
-        low=FIRST_DATA_TOKEN,
+        low=FIRST_DATA_TOKEN if reserve_frame_tokens else 1,
         high=key_vocab_size,
         num_rows=num_examples,
         row_width=num_kv_pairs,
@@ -409,12 +430,10 @@ def _sample_vectorized_key_values(
         row_width=num_kv_pairs,
     )
 
-    context_size = num_kv_pairs * PAIR_WIDTH
+    context_size = num_kv_pairs * CLEAN_PAIR_WIDTH
     context = np.empty((num_examples, context_size), dtype=np.int64)
-    context[:, 0::PAIR_WIDTH] = PAIR_OPEN_TOKEN
-    context[:, 1::PAIR_WIDTH] = keys
-    context[:, 2::PAIR_WIDTH] = values
-    context[:, 3::PAIR_WIDTH] = PAIR_CLOSE_TOKEN
+    context[:, 0::CLEAN_PAIR_WIDTH] = keys
+    context[:, 1::CLEAN_PAIR_WIDTH] = values
     return keys, values, context
 
 
@@ -430,14 +449,12 @@ def _build_vectorized_dense_dataset(
     query_distribution: str,
     effective_power_a: float | None,
 ) -> MQARDataset:
-    context_size = num_kv_pairs * PAIR_WIDTH
+    context_size = num_kv_pairs * CLEAN_PAIR_WIDTH
     inputs_array = np.concatenate([context, queries], axis=1)
     labels_array = np.full_like(inputs_array, -100)
     labels_array[:, context_size:] = answers
-    if not np.all(context[:, 0::PAIR_WIDTH] == PAIR_OPEN_TOKEN):
-        raise RuntimeError("Dense MQAR pair-open framing tokens are malformed.")
-    if not np.all(context[:, 3::PAIR_WIDTH] == PAIR_CLOSE_TOKEN):
-        raise RuntimeError("Dense MQAR pair-close framing tokens are malformed.")
+    if np.any(context == PAIR_OPEN_TOKEN):
+        raise RuntimeError("Dense MQAR unexpectedly contains filler token 0.")
 
     return MQARDataset(
         torch.from_numpy(inputs_array),
@@ -464,6 +481,7 @@ def _uniform_dense_multiquery_ar(
     seed: int,
     num_kv_pairs: int,
     num_passes: int,
+    reserve_frame_tokens: bool,
 ) -> MQARDataset:
     rng = np.random.default_rng(seed)
     keys, values, context = _sample_vectorized_key_values(
@@ -471,6 +489,7 @@ def _uniform_dense_multiquery_ar(
         vocab_size=vocab_size,
         num_examples=num_examples,
         num_kv_pairs=num_kv_pairs,
+        reserve_frame_tokens=reserve_frame_tokens,
     )
 
     # Sorting independent continuous scores gives a uniform random permutation
@@ -504,6 +523,7 @@ def _power_law_dense_multiquery_ar(
     power_a: float,
     num_kv_pairs: int,
     num_passes: int,
+    reserve_frame_tokens: bool,
 ) -> MQARDataset:
     rng = np.random.default_rng(seed)
     keys, values, context = _sample_vectorized_key_values(
@@ -511,6 +531,7 @@ def _power_law_dense_multiquery_ar(
         vocab_size=vocab_size,
         num_examples=num_examples,
         num_kv_pairs=num_kv_pairs,
+        reserve_frame_tokens=reserve_frame_tokens,
     )
 
     positions = np.arange(1, num_kv_pairs + 1, dtype=np.float64)
@@ -551,23 +572,25 @@ def _zoology_dense_multiquery_ar(
     num_kv_pairs: int,
     num_passes: int,
     include_slices: bool,
+    reserve_frame_tokens: bool,
     **kwargs,
 ) -> MQARDataset:
     """Preserve the upstream-derived query-ordering behavior."""
-    context_size = num_kv_pairs * PAIR_WIDTH
+    context_size = num_kv_pairs * CLEAN_PAIR_WIDTH
 
-    # Six tokens per pair is the minimum legal source layout: four framed
-    # context tokens plus a query token and its otherwise-unused label slot.
+    # Four tokens per pair is the minimum legal source layout: two context
+    # tokens plus a query token and its otherwise-unused label slot.
     source = multiquery_ar(
         vocab_size=vocab_size,
         num_examples=num_examples,
-        input_seq_len=num_kv_pairs * 6,
+        input_seq_len=num_kv_pairs * 4,
         seed=seed,
         power_a=power_a,
         num_kv_pairs=num_kv_pairs,
         num_passes=num_passes,
         random_non_queries=False,
         include_slices=include_slices,
+        reserve_frame_tokens=reserve_frame_tokens,
         **kwargs,
     )
 
@@ -587,10 +610,8 @@ def _zoology_dense_multiquery_ar(
     labels = torch.full_like(inputs, -100)
     labels[:, context_size:] = dense_answers
 
-    if not torch.all(inputs[:, :context_size][:, 0::PAIR_WIDTH] == PAIR_OPEN_TOKEN):
-        raise RuntimeError("Dense MQAR pair-open framing tokens are malformed.")
-    if not torch.all(inputs[:, :context_size][:, 3::PAIR_WIDTH] == PAIR_CLOSE_TOKEN):
-        raise RuntimeError("Dense MQAR pair-close framing tokens are malformed.")
+    if torch.any(inputs == PAIR_OPEN_TOKEN):
+        raise RuntimeError("Dense MQAR unexpectedly contains filler token 0.")
     return MQARDataset(
         inputs,
         labels,
@@ -629,14 +650,15 @@ def dense_multiquery_ar(
     the upstream generator at its minimum legal sequence length. With
     ``mqar_noise_lvl=0``, all modes yield exactly:
 
-         < K1 V1 > ... < Kn Vn > Q1 ... Qn
+         K1 V1 ... Kn Vn Q1 ... Qn
 
-     With noise enabled, random tokens are inserted between the framed KV
-     pairs. Queries and their labels are unchanged.
+     With noise enabled, each useful KV pair is framed as ``< K V >`` and
+     random tokens are inserted between the framed pairs. Queries and their
+     labels are unchanged.
 
-     Labels contain corresponding values at the query-key positions. Tokens 0
-     and 1 are reserved for pair framing and never occur in keys, values, or
-     noise.
+     Labels contain corresponding values at the query-key positions. In the
+     noisy case, tokens 0 and 1 are reserved for pair framing and never occur
+     in keys, values, or noise.
 
     Choose ``query_sampling`` according to the experiment:
 
@@ -677,6 +699,7 @@ def dense_multiquery_ar(
         random_non_queries=random_non_queries,
         query_sampling=query_sampling,
         power_a=power_a,
+        reserve_frame_tokens=mqar_noise_lvl > 0.0,
     )
 
     if query_sampling == QUERY_SAMPLING_UNIFORM:
@@ -687,6 +710,7 @@ def dense_multiquery_ar(
             seed=seed,
             num_kv_pairs=num_kv_pairs,
             num_passes=num_passes,
+            reserve_frame_tokens=mqar_noise_lvl > 0.0,
         )
     elif query_sampling == QUERY_SAMPLING_POWER_LAW:
         dataset = _power_law_dense_multiquery_ar(
@@ -697,6 +721,7 @@ def dense_multiquery_ar(
             power_a=power_a,
             num_kv_pairs=num_kv_pairs,
             num_passes=num_passes,
+            reserve_frame_tokens=mqar_noise_lvl > 0.0,
         )
     else:
         dataset = _zoology_dense_multiquery_ar(
@@ -708,6 +733,7 @@ def dense_multiquery_ar(
             num_kv_pairs=num_kv_pairs,
             num_passes=num_passes,
             include_slices=include_slices,
+            reserve_frame_tokens=mqar_noise_lvl > 0.0,
             **kwargs,
         )
     return _add_context_noise(

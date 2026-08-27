@@ -157,7 +157,7 @@ class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
     vocab_size: Optional[int] = field(default=8192)
-    input_seq_len: Optional[int] = field(default=40)
+    input_seq_len: Optional[int] = field(default=24)
     num_kv_pairs: Optional[int] = field(default=8)
     train_num_examples: Optional[int] = field(default=100_000)
     valid_num_examples: Optional[int] = field(default=3_000)
@@ -233,7 +233,7 @@ def build_base_config(args):
 
     config.torch_dtype = 'float32'
     config.vocab_size = args.vocab_size
-    # Token 0 is a visible MQAR pair frame, not padding.
+    # Token 0 is a visible noisy-MQAR pair frame, not padding.
     # MQAR examples are fixed-length and token 0 is valid data. Do not use
     # vocab_size as a padding sentinel: LLaMA requires padding_idx to be a
     # valid embedding row during model construction.
@@ -348,8 +348,8 @@ if __name__ == '__main__':
             'context_noise': {
                 'level': args.mqar_noise_lvl,
                 'tokens': dataset_metadata.get('noise_tokens', 0),
-                'pair_open_token': dataset_metadata.get('pair_open_token', 0),
-                'pair_close_token': dataset_metadata.get('pair_close_token', 1),
+                'pair_open_token': dataset_metadata.get('pair_open_token'),
+                'pair_close_token': dataset_metadata.get('pair_close_token'),
             },
             'train_data_seed': train_data_seed,
             'valid_data_seed': valid_data_seed,

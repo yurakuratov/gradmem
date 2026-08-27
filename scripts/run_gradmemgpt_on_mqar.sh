@@ -44,7 +44,7 @@ BASE_MODEL=llama
 # Dense MQAR query-order distribution.
 VOCAB_SIZE=8192
 NUM_KV_PAIRS=${NUM_KV_PAIRS:-16}
-INPUT_SEQ_LEN=$((5 * NUM_KV_PAIRS))
+INPUT_SEQ_LEN=$((3 * NUM_KV_PAIRS))
 MQAR_NOISE_LVL=${MQAR_NOISE_LVL:-0.0}
 # zoology uses power_law with 0.01
 QUERY_SAMPLING=${QUERY_SAMPLING:-uniform}
@@ -74,7 +74,7 @@ fi
 MQAR_DATA_PATH=${MQAR_DATA_PATH:-./data/${DATA_NAME}}
 
 # For sparse upstream MQAR, add --dense_queries false and set INPUT_SEQ_LEN to
-# at least 6*NUM_KV_PAIRS. query_sampling only controls dense query ordering.
+# at least 4*NUM_KV_PAIRS. query_sampling only controls dense query ordering.
 
 # GradMemGPT specific parameters
 MEMORY_BACKEND="prefix"

@@ -43,8 +43,8 @@ BASE_MODEL=llama
 
 # Dense MQAR task: 4K framed context tokens + K contiguous queries.
 VOCAB_SIZE=8192
-NUM_KV_PAIRS=${NUM_KV_PAIRS:-8}
-INPUT_SEQ_LEN=$((5 * NUM_KV_PAIRS))
+NUM_KV_PAIRS=${NUM_KV_PAIRS:-16}
+INPUT_SEQ_LEN=$((3 * NUM_KV_PAIRS))
 DENSE_QUERIES=true
 MQAR_NOISE_LVL=${MQAR_NOISE_LVL:-0.0}
 # zoology uses power_law with 0.01
