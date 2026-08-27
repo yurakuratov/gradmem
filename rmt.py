@@ -202,7 +202,9 @@ class RMT2Segm(PreTrainedModel):
         ctx_emb = self.model.get_input_embeddings()(context_input_ids)      # [B,S,d]
 
         # attention masks
-        ctx_mask = (context_input_ids != pad_id).to(dtype=torch.long)
+        ctx_mask = ((context_input_ids != pad_id).to(dtype=torch.long)
+                    if pad_id is not None else
+                    torch.ones_like(context_input_ids, dtype=torch.long))
         mem_mask = torch.ones(B, self.n_mem_tokens, dtype=torch.long, device=device)
 
         stats = {}
@@ -248,7 +250,8 @@ class RMT2Segm(PreTrainedModel):
                 # ignore rec_loss at first step, as initial memory is empty, so loss can't be reduced much
                 if k != 0:
                     lm_labels = context_input_ids.clone()
-                    lm_labels[lm_labels == pad_id] = -100
+                    if pad_id is not None:
+                        lm_labels[lm_labels == pad_id] = -100
                     # get logits for reconstruction loss
                     logits_st_pos = self.n_mem_tokens+self.n_ctrl_tokens*2 - 1
                     logits_end_pos = -(self.n_mem_tokens+self.n_ctrl_tokens*1)
@@ -301,7 +304,9 @@ class RMT2Segm(PreTrainedModel):
         # 2.  Process 2nd segment: query -> target. READ phase.
         # ---------------------------------------------------------------- #
         qry_emb = self.model.get_input_embeddings()(query_input_ids)  # [B,Q,d]
-        qry_mask = (query_input_ids != pad_id).to(dtype=torch.long)
+        qry_mask = ((query_input_ids != pad_id).to(dtype=torch.long)
+                    if pad_id is not None else
+                    torch.ones_like(query_input_ids, dtype=torch.long))
 
         # TODO: check if mem_proj needed here, seems its ok to not use it
         # if self.mem_proj_mode == "none":

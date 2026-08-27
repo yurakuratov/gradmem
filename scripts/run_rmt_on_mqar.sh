@@ -2,38 +2,32 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_DIR"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/collect_env_state.sh"
 
-# Define arguments for the script
-NP=${NP:-1}  # Default to 1 process if not set
+NP=${NP:-1}
 LR=${LR:-1e-04}
-ADAM_BETA2=${ADAM_BETA2:-}
 TBS=${TBS:-64}
 PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-64}
 STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-0.99}
 MIXED_PRECISION=${MIXED_PRECISION:-no}
 RUN_NAME_SUFFIX=${RUN_NAME_SUFFIX:-}
 
-L=4
-H=4
-D=256
-MAX_POSITION_EMBEDDINGS=1024
-BASE_MODEL=mamba
+L=${L:-4}
+H=${H:-4}
+D=${D:-256}
+MAX_POSITION_EMBEDDINGS=${MAX_POSITION_EMBEDDINGS:-1024}
+BASE_MODEL=${BASE_MODEL:-llama}
 
-# Dense MQAR query-order distribution.
-VOCAB_SIZE=8192
-NUM_KV_PAIRS=32
+VOCAB_SIZE=${VOCAB_SIZE:-8192}
+NUM_KV_PAIRS=8
 INPUT_SEQ_LEN=$((5 * NUM_KV_PAIRS))
 MQAR_NOISE_LVL=${MQAR_NOISE_LVL:-0.0}
-TRAIN_NUM_EXAMPLES=1000000
-VALID_NUM_EXAMPLES=5000
-# zoology uses power_law with 0.01
 QUERY_SAMPLING=${QUERY_SAMPLING:-uniform}
 POWER_A=${POWER_A:-0.01}
-DATA_SEED=123
+TRAIN_NUM_EXAMPLES=${TRAIN_NUM_EXAMPLES:-1000000}
+VALID_NUM_EXAMPLES=${VALID_NUM_EXAMPLES:-5000}
+DATA_SEED=${DATA_SEED:-123}
 
 case "$QUERY_SAMPLING" in
   uniform)
@@ -55,44 +49,51 @@ if [ "$MQAR_NOISE_LVL" != "0.0" ]; then
 fi
 MQAR_DATA_PATH=${MQAR_DATA_PATH:-./data/${DATA_NAME}}
 
-# For sparse upstream MQAR, add --dense_queries false and set INPUT_SEQ_LEN to
-# at least 6*NUM_KV_PAIRS. query_sampling only controls dense query ordering.
-
 if (( TBS % (PER_DEVICE_BATCH_SIZE*NP) != 0 )); then
   echo "TBS must be divisible by PER_DEVICE_BATCH_SIZE*NP" >&2
   exit 2
 fi
 GRAD_ACC_STEPS=$((TBS/(PER_DEVICE_BATCH_SIZE*NP)))
 
-if [ "$BASE_MODEL" == "mamba" ]; then
-  RUN_NAME="${BASE_MODEL}_L${L}D${D}"
-else
-  RUN_NAME="${BASE_MODEL}_L${L}H${H}D${D}"
-  if [ -n "$MAX_POSITION_EMBEDDINGS" ]; then
-    RUN_NAME="${RUN_NAME}_L${MAX_POSITION_EMBEDDINGS}"
-  fi
-fi
+N_MEM_TOKENS=${N_MEM_TOKENS:-8}
+K=1
+N_CTRL_TOKENS=${N_CTRL_TOKENS:-0}
+USE_MEM_PROJ=true
+MEM_PROJ_MODE=proj
+USE_RECONSTRUCTION_LOSS=true
+RECONSTRUCTION_LOSS_WEIGHT=1.0
+USE_WRITE_HEAD=true
+USE_MEM_RESIDUAL=${USE_MEM_RESIDUAL:-false}
+ATTN_IMPLEMENTATION=${ATTN_IMPLEMENTATION:-eager}
+MAX_STEPS=300000
 
+RUN_NAME="rmt2segm_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}_K${K}"
+if [ "$N_CTRL_TOKENS" -gt 0 ]; then
+  RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
+fi
+if [ "$USE_MEM_PROJ" = true ]; then
+  RUN_NAME=${RUN_NAME}_mem_${MEM_PROJ_MODE}
+fi
+if [ "$USE_RECONSTRUCTION_LOSS" = true ]; then
+  RUN_NAME=${RUN_NAME}_rec_loss_w${RECONSTRUCTION_LOSS_WEIGHT}
+fi
+if [ "$USE_WRITE_HEAD" = true ]; then
+  RUN_NAME=${RUN_NAME}_whead
+fi
+if [ "$USE_MEM_RESIDUAL" = true ]; then
+  RUN_NAME=${RUN_NAME}_res
+fi
 RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
 if [ "$MQAR_NOISE_LVL" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_mqarnoise${MQAR_NOISE_LVL}
 fi
-
-if [ -n "$ADAM_BETA2" ]; then
-  RUN_NAME=${RUN_NAME}_b2_${ADAM_BETA2}
-fi
-
-if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
+if [ -n "$RUN_NAME_SUFFIX" ]; then
   RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
 fi
 
-
-# Run ID
 N_VALUES=(1 2 3)
 for N in "${N_VALUES[@]}"; do
-  # Path to save experiment results
-  EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
-
+  EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_${N}"
   if [ "$MIXED_PRECISION" != "no" ]; then
     EXP_PATH="${EXP_PATH}_${MIXED_PRECISION}"
   fi
@@ -102,14 +103,13 @@ for N in "${N_VALUES[@]}"; do
   fi
 
   PORT="$(find_free_port)"
-
   CMD=(
     accelerate launch
       --main_process_port "$PORT"
       --num_processes "$NP"
       --mixed_precision "$MIXED_PRECISION"
       --config_file accelerate.yaml
-    "$REPO_DIR/run_gpt2_on_mqar.py"
+    run_rmt_on_mqar.py
       --exp_path "$EXP_PATH"
       --per_device_batch_size "$PER_DEVICE_BATCH_SIZE"
       --gradient_accumulation_steps "$GRAD_ACC_STEPS"
@@ -124,13 +124,24 @@ for N in "${N_VALUES[@]}"; do
       --train_num_examples "$TRAIN_NUM_EXAMPLES"
       --valid_num_examples "$VALID_NUM_EXAMPLES"
       --data_seed "$DATA_SEED"
+      --dense_queries true
       --learning_rate "$LR"
       --n_layer "$L"
       --n_head "$H"
       --n_embd "$D"
       --max_position_embeddings "$MAX_POSITION_EMBEDDINGS"
       --base_model "$BASE_MODEL"
-      --max_steps 200000
+      --n_mem_tokens "$N_MEM_TOKENS"
+      --K "$K"
+      --n_ctrl_tokens "$N_CTRL_TOKENS"
+      --use_mem_proj "$USE_MEM_PROJ"
+      --mem_proj_mode "$MEM_PROJ_MODE"
+      --use_reconstruction_loss "$USE_RECONSTRUCTION_LOSS"
+      --reconstruction_loss_weight "$RECONSTRUCTION_LOSS_WEIGHT"
+      --use_write_head "$USE_WRITE_HEAD"
+      --use_mem_residual "$USE_MEM_RESIDUAL"
+      --attn_implementation "$ATTN_IMPLEMENTATION"
+      --max_steps "$MAX_STEPS"
       --eval_steps 500
       --logging_steps 500
       --warmup_steps 10000
@@ -139,11 +150,8 @@ for N in "${N_VALUES[@]}"; do
       --seed "$((142+N))"
   )
 
-  if [ -n "$ADAM_BETA2" ]; then
-    CMD+=(--adam_beta2 "$ADAM_BETA2")
-  fi
   if [ -n "${INIT_CHECKPOINT:-}" ]; then
-    CMD+=(--init_checkpoint "$INIT_CHECKPOINT")
+    CMD+=( --init_checkpoint "$INIT_CHECKPOINT" )
   fi
 
   print_run_header "$EXP_PATH" "$PORT" "$NP" "$MIXED_PRECISION" "${CMD[@]}"
@@ -153,7 +161,6 @@ for N in "${N_VALUES[@]}"; do
   "${CMD[@]}" 2>&1 | tee -a "$RUN_LOCK_LOG"
   RC=${PIPESTATUS[0]}
   set -e
-
   finalize_locked_run "$EXP_PATH" "$RUN_LOCK_DIR" "$RUN_LOCK_LOG" "$RC"
 done
 

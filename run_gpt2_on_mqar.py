@@ -23,7 +23,11 @@ from transformers import (
 )
 
 from transformers.trainer_utils import get_last_checkpoint
-from zoology_mqar_data import ZOOLOGY_MQAR_SOURCE, build_mqar_datasets
+from zoology_mqar_data import (
+    ZOOLOGY_MQAR_SOURCE,
+    build_mqar_datasets,
+    load_saved_mqar_datasets,
+)
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
@@ -40,7 +44,7 @@ def collate_fn(batch):
     labels = torch.stack([item['labels'] for item in batch])
     return {
         'input_ids': input_ids,
-        # MQAR examples are fixed-length. Token 0 is data, not padding.
+        # MQAR examples are fixed-length. Token 0 is a visible pair frame.
         'attention_mask': torch.ones_like(input_ids),
         'labels': labels,
     }
@@ -157,12 +161,14 @@ class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
     vocab_size: Optional[int] = field(default=8192)
-    input_seq_len: Optional[int] = field(default=24)
+    input_seq_len: Optional[int] = field(default=40)
     num_kv_pairs: Optional[int] = field(default=8)
     train_num_examples: Optional[int] = field(default=100_000)
     valid_num_examples: Optional[int] = field(default=3_000)
     power_a: Optional[float] = field(default=0.01)
     random_non_queries: Optional[bool] = field(default=False)
+    mqar_noise_lvl: Optional[float] = field(default=0.0)
+    mqar_data_path: Optional[str] = field(default=None)
     data_seed: Optional[int] = field(default=123)
     dense_queries: Optional[bool] = field(default=True)
     query_sampling: Optional[str] = field(default='uniform',
@@ -221,36 +227,76 @@ if __name__ == '__main__':
         raise RuntimeError(f"Output directory already exists: {output_dir}. "
                            f"Pass --overwrite_output_dir to resume/continue here, or choose a new --exp_path.")
 
-    train_dataset, valid_dataset, train_data_seed, valid_data_seed = build_mqar_datasets(
-        vocab_size=args.vocab_size,
-        input_seq_len=args.input_seq_len,
-        num_kv_pairs=args.num_kv_pairs,
-        train_num_examples=args.train_num_examples,
-        valid_num_examples=args.valid_num_examples,
-        power_a=args.power_a,
-        random_non_queries=args.random_non_queries,
-        data_seed=args.data_seed,
-        dense_queries=args.dense_queries,
-        query_sampling=args.query_sampling,
-    )
+    if args.mqar_data_path is None:
+        train_dataset, valid_dataset, train_data_seed, valid_data_seed = build_mqar_datasets(
+            vocab_size=args.vocab_size,
+            input_seq_len=args.input_seq_len,
+            num_kv_pairs=args.num_kv_pairs,
+            train_num_examples=args.train_num_examples,
+            valid_num_examples=args.valid_num_examples,
+            power_a=args.power_a,
+            random_non_queries=args.random_non_queries,
+            data_seed=args.data_seed,
+            dense_queries=args.dense_queries,
+            query_sampling=args.query_sampling,
+            mqar_noise_lvl=args.mqar_noise_lvl,
+        )
+        dataset_metadata = train_dataset.slices
+    else:
+        train_dataset, valid_dataset, dataset_metadata = load_saved_mqar_datasets(args.mqar_data_path)
+        for key, expected in (
+            ('vocab_size', args.vocab_size),
+            ('num_kv_pairs', args.num_kv_pairs),
+            ('dense_queries', args.dense_queries),
+            ('query_sampling', args.query_sampling),
+            ('mqar_noise_lvl', args.mqar_noise_lvl),
+        ):
+            if key in dataset_metadata and dataset_metadata[key] != expected:
+                raise ValueError(
+                    f'Saved MQAR metadata mismatch for {key}: '
+                    f'saved={dataset_metadata[key]!r}, requested={expected!r}'
+                )
+        train_data_seed = dataset_metadata.get('train_data_seed')
+        valid_data_seed = dataset_metadata.get('valid_data_seed')
+        args.train_num_examples = len(train_dataset)
+        args.valid_num_examples = len(valid_dataset)
+        args.input_seq_len = dataset_metadata['input_seq_len']
 
     if accel.is_main_process and not args.do_eval_only:
+        noise_enabled = dataset_metadata.get('noise_tokens', 0) > 0
+        if args.dense_queries:
+            query_layout = (
+                'dense context with framed KV pairs and interleaved random noise'
+                if noise_enabled else
+                'dense context and contiguous query keys; no fillers'
+            )
+        else:
+            query_layout = (
+                'upstream power-law query placement with framed KV pairs and interleaved random noise'
+                if noise_enabled else
+                'upstream power-law query placement'
+            )
         config = {
             'cli_args': dict(vars(args)),
             'task_source': ZOOLOGY_MQAR_SOURCE,
             'task': 'Zoology MQAR' + (' dense' if args.dense_queries else ' upstream'),
-            'query_layout': (
-                'dense context and contiguous query keys; no fillers'
-                if args.dense_queries else
-                'upstream power-law query placement'
-            ),
-            'query_sampling': train_dataset.slices.get('query_sampling'),
-            'data_generator': train_dataset.slices.get('generator', 'upstream'),
-            'query_distribution': train_dataset.slices.get(
+            'query_layout': query_layout,
+            'query_sampling': dataset_metadata.get('query_sampling'),
+            'data_generator': dataset_metadata.get('generator', 'saved' if args.mqar_data_path else 'upstream'),
+            'query_distribution': dataset_metadata.get(
                 'query_distribution', 'power_law_placement'
             ),
-            'effective_power_a': train_dataset.slices.get('effective_power_a', args.power_a),
+            'effective_power_a': dataset_metadata.get('effective_power_a', args.power_a),
             'loss_alignment': 'same-position masked cross entropy; no causal label shift',
+            'context_size': dataset_metadata.get('context_size'),
+            'query_size': dataset_metadata['input_seq_len'] - dataset_metadata.get('context_size'),
+            'input_seq_len': dataset_metadata['input_seq_len'],
+            'context_noise': {
+                'level': args.mqar_noise_lvl,
+                'tokens': dataset_metadata.get('noise_tokens', 0),
+                'pair_open_token': dataset_metadata.get('pair_open_token', 0),
+                'pair_close_token': dataset_metadata.get('pair_close_token', 1),
+            },
             'train_data_seed': train_data_seed,
             'valid_data_seed': valid_data_seed,
             'metrics': [
@@ -301,7 +347,7 @@ if __name__ == '__main__':
             if args.max_position_embeddings is not None:
                 config.max_position_embeddings = args.max_position_embeddings
         elif args.base_model == 'llama':
-            config = AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B')
+            config = AutoConfig.from_pretrained('unsloth/Llama-3.2-1B')
             config.num_hidden_layers = args.n_layer
             config.num_attention_heads = args.n_head
             config.num_key_value_heads = args.n_head
@@ -366,9 +412,8 @@ if __name__ == '__main__':
 
     # Training arguments
     training_args = TrainingArguments(
-        output_dir=output_dir,
-        logging_dir=output_dir,
-        overwrite_output_dir=args.overwrite_output_dir,
+        output_dir=str(output_dir),
+        logging_dir=str(output_dir),
 
         max_steps=args.max_steps,
         per_device_train_batch_size=args.per_device_batch_size,

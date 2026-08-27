@@ -1,0 +1,24 @@
+name: energygradmem
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pytorch=2.5.1
+  - pytorch-cuda=12.1
+  - cuda-nvcc=12.1
+  - cuda-cudart-dev=12.1
+  - cuda-libraries-dev=12.1
+  - cuda-cccl=12.1
+  - pip:
+      - accelerate
+      - causal-conv1d==1.5.2
+      - datasets
+      - deepspeed
+      - mamba-ssm==2.2.4
+      - pandas
+      - tensorboard
+      - tqdm
+      - transformers>=4.45,<5

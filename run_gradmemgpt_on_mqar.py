@@ -20,7 +20,11 @@ from transformers import (
 )
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
-from zoology_mqar_data import ZOOLOGY_MQAR_SOURCE, build_mqar_datasets
+from zoology_mqar_data import (
+    ZOOLOGY_MQAR_SOURCE,
+    build_mqar_datasets,
+    load_saved_mqar_datasets,
+)
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -69,21 +73,31 @@ class GradMemMQARDataset(torch.utils.data.Dataset):
     """Expose an MQAR example through GradMem's write/read split."""
 
     def __init__(self, dataset, context_size):
-        if context_size <= 0 or context_size >= dataset.inputs.shape[1]:
-            raise ValueError(
-                f'Invalid context_size={context_size} for input length {dataset.inputs.shape[1]}.'
-            )
-        if torch.any(dataset.labels[:, :context_size] != -100):
-            raise ValueError('MQAR labels unexpectedly supervise the KV context.')
         self.source_dataset = dataset
-        self.context_input_ids = dataset.inputs[:, :context_size]
-        self.query_input_ids = dataset.inputs[:, context_size:]
-        self.labels = dataset.labels[:, context_size:]
+        self.context_size = context_size
+        self._uses_tensors = hasattr(dataset, 'inputs')
+        if self._uses_tensors:
+            if context_size <= 0 or context_size >= dataset.inputs.shape[1]:
+                raise ValueError(
+                    f'Invalid context_size={context_size} for input length {dataset.inputs.shape[1]}.'
+                )
+            if torch.any(dataset.labels[:, :context_size] != -100):
+                raise ValueError('MQAR labels unexpectedly supervise the KV context.')
+            self.context_input_ids = dataset.inputs[:, :context_size]
+            self.query_input_ids = dataset.inputs[:, context_size:]
+            self.labels = dataset.labels[:, context_size:]
 
     def __len__(self):
         return len(self.source_dataset)
 
     def __getitem__(self, index):
+        if not self._uses_tensors:
+            item = self.source_dataset[index]
+            return {
+                'context_input_ids': item['input_ids'][:self.context_size],
+                'query_input_ids': item['input_ids'][self.context_size:],
+                'labels': item['labels'][self.context_size:],
+            }
         return {
             'context_input_ids': self.context_input_ids[index],
             'query_input_ids': self.query_input_ids[index],
@@ -129,9 +143,7 @@ class MQARGradMemGPT(GradMemGPT):
                 f'MQAR vocab_size {expected_vocab_size}.'
             )
 
-        # GradMem uses token 0 as an internal padding sentinel. It cannot occur
-        # in the initial KV context, but sparse MQAR may use it as an attended
-        # filler in the read sequence, so keep its embedding trainable.
+        # MQAR uses token 0 as the visible left frame for every KV pair.
         embeddings = self.model.get_input_embeddings()
         if embeddings.padding_idx == 0:
             embeddings.padding_idx = None
@@ -328,12 +340,14 @@ class ExperimentArgs:
     exp_path: str = field()
     per_device_batch_size: int = field()
     vocab_size: Optional[int] = field(default=8192)
-    input_seq_len: Optional[int] = field(default=24)
+    input_seq_len: Optional[int] = field(default=40)
     num_kv_pairs: Optional[int] = field(default=8)
     train_num_examples: Optional[int] = field(default=100_000)
     valid_num_examples: Optional[int] = field(default=3_000)
     power_a: Optional[float] = field(default=0.01)
     random_non_queries: Optional[bool] = field(default=False)
+    mqar_noise_lvl: Optional[float] = field(default=0.0)
+    mqar_data_path: Optional[str] = field(default=None)
     data_seed: Optional[int] = field(default=123)
     dense_queries: Optional[bool] = field(default=True)
     query_sampling: Optional[str] = field(
@@ -363,6 +377,7 @@ class ExperimentArgs:
     pretrained_model: Optional[str] = field(default=None)
     init_base_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize base model'})
     init_checkpoint: Optional[str] = field(default=None, metadata={'help': 'checkpoint to initialize gradmem model'})
+    resume_from_checkpoint: Optional[str] = field(default=None)
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
@@ -434,6 +449,20 @@ if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
     args = parser.parse_args_into_dataclasses()[0]
 
+    if args.init_checkpoint is not None and args.resume_from_checkpoint is not None:
+        raise ValueError('--init_checkpoint and --resume_from_checkpoint are mutually exclusive')
+    if args.resume_from_checkpoint is not None:
+        resume_path = Path(args.resume_from_checkpoint).resolve()
+        output_path = Path(args.exp_path).resolve()
+        if not resume_path.is_dir():
+            raise ValueError(f'Resume checkpoint directory does not exist: {resume_path}')
+        if resume_path.parent != output_path:
+            raise ValueError(
+                '--resume_from_checkpoint must be a checkpoint directly inside --exp_path so logs continue '
+                f'in the same run: checkpoint={resume_path}, exp_path={output_path}'
+            )
+        args.resume_from_checkpoint = str(resume_path)
+
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
     logger = get_logger('')
@@ -447,42 +476,85 @@ if __name__ == '__main__':
     if args.pretrained_model is not None and args.init_base_checkpoint is not None:
         raise ValueError('pretrained_model and init_base_checkpoint are mutually exclusive.')
 
-    source_train, source_valid, train_data_seed, valid_data_seed = build_mqar_datasets(
-        vocab_size=args.vocab_size,
-        input_seq_len=args.input_seq_len,
-        num_kv_pairs=args.num_kv_pairs,
-        train_num_examples=args.train_num_examples,
-        valid_num_examples=args.valid_num_examples,
-        power_a=args.power_a,
-        random_non_queries=args.random_non_queries,
-        data_seed=args.data_seed,
-        dense_queries=args.dense_queries,
-        query_sampling=args.query_sampling,
-    )
-    context_size = args.num_kv_pairs * 2
+    if args.mqar_data_path is None:
+        source_train, source_valid, train_data_seed, valid_data_seed = build_mqar_datasets(
+            vocab_size=args.vocab_size,
+            input_seq_len=args.input_seq_len,
+            num_kv_pairs=args.num_kv_pairs,
+            train_num_examples=args.train_num_examples,
+            valid_num_examples=args.valid_num_examples,
+            power_a=args.power_a,
+            random_non_queries=args.random_non_queries,
+            data_seed=args.data_seed,
+            dense_queries=args.dense_queries,
+            query_sampling=args.query_sampling,
+            mqar_noise_lvl=args.mqar_noise_lvl,
+        )
+        dataset_metadata = source_train.slices
+    else:
+        source_train, source_valid, dataset_metadata = load_saved_mqar_datasets(args.mqar_data_path)
+        for key, expected in (
+            ('vocab_size', args.vocab_size),
+            ('num_kv_pairs', args.num_kv_pairs),
+            ('dense_queries', args.dense_queries),
+            ('query_sampling', args.query_sampling),
+            ('mqar_noise_lvl', args.mqar_noise_lvl),
+        ):
+            if key in dataset_metadata and dataset_metadata[key] != expected:
+                raise ValueError(
+                    f'Saved MQAR metadata mismatch for {key}: '
+                    f'saved={dataset_metadata[key]!r}, requested={expected!r}'
+                )
+        train_data_seed = dataset_metadata.get('train_data_seed')
+        valid_data_seed = dataset_metadata.get('valid_data_seed')
+        args.train_num_examples = len(source_train)
+        args.valid_num_examples = len(source_valid)
+        args.input_seq_len = dataset_metadata['input_seq_len']
+
+    context_size = dataset_metadata['context_size']
+    if source_valid is not None and hasattr(source_valid, 'slices') and source_valid.slices['context_size'] != context_size:
+        raise ValueError('MQAR train and validation context sizes do not match.')
+    if dataset_metadata.get('input_seq_len') != source_valid[0]['input_ids'].shape[0]:
+        raise ValueError('MQAR train and validation sequence lengths do not match.')
     train_dataset = GradMemMQARDataset(source_train, context_size=context_size)
     valid_dataset = GradMemMQARDataset(source_valid, context_size=context_size)
     output_dir = Path(args.exp_path)
 
     if accel.is_main_process:
+        noise_enabled = dataset_metadata.get('noise_tokens', 0) > 0
+        if args.dense_queries:
+            query_layout = (
+                'dense context with framed KV pairs and interleaved random noise'
+                if noise_enabled else
+                'dense context and contiguous query keys; no fillers'
+            )
+        else:
+            query_layout = (
+                'upstream power-law query placement with framed KV pairs and interleaved random noise'
+                if noise_enabled else
+                'upstream power-law query placement'
+            )
         config = {
             'cli_args': dict(vars(args)),
             'task_source': ZOOLOGY_MQAR_SOURCE,
             'task': 'Zoology MQAR with GradMem write/read split',
-            'query_layout': (
-                'dense context and contiguous query keys; no fillers'
-                if args.dense_queries else
-                'upstream power-law query placement'
-            ),
-            'query_sampling': source_train.slices.get('query_sampling'),
-            'data_generator': source_train.slices.get('generator', 'upstream'),
-            'query_distribution': source_train.slices.get(
+            'query_layout': query_layout,
+            'query_sampling': dataset_metadata.get('query_sampling'),
+            'data_generator': dataset_metadata.get('generator', 'saved' if args.mqar_data_path else 'upstream'),
+            'query_distribution': dataset_metadata.get(
                 'query_distribution', 'power_law_placement'
             ),
-            'effective_power_a': source_train.slices.get('effective_power_a', args.power_a),
+            'effective_power_a': dataset_metadata.get('effective_power_a', args.power_a),
             'loss_alignment': 'query-position read loss; generated labels are unchanged',
             'context_size': context_size,
-            'query_size': args.input_seq_len - context_size,
+            'query_size': dataset_metadata['input_seq_len'] - context_size,
+            'input_seq_len': dataset_metadata['input_seq_len'],
+            'context_noise': {
+                'level': args.mqar_noise_lvl,
+                'tokens': dataset_metadata.get('noise_tokens', 0),
+                'pair_open_token': dataset_metadata.get('pair_open_token', 0),
+                'pair_close_token': dataset_metadata.get('pair_close_token', 1),
+            },
             'train_data_seed': train_data_seed,
             'valid_data_seed': valid_data_seed,
             'checkpoint_source': (
@@ -501,7 +573,7 @@ if __name__ == '__main__':
             ],
         }
         logger.info(f'saving experiment configuration to {args.exp_path}')
-        output_dir.mkdir(parents=True)
+        output_dir.mkdir(parents=True, exist_ok=True)
         json.dump(config, open(output_dir / 'config.json', 'w'), indent=4)
 
     if args.pretrained_model is None:
@@ -533,7 +605,7 @@ if __name__ == '__main__':
             config.intermediate_size = config.hidden_size * 4
             config.max_position_embeddings = args.max_position_embeddings
         elif args.base_model == 'llama':
-            config = AutoConfig.from_pretrained('meta-llama/Llama-3.2-1B')
+            config = AutoConfig.from_pretrained('unsloth/Llama-3.2-1B')
             config.num_hidden_layers = args.n_layer
             config.num_attention_heads = args.n_head
             config.num_key_value_heads = args.n_head
@@ -732,7 +804,7 @@ if __name__ == '__main__':
                    ],
     )
     # Train the model
-    trainer.train()
+    trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     logger.info('training done. running final evaluation...')
     metrics = trainer.evaluate(valid_dataset)
     logger.info(f'{metrics}')

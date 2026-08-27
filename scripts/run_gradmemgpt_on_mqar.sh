@@ -6,6 +6,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/collect_env_state.sh"
 
 # Define arguments for the script
+RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resume_from_checkpoint|--resume-from-checkpoint)
+      if [[ $# -lt 2 ]]; then
+        echo "[ERROR] $1 requires a checkpoint directory" >&2
+        exit 2
+      fi
+      RESUME_FROM_CHECKPOINT="$2"
+      shift 2
+      ;;
+    --resume_from_checkpoint=*|--resume-from-checkpoint=*)
+      RESUME_FROM_CHECKPOINT="${1#*=}"
+      shift
+      ;;
+    *)
+      echo "[ERROR] unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
 NP=${NP:-1}  # Default to 1 process if not set
 LR=${LR:-1e-04}
 ADAM_BETA1=${ADAM_BETA1:-0.9}
@@ -21,13 +43,14 @@ BASE_MODEL=llama
 
 # Dense MQAR query-order distribution.
 VOCAB_SIZE=8192
-NUM_KV_PAIRS=16
-INPUT_SEQ_LEN=$((3 * NUM_KV_PAIRS))
+NUM_KV_PAIRS=${NUM_KV_PAIRS:-16}
+INPUT_SEQ_LEN=$((5 * NUM_KV_PAIRS))
+MQAR_NOISE_LVL=${MQAR_NOISE_LVL:-0.0}
 # zoology uses power_law with 0.01
 QUERY_SAMPLING=${QUERY_SAMPLING:-uniform}
 POWER_A=${POWER_A:-0.01}
-TRAIN_NUM_EXAMPLES=100000
-VALID_NUM_EXAMPLES=3000
+TRAIN_NUM_EXAMPLES=1000000
+VALID_NUM_EXAMPLES=5000
 DATA_SEED=123
 
 case "$QUERY_SAMPLING" in
@@ -45,9 +68,13 @@ case "$QUERY_SAMPLING" in
     exit 2
     ;;
 esac
+if [ "$MQAR_NOISE_LVL" != "0.0" ]; then
+  DATA_NAME="${DATA_NAME}_noise${MQAR_NOISE_LVL}"
+fi
+MQAR_DATA_PATH=${MQAR_DATA_PATH:-./data/${DATA_NAME}}
 
 # For sparse upstream MQAR, add --dense_queries false and set INPUT_SEQ_LEN to
-# at least 4*NUM_KV_PAIRS. query_sampling only controls dense query ordering.
+# at least 6*NUM_KV_PAIRS. query_sampling only controls dense query ordering.
 
 # GradMemGPT specific parameters
 MEMORY_BACKEND="prefix"
@@ -119,6 +146,7 @@ STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
 STOP_ON_METRIC_VALUE=0.99
 RUN_NAME_SUFFIX=0.99
 SAVE_STEPS=${SAVE_STEPS:-}
+MAX_STEPS=${MAX_STEPS:-200000}
 
 ATTN_IMPL="eager"
 MIXED_PRECISION='no'
@@ -176,6 +204,9 @@ if [ "$USE_WRITE_LORA" = true ]; then
   fi
 fi
 RUN_NAME=${RUN_NAME}_grad_${GRAD_MODE}
+if [ "$MQAR_NOISE_LVL" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_mqarnoise${MQAR_NOISE_LVL}
+fi
 if [ "$ADD_INNER_LOSS_TO_OUTER" = true ]; then
   RUN_NAME=${RUN_NAME}_add_inner
   if [ "$INNER_LOSS_WEIGHT" != "None" ]; then
@@ -215,6 +246,20 @@ fi
 
 # Run ID
 N_VALUES=(1 2 3)
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+  if [ ! -d "$RESUME_FROM_CHECKPOINT" ]; then
+    echo "[ERROR] resume checkpoint directory does not exist: $RESUME_FROM_CHECKPOINT" >&2
+    exit 1
+  fi
+  RESUME_FROM_CHECKPOINT="$(realpath "$RESUME_FROM_CHECKPOINT")"
+  RESUME_EXP_PATH="$(dirname "$RESUME_FROM_CHECKPOINT")"
+  RESUME_RUN_DIR="$(basename "$RESUME_EXP_PATH")"
+  if [[ ! "$RESUME_RUN_DIR" =~ ^run_([0-9]+)(_(bf16|fp16))?$ ]]; then
+    echo "[ERROR] could not infer run number from resume path: $RESUME_EXP_PATH" >&2
+    exit 1
+  fi
+  N_VALUES=("${BASH_REMATCH[1]}")
+fi
 for N in "${N_VALUES[@]}"; do
   # Path to save experiment results
   RND=$(date +%Y%m%d%H%M%S)
@@ -224,7 +269,13 @@ for N in "${N_VALUES[@]}"; do
     EXP_PATH="${EXP_PATH}_${MIXED_PRECISION}"
   fi
 
-  if ! prepare_locked_run "$EXP_PATH" "$0" "$NP"; then
+  ALLOW_EXISTING=false
+  if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    EXP_PATH="$RESUME_EXP_PATH"
+    ALLOW_EXISTING=true
+  fi
+
+  if ! prepare_locked_run "$EXP_PATH" "$0" "$NP" "$ALLOW_EXISTING"; then
     continue
   fi
 
@@ -248,6 +299,8 @@ for N in "${N_VALUES[@]}"; do
     --vocab_size "$VOCAB_SIZE"
     --input_seq_len "$INPUT_SEQ_LEN"
     --num_kv_pairs "$NUM_KV_PAIRS"
+    --mqar_noise_lvl "$MQAR_NOISE_LVL"
+    --mqar_data_path "$MQAR_DATA_PATH"
     --query_sampling "$QUERY_SAMPLING"
     --power_a "$POWER_A"
     --train_num_examples "$TRAIN_NUM_EXAMPLES"
@@ -287,7 +340,7 @@ for N in "${N_VALUES[@]}"; do
     --memory_noise_sigma "$MEMORY_NOISE_SIGMA"
     --orthogonal_loss_weight "$ORTHOGONAL_LOSS_WEIGHT"
     --ivan_loss_weight "$IVAN_LOSS_WEIGHT"
-    --max_steps 200000
+    --max_steps "$MAX_STEPS"
     --eval_steps 500
     --logging_steps 500
     --warmup_steps 10000
@@ -296,7 +349,7 @@ for N in "${N_VALUES[@]}"; do
     --seed "$((142+$N))"
   )
   # Optional args
-  if [ -n "${INIT_CHECKPOINT:-}" ]; then
+  if [ -n "${INIT_CHECKPOINT:-}" ] && [ -z "$RESUME_FROM_CHECKPOINT" ]; then
     CMD+=( --init_checkpoint "$INIT_CHECKPOINT" )
   fi
   if [ -n "${INIT_BASE_CHECKPOINT:-}" ]; then
@@ -325,6 +378,9 @@ for N in "${N_VALUES[@]}"; do
   fi
   if [ -n "$SAVE_STEPS" ]; then
     CMD+=( --save_steps "$SAVE_STEPS" )
+  fi
+  if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    CMD+=( --resume_from_checkpoint "$RESUME_FROM_CHECKPOINT" )
   fi
 
   if [ "$USE_WRITE_LORA" = true ]; then

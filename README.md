@@ -72,6 +72,12 @@ Download prepared datasets from Hugging Face:
 
 You can also generate data with `notebooks/dump_dataset.ipynb` (uses `kv_dataset_utils.generate_sequence`).
 
+The framed MQAR noise datasets can be downloaded with:
+
+```bash
+./scripts/download_mqar_noise_datasets.sh
+```
+
 ### bAbI
 
 ```bash
