@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import random
 import string
 import unicodedata as ud
@@ -28,8 +30,122 @@ RANGES = [
 ]
 
 
-def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
-                      min_segment_len=32, max_segment_len=64, kv_alphabet=BASE_KV_ALPHABET):
+class ComplexityValueMapper:
+    """Expand a short latent value into a longer, deterministic value.
+
+    The mapper embeds the latent value in the larger ``alphabet ** v_length``
+    domain and applies a keyed Feistel-style permutation. Consequently, the
+    visible values are fully mixed across their positions while the mapping
+    remains stateless and collision-free.
+    """
+
+    _N_ROUNDS = 8
+    _MAX_CACHE_ENTRIES = 62 ** 3
+
+    def __init__(self, complexity, v_length, alphabet=BASE_KV_ALPHABET, seed=0):
+        self.complexity = int(complexity)
+        self.v_length = int(v_length)
+        self.alphabet = str(alphabet)
+        self.seed = int(seed)
+
+        if self.complexity < 1:
+            raise ValueError("complexity must be a positive integer")
+        if self.v_length < self.complexity:
+            raise ValueError("v_length must be greater than or equal to complexity")
+        if len(self.alphabet) < 2:
+            raise ValueError("alphabet must contain at least two characters")
+        if len(set(self.alphabet)) != len(self.alphabet):
+            raise ValueError("alphabet characters must be unique")
+
+        self._char_to_index = {char: index for index, char in enumerate(self.alphabet)}
+        self._radix = len(self.alphabet)
+        self._right_width = self.v_length - self.v_length // 2
+        self._left_modulus = self._radix ** (self.v_length - self._right_width)
+        self._right_modulus = self._radix ** self._right_width
+        latent_space_size = self._radix ** self.complexity
+        self._cache = (
+            {}
+            if self.complexity < self.v_length
+            and latent_space_size <= self._MAX_CACHE_ENTRIES
+            else None
+        )
+        key_material = "\0".join(
+            (
+                "kv-complexity-feistel-v1",
+                str(self.seed),
+                str(self.complexity),
+                str(self.v_length),
+                self.alphabet,
+            )
+        ).encode("utf-8")
+        self._key = hashlib.sha256(key_material).digest()
+
+    def _string_to_integer(self, value):
+        integer = 0
+        for char in value:
+            try:
+                digit = self._char_to_index[char]
+            except KeyError as exc:
+                raise ValueError(f"latent value contains character outside the alphabet: {char!r}") from exc
+            integer = integer * self._radix + digit
+        return integer
+
+    def _integer_to_string(self, integer):
+        chars = [self.alphabet[0]] * self.v_length
+        for position in range(self.v_length - 1, -1, -1):
+            integer, digit = divmod(integer, self._radix)
+            chars[position] = self.alphabet[digit]
+        return "".join(chars)
+
+    def _round_value(self, round_index, source, modulus):
+        message = f"{round_index}:{source}".encode("ascii")
+        digest = hmac.new(self._key, message, hashlib.sha256).digest()
+        return int.from_bytes(digest, "big") % modulus
+
+    def _permute(self, integer):
+        left, right = divmod(integer, self._right_modulus)
+        for round_index in range(self._N_ROUNDS):
+            if round_index % 2 == 0:
+                left = (
+                    left + self._round_value(round_index, right, self._left_modulus)
+                ) % self._left_modulus
+            else:
+                right = (
+                    right + self._round_value(round_index, left, self._right_modulus)
+                ) % self._right_modulus
+        return left * self._right_modulus + right
+
+    def __call__(self, latent_value):
+        if not isinstance(latent_value, str):
+            raise TypeError("latent value must be a string")
+        if len(latent_value) != self.complexity:
+            raise ValueError(
+                f"latent value must have length {self.complexity}; got {len(latent_value)}"
+            )
+        if self._cache is not None:
+            cached_value = self._cache.get(latent_value)
+            if cached_value is not None:
+                return cached_value
+
+        visible_value = self._integer_to_string(
+            self._permute(self._string_to_integer(latent_value))
+        )
+        if self._cache is not None:
+            self._cache[latent_value] = visible_value
+        return visible_value
+
+
+def generate_sequence(
+    num_kv_pairs=3,
+    k_length=4,
+    v_length=4,
+    n_segments=4,
+    min_segment_len=32,
+    max_segment_len=64,
+    kv_alphabet=BASE_KV_ALPHABET,
+    complexity=None,
+    complexity_function=None,
+):
     """
     Generate a sequence with random text, key-value pairs, and a query.
 
@@ -57,6 +173,9 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
         n_segments: Number of segments/messages in the sequence
         min_segment_len: Minimum length of each segment
         max_segment_len: Maximum length of each segment
+        kv_alphabet: Characters used for keys, values, and filler text
+        complexity: Length of the latent value before deterministic expansion
+        complexity_function: Callable mapping latent values to visible values
 
     Returns:
         Dictionary containing:
@@ -67,6 +186,16 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
         - input_sequence: Complete sequence string (context + query)
         - target: Target value for the query in format V!|
     """
+    if complexity is not None:
+        if not 0 < complexity <= v_length:
+            raise ValueError("complexity must be positive and no greater than v_length")
+        if complexity < v_length and complexity_function is None:
+            raise ValueError(
+                "complexity_function is required when complexity is smaller than v_length"
+            )
+    elif complexity_function is not None:
+        raise ValueError("complexity must be set when complexity_function is provided")
+
     # generate unique keys and values
     keys = []
     values = []
@@ -75,7 +204,14 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
             key = ''.join(random.choice(kv_alphabet) for _ in range(k_length))
             if key not in keys:
                 break
-        value = ''.join(random.choice(kv_alphabet) for _ in range(v_length))
+        latent_length = complexity if complexity is not None else v_length
+        value = ''.join(random.choice(kv_alphabet) for _ in range(latent_length))
+        if complexity is not None and complexity < v_length:
+            value = complexity_function(value)
+            if len(value) != v_length:
+                raise ValueError(
+                    f"complexity_function must return values of length {v_length}; got {len(value)}"
+                )
         keys.append(key)
         values.append(value)
     kv_pairs_dict = dict(zip(keys, values))
