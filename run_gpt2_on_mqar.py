@@ -23,7 +23,6 @@ from transformers import (
 )
 
 from transformers.trainer_utils import get_last_checkpoint
-from resume_utils import restore_resume_args
 from zoology_mqar_data import (
     ZOOLOGY_MQAR_SOURCE,
     build_mqar_datasets,
@@ -213,7 +212,6 @@ if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
     args = parser.parse_args_into_dataclasses()[0]
 
-    restore_resume_args(args, logger)
     if args.init_checkpoint is not None and args.resume_from_checkpoint is not None:
         raise ValueError('--init_checkpoint and --resume_from_checkpoint are mutually exclusive')
 
@@ -270,7 +268,7 @@ if __name__ == '__main__':
         args.valid_num_examples = len(valid_dataset)
         args.input_seq_len = dataset_metadata['input_seq_len']
 
-    if accel.is_main_process and not args.do_eval_only and args.resume_from_checkpoint is None:
+    if accel.is_main_process and not args.do_eval_only:
         noise_enabled = dataset_metadata.get('noise_tokens', 0) > 0
         if args.dense_queries:
             query_layout = (
