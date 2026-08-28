@@ -8,6 +8,28 @@ cd "$REPO_DIR"
 source "$SCRIPT_DIR/collect_env_state.sh"
 
 # Define arguments for the script
+RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --resume_from_checkpoint|--resume-from-checkpoint)
+      if [[ $# -lt 2 ]]; then
+        echo "[ERROR] $1 requires a checkpoint directory" >&2
+        exit 2
+      fi
+      RESUME_FROM_CHECKPOINT="$2"
+      shift 2
+      ;;
+    --resume_from_checkpoint=*|--resume-from-checkpoint=*)
+      RESUME_FROM_CHECKPOINT="${1#*=}"
+      shift
+      ;;
+    *)
+      echo "[ERROR] unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
 NP=${NP:-1}  # Default to 1 process if not set
 LR=${LR:-1e-04}
 ADAM_BETA2=${ADAM_BETA2:-}
@@ -89,6 +111,20 @@ fi
 
 # Run ID
 N_VALUES=(1 2 3)
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+  if [ ! -d "$RESUME_FROM_CHECKPOINT" ]; then
+    echo "[ERROR] resume checkpoint directory does not exist: $RESUME_FROM_CHECKPOINT" >&2
+    exit 1
+  fi
+  RESUME_FROM_CHECKPOINT="$(realpath "$RESUME_FROM_CHECKPOINT")"
+  RESUME_EXP_PATH="$(dirname "$RESUME_FROM_CHECKPOINT")"
+  RESUME_RUN_DIR="$(basename "$RESUME_EXP_PATH")"
+  if [[ ! "$RESUME_RUN_DIR" =~ ^run_([0-9]+)(_(bf16|fp16))?$ ]]; then
+    echo "[ERROR] could not infer run number from resume path: $RESUME_EXP_PATH" >&2
+    exit 1
+  fi
+  N_VALUES=("${BASH_REMATCH[1]}")
+fi
 for N in "${N_VALUES[@]}"; do
   # Path to save experiment results
   EXP_PATH="./runs/${DATA_NAME}/${RUN_NAME}/run_$N"
@@ -97,7 +133,13 @@ for N in "${N_VALUES[@]}"; do
     EXP_PATH="${EXP_PATH}_${MIXED_PRECISION}"
   fi
 
-  if ! prepare_locked_run "$EXP_PATH" "$0" "$NP"; then
+  ALLOW_EXISTING=false
+  if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    EXP_PATH="$RESUME_EXP_PATH"
+    ALLOW_EXISTING=true
+  fi
+
+  if ! prepare_locked_run "$EXP_PATH" "$0" "$NP" "$ALLOW_EXISTING"; then
     continue
   fi
 
@@ -142,8 +184,11 @@ for N in "${N_VALUES[@]}"; do
   if [ -n "$ADAM_BETA2" ]; then
     CMD+=(--adam_beta2 "$ADAM_BETA2")
   fi
-  if [ -n "${INIT_CHECKPOINT:-}" ]; then
+  if [ -n "${INIT_CHECKPOINT:-}" ] && [ -z "$RESUME_FROM_CHECKPOINT" ]; then
     CMD+=(--init_checkpoint "$INIT_CHECKPOINT")
+  fi
+  if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+    CMD+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT")
   fi
 
   print_run_header "$EXP_PATH" "$PORT" "$NP" "$MIXED_PRECISION" "${CMD[@]}"

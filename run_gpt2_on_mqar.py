@@ -23,6 +23,7 @@ from transformers import (
 )
 
 from transformers.trainer_utils import get_last_checkpoint
+from resume_utils import restore_resume_args
 from zoology_mqar_data import (
     ZOOLOGY_MQAR_SOURCE,
     build_mqar_datasets,
@@ -194,6 +195,7 @@ class ExperimentArgs:
     base_model: Optional[str] = field(default=None)
     pretrained_model: Optional[str] = field(default=None)
     init_checkpoint: Optional[str] = field(default=None)
+    resume_from_checkpoint: Optional[str] = field(default=None)
     n_layer: Optional[int] = field(default=4)
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
@@ -211,6 +213,10 @@ if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
     args = parser.parse_args_into_dataclasses()[0]
 
+    restore_resume_args(args, logger)
+    if args.init_checkpoint is not None and args.resume_from_checkpoint is not None:
+        raise ValueError('--init_checkpoint and --resume_from_checkpoint are mutually exclusive')
+
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
     logger = get_logger('')
@@ -223,9 +229,11 @@ if __name__ == '__main__':
     assert not (args.pretrained_model is not None and args.base_model is not None), "only one of these args must be set"
 
     output_dir = Path(args.exp_path)
-    if accel.is_main_process and output_dir.exists() and not args.overwrite_output_dir and not args.do_eval_only:
+    if (accel.is_main_process and output_dir.exists() and args.resume_from_checkpoint is None
+            and not args.overwrite_output_dir and not args.do_eval_only):
         raise RuntimeError(f"Output directory already exists: {output_dir}. "
-                           f"Pass --overwrite_output_dir to resume/continue here, or choose a new --exp_path.")
+                           f"Pass --resume_from_checkpoint with a checkpoint in this run, "
+                           f"--overwrite_output_dir to reuse it, or choose a new --exp_path.")
 
     if args.mqar_data_path is None:
         train_dataset, valid_dataset, train_data_seed, valid_data_seed = build_mqar_datasets(
@@ -262,7 +270,7 @@ if __name__ == '__main__':
         args.valid_num_examples = len(valid_dataset)
         args.input_seq_len = dataset_metadata['input_seq_len']
 
-    if accel.is_main_process and not args.do_eval_only:
+    if accel.is_main_process and not args.do_eval_only and args.resume_from_checkpoint is None:
         noise_enabled = dataset_metadata.get('noise_tokens', 0) > 0
         if args.dense_queries:
             query_layout = (
@@ -476,10 +484,8 @@ if __name__ == '__main__':
             logger.error(f"Failed to load best model from {output_dir}: {e}")
             exit(1)
     else:
-        if last_ckpt:
-            logger.info(f'Resuming training from last checkpoint: {last_ckpt}')
         # run training
-        trainer.train(resume_from_checkpoint=last_ckpt)
+        trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
         logger.info('training done. running final evaluation...')
     # run final evaluation
     metrics = trainer.evaluate(valid_dataset)
