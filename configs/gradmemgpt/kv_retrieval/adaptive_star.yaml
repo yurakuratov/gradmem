@@ -34,6 +34,7 @@ run_naming:
     - {key: adaptive.star_perturbation, prefix: sp_}
     - {key: adaptive.star_weight, prefix: sw_}
     - {key: adaptive.star_gamma, prefix: sg_}
+    - {key: adaptive.replay_weight, prefix: rw_}
     - {key: gradmem.n_mem_tokens, prefix: m}
     - {key: dataset.data_name, prefix: ds_}
 
@@ -102,6 +103,17 @@ adaptive:
   star_correct_only: true    # x*: only currently-retrievable pairs
   star_boundaries: "all"     # every segment boundary ("last" = final only)
   star_anneal_steps: 0       # lambda warmup steps (0 = constant)
+
+  # ---- outer-loss vanilla replay (the corrective STAR ablation) ---- #
+  # CE of READ(m_s; probe) against the probe's answer tokens, at the SAME
+  # boundaries / probe scope / correct-only mask as STAR. The {replay} x
+  # {STAR} 2x2 isolates refitting vs worst-case consistency on identical
+  # data. One probe forward per boundary (cheaper than STAR's three).
+  # replay_weight: 0.1        # rho (0 = off; uncomment to enable)
+  # replay_boundaries: "all"
+  # replay_probe_scope: "all"
+  # replay_correct_only: true
+  # replay_anneal_steps: 0
 
   # ---- VAE-style memory regularisation (default-off; orthogonal to STAR) ---- #
   # mem_noise_std: 0.05

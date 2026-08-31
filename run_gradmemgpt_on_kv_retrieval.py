@@ -222,11 +222,14 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     # are also emitted by the segmented adaptive path.
     # star_*: the STAR worst-case stability term (train-only): star_kl is the
     # mean worst-case KL at segment boundaries, star_delta_ratio the achieved
-    # relative perturbation size (should sit near star_gamma).
+    # relative perturbation size (should sit near star_gamma). replay_*: the
+    # vanilla-replay ablation on the same probes; replay_em_rate is a live
+    # forgetting measurement (fraction of in-scope probes currently retrieved).
     for _k in ('gate_retain_mean', 'gate_write_mean', 'gate_delta_mean',
                'seg_nonempty_count_mean', 'seg_nonempty_size_mean',
                'mem_prior_loss', 'mem_prior_weight_now', 'mem_sampled_delta_norm_mean',
-               'star_kl', 'star_weight_now', 'star_n_probes', 'star_delta_ratio'):
+               'star_kl', 'star_weight_now', 'star_n_probes', 'star_delta_ratio',
+               'replay_ce', 'replay_weight_now', 'replay_n_probes', 'replay_em_rate'):
         if _k in inner_loop_stats:
             metrics[_k] = float(inner_loop_stats[_k].mean())
     return metrics
@@ -989,6 +992,15 @@ class ExperimentArgs:
     star_correct_only: Optional[bool] = field(default=True)    # STAR's x* masking
     star_boundaries: Optional[str] = field(default="all")      # all | last
     star_anneal_steps: Optional[int] = field(default=0)        # lambda warmup steps
+    # ---- outer-loss vanilla replay (default-off; STAR ablation) ---- #
+    # CE of READ(m_s; probe) against the probe's answer tokens at the SAME
+    # boundaries/probes as STAR -- corrective vs STAR's preventive. Enabling
+    # it (>0) also attaches the ?!K:V!| probe queries to TRAINING batches.
+    replay_weight: Optional[float] = field(default=0.0)        # rho (0 = off)
+    replay_boundaries: Optional[str] = field(default="all")    # all | last
+    replay_probe_scope: Optional[str] = field(default="all")   # all | past
+    replay_correct_only: Optional[bool] = field(default=True)
+    replay_anneal_steps: Optional[int] = field(default=0)      # rho warmup steps
 
 
 def _resolve_init_checkpoint(spec: str) -> Path:
@@ -1263,6 +1275,12 @@ def main(config_path: Optional[str] = None):
             star_correct_only=args.star_correct_only,
             star_boundaries=args.star_boundaries,
             star_anneal_steps=args.star_anneal_steps,
+            # outer-loss vanilla replay (STAR ablation)
+            replay_weight=args.replay_weight,
+            replay_boundaries=args.replay_boundaries,
+            replay_probe_scope=args.replay_probe_scope,
+            replay_correct_only=args.replay_correct_only,
+            replay_anneal_steps=args.replay_anneal_steps,
         )
         # Adaptive segments need the full (un-truncated) context so every
         # segment has real tokens. The shared collator already disables
@@ -1305,17 +1323,17 @@ def main(config_path: Optional[str] = None):
 
     dataset = datasets.load_from_disk(args.data_path)
 
-    # STAR stability term needs the ?!K:V!| probe queries in TRAINING batches.
+    # STAR / replay need the ?!K:V!| probe queries in TRAINING batches.
     # They ride as a TOP-LEVEL batch key (the model takes a matching
     # ``kv_queries`` forward arg) — NOT inside input_ids, whose leaves the
     # Trainer's eval input-decoding pads and it rejects non-tensor types.
     # Eval-mode forwards ignore them, so eval behaviour is unchanged.
-    use_star = bool(args.star_weight) and use_adaptive_model
+    use_probes = bool(args.star_weight or args.replay_weight) and use_adaptive_model
 
     def data_collator(batch):
         out = collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
                          hopfield=args.use_hopfield_memory or args.use_gated_delta_memory)
-        if use_star:
+        if use_probes:
             out['kv_queries'] = build_kv_probe_queries(
                 batch, tokenizer, out['input_ids']['context_input_ids'].size(1),
                 n_segments=args.n_segments, segment_size=args.segment_size)
@@ -1465,7 +1483,7 @@ def main(config_path: Optional[str] = None):
             def stage_data_collator(batch):
                 out = collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
                                  hopfield=args.use_hopfield_memory or args.use_gated_delta_memory)
-                if use_star:
+                if use_probes:
                     out['kv_queries'] = build_kv_probe_queries(
                         batch, tokenizer, out['input_ids']['context_input_ids'].size(1),
                         n_segments=args.n_segments, segment_size=args.segment_size)

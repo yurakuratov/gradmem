@@ -154,6 +154,16 @@ class GradMemGPTConfig(PretrainedConfig):
                  star_correct_only=True,      # restrict probes to currently-retrievable pairs (STAR's x*)
                  star_boundaries="all",       # which segment boundaries: "all" | "last"
                  star_anneal_steps=0,         # λ warmup: 0 -> star_weight over this many steps (0 = constant)
+                 # ---- outer-loss vanilla replay (default-off; STAR ablation) ---- #
+                 # Meta-level rehearsal on the SAME probes/boundaries as STAR:
+                 # + rho * CE(READ(m_s; probe), answer) -- corrective where STAR
+                 # is preventive (non-zero gradient whenever an old pair is
+                 # answered imperfectly). See _replay_boundary_loss.
+                 replay_weight=0.0,           # rho: outer-loss weight (0 = off)
+                 replay_boundaries="all",     # which segment boundaries: "all" | "last"
+                 replay_probe_scope="all",    # probes from segments "all" (<= s) | "past" (< s)
+                 replay_correct_only=True,    # restrict probes to currently-retrievable pairs
+                 replay_anneal_steps=0,       # rho warmup: 0 -> replay_weight over this many steps
                  **kwargs):
         """
         Args (new vs grad_memgpt_old.py):
@@ -241,6 +251,20 @@ class GradMemGPTConfig(PretrainedConfig):
                 (cheapest; for S=2 they coincide).
             star_anneal_steps: int, lambda warmup: linear 0 -> star_weight over
                 this many outer steps, then constant. 0 = constant from step 0.
+            replay_weight: float, outer-loss vanilla-replay weight rho (0 = off).
+                Adds rho * mean over segment boundaries of the CE of READ(m_s;
+                probe) against the answer tokens the teacher-forced probe
+                already contains -- the corrective counterpart of STAR's
+                preventive KL (non-zero gradient whenever an old pair is
+                answered imperfectly). Uses the SAME probe set, boundaries and
+                correct-only masking as STAR so the {replay} x {STAR} ablation
+                isolates the functional form. One extra probe forward per
+                boundary (cheaper than STAR's three).
+            replay_boundaries: "all" | "last" -- same semantics as star_boundaries.
+            replay_probe_scope: "all" | "past" -- same semantics as star_probe_scope.
+            replay_correct_only: bool, same semantics as star_correct_only.
+            replay_anneal_steps: int, rho warmup: linear 0 -> replay_weight over
+                this many outer steps, then constant. 0 = constant.
 
         (All other args are unchanged from grad_memgpt_old.py; see its docstring.)
         """
@@ -310,6 +334,13 @@ class GradMemGPTConfig(PretrainedConfig):
         self.star_boundaries = star_boundaries
         self.star_anneal_steps = star_anneal_steps
 
+        # outer-loss vanilla replay (STAR ablation)
+        self.replay_weight = replay_weight
+        self.replay_boundaries = replay_boundaries
+        self.replay_probe_scope = replay_probe_scope
+        self.replay_correct_only = replay_correct_only
+        self.replay_anneal_steps = replay_anneal_steps
+
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), \
@@ -356,6 +387,16 @@ class GradMemGPTConfig(PretrainedConfig):
             f"star_boundaries must be 'all' or 'last', got '{star_boundaries}'"
         assert star_anneal_steps >= 0, \
             f"star_anneal_steps must be >= 0, got {star_anneal_steps}"
+
+        # Validate vanilla-replay settings (STAR ablation)
+        assert replay_weight >= 0.0, f"replay_weight must be >= 0.0, got {replay_weight}"
+        assert replay_boundaries in ("all", "last"), \
+            f"replay_boundaries must be 'all' or 'last', got '{replay_boundaries}'"
+        assert replay_probe_scope in ("all", "past"), \
+            f"replay_probe_scope must be 'all' or 'past', got '{replay_probe_scope}'"
+        assert isinstance(replay_correct_only, bool), "replay_correct_only must be a bool"
+        assert replay_anneal_steps >= 0, \
+            f"replay_anneal_steps must be >= 0, got {replay_anneal_steps}"
 
 
 class GradMemGPT(PreTrainedModel):
@@ -464,6 +505,13 @@ class GradMemGPT(PreTrainedModel):
         self.star_correct_only = config.star_correct_only
         self.star_boundaries = config.star_boundaries
         self.star_anneal_steps = config.star_anneal_steps
+
+        # outer-loss vanilla replay (STAR ablation)
+        self.replay_weight = config.replay_weight
+        self.replay_boundaries = config.replay_boundaries
+        self.replay_probe_scope = config.replay_probe_scope
+        self.replay_correct_only = config.replay_correct_only
+        self.replay_anneal_steps = config.replay_anneal_steps
 
         self.current_train_step = 0   # stamped by CustomTrainer.compute_loss via set_train_step
 
@@ -711,6 +759,13 @@ class GradMemGPT(PreTrainedModel):
         frac = min(self.current_train_step / self.star_anneal_steps, 1.0)
         return self.star_weight * frac
 
+    def _replay_weight_now(self):
+        """Replay rho schedule: 0 -> replay_weight over replay_anneal_steps, then constant."""
+        if self.replay_anneal_steps <= 0:
+            return self.replay_weight
+        frac = min(self.current_train_step / self.replay_anneal_steps, 1.0)
+        return self.replay_weight * frac
+
     def _sgd_step(self, p, g, lr=None):
         """Stateless SGD: m = m - lr*g. r_t = 1, w_t = 1 (degenerate running-sum RNN)."""
         g = self._clip_grad(g)
@@ -875,6 +930,66 @@ class GradMemGPT(PreTrainedModel):
         loss = self._star_kl(ref_logits, star_logits, score, selected)
         ratio = (delta.norm(dim=-1) / (tok_norm.squeeze(-1) + 1e-12)).mean().detach()
         return loss, int(selected.sum().item()), ratio
+
+    def _replay_boundary_loss(self, mem_batch, kv_queries, boundary_seg,
+                              W_batch=None, b_batch=None,
+                              read_st_batch=None, read_end_batch=None):
+        """Outer-loss vanilla replay (meta-level rehearsal) at one segment boundary.
+
+        The corrective counterpart of _star_boundary_loss, kept deliberately
+        symmetric so the {replay} x {STAR} ablation isolates the functional
+        form on IDENTICAL data: same teacher-forced probes, same boundary
+        semantics, same scope / correct-only selection. Where STAR penalises
+        the worst-case OUTPUT DRIFT under a memory perturbation (zero gradient
+        when retrieval is already robust -- preventive), replay directly
+        minimises the CE of READ(m_s; probe) against the answer tokens the
+        probe already contains (non-zero gradient whenever an old pair is
+        answered imperfectly -- corrective, can recover dropped pairs).
+
+        One grad-carrying probe forward per boundary (STAR needs three).
+        Returns None when no probe is eligible, else
+        (loss, n_probes, em_rate) where em_rate is the fraction of in-scope
+        probes currently retrieved with exact match (a live forgetting
+        measurement, also logged when the term itself is masked empty).
+        """
+        qids = kv_queries['query_input_ids']            # [B, n_q, Q]
+        tmask = kv_queries['target_mask']               # [B, n_q, Q] bool
+        seg_idx = kv_queries['seg_idx']                 # [B, n_q]
+        qmask = kv_queries['mask']                      # [B, n_q] bool
+        ignore_token_ids = kv_queries.get('ignore_token_ids', [])
+
+        in_scope = qmask & (seg_idx <= boundary_seg if self.replay_probe_scope == "all"
+                            else seg_idx < boundary_seg)
+        if not in_scope.any():
+            return None
+
+        # one grad-carrying forward; the correct-only mask comes from its own
+        # (detached) argmax, so the CE gradient flows only through selected
+        # probes' logits
+        logits = self._read_once(mem_batch, qids, read_st_batch, read_end_batch,
+                                 W_batch, b_batch)
+        em = torch.zeros_like(qmask)
+        for i in range(qids.size(0)):
+            em[i] = self._probe_exact_match(logits[i].detach(), qids[i], tmask[i],
+                                            ignore_token_ids)
+        em_rate = em[in_scope].float().mean().detach()
+
+        selected = in_scope & em if self.replay_correct_only else in_scope
+        if not selected.any():
+            return None
+
+        # scored positions (identical convention to _star_kl / EM): target_mask
+        # minus the structural ignore tokens; slot t predicts token t
+        score = tmask.clone()
+        for ig in ignore_token_ids:
+            score &= (qids != ig)
+
+        logp = F.log_softmax(logits.float(), dim=-1)                     # [B, n_q, Q+1, V]
+        tok_logp = logp[:, :, :-1].gather(-1, qids.unsqueeze(-1)).squeeze(-1)  # [B, n_q, Q]
+        ce_probe = -(tok_logp * score).sum(-1)                           # [B, n_q]
+        denom = selected.float().sum().clamp_min(1.0)
+        loss = (ce_probe * selected.float()).sum() / denom
+        return loss, int(selected.sum().item()), em_rate
 
     @staticmethod
     def _apply_linear(mem, W, b):
@@ -1173,15 +1288,20 @@ class GradMemGPT(PreTrainedModel):
         B = context_input_ids.size(0)
         inner_loss = torch.tensor(0.0, device=device)
 
-        # STAR stability-regulariser state (train-only; no-op unless enabled —
-        # with star_weight=0 or eval mode nothing below executes, so the
-        # forward is bitwise identical to the pre-STAR one).
+        # STAR / replay regulariser state (train-only; no-op unless enabled —
+        # with both weights at 0 or eval mode nothing below executes, so the
+        # forward is bitwise identical to the pre-regulariser one).
         star_active = (self.training and self.star_weight > 0)
-        kv_queries = kv_queries if star_active else None
+        replay_active = (self.training and self.replay_weight > 0)
+        kv_queries = kv_queries if (star_active or replay_active) else None
         star_loss_sum = torch.tensor(0.0, device=device)
         star_terms = 0
         star_n_probes = 0
         star_delta_ratio = torch.tensor(0.0, device=device)
+        replay_loss_sum = torch.tensor(0.0, device=device)
+        replay_terms = 0
+        replay_n_probes = 0
+        replay_em_rate = torch.tensor(0.0, device=device)
 
         # actual model inputs starts after mem tokens and ctrl tokens
         mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
@@ -1439,6 +1559,24 @@ class GradMemGPT(PreTrainedModel):
                                 star_loss_sum = star_loss_sum + loss_b
                                 star_terms += 1
 
+                    # ---- vanilla replay (train-only, same boundaries/probes) ---- #
+                    # Corrective counterpart of the STAR term: CE of the READ
+                    # outputs on the stored probes against their answer tokens.
+                    if replay_active and kv_queries is not None:
+                        W_arg = W_batch if self.mem_proj_mode == 'per_sample' else None
+                        b_arg = b_batch if self.mem_proj_mode == 'per_sample' else None
+                        res_r = self._replay_boundary_loss(
+                            mem_batch, kv_queries, seg_idx, W_arg, b_arg,
+                            read_st_batch, read_end_batch)
+                        if res_r is not None:
+                            loss_r, replay_n_probes, replay_em_rate = res_r
+                            if self.replay_boundaries == "last":
+                                replay_loss_sum = loss_r
+                                replay_terms = 1
+                            else:
+                                replay_loss_sum = replay_loss_sum + loss_r
+                                replay_terms += 1
+
         if total_inner_steps > 0:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / total_inner_steps
             if self.K:
@@ -1567,5 +1705,15 @@ class GradMemGPT(PreTrainedModel):
             output['inner_loop_stats']['star_n_probes'] = torch.tensor(
                 float(star_n_probes), device=device)
             output['inner_loop_stats']['star_delta_ratio'] = star_delta_ratio
+        if replay_terms > 0:
+            replay_w_now = self._replay_weight_now()
+            replay_loss = replay_loss_sum / replay_terms
+            combined_loss = combined_loss + replay_w_now * replay_loss
+            output['inner_loop_stats']['replay_ce'] = replay_loss.detach()
+            output['inner_loop_stats']['replay_weight_now'] = torch.tensor(
+                float(replay_w_now), device=device)
+            output['inner_loop_stats']['replay_n_probes'] = torch.tensor(
+                float(replay_n_probes), device=device)
+            output['inner_loop_stats']['replay_em_rate'] = replay_em_rate
         output['loss'] = combined_loss
         return output

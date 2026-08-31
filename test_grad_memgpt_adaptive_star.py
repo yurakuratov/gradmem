@@ -127,6 +127,12 @@ def _star_on(**overrides):
     return kw
 
 
+def _replay_on(**overrides):
+    kw = dict(replay_weight=0.1, replay_correct_only=False)
+    kw.update(overrides)
+    return kw
+
+
 # --------------------------------------------------------------------------- #
 # A. bitwise-off guarantee
 # --------------------------------------------------------------------------- #
@@ -267,18 +273,85 @@ def test_star_random_perturbation_norm_and_tiny_gamma():
     print("  [calib]   random delta ratio == gamma; tiny delta -> loss collapses OK")
 
 
+# --------------------------------------------------------------------------- #
+# F. vanilla replay (outer-loss corrective ablation)
+# --------------------------------------------------------------------------- #
+def test_replay_outer_term():
+    inputs, labels = _inputs()
+    kv = _kv_queries()
+    model = _make_model(**_replay_on())
+
+    model.eval()                                   # replay off (train-only)
+    torch.manual_seed(123)
+    out_off = model(inputs, kv_queries=kv, labels=labels, return_mem=True)
+
+    model.train()                                  # replay on
+    torch.manual_seed(123)
+    out_on = model(inputs, kv_queries=kv, labels=labels, return_mem=True)
+
+    # outer-loss-only: WRITE trajectory and READ outputs bitwise identical
+    assert _max_diff(out_off["predictions"], out_on["predictions"]) == 0.0
+    assert _max_diff(out_off["mem"], out_on["mem"]) == 0.0
+    ce = out_on["inner_loop_stats"]["replay_ce"].item()
+    assert ce > 0.0, f"replay_ce must be positive, got {ce}"
+    assert out_on["inner_loop_stats"]["replay_n_probes"].item() > 0
+    em_rate = out_on["inner_loop_stats"]["replay_em_rate"].item()
+    assert 0.0 <= em_rate <= 1.0
+    # loss grew by rho * replay_ce
+    diff = out_on["loss"].item() - out_off["loss"].item()
+    expected = ce * model.replay_weight
+    assert diff > 0.0 and abs(diff - expected) < 1e-5, \
+        f"diff={diff:.3e} != rho*replay_ce={expected:.3e}"
+
+    # meta-gradient flow: self.mem under "second", backbone even under "none"
+    for grad_mode in ("second", "none"):
+        m2 = _make_model(grad_mode=grad_mode, **_replay_on())
+        m2.train()
+        torch.manual_seed(123)
+        m2(inputs, kv_queries=kv, labels=labels)["loss"].backward()
+        backbone_grad = sum(p.grad.abs().sum().item()
+                            for _, p in m2.model.named_parameters() if p.grad is not None)
+        assert backbone_grad > 0, f"no replay gradient reached backbone ({grad_mode})"
+        if grad_mode == "second":
+            assert m2.mem.grad is not None and m2.mem.grad.abs().sum() > 0
+    print(f"  [replay]  outer-only invariance; rho*ce={expected:.3e}; em_rate={em_rate:.2f} OK")
+
+
+def test_star_replay_compose():
+    inputs, labels = _inputs()
+    kv = _kv_queries()
+    model = _make_model(**_star_on(star_gamma=1.0), **_replay_on())
+    model.eval()
+    torch.manual_seed(123)
+    out_off = model(inputs, kv_queries=kv, labels=labels, return_mem=True)
+    model.train()
+    torch.manual_seed(123)
+    out_on = model(inputs, kv_queries=kv, labels=labels, return_mem=True)
+
+    assert _max_diff(out_off["predictions"], out_on["predictions"]) == 0.0
+    star_kl = out_on["inner_loop_stats"]["star_kl"].item()
+    ce = out_on["inner_loop_stats"]["replay_ce"].item()
+    diff = out_on["loss"].item() - out_off["loss"].item()
+    expected = star_kl * model.star_weight + ce * model.replay_weight
+    assert abs(diff - expected) < 1e-4, \
+        f"diff={diff:.3e} != lambda*kl + rho*ce={expected:.3e}"
+    print(f"  [compose] lambda*kl + rho*ce = {expected:.3e} additive OK")
+
+
 TESTS = [
     test_star_off_bitwise_identical,
     test_star_write_path_invariant_positive_kl,
     test_star_grad_flow,
     test_star_no_probes_is_noop,
     test_star_random_perturbation_norm_and_tiny_gamma,
+    test_replay_outer_term,
+    test_star_replay_compose,
 ]
 
 
 def _main():
     print("=" * 70)
-    print("grad_memgpt_adaptive STAR regulariser")
+    print("grad_memgpt_adaptive STAR regulariser + vanilla-replay ablation")
     print("=" * 70)
     n_fail = 0
     for test in TESTS:
