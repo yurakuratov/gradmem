@@ -138,6 +138,22 @@ class GradMemGPTConfig(PretrainedConfig):
                  mem_noise_std=0.0,           # σ: fixed Gaussian noise on mem before READ (0 = off)
                  mem_prior_weight=0.0,        # λ: weight of MSE(m_0, m_final) outer-loop prior (0 = off)
                  mem_prior_anneal_steps=0,    # λ warmup: 0 -> mem_prior_weight over this many steps (0 = constant)
+                 # ---- STAR worst-case stability regulariser (default-off) ---- #
+                 # Adapted from "STAR: Stability-Inducing Weight Perturbation for
+                 # Continual Learning" (ICLR 2025) with the continually-updated
+                 # weights replaced by the memory tokens: at each segment boundary
+                 # the READ outputs on already-stored KV probes must stay stable
+                 # under the worst-case (gradient-ascent) perturbation of the
+                 # memory. See _star_boundary_loss for the exact math.
+                 star_weight=0.0,             # λ: outer-loss weight (0 = off)
+                 star_gamma=0.01,             # γ: relative perturbation size ‖δ_j‖/‖m_j‖ per memory token
+                 star_epsilon=1e-2,           # ε: δ0 noise std as a fraction of the per-token mem norm
+                 star_ascent_steps=1,         # gradient-ascent steps for the worst-case δ (paper: 1)
+                 star_perturbation="grad",    # "grad" (worst case) | "random" (matched-magnitude noise ablation)
+                 star_probe_scope="all",      # probes from segments "all" (<= s) | "past" (< s)
+                 star_correct_only=True,      # restrict probes to currently-retrievable pairs (STAR's x*)
+                 star_boundaries="all",       # which segment boundaries: "all" | "last"
+                 star_anneal_steps=0,         # λ warmup: 0 -> star_weight over this many steps (0 = constant)
                  **kwargs):
         """
         Args (new vs grad_memgpt_old.py):
@@ -192,6 +208,39 @@ class GradMemGPTConfig(PretrainedConfig):
             mem_prior_anneal_steps: int, lambda warmup: linear 0 -> mem_prior_weight
                 over this many outer steps, then constant. 0 = constant lambda from
                 step 0 (no warmup).
+            star_weight: float, STAR stability-regulariser weight lambda (0 = off).
+                Adds lambda * mean over segment boundaries of the worst-case KL
+                    L_STAR(m_s) = KL( READ(m_s; probes) || READ(m_s + delta; probes) )
+                    delta = argmax over per-token-normalised perturbations
+                where probes are teacher-forced ?!K:V!| queries of KV pairs already
+                written into memory (see star_probe_scope / star_correct_only).
+                delta is found with star_ascent_steps noise-initialised gradient-
+                ascent steps (paper Eq. 9-11, adapted per memory token instead of
+                per layer) and is DETACHED from the meta-graph, as is the reference
+                branch -- so the term never exceeds the existing second-order
+                autograd depth. Train-only: eval forwards are unaffected.
+            star_gamma: float, relative perturbation size gamma: after the ascent
+                step, ‖delta_j‖_2 / ‖m_j‖_2 ~= gamma per memory token j (paper
+                grid-searches 0.001..0.05).
+            star_epsilon: float, delta0 noise std as a fraction of the per-token
+                mem norm (delta escapes the all-zero-gradient point at delta=0,
+                where the KL and its gradient vanish).
+            star_ascent_steps: int, number of normalised gradient-ascent steps for
+                delta (paper: 1 is best, >=5 degrades the first-order approximation).
+            star_perturbation: "grad" (worst-case direction, the method) or
+                "random" (delta = gamma-normalised Gaussian noise, the paper's
+                Table-3 ablation -- also the adversarial analogue of mem_noise_std).
+            star_probe_scope: "all" probes from segments <= s (buffer-at-end-of-task
+                semantics, like STAR's rehearsal buffer after task t) or "past"
+                segments < s only (excludes the just-written segment).
+            star_correct_only: bool, restrict probes to pairs currently retrieved
+                with exact match under m_s (STAR's x*: "you can only forget what
+                you currently know"; enforcing stability on not-yet-learned content
+                collapses performance in the paper's Table 4).
+            star_boundaries: "all" segment boundaries or only the "last" one
+                (cheapest; for S=2 they coincide).
+            star_anneal_steps: int, lambda warmup: linear 0 -> star_weight over
+                this many outer steps, then constant. 0 = constant from step 0.
 
         (All other args are unchanged from grad_memgpt_old.py; see its docstring.)
         """
@@ -250,6 +299,17 @@ class GradMemGPTConfig(PretrainedConfig):
         self.mem_prior_weight = mem_prior_weight
         self.mem_prior_anneal_steps = mem_prior_anneal_steps
 
+        # STAR worst-case stability regulariser
+        self.star_weight = star_weight
+        self.star_gamma = star_gamma
+        self.star_epsilon = star_epsilon
+        self.star_ascent_steps = star_ascent_steps
+        self.star_perturbation = star_perturbation
+        self.star_probe_scope = star_probe_scope
+        self.star_correct_only = star_correct_only
+        self.star_boundaries = star_boundaries
+        self.star_anneal_steps = star_anneal_steps
+
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample"]
         assert self.use_mem_proj == (mem_proj_mode != 'none'), \
@@ -280,6 +340,22 @@ class GradMemGPTConfig(PretrainedConfig):
         assert mem_prior_weight >= 0.0, f"mem_prior_weight must be >= 0.0, got {mem_prior_weight}"
         assert mem_prior_anneal_steps >= 0, \
             f"mem_prior_anneal_steps must be >= 0, got {mem_prior_anneal_steps}"
+
+        # Validate STAR regulariser settings
+        assert star_weight >= 0.0, f"star_weight must be >= 0.0, got {star_weight}"
+        assert star_gamma >= 0.0, f"star_gamma must be >= 0.0, got {star_gamma}"
+        assert star_epsilon >= 0.0, f"star_epsilon must be >= 0.0, got {star_epsilon}"
+        assert star_ascent_steps >= 1, \
+            f"star_ascent_steps must be >= 1, got {star_ascent_steps}"
+        assert star_perturbation in ("grad", "random"), \
+            f"star_perturbation must be 'grad' or 'random', got '{star_perturbation}'"
+        assert star_probe_scope in ("all", "past"), \
+            f"star_probe_scope must be 'all' or 'past', got '{star_probe_scope}'"
+        assert isinstance(star_correct_only, bool), "star_correct_only must be a bool"
+        assert star_boundaries in ("all", "last"), \
+            f"star_boundaries must be 'all' or 'last', got '{star_boundaries}'"
+        assert star_anneal_steps >= 0, \
+            f"star_anneal_steps must be >= 0, got {star_anneal_steps}"
 
 
 class GradMemGPT(PreTrainedModel):
@@ -377,6 +453,18 @@ class GradMemGPT(PreTrainedModel):
         self.mem_noise_std = config.mem_noise_std
         self.mem_prior_weight = config.mem_prior_weight
         self.mem_prior_anneal_steps = config.mem_prior_anneal_steps
+
+        # STAR worst-case stability regulariser (no new parameters: pure loss term)
+        self.star_weight = config.star_weight
+        self.star_gamma = config.star_gamma
+        self.star_epsilon = config.star_epsilon
+        self.star_ascent_steps = config.star_ascent_steps
+        self.star_perturbation = config.star_perturbation
+        self.star_probe_scope = config.star_probe_scope
+        self.star_correct_only = config.star_correct_only
+        self.star_boundaries = config.star_boundaries
+        self.star_anneal_steps = config.star_anneal_steps
+
         self.current_train_step = 0   # stamped by CustomTrainer.compute_loss via set_train_step
 
         # memory parameters (shape = n_mem_tokens × d)
@@ -616,6 +704,13 @@ class GradMemGPT(PreTrainedModel):
         frac = min(self.current_train_step / self.mem_prior_anneal_steps, 1.0)
         return self.mem_prior_weight * frac
 
+    def _star_weight_now(self):
+        """STAR lambda schedule: 0 -> star_weight over star_anneal_steps, then constant."""
+        if self.star_anneal_steps <= 0:
+            return self.star_weight
+        frac = min(self.current_train_step / self.star_anneal_steps, 1.0)
+        return self.star_weight * frac
+
     def _sgd_step(self, p, g, lr=None):
         """Stateless SGD: m = m - lr*g. r_t = 1, w_t = 1 (degenerate running-sum RNN)."""
         g = self._clip_grad(g)
@@ -667,6 +762,119 @@ class GradMemGPT(PreTrainedModel):
         stats["gate_retain_mean"] = retain.mean().detach()
         stats["gate_write_mean"] = write.mean().detach()
         return m_new, stats
+
+    # ---------------------------------------------------------------- #
+    # STAR worst-case stability regulariser (train-only).
+    # ---------------------------------------------------------------- #
+    # Adapted from STAR (ICLR 2025, arXiv:2503.01595) with the continually-
+    # updated model weights replaced by the carried memory state: at a
+    # segment boundary s, the READ output distribution on already-stored KV
+    # probes must stay stable under a worst-case perturbation of m_s,
+    #
+    #     L_STAR(m_s) = KL( READ(m_s; p*) || READ(m_s + delta; p*) )
+    #     delta = delta0 + gamma * (||m_j|| / ||g_j||) * g_j     (per token j)
+    #     g      = d KL / d (m + delta)  at the perturbed point
+    #     delta0 = eps * ||m_j|| * N(0, I)
+    #
+    # The perturbation plays the role of STAR's "future parameter update":
+    # the inner-loop GD steps of LATER segments move the memory in (at the
+    # boundary) unknown directions, so robustness is enforced against the
+    # worst case. p* are teacher-forced ?!K:V!| probe queries of KV pairs
+    # already written into memory, restricted to currently-retrievable ones
+    # (exact match under m_s) -- STAR's x*: you can only forget what you
+    # currently know. Only the PERTURBED branch carries meta-gradient; the
+    # reference branch and delta are detached (the paper's first-order
+    # approximation), so the term never exceeds the existing second-order
+    # autograd depth. "random" replaces the ascent direction with matched-
+    # magnitude Gaussian noise (the paper's Table-3 ablation; the adversarial
+    # analogue of mem_noise_std). No new parameters: a pure loss term.
+
+    @staticmethod
+    def _star_kl(ref_logits, pert_logits, score, selected):
+        """KL(ref || pert) summed over scored positions, meaned over selected probes.
+
+        Slot t of the [.., Q+1, V] READ logits predicts token t (the same
+        convention as _probe_exact_match), so slot t is compared against the
+        query token at position t. score/selected: [B, n_q, Q] / [B, n_q].
+        """
+        log_ref = F.log_softmax(ref_logits.float(), dim=-1)
+        log_pert = F.log_softmax(pert_logits.float(), dim=-1)
+        # per-slot KL: sum_v p_v (log p_v - log q_v), then keep slots 0..Q-1
+        kl_pos = (log_ref.exp() * (log_ref - log_pert)).sum(-1)          # [B, n_q, Q+1]
+        kl_probe = (kl_pos[:, :, :-1] * score).sum(-1)                   # [B, n_q]
+        denom = selected.float().sum().clamp_min(1.0)
+        return (kl_probe * selected.float()).sum() / denom
+
+    def _star_boundary_loss(self, mem_batch, kv_queries, boundary_seg,
+                            W_batch=None, b_batch=None,
+                            read_st_batch=None, read_end_batch=None):
+        """Worst-case KL at one segment boundary. Returns None when no probe
+        is eligible (empty scope, or nothing currently retrievable), else
+        (loss, n_probes, delta_ratio) where loss is a scalar carrying
+        meta-gradient through the perturbed branch only.
+        """
+        qids = kv_queries['query_input_ids']            # [B, n_q, Q]
+        tmask = kv_queries['target_mask']               # [B, n_q, Q] bool
+        seg_idx = kv_queries['seg_idx']                 # [B, n_q]
+        qmask = kv_queries['mask']                      # [B, n_q] bool
+        ignore_token_ids = kv_queries.get('ignore_token_ids', [])
+
+        in_scope = qmask & (seg_idx <= boundary_seg if self.star_probe_scope == "all"
+                            else seg_idx < boundary_seg)
+        if not in_scope.any():
+            return None
+
+        mem_det = mem_batch.detach()
+        W_det = W_batch.detach() if isinstance(W_batch, torch.Tensor) else W_batch
+        b_det = b_batch.detach() if isinstance(b_batch, torch.Tensor) else b_batch
+
+        # ---- reference branch (anchor q_theta_t): detached, no_grad ------- #
+        with torch.no_grad():
+            ref_logits = self._read_once(mem_det, qids, read_st_batch, read_end_batch,
+                                         W_det, b_det).detach()
+            if self.star_correct_only:
+                correct = torch.zeros_like(qmask)
+                for i in range(qids.size(0)):
+                    correct[i] = self._probe_exact_match(
+                        ref_logits[i], qids[i], tmask[i], ignore_token_ids)
+                selected = in_scope & correct
+            else:
+                selected = in_scope
+
+        if not selected.any():
+            return None
+
+        # scored (target-content) positions for the KL: target_mask minus the
+        # structural ignore tokens (! and |) -- same scoring as EM itself
+        score = tmask.clone()
+        for ig in ignore_token_ids:
+            score &= (qids != ig)
+
+        # ---- worst-case delta (per memory token, relative-normalised) ----- #
+        tok_norm = mem_det.norm(dim=-1, keepdim=True)                     # [B, M, 1]
+        if self.star_perturbation == "random":
+            z = torch.randn_like(mem_det)
+            z_norm = z.norm(dim=-1, keepdim=True)
+            delta = self.star_gamma * tok_norm * z / (z_norm + 1e-12)
+        else:
+            delta = self.star_epsilon * tok_norm * torch.randn_like(mem_det)
+            for _ in range(self.star_ascent_steps):
+                # detached working point: the ascent never touches the meta-graph
+                m_pert = (mem_det + delta).requires_grad_(True)
+                pert_logits = self._read_once(m_pert, qids, read_st_batch, read_end_batch,
+                                              W_det, b_det)
+                kl = self._star_kl(ref_logits, pert_logits, score, selected)
+                g, = torch.autograd.grad(kl, m_pert)
+                g_norm = g.norm(dim=-1, keepdim=True)
+                delta = delta + self.star_gamma * tok_norm * g / (g_norm + 1e-12)
+        delta = delta.detach()
+
+        # ---- final perturbed branch: the only meta-gradient path ---------- #
+        star_logits = self._read_once(mem_batch + delta, qids, read_st_batch, read_end_batch,
+                                      W_batch, b_batch)
+        loss = self._star_kl(ref_logits, star_logits, score, selected)
+        ratio = (delta.norm(dim=-1) / (tok_norm.squeeze(-1) + 1e-12)).mean().detach()
+        return loss, int(selected.sum().item()), ratio
 
     @staticmethod
     def _apply_linear(mem, W, b):
@@ -943,10 +1151,16 @@ class GradMemGPT(PreTrainedModel):
                 torch.tensor(probe_seg_list, dtype=torch.long, device=device),
                 torch.tensor(em_list, dtype=torch.bool, device=device))
 
-    def forward(self, input_ids, labels=None, return_mem=False, collect_segment_mems=False):
+    def forward(self, input_ids, labels=None, return_mem=False, collect_segment_mems=False,
+                kv_queries=None):
         # context_input_ids : B × S   (segments only, each ends with `|`)
         # query_input_ids   : B × Q   (e.g.  "?!K:V!|") i.e. the last segment
         # labels            : B × Q   (-100 everywhere except the target tokens (V!|))
+        # kv_queries        : optional ?!K:V!| probe set for the STAR boundary
+        #                     loss (top-level batch key, NOT inside input_ids —
+        #                     the Trainer's eval input-decoding path pads
+        #                     input_ids leaf tensors and rejects other types).
+        #                     Ignored unless training with star_weight > 0.
 
         """
         All tensors already padded to the same length in the datacollator.
@@ -958,6 +1172,16 @@ class GradMemGPT(PreTrainedModel):
         device = context_input_ids.device
         B = context_input_ids.size(0)
         inner_loss = torch.tensor(0.0, device=device)
+
+        # STAR stability-regulariser state (train-only; no-op unless enabled —
+        # with star_weight=0 or eval mode nothing below executes, so the
+        # forward is bitwise identical to the pre-STAR one).
+        star_active = (self.training and self.star_weight > 0)
+        kv_queries = kv_queries if star_active else None
+        star_loss_sum = torch.tensor(0.0, device=device)
+        star_terms = 0
+        star_n_probes = 0
+        star_delta_ratio = torch.tensor(0.0, device=device)
 
         # actual model inputs starts after mem tokens and ctrl tokens
         mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
@@ -1189,6 +1413,32 @@ class GradMemGPT(PreTrainedModel):
                     if collect_segment_mems:
                         segment_mems[seg_idx] = mem_batch.detach()
 
+                    # ---- STAR worst-case stability term (train-only) ------ #
+                    # Fires at the boundary AFTER this segment's K steps: the
+                    # probes are KV pairs already stored in the carried memory,
+                    # and the worst-case perturbation stands in for the memory
+                    # movement that later segments' inner-loop updates cause.
+                    # Under seg_bptt, boundaries older than the window have a
+                    # detached mem_batch: their meta-gradient then flows only
+                    # through the perturbed probe forward (local robustness),
+                    # not through the inner loop — correct, just weaker.
+                    if star_active and kv_queries is not None:
+                        W_arg = W_batch if self.mem_proj_mode == 'per_sample' else None
+                        b_arg = b_batch if self.mem_proj_mode == 'per_sample' else None
+                        res = self._star_boundary_loss(
+                            mem_batch, kv_queries, seg_idx, W_arg, b_arg,
+                            read_st_batch, read_end_batch)
+                        if res is not None:
+                            loss_b, star_n_probes, star_delta_ratio = res
+                            if self.star_boundaries == "last":
+                                # keep only the LAST processed boundary
+                                # (trailing empty segments are skipped above)
+                                star_loss_sum = loss_b
+                                star_terms = 1
+                            else:
+                                star_loss_sum = star_loss_sum + loss_b
+                                star_terms += 1
+
         if total_inner_steps > 0:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / total_inner_steps
             if self.K:
@@ -1305,5 +1555,17 @@ class GradMemGPT(PreTrainedModel):
             combined_loss = combined_loss + self.inner_loss_weight * (inner_loss / B)
         if self.mem_prior_weight > 0:
             combined_loss = combined_loss + mem_prior_w * mem_prior_loss
+        if star_terms > 0:
+            star_w_now = self._star_weight_now()
+            star_loss = star_loss_sum / star_terms
+            combined_loss = combined_loss + star_w_now * star_loss
+            # stats only when the term actually fired: star-off forwards keep
+            # the inner_loop_stats dict keys identical (bitwise-off guarantee)
+            output['inner_loop_stats']['star_kl'] = star_loss.detach()
+            output['inner_loop_stats']['star_weight_now'] = torch.tensor(
+                float(star_w_now), device=device)
+            output['inner_loop_stats']['star_n_probes'] = torch.tensor(
+                float(star_n_probes), device=device)
+            output['inner_loop_stats']['star_delta_ratio'] = star_delta_ratio
         output['loss'] = combined_loss
         return output

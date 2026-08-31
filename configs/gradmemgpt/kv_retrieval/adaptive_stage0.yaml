@@ -1,0 +1,71 @@
+# GradMemGPT — Stage-0 controls (STAR pre-requisites, no STAR).
+#
+# Answers the 2026-08-10 open question BEFORE any STAR runs: is the 2-segment
+# drop on kv4 catastrophic-forgetting (interference) or limited capacity?
+#
+#   * n_segments=1: the whole 4-pair context is written in ONE segment. If
+#     m=3 fails here too -> the drop is CAPACITY (STAR cannot help; pilot m=4).
+#     If m=3 passes here but fails at n_segments=2 -> INTERFERENCE confirmed
+#     (STAR is the right tool; pilot m=3, the sharpest signal).
+#   * n_segments=2: boundary at token 16 -> pairs {1,2} in seg 0, pair 3
+#     straddles (attributed to seg 1), pair 4 in seg 1.
+#
+# Decision rule: forgetting gap G = EM_1seg - EM_2seg at the same m.
+# Also reproduces the 2026-08-10 retention matrices (m=3 ~0.90->0.73;
+# m=4 K=2 ~0.99+) as the baseline forgetting reference.
+
+run_naming:
+  separator: "_"
+  keys:
+    - {key: adaptive.n_segments, prefix: ns}
+    - {key: gradmem.n_mem_tokens, prefix: m}
+    - {key: gradmem.K, prefix: K}
+    - {key: dataset.data_name, prefix: ds_}
+
+model:
+  base_model: gpt2
+  n_layer: 4
+  n_head: 4
+  n_embd: 128
+
+training:
+  per_device_batch_size: 64
+  total_batch_size: 64
+  learning_rate: 1.0e-4
+  max_steps: 1000000
+  eval_steps: 500
+  logging_steps: 500
+  warmup_steps: 10000
+  early_stopping_patience: 500
+  seed: 143
+  per_segment_eval: true
+  per_segment_eval_steps: 2500
+
+dataset:
+  data_name: "kv4"
+  data_path: "./data/N4-K2V2-V62_1M"
+  tokenizer_path: "./tokenizers/kv_alphabet_62/"
+
+gradmem:
+  n_mem_tokens: 4
+  n_ctrl_tokens: 0
+  K: 2
+  last_K_second_order: 2
+  inner_lr: 0.04
+  inner_clip_value: null
+  inner_clip_norm: null
+  use_adam: false
+  grad_mode: "second"
+  use_mem_proj: false
+  mem_proj_mode: "none"
+  use_write_head: true
+  add_inner_loss_to_outer: true
+  inner_loss_weight: 0.5
+
+adaptive:
+  n_segments: 2          # grid axis: 1 (one-shot control) vs 2 (sequential)
+  segment_size: null
+  seg_bptt: null
+  memory_update_rule: "sgd"
+  # STAR off: pure-SGD multi-segment baseline (the thing to beat / diagnose)
+  star_weight: 0.0

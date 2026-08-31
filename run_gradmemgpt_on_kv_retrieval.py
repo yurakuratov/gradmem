@@ -220,9 +220,13 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     # gated recurrence m_t = r_t*m_{t-1} + w_t*x_t (->1 = pure SGD running-sum).
     # gate_delta_mean: mean Mamba Delta (->0 = full retention). seg stats below
     # are also emitted by the segmented adaptive path.
+    # star_*: the STAR worst-case stability term (train-only): star_kl is the
+    # mean worst-case KL at segment boundaries, star_delta_ratio the achieved
+    # relative perturbation size (should sit near star_gamma).
     for _k in ('gate_retain_mean', 'gate_write_mean', 'gate_delta_mean',
                'seg_nonempty_count_mean', 'seg_nonempty_size_mean',
-               'mem_prior_loss', 'mem_prior_weight_now', 'mem_sampled_delta_norm_mean'):
+               'mem_prior_loss', 'mem_prior_weight_now', 'mem_sampled_delta_norm_mean',
+               'star_kl', 'star_weight_now', 'star_n_probes', 'star_delta_ratio'):
         if _k in inner_loop_stats:
             metrics[_k] = float(inner_loop_stats[_k].mean())
     return metrics
@@ -452,6 +456,84 @@ def _isnan(x):
         return False
 
 
+def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segment_size=None):
+    """Build the `kv_queries` probe dict for one batch of raw samples.
+
+    Shared by the per-segment forgetting eval (make_collate_fn_per_segment)
+    and the STAR training term: each KV pair in each sample's context becomes
+    one TEACHER-FORCED probe '?!K:V!|' (query + target concatenated, exactly
+    as collate_fn builds the normal READ query) plus a target_mask flagging
+    the 'V!|' positions and the pair's source model-segment. EM / KL are
+    scored only at target positions, mirroring compute_metrics_fn.
+
+    KV->segment attribution MUST match the model's forward chunking: the
+    model chunks the PADDED context (right-padded, so a KV's real char
+    position -- 1 char/token for the KV alphabet -- equals its padded token
+    position) via ceil(padded_len / n_segments). A pair straddling a segment
+    boundary is attributed to the LATER segment (it is not fully written
+    until then).
+
+    Returns {'query_input_ids': [B, n_q_max, Q], 'target_mask': [B, n_q_max, Q],
+             'seg_idx': [B, n_q_max], 'mask': [B, n_q_max],
+             'ignore_token_ids': [! , |] token ids}.
+    """
+    import re as _re
+
+    pad_id = tokenizer.pad_token_id
+    B = len(batch)
+
+    per_sample = []  # list of [(q_ids, target_mask, seg_idx), ...]
+    for b_idx, item in enumerate(batch):
+        text = item['context']
+        pairs = []
+        for m in _re.finditer(r'!([^!|:]+):([^!|]+)!', text):
+            k, v = m.group(1), m.group(2)
+            pairs.append((m.start(), m.end(), k, v))
+        if segment_size is not None:
+            n_seg = max(1, math.ceil(padded_len / segment_size))
+            seg_sz = segment_size
+        else:
+            n_seg = n_segments if n_segments else 1
+            seg_sz = max(1, math.ceil(padded_len / n_seg))
+        sample_pairs = []
+        for ts, te, k, v in pairs:
+            # Attribute the KV to the segment containing its LAST token (the
+            # closing '!' of !K:V!): the pair is only fully written -- and thus
+            # retrievable -- once the model has processed that segment.
+            src_seg = min((te - 1) // seg_sz, n_seg - 1)
+            # teacher-forced query: '?!K:' + target 'V!|'
+            q_str = f'?!{k}:'
+            t_str = f'{v}!|'
+            q_ids = tokenizer(q_str, add_special_tokens=False).input_ids
+            t_ids = tokenizer(t_str, add_special_tokens=False).input_ids
+            full = q_ids + t_ids
+            tmask = [False] * len(q_ids) + [True] * len(t_ids)
+            sample_pairs.append((full, tmask, src_seg))
+        per_sample.append(sample_pairs)
+
+    n_q_max = max((len(p) for p in per_sample), default=1) or 1
+    Q = max((len(q) for p in per_sample for (q, _, _) in p), default=1) or 1
+
+    query_input_ids = torch.full((B, n_q_max, Q), pad_id, dtype=torch.long)
+    target_mask = torch.zeros(B, n_q_max, Q, dtype=torch.bool)
+    seg_idx = torch.zeros(B, n_q_max, dtype=torch.long)
+    qmask = torch.zeros(B, n_q_max, dtype=torch.bool)
+    for b, pairs in enumerate(per_sample):
+        for j, (q, tm, s) in enumerate(pairs):
+            query_input_ids[b, j, :len(q)] = torch.tensor(q, dtype=torch.long)
+            target_mask[b, j, :len(tm)] = torch.tensor(tm, dtype=torch.bool)
+            seg_idx[b, j] = s
+            qmask[b, j] = True
+
+    return {
+        'query_input_ids': query_input_ids,
+        'target_mask': target_mask,
+        'seg_idx': seg_idx,
+        'mask': qmask,
+        'ignore_token_ids': [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']],
+    }
+
+
 def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=None,
                                 segment_size=None):
     """Build a collator that emits, per sample, the WRITE context PLUS one probe
@@ -470,7 +552,6 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
     segment boundary are attributed to the later segment (not fully written
     until then).
     """
-    import re as _re
 
     def collate_fn_per_segment(batch, tokenizer, max_context_length=None):
         # --- context: identical to collate_fn ---
@@ -479,91 +560,20 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
                                       padding=True, pad_to_multiple_of=8, max_length=max_context_length,
                                       truncation=True).input_ids
 
-        pad_id = tokenizer.pad_token_id
-        B = len(batch)
-
-        # --- per-sample KV probe pairs ---
-        # Each probe is the TEACHER-FORCED query '?!K:V!|' (query + target
-        # concatenated, exactly as collate_fn builds the normal READ query), plus
-        # a target_mask flagging the 'V!|' positions. EM is scored only there,
-        # mirroring compute_metrics_fn -- so a probe is correct iff the model
-        # re-predicts the value tokens given the correct preceding tokens.
-        #
-        # KV->segment attribution MUST match the model's forward chunking. The
-        # model chunks the PADDED context (ctx_emb.size(1)) via
-        # ceil(padded_len / n_segments). The collator right-pads, so a KV's real
-        # char position ts (1 char/token for the KV alphabet) is already its
-        # position in the PADDED sequence (pad tokens sit to the right of the
-        # real tokens). This keeps the collator and the model on exactly the
-        # same segment boundaries.
-        padded_len = context_input_ids.size(1)
-        per_sample = []  # list of [(q_ids, target_mask, seg_idx), ...]
-        for b_idx, item in enumerate(batch):
-            text = item['context']
-            pairs = []
-            for m in _re.finditer(r'!([^!|:]+):([^!|]+)!', text):
-                k, v = m.group(1), m.group(2)
-                pairs.append((m.start(), m.end(), k, v))
-            # The context is RIGHT-padded (tokenizer default padding_side='right';
-            # collate_fn does not override it). Pads append after the trailing '|',
-            # so a KV's real char position == its padded token position. The model
-            # chunks the padded tensor, so we attribute using these positions to
-            # stay aligned with the model's segment boundaries.
-            if segment_size is not None:
-                n_seg = max(1, math.ceil(padded_len / segment_size))
-                seg_sz = segment_size
-            else:
-                n_seg = n_segments if n_segments else 1
-                seg_sz = max(1, math.ceil(padded_len / n_seg))
-            sample_pairs = []
-            for ts, te, k, v in pairs:
-                # Attribute the KV to the segment containing its LAST token (the
-                # closing '!' of !K:V!). A KV is only fully written -- and thus
-                # retrievable -- once the model has processed the segment that
-                # contains the END of its span. Using the end position (not the
-                # start) is what makes this correct when a KV straddles a segment
-                # boundary: ~37% of KVs straddle at typical seg_sz (e.g. seg_sz=15
-                # vs 7-char KVs), and start-position attribution would (a) starve
-                # the last segment of any KV and (b) depress the matrix diagonal
-                # (a straddling KV is incomplete at its start-segment's write).
-                # Right-padding: padded position == real position (pads past '|').
-                src_seg = min((te - 1) // seg_sz, n_seg - 1)
-                # teacher-forced query: '?!K:' + target 'V!|'
-                q_str = f'?!{k}:'
-                t_str = f'{v}!|'
-                q_ids = tokenizer(q_str, add_special_tokens=False).input_ids
-                t_ids = tokenizer(t_str, add_special_tokens=False).input_ids
-                full = q_ids + t_ids
-                tmask = [False] * len(q_ids) + [True] * len(t_ids)
-                sample_pairs.append((full, tmask, src_seg))
-            per_sample.append(sample_pairs)
-
-        n_q_max = max((len(p) for p in per_sample), default=1) or 1
-        Q = max((len(q) for p in per_sample for (q, _, _) in p), default=1) or 1
-
-        query_input_ids = torch.full((B, n_q_max, Q), pad_id, dtype=torch.long)
-        target_mask = torch.zeros(B, n_q_max, Q, dtype=torch.bool)
-        seg_idx = torch.zeros(B, n_q_max, dtype=torch.long)
-        qmask = torch.zeros(B, n_q_max, dtype=torch.bool)
-        for b, pairs in enumerate(per_sample):
-            for j, (q, tm, s) in enumerate(pairs):
-                query_input_ids[b, j, :len(q)] = torch.tensor(q, dtype=torch.long)
-                target_mask[b, j, :len(tm)] = torch.tensor(tm, dtype=torch.bool)
-                seg_idx[b, j] = s
-                qmask[b, j] = True
+        # --- per-sample KV probe pairs (shared with the STAR training term) ---
+        # Teacher-forced '?!K:V!|' probes with KV->segment attribution that
+        # matches the model's segmentation of the padded context; see
+        # build_kv_probe_queries. EM is scored at the target positions only,
+        # mirroring compute_metrics_fn.
+        kv_queries = build_kv_probe_queries(batch, tokenizer, context_input_ids.size(1),
+                                            n_segments=n_segments, segment_size=segment_size)
 
         return {
             'input_ids': {
                 'context_input_ids': context_input_ids,
                 'query_input_ids': None,  # unused by forward_per_segment_eval; kept for shape compat
             },
-            'kv_queries': {
-                'query_input_ids': query_input_ids,
-                'target_mask': target_mask,
-                'seg_idx': seg_idx,
-                'mask': qmask,
-                'ignore_token_ids': [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']],
-            },
+            'kv_queries': kv_queries,
         }
 
     return lambda batch: collate_fn_per_segment(batch, tokenizer, max_context_length)
@@ -964,6 +974,21 @@ class ExperimentArgs:
     mem_noise_std: Optional[float] = field(default=0.0)
     mem_prior_weight: Optional[float] = field(default=0.0)
     mem_prior_anneal_steps: Optional[int] = field(default=0)
+    # ---- STAR worst-case stability regulariser (default-off; adaptive fork only) ---- #
+    # Adapted from STAR (ICLR 2025): at each segment boundary the READ outputs
+    # on already-stored KV probes must stay stable under a worst-case
+    # (gradient-ascent) perturbation of the memory tokens. Enabling it (>0)
+    # also attaches the ?!K:V!| probe queries to TRAINING batches. See
+    # grad_memgpt_adaptive.py (_star_boundary_loss) for the exact math.
+    star_weight: Optional[float] = field(default=0.0)      # lambda (0 = off)
+    star_gamma: Optional[float] = field(default=0.01)      # relative perturbation size
+    star_epsilon: Optional[float] = field(default=1e-2)    # delta0 noise scale
+    star_ascent_steps: Optional[int] = field(default=1)    # ascent steps for delta
+    star_perturbation: Optional[str] = field(default="grad")   # grad | random
+    star_probe_scope: Optional[str] = field(default="all")     # all | past
+    star_correct_only: Optional[bool] = field(default=True)    # STAR's x* masking
+    star_boundaries: Optional[str] = field(default="all")      # all | last
+    star_anneal_steps: Optional[int] = field(default=0)        # lambda warmup steps
 
 
 def _resolve_init_checkpoint(spec: str) -> Path:
@@ -1228,6 +1253,16 @@ def main(config_path: Optional[str] = None):
             mem_noise_std=args.mem_noise_std,
             mem_prior_weight=args.mem_prior_weight,
             mem_prior_anneal_steps=args.mem_prior_anneal_steps,
+            # STAR worst-case stability regulariser
+            star_weight=args.star_weight,
+            star_gamma=args.star_gamma,
+            star_epsilon=args.star_epsilon,
+            star_ascent_steps=args.star_ascent_steps,
+            star_perturbation=args.star_perturbation,
+            star_probe_scope=args.star_probe_scope,
+            star_correct_only=args.star_correct_only,
+            star_boundaries=args.star_boundaries,
+            star_anneal_steps=args.star_anneal_steps,
         )
         # Adaptive segments need the full (un-truncated) context so every
         # segment has real tokens. The shared collator already disables
@@ -1270,9 +1305,21 @@ def main(config_path: Optional[str] = None):
 
     dataset = datasets.load_from_disk(args.data_path)
 
+    # STAR stability term needs the ?!K:V!| probe queries in TRAINING batches.
+    # They ride as a TOP-LEVEL batch key (the model takes a matching
+    # ``kv_queries`` forward arg) — NOT inside input_ids, whose leaves the
+    # Trainer's eval input-decoding pads and it rejects non-tensor types.
+    # Eval-mode forwards ignore them, so eval behaviour is unchanged.
+    use_star = bool(args.star_weight) and use_adaptive_model
+
     def data_collator(batch):
-        return collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
-                          hopfield=args.use_hopfield_memory or args.use_gated_delta_memory)
+        out = collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
+                         hopfield=args.use_hopfield_memory or args.use_gated_delta_memory)
+        if use_star:
+            out['kv_queries'] = build_kv_probe_queries(
+                batch, tokenizer, out['input_ids']['context_input_ids'].size(1),
+                n_segments=args.n_segments, segment_size=args.segment_size)
+        return out
 
     ignore_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in ['!', '|']]
 
@@ -1416,8 +1463,13 @@ def main(config_path: Optional[str] = None):
             stage_output_dir.mkdir(parents=True, exist_ok=True)
 
             def stage_data_collator(batch):
-                return collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
-                                  hopfield=args.use_hopfield_memory or args.use_gated_delta_memory)
+                out = collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
+                                 hopfield=args.use_hopfield_memory or args.use_gated_delta_memory)
+                if use_star:
+                    out['kv_queries'] = build_kv_probe_queries(
+                        batch, tokenizer, out['input_ids']['context_input_ids'].size(1),
+                        n_segments=args.n_segments, segment_size=args.segment_size)
+                return out
 
             training_args = TrainingArguments(
                 output_dir=stage_output_dir,

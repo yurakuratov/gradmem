@@ -1,0 +1,109 @@
+# GradMemGPT — adaptive fork + STAR worst-case stability regulariser on KV-retrieval.
+#
+# STAR (ICLR 2025, arXiv:2503.01595) adapted one level down: instead of
+# continually-updated model weights, the perturbation hits the carried MEMORY
+# tokens. At every segment boundary s the READ outputs on already-stored KV
+# probes must stay stable under a worst-case (gradient-ascent) per-token-
+# normalised perturbation delta of m_s:
+#
+#     L_STAR(m_s) = KL( READ(m_s; probes*) || READ(m_s + delta; probes*) )
+#     delta = delta0 + gamma * (||m_j|| / ||g_j||) * g_j   (one ascent step)
+#
+# probes* = teacher-forced ?!K:V!| queries of pairs currently retrieved with
+# exact match (STAR's x*). Minimising the worst-case KL makes retrieval of
+# stored content robust to the memory movement caused by LATER segments'
+# inner-loop updates — the multi-segment overwrite problem. Only the perturbed
+# branch carries meta-gradient (delta and the reference are detached), so the
+# term never exceeds the existing second-order autograd depth.
+#
+# Pilot ladder (STAR Table-3 replication) — swap star_perturbation:
+#   star_weight: 0                -> plain-SGD multi-segment baseline
+#   star_perturbation: "random"   -> matched-magnitude noise ablation (x* + z)
+#   star_perturbation: "grad"     -> full STAR (x* + grad), this file
+#
+# Minimal setup (2026-08-08/08-10 notes): kv4 dataset, 1 KV pair = 7 tokens,
+# segment_size 14 = exactly 2 aligned pairs per segment (fixes the canvas
+# misalignment warning), S = 2 segments. n_mem_tokens/K per the Stage-0
+# capacity-vs-interference controls (m=3 if interference, m=4 if capacity).
+
+run_naming:
+  separator: "_"
+  keys:
+    - {key: adaptive.n_segments, prefix: ns}
+    - {key: adaptive.memory_update_rule, prefix: ur_}
+    - {key: adaptive.star_perturbation, prefix: sp_}
+    - {key: adaptive.star_weight, prefix: sw_}
+    - {key: adaptive.star_gamma, prefix: sg_}
+    - {key: gradmem.n_mem_tokens, prefix: m}
+    - {key: dataset.data_name, prefix: ds_}
+
+model:
+  base_model: gpt2
+  n_layer: 4
+  n_head: 4
+  n_embd: 128
+
+training:
+  per_device_batch_size: 64
+  total_batch_size: 64
+  learning_rate: 1.0e-4
+  max_steps: 1000000
+  eval_steps: 500
+  logging_steps: 500
+  warmup_steps: 10000
+  early_stopping_patience: 500
+  seed: 143
+  # Per-segment forgetting eval: retention matrix every cadence steps; this is
+  # the primary acceptance metric (forgetting gap G = EM_1seg - EM_2seg -> 0).
+  per_segment_eval: true
+  per_segment_eval_steps: 2500
+
+dataset:
+  data_name: "kv4"
+  data_path: "./data/N4-K2V2-V62_1M"
+  tokenizer_path: "./tokenizers/kv_alphabet_62/"
+
+gradmem:
+  n_mem_tokens: 4
+  n_ctrl_tokens: 0
+  K: 2
+  last_K_second_order: 2
+  inner_lr: 0.04
+  inner_clip_value: null
+  inner_clip_norm: null
+  use_adam: false
+  grad_mode: "second"
+  use_mem_proj: false
+  mem_proj_mode: "none"
+  use_write_head: true
+  add_inner_loss_to_outer: true
+  inner_loss_weight: 0.5
+
+adaptive:
+  # ---- segmentation ---- #
+  # kv4 context = BOS + 4x7 = 29 tokens, padded to 32. n_segments=2 ->
+  # boundary at 16: pairs {1,2} fully in seg 0, pair 3 straddles (attributed
+  # to seg 1, the later segment, per the collator convention), pair 4 in
+  # seg 1. (segment_size=14 would give ceil(32/14)=3 segments instead.)
+  n_segments: 2
+  segment_size: null
+  seg_bptt: null
+
+  # ---- memory update rule: plain SGD (STAR is orthogonal to the gated line) ---- #
+  memory_update_rule: "sgd"
+
+  # ---- STAR worst-case stability regulariser ---- #
+  star_weight: 0.1           # lambda; paper grid: 0.005..0.1
+  star_gamma: 0.01           # relative perturbation size; paper grid: 0.001..0.05
+  star_epsilon: 0.01         # delta0 noise std (fraction of per-token mem norm)
+  star_ascent_steps: 1       # paper: 1 best, >=5 degrades (first-order approx)
+  star_perturbation: "grad"  # "random" = the matched-noise ablation
+  star_probe_scope: "all"    # probes from segments <= s ("past" = < s only)
+  star_correct_only: true    # x*: only currently-retrievable pairs
+  star_boundaries: "all"     # every segment boundary ("last" = final only)
+  star_anneal_steps: 0       # lambda warmup steps (0 = constant)
+
+  # ---- VAE-style memory regularisation (default-off; orthogonal to STAR) ---- #
+  # mem_noise_std: 0.05
+  # mem_prior_weight: 0.1
+  # mem_prior_anneal_steps: 2000

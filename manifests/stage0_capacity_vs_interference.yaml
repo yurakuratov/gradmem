@@ -1,0 +1,25 @@
+# Stage-0 controls: capacity vs interference on kv4 (STAR pre-requisites).
+#
+# 4 grid runs (m x n_segments) + 1 seed-repro repeat of the m=4/n=2 cell
+# (2026-08-05/08-14 note: same-seed runs must reproduce; compare loss curves
+# of run idx 3 and the stage0_seed_repro run).
+#
+# Decision after completion:
+#   - m=3 fails at n_segments=1  -> capacity problem -> pilot uses m=4
+#   - m=3 passes 1seg, fails 2seg -> interference     -> pilot uses m=3
+# Metrics: eval_exact_match per cell (forgetting gap G = EM_1seg - EM_2seg)
+# + forgetting matrices at each per_segment_eval cadence.
+max_parallel: 1
+experiments:
+  - name: stage0_capacity_vs_interference
+    command: "python run_from_config.py --debug --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/adaptive_stage0.yaml"
+    grid:
+      gradmem.n_mem_tokens: [3, 4]
+      adaptive.n_segments: [1, 2]
+  - name: stage0_seed_repro
+    command: "python run_from_config.py --debug --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/adaptive_stage0.yaml"
+    overrides:
+      gradmem.n_mem_tokens: 4
+      adaptive.n_segments: 2
