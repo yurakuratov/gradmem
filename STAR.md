@@ -174,6 +174,16 @@ Runs 1/3/4/5 form the {replay} × {STAR} 2×2 on identical probes and boundaries
 3. No regression on one-segment tasks (stability must not kill plasticity).
 4. Retention matrices (`forgetting_matrix_step*.json/csv` per run dir) show the off-diagonal decay flattening.
 
+## Performance (what it should cost, and what to do if it doesn't)
+
+Measured on the kv4 pilot config (B=64, `grad_mode="second"`, S=2, n_q=4 probes) on a laptop RTX 3050: **~20% overhead** (33 → 39 ms/step; each `_star_boundary_loss` ≈ 5 ms, a probe forward ≈ 0.9 ms), unchanged under the `accelerate` wrapper and bf16. Replay adds one probe forward per boundary — less. If a STAR run is *much* slower than that, it is not the method's compute — it is one of the latency-bound paths, all of which are now optimised:
+
+- **Correct-only mask** — was a per-sample Python loop whose `if score.sum() == 0:` device-syncs once per probe (~250 syncs/step; latency-bound, amplified by deep GPU queues on faster cards and by multi-device setups). Now `_probe_exact_match_batch`, a vectorised one-shot (locked equal to the scalar helper by a test). The eval-only forgetting pass still uses the scalar helper (eval cadence, not hot).
+- **Probe collator** — was 2 tokenizer calls *per KV pair* (~512 per batch; per-call overhead dominates on fast tokenizers). Now one batched encode per side (2 calls total); outputs verified bitwise-identical to the old builder. If the dataloader runs with `num_workers=0`, this was inline in the training loop — the most plausible cause of a ~30× slowdown observed on one remote setup.
+- No `.item()` syncs remain in the boundary losses (stats are tensors).
+
+If slowness persists after syncing these files, bisect on the remote: `adaptive.star_correct_only=false` (mask path), `adaptive.star_boundaries=last` (half the terms), and `adaptive.star_weight=0 adaptive.replay_weight=0.1` (collator only, no STAR compute). A `py-spy dump --pid <trainer_pid>` (or `py-spy top`) on the slow run pinpoints the stuck stack immediately.
+
 ## Diagnostics
 
 | metric | meaning |

@@ -860,6 +860,23 @@ class GradMemGPT(PreTrainedModel):
         denom = selected.float().sum().clamp_min(1.0)
         return (kl_probe * selected.float()).sum() / denom
 
+    @staticmethod
+    def _probe_exact_match_batch(logits, qids, tmask, ignore_token_ids):
+        """Vectorised exact match over a whole probe batch: [B, n_q, Q+1, V].
+
+        Same scoring as _probe_exact_match (slot t predicts token t; scored on
+        target_mask minus ignore tokens; nothing-to-score counts as correct)
+        but in a handful of tensor ops -- no Python loops and, critically, no
+        per-probe device sync (the scalar helper's `if score.sum() == 0:`
+        syncs once per probe, which is latency-bound and can dominate the
+        STAR/replay boundary cost). Returns [B, n_q] bool.
+        """
+        preds = logits.argmax(dim=-1)[:, :, :-1]         # [B, n_q, Q]
+        score = tmask.clone()
+        for ig in ignore_token_ids:
+            score &= (qids != ig)
+        return ((preds == qids) | ~score).all(dim=-1)
+
     def _star_boundary_loss(self, mem_batch, kv_queries, boundary_seg,
                             W_batch=None, b_batch=None,
                             read_st_batch=None, read_end_batch=None):
@@ -888,11 +905,9 @@ class GradMemGPT(PreTrainedModel):
             ref_logits = self._read_once(mem_det, qids, read_st_batch, read_end_batch,
                                          W_det, b_det).detach()
             if self.star_correct_only:
-                correct = torch.zeros_like(qmask)
-                for i in range(qids.size(0)):
-                    correct[i] = self._probe_exact_match(
-                        ref_logits[i], qids[i], tmask[i], ignore_token_ids)
-                selected = in_scope & correct
+                # vectorised x* mask (no per-probe device syncs)
+                selected = in_scope & self._probe_exact_match_batch(
+                    ref_logits, qids, tmask, ignore_token_ids)
             else:
                 selected = in_scope
 
@@ -929,7 +944,7 @@ class GradMemGPT(PreTrainedModel):
                                       W_batch, b_batch)
         loss = self._star_kl(ref_logits, star_logits, score, selected)
         ratio = (delta.norm(dim=-1) / (tok_norm.squeeze(-1) + 1e-12)).mean().detach()
-        return loss, int(selected.sum().item()), ratio
+        return loss, selected.sum(), ratio
 
     def _replay_boundary_loss(self, mem_batch, kv_queries, boundary_seg,
                               W_batch=None, b_batch=None,
@@ -968,10 +983,7 @@ class GradMemGPT(PreTrainedModel):
         # probes' logits
         logits = self._read_once(mem_batch, qids, read_st_batch, read_end_batch,
                                  W_batch, b_batch)
-        em = torch.zeros_like(qmask)
-        for i in range(qids.size(0)):
-            em[i] = self._probe_exact_match(logits[i].detach(), qids[i], tmask[i],
-                                            ignore_token_ids)
+        em = self._probe_exact_match_batch(logits.detach(), qids, tmask, ignore_token_ids)
         em_rate = em[in_scope].float().mean().detach()
 
         selected = in_scope & em if self.replay_correct_only else in_scope
@@ -989,7 +1001,7 @@ class GradMemGPT(PreTrainedModel):
         ce_probe = -(tok_logp * score).sum(-1)                           # [B, n_q]
         denom = selected.float().sum().clamp_min(1.0)
         loss = (ce_probe * selected.float()).sum() / denom
-        return loss, int(selected.sum().item()), em_rate
+        return loss, selected.sum(), em_rate
 
     @staticmethod
     def _apply_linear(mem, W, b):
@@ -1702,8 +1714,7 @@ class GradMemGPT(PreTrainedModel):
             output['inner_loop_stats']['star_kl'] = star_loss.detach()
             output['inner_loop_stats']['star_weight_now'] = torch.tensor(
                 float(star_w_now), device=device)
-            output['inner_loop_stats']['star_n_probes'] = torch.tensor(
-                float(star_n_probes), device=device)
+            output['inner_loop_stats']['star_n_probes'] = star_n_probes.detach().float()
             output['inner_loop_stats']['star_delta_ratio'] = star_delta_ratio
         if replay_terms > 0:
             replay_w_now = self._replay_weight_now()
@@ -1712,8 +1723,7 @@ class GradMemGPT(PreTrainedModel):
             output['inner_loop_stats']['replay_ce'] = replay_loss.detach()
             output['inner_loop_stats']['replay_weight_now'] = torch.tensor(
                 float(replay_w_now), device=device)
-            output['inner_loop_stats']['replay_n_probes'] = torch.tensor(
-                float(replay_n_probes), device=device)
+            output['inner_loop_stats']['replay_n_probes'] = replay_n_probes.detach().float()
             output['inner_loop_stats']['replay_em_rate'] = replay_em_rate
         output['loss'] = combined_loss
         return output

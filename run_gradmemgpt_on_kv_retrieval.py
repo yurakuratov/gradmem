@@ -486,6 +486,7 @@ def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segmen
     B = len(batch)
 
     per_sample = []  # list of [(q_ids, target_mask, seg_idx), ...]
+    q_strs, t_strs = [], []   # batched through the tokenizer (one call each)
     for b_idx, item in enumerate(batch):
         text = item['context']
         pairs = []
@@ -504,29 +505,41 @@ def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segmen
             # closing '!' of !K:V!): the pair is only fully written -- and thus
             # retrievable -- once the model has processed that segment.
             src_seg = min((te - 1) // seg_sz, n_seg - 1)
-            # teacher-forced query: '?!K:' + target 'V!|'
-            q_str = f'?!{k}:'
-            t_str = f'{v}!|'
-            q_ids = tokenizer(q_str, add_special_tokens=False).input_ids
-            t_ids = tokenizer(t_str, add_special_tokens=False).input_ids
-            full = q_ids + t_ids
-            tmask = [False] * len(q_ids) + [True] * len(t_ids)
-            sample_pairs.append((full, tmask, src_seg))
+            q_strs.append(f'?!{k}:')               # teacher-forced query '?!K:'
+            t_strs.append(f'{v}!|')                # target 'V!|'
+            sample_pairs.append(src_seg)
         per_sample.append(sample_pairs)
 
-    n_q_max = max((len(p) for p in per_sample), default=1) or 1
-    Q = max((len(q) for p in per_sample for (q, _, _) in p), default=1) or 1
+    # one batched encode per side (fast tokenizers amortise the per-call
+    # overhead; per-string calls made this collator the dataloader bottleneck)
+    q_enc = tokenizer(q_strs, add_special_tokens=False)['input_ids'] if q_strs else []
+    t_enc = tokenizer(t_strs, add_special_tokens=False)['input_ids'] if t_strs else []
+
+    probe_flat = []
+    idx = 0
+    for sample_pairs in per_sample:
+        flat = []
+        for _ in sample_pairs:
+            q_ids, t_ids = q_enc[idx], t_enc[idx]
+            idx += 1
+            flat.append((q_ids + t_ids,
+                         [False] * len(q_ids) + [True] * len(t_ids)))
+        probe_flat.append(flat)
+
+    n_q_max = max((len(p) for p in probe_flat), default=1) or 1
+    Q = max((len(q) for p in probe_flat for (q, _) in p), default=1) or 1
 
     query_input_ids = torch.full((B, n_q_max, Q), pad_id, dtype=torch.long)
     target_mask = torch.zeros(B, n_q_max, Q, dtype=torch.bool)
     seg_idx = torch.zeros(B, n_q_max, dtype=torch.long)
     qmask = torch.zeros(B, n_q_max, dtype=torch.bool)
-    for b, pairs in enumerate(per_sample):
-        for j, (q, tm, s) in enumerate(pairs):
+    for b, pairs in enumerate(probe_flat):
+        for j, (q, tm) in enumerate(pairs):
             query_input_ids[b, j, :len(q)] = torch.tensor(q, dtype=torch.long)
             target_mask[b, j, :len(tm)] = torch.tensor(tm, dtype=torch.bool)
-            seg_idx[b, j] = s
             qmask[b, j] = True
+        for j, s in enumerate(per_sample[b]):
+            seg_idx[b, j] = s
 
     return {
         'query_input_ids': query_input_ids,

@@ -338,6 +338,24 @@ def test_star_replay_compose():
     print(f"  [compose] lambda*kl + rho*ce = {expected:.3e} additive OK")
 
 
+# --------------------------------------------------------------------------- #
+# G. vectorised EM mask == scalar helper (used by the STAR/replay x* mask)
+# --------------------------------------------------------------------------- #
+def test_probe_em_batch_matches_scalar():
+    torch.manual_seed(7)
+    logits = torch.randn(3, 5, 8, 70)                    # [B, n_q, Q+1, V]
+    qids = torch.randint(2, 68, (3, 5, 7))               # [B, n_q, Q]
+    tmask = torch.zeros(3, 5, 7, dtype=torch.bool)
+    tmask[..., 4:] = True
+    ig = [68, 69]
+    scalar = torch.zeros(3, 5, dtype=torch.bool)
+    for b in range(3):
+        scalar[b] = AdpModel._probe_exact_match(logits[b], qids[b], tmask[b], ig)
+    batch = AdpModel._probe_exact_match_batch(logits, qids, tmask, ig)
+    assert torch.equal(scalar, batch), "vectorised EM mask diverged from scalar helper"
+    print("  [em-batch] vectorised EM mask == scalar helper OK")
+
+
 TESTS = [
     test_star_off_bitwise_identical,
     test_star_write_path_invariant_positive_kl,
@@ -346,6 +364,7 @@ TESTS = [
     test_star_random_perturbation_norm_and_tiny_gamma,
     test_replay_outer_term,
     test_star_replay_compose,
+    test_probe_em_batch_matches_scalar,
 ]
 
 
