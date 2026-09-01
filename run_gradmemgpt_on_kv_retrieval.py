@@ -376,9 +376,26 @@ class CustomTrainer(Trainer):
             m = m.module
         if hasattr(m, "set_train_step"):
             m.set_train_step(self.state.global_step)
-        return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+        # Always fetch outputs so TRAIN-ONLY stats (STAR / replay boundary terms
+        # -- they never appear in eval forwards, so the eval-only
+        # preprocess_logits_for_metrics -> compute_metrics_fn path drops them)
+        # can be surfaced as train_* metrics at the next logging step.
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        stats = outputs.get('inner_loop_stats') if isinstance(outputs, dict) else None
+        if stats:
+            self._last_train_stats = {
+                k: float(v.detach().mean())
+                for k, v in stats.items()
+                if k.startswith(('star_', 'replay_')) and torch.is_tensor(v)
+            }
+        return (loss, outputs) if return_outputs else loss
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        # inject the latest training-step STAR/replay stats into TRAINING logs
+        # only (eval logs carry eval_* keys; train logs carry bare 'loss')
+        if 'loss' in logs and 'eval_loss' not in logs and hasattr(self, '_last_train_stats'):
+            for k, v in self._last_train_stats.items():
+                logs[f'train_{k}'] = v
         for cb in self.callback_handler.callbacks:
             if isinstance(cb, EarlyStoppingCallback):
                 logs['patience'] = cb.early_stopping_patience_counter

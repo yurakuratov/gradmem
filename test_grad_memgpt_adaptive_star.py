@@ -225,24 +225,24 @@ def test_star_grad_flow():
 # --------------------------------------------------------------------------- #
 def test_star_no_probes_is_noop():
     inputs, labels = _inputs()
-    model = _make_model(**_star_on(star_probe_scope="past"))   # past at boundary 0: empty
+    # all probes attributed to segment 1 -> scope 'past' (< boundary_seg) is
+    # empty at every boundary: the term contributes NOTHING to the loss, and
+    # the idle-zeros stats mark it "enabled but idle" (star_n_probes == 0)
+    model = _make_model(**_star_on(star_probe_scope="past"))
     model.train()
-    # all probes attributed to segment >= 0 -> scope 'past' (< boundary_seg) is
-    # empty at boundary 0; at boundary 1 it holds seg-0 probes. Use a probe set
-    # attributed ONLY to segment 1 so every boundary is out of scope.
     kv = _kv_queries()
     kv['seg_idx'][:] = 1
     torch.manual_seed(123)
     out = model(inputs, kv_queries=kv, labels=labels)
-    assert "star_kl" not in out["inner_loop_stats"]
-    assert "star_n_probes" not in out["inner_loop_stats"]
+    assert out["inner_loop_stats"]["star_kl"].item() == 0.0
+    assert out["inner_loop_stats"]["star_n_probes"].item() == 0.0
     # and with probes present but 'last' boundary selection, exactly one term
     model2 = _make_model(**_star_on(star_boundaries="last"))
     model2.train()
     torch.manual_seed(123)
     out2 = model2(inputs, kv_queries=_kv_queries(), labels=labels)
     assert out2["inner_loop_stats"]["star_kl"].item() > 0
-    print("  [guards]  empty scope -> silent no-op; 'last' -> single term OK")
+    print("  [guards]  empty scope -> idle zeros (no loss term); 'last' -> single term OK")
 
 
 # --------------------------------------------------------------------------- #
@@ -356,6 +356,26 @@ def test_probe_em_batch_matches_scalar():
     print("  [em-batch] vectorised EM mask == scalar helper OK")
 
 
+# near-zero perturbation collapses the loss is covered above; here we also
+# lock the 'grad' delta calibration: ||delta_j||/||m_j|| ~= sqrt(gamma^2+eps^2)
+# (delta0 vector-normalised per token + gamma-normalised ascent step; the two
+# are near-orthogonal at random init). A bare eps*||m||*randn delta0 would
+# give eps*sqrt(d) instead -- at d=128 that is ~11x the intended scale.
+def test_star_grad_delta_calibration():
+    inputs, labels = _inputs()
+    gamma, eps = 0.05, 0.01
+    model = _make_model(**_star_on(star_gamma=gamma, star_epsilon=eps))
+    model.train()
+    torch.manual_seed(123)
+    out = model(inputs, kv_queries=_kv_queries(), labels=labels)
+    ratio = out["inner_loop_stats"]["star_delta_ratio"].item()
+    expected = (gamma ** 2 + eps ** 2) ** 0.5
+    assert abs(ratio - expected) < 0.01, \
+        f"grad delta ratio {ratio:.4f} != sqrt(g^2+e^2)={expected:.4f} " \
+        f"(delta0 not vector-normalised?)"
+    print(f"  [calib-g] grad delta ratio {ratio:.4f} ~= sqrt(g^2+e^2)={expected:.4f} OK")
+
+
 TESTS = [
     test_star_off_bitwise_identical,
     test_star_write_path_invariant_positive_kl,
@@ -365,6 +385,7 @@ TESTS = [
     test_replay_outer_term,
     test_star_replay_compose,
     test_probe_em_batch_matches_scalar,
+    test_star_grad_delta_calibration,
 ]
 
 

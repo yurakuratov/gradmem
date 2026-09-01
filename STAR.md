@@ -40,7 +40,9 @@ At every segment boundary $s$ (after segment $s$'s $K$ inner steps), with $m_s$ 
 
 $$\mathcal{L}_{\text{STAR}}(m_s) \;=\; \mathrm{KL}\big(\,\mathrm{READ}(m_s;\,p^*)\;\big\|\;\mathrm{READ}(m_s+\delta;\,p^*)\,\big)$$
 
-$$\delta \;=\; \delta_0 + \gamma\cdot\frac{\lVert m_j\rVert_2}{\lVert g_j\rVert_2}\, g_j \quad\text{(per memory token } j\text{)}, \qquad \delta_0 = \varepsilon\,\lVert m_j\rVert_2\cdot\mathcal{N}(0,I)$$
+$$\delta \;=\; \delta_0 + \gamma\cdot\frac{\lVert m_j\rVert_2}{\lVert g_j\rVert_2}\, g_j \quad\text{(per memory token } j\text{)}, \qquad \lVert\delta_0\rVert_2 = \varepsilon\,\lVert m_j\rVert_2$$
+
+($\delta_0$ is **vector-normalised** noise — a bare $\varepsilon\lVert m_j\rVert\cdot\mathcal{N}(0,I_d)$ has vector norm $\varepsilon\sqrt{d}\,\lVert m_j\rVert$, $\sim$11× too large at $d{=}128$, which drowns the $\gamma$-scaled ascent direction; a test locks $\lVert\delta_j\rVert/\lVert m_j\rVert \approx \sqrt{\gamma^2{+}\varepsilon^2}$.)
 
 $$g \;=\; \nabla_{m+\delta_0}\,\mathrm{KL}\big(\mathrm{READ}(m_s) \,\big\|\, \mathrm{READ}(m+\delta_0)\big) \quad\text{(one gradient-}\textbf{ascent}\text{ step)}$$
 
@@ -108,13 +110,15 @@ All knobs live under the `adaptive:` config section (flattened to `--star-*` CLI
 | what | where |
 |---|---|
 | config params + validation + docstring | `GradMemGPTConfig.__init__` (`grad_memgpt_adaptive.py:148`) |
-| $\lambda$ schedule | `_star_weight_now` (`grad_memgpt_adaptive.py:707`) |
-| position-summed KL | `_star_kl` (`grad_memgpt_adaptive.py:793`) |
-| the whole boundary term | `_star_boundary_loss` (`grad_memgpt_adaptive.py:808`) |
-| vanilla-replay boundary term | `_replay_boundary_loss` (`grad_memgpt_adaptive.py:934`), $\rho$ schedule `_replay_weight_now` (`:762`) |
-| forward integration (train-only gate, boundary loop, loss assembly) | `forward`: `star_active`/`replay_active` at `:1295`, boundary calls at `:1428`/`:1565`, `+λ·KL`/`+ρ·CE` at `:1558`/`:1708` |
+| $\lambda$ / $\rho$ schedules | `_star_weight_now` / `_replay_weight_now` (`grad_memgpt_adaptive.py:755`/`:762`) |
+| position-summed KL | `_star_kl` (`grad_memgpt_adaptive.py:848`) |
+| vectorised EM mask (shared by both boundary terms) | `_probe_exact_match_batch` (`grad_memgpt_adaptive.py:864`) |
+| the whole boundary term | `_star_boundary_loss` (`grad_memgpt_adaptive.py:880`) |
+| vanilla-replay boundary term | `_replay_boundary_loss` (`grad_memgpt_adaptive.py:955`) |
+| forward integration (train-only gate, boundary loop, loss assembly + idle-zeros) | `forward`: `star_active`/`replay_active` at `:1314`, boundary calls at `:1568`/`:1588`, loss assembly at `:1720`+ |
+| train-time metric surfacing (`train_star_*` / `train_replay_*` into the HF logs → comet) | `CustomTrainer.compute_loss` / `.log` (`run_gradmemgpt_on_kv_retrieval.py:366`) |
 | probe construction (shared with the forgetting eval) | `build_kv_probe_queries` (`run_gradmemgpt_on_kv_retrieval.py:459`) |
-| train collator attaches probes when `star_weight>0` **or** `replay_weight>0` | `use_probes` at `run_gradmemgpt_on_kv_retrieval.py:1331` (single-stage + curriculum stages) |
+| train collator attaches probes when `star_weight>0` **or** `replay_weight>0` | `use_probes` at `run_gradmemgpt_on_kv_retrieval.py:1361` (single-stage + curriculum stages) |
 | CLI fields → config | `ExperimentArgs` at `:983`+, pass-through in the `AdaptiveGMConfig(...)` call |
 
 `_star_boundary_loss` reuses the READ machinery verbatim — `_read_once` for the batched probe forwards and `_probe_exact_match` for the correct-only mask — so the stability term measures *exactly* the quantity the forgetting matrix measures. Per boundary it costs one no-grad reference forward, `star_ascent_steps` × (forward+backward) for the ascent, and one meta-gradient-carrying forward — small probe sequences ($M$ + ~7 tokens), typically ~1.5–2× training time, matching the paper's reported overhead.
@@ -188,15 +192,17 @@ If slowness persists after syncing these files, bisect on the remote: `adaptive.
 
 | metric | meaning |
 |---|---|
-| `star_kl` | mean worst-case KL over the fired boundaries (the term being minimised; should trend down across training) |
-| `star_delta_ratio` | achieved $\lVert\delta_j\rVert/\lVert m_j\rVert$ — expect $\approx\sqrt{\gamma^2+\varepsilon^2}$ (exactly $\gamma$ for `"random"`). Far from that = a bug, not a result |
-| `star_n_probes` | number of selected probes at the **last** fired boundary (like `star_delta_ratio`, this reports the most recent boundary, not the mean) |
-| `star_weight_now` | the scheduled $\lambda$ (sanity for the warmup) |
-| `replay_ce` | mean replay CE over the fired boundaries (the corrective term; should fall toward 0 on retrievable pairs) |
-| `replay_em_rate` | fraction of in-scope probes currently retrieved with exact match at the last boundary — a **live forgetting measurement** during training |
-| `replay_weight_now` | the scheduled $\rho$ |
+| `train_star_kl` | mean worst-case KL over the fired boundaries (the term being minimised; should trend down across training). **0.0 = enabled but idle** (x\* empty — nothing currently retrievable) |
+| `train_star_delta_ratio` | achieved $\lVert\delta_j\rVert/\lVert m_j\rVert$ — expect $\approx\sqrt{\gamma^2+\varepsilon^2}$ (exactly $\gamma$ for `"random"`). Far from that = a bug, not a result |
+| `train_star_n_probes` | number of selected probes at the **last** fired boundary |
+| `train_star_weight_now` | the scheduled $\lambda$ (sanity for the warmup) |
+| `train_replay_ce` | mean replay CE over the fired boundaries (the corrective term; should fall toward 0 on retrievable pairs) |
+| `train_replay_em_rate` | fraction of in-scope probes currently retrieved with exact match at the last boundary — a **live forgetting measurement** during training, reported even when the CE term is masked empty |
+| `train_replay_weight_now` | the scheduled $\rho$ |
 
-**Observability caveat:** the term is train-only, and the HF Trainer surfaces `inner_loop_stats` through *eval* predictions — so `star_*` currently do **not** appear in eval metrics/comet. The quickest trajectory proxy is the loss gap against a star-off twin run ($\Delta\mathrm{loss} = \lambda\cdot\mathrm{star\_kl}$); a small logging callback can be added if the trajectory itself becomes interesting.
+(Eval-side metrics never include these keys: the terms are train-only by design.)
+
+**Metric surfacing (train-time).** The terms are train-only and the standard `inner_loop_stats` → eval → comet path only carries eval forwards — so `CustomTrainer.compute_loss` captures the STAR/replay stats of every training step and `CustomTrainer.log` injects them into the training logs as **`train_star_kl`**, **`train_star_delta_ratio`**, **`train_star_n_probes`**, **`train_star_weight_now`** (and the `train_replay_*` equivalents) — these are the curves to watch on comet. When a term is *enabled but idle* (no eligible probe: empty scope, or nothing currently retrievable under the x\* mask — the normal state early in training), the metrics are reported as **zeros** rather than going silent, so "off" and "idle" are distinguishable. `train_replay_em_rate` is reported whenever probes were seen, even when the CE term itself is masked empty.
 
 ## Tests
 

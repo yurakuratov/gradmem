@@ -927,7 +927,13 @@ class GradMemGPT(PreTrainedModel):
             z_norm = z.norm(dim=-1, keepdim=True)
             delta = self.star_gamma * tok_norm * z / (z_norm + 1e-12)
         else:
-            delta = self.star_epsilon * tok_norm * torch.randn_like(mem_det)
+            # delta0 escapes the all-zero-gradient point at delta=0; its
+            # VECTOR norm is epsilon*||m_j|| per token (normalised randn -- a
+            # bare epsilon*||m||*randn would have norm epsilon*sqrt(d)*||m||,
+            # ~11x larger at d=128, drowning the gamma-scaled ascent direction)
+            z0 = torch.randn_like(mem_det)
+            z0_norm = z0.norm(dim=-1, keepdim=True)
+            delta = self.star_epsilon * tok_norm * z0 / (z0_norm + 1e-12)
             for _ in range(self.star_ascent_steps):
                 # detached working point: the ascent never touches the meta-graph
                 m_pert = (mem_det + delta).requires_grad_(True)
@@ -988,7 +994,9 @@ class GradMemGPT(PreTrainedModel):
 
         selected = in_scope & em if self.replay_correct_only else in_scope
         if not selected.any():
-            return None
+            # CE masked empty (nothing currently retrievable): loss None, but
+            # em_rate still reports the live forgetting measurement
+            return None, 0, em_rate
 
         # scored positions (identical convention to _star_kl / EM): target_mask
         # minus the structural ignore tokens; slot t predicts token t
@@ -1581,13 +1589,15 @@ class GradMemGPT(PreTrainedModel):
                             mem_batch, kv_queries, seg_idx, W_arg, b_arg,
                             read_st_batch, read_end_batch)
                         if res_r is not None:
-                            loss_r, replay_n_probes, replay_em_rate = res_r
-                            if self.replay_boundaries == "last":
-                                replay_loss_sum = loss_r
-                                replay_terms = 1
-                            else:
-                                replay_loss_sum = replay_loss_sum + loss_r
-                                replay_terms += 1
+                            loss_r, n_r, replay_em_rate = res_r
+                            if loss_r is not None:
+                                replay_n_probes = n_r
+                                if self.replay_boundaries == "last":
+                                    replay_loss_sum = loss_r
+                                    replay_terms = 1
+                                else:
+                                    replay_loss_sum = replay_loss_sum + loss_r
+                                    replay_terms += 1
 
         if total_inner_steps > 0:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / total_inner_steps
@@ -1709,21 +1719,35 @@ class GradMemGPT(PreTrainedModel):
             star_w_now = self._star_weight_now()
             star_loss = star_loss_sum / star_terms
             combined_loss = combined_loss + star_w_now * star_loss
-            # stats only when the term actually fired: star-off forwards keep
-            # the inner_loop_stats dict keys identical (bitwise-off guarantee)
             output['inner_loop_stats']['star_kl'] = star_loss.detach()
+            output['inner_loop_stats']['star_n_probes'] = star_n_probes.detach().float()
+        elif star_active and kv_queries is not None:
+            # enabled but IDLE (no eligible probe: empty scope, or nothing
+            # currently retrievable under the x* mask) -- emit zeros so the
+            # metrics distinguish "idle" from "off" instead of going silent
+            star_w_now = self._star_weight_now()
+            output['inner_loop_stats']['star_kl'] = torch.tensor(0.0, device=device)
+            output['inner_loop_stats']['star_n_probes'] = torch.tensor(0.0, device=device)
+        if star_active and kv_queries is not None:
             output['inner_loop_stats']['star_weight_now'] = torch.tensor(
                 float(star_w_now), device=device)
-            output['inner_loop_stats']['star_n_probes'] = star_n_probes.detach().float()
             output['inner_loop_stats']['star_delta_ratio'] = star_delta_ratio
+
         if replay_terms > 0:
             replay_w_now = self._replay_weight_now()
             replay_loss = replay_loss_sum / replay_terms
             combined_loss = combined_loss + replay_w_now * replay_loss
             output['inner_loop_stats']['replay_ce'] = replay_loss.detach()
+            output['inner_loop_stats']['replay_n_probes'] = replay_n_probes.detach().float()
+        elif replay_active and kv_queries is not None:
+            output['inner_loop_stats']['replay_ce'] = torch.tensor(0.0, device=device)
+            output['inner_loop_stats']['replay_n_probes'] = torch.tensor(0.0, device=device)
+        if replay_active and kv_queries is not None:
+            replay_w_now = self._replay_weight_now()
             output['inner_loop_stats']['replay_weight_now'] = torch.tensor(
                 float(replay_w_now), device=device)
-            output['inner_loop_stats']['replay_n_probes'] = replay_n_probes.detach().float()
+            # em_rate is the live forgetting diagnostic: always reported when
+            # probes were seen, even when the CE term itself is masked empty
             output['inner_loop_stats']['replay_em_rate'] = replay_em_rate
         output['loss'] = combined_loss
         return output
