@@ -116,7 +116,7 @@ All knobs live under the `adaptive:` config section (flattened to `--star-*` CLI
 | the whole boundary term | `_star_boundary_loss` (`grad_memgpt_adaptive.py:880`) |
 | vanilla-replay boundary term | `_replay_boundary_loss` (`grad_memgpt_adaptive.py:955`) |
 | forward integration (train-only gate, boundary loop, loss assembly + idle-zeros) | `forward`: `star_active`/`replay_active` at `:1314`, boundary calls at `:1568`/`:1588`, loss assembly at `:1720`+ |
-| train-time metric surfacing (`train_star_*` / `train_replay_*` into the HF logs → comet) | `CustomTrainer.compute_loss` / `.log` (`run_gradmemgpt_on_kv_retrieval.py:366`) |
+| train-time metric surfacing (generic: ALL `inner_loop_stats` tensor keys → `train_*` in the HF logs → comet; no trainer edit needed for new metrics) | `CustomTrainer.compute_loss` / `.log` (`run_gradmemgpt_on_kv_retrieval.py:366`) |
 | probe construction (shared with the forgetting eval) | `build_kv_probe_queries` (`run_gradmemgpt_on_kv_retrieval.py:459`) |
 | train collator attaches probes when `star_weight>0` **or** `replay_weight>0` | `use_probes` at `run_gradmemgpt_on_kv_retrieval.py:1361` (single-stage + curriculum stages) |
 | CLI fields → config | `ExperimentArgs` at `:983`+, pass-through in the `AdaptiveGMConfig(...)` call |

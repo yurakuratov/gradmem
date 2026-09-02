@@ -214,24 +214,23 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     if 'learned_update_imitation_loss' in inner_loop_stats:
         # MSE(delta, g_real); only present during the warmup window.
         metrics['learned_update_imitation_loss'] = float(inner_loop_stats['learned_update_imitation_loss'].mean())
-    # ---- adaptive (segmented/gated) update diagnostics ---- #
-    # Only present under the adaptive model with memory_update_rule != "sgd".
-    # gate_retain_mean / gate_write_mean: mean retention r_t and write w_t of the
-    # gated recurrence m_t = r_t*m_{t-1} + w_t*x_t (->1 = pure SGD running-sum).
-    # gate_delta_mean: mean Mamba Delta (->0 = full retention). seg stats below
-    # are also emitted by the segmented adaptive path.
-    # star_*: the STAR worst-case stability term (train-only): star_kl is the
-    # mean worst-case KL at segment boundaries, star_delta_ratio the achieved
-    # relative perturbation size (should sit near star_gamma). replay_*: the
-    # vanilla-replay ablation on the same probes; replay_em_rate is a live
-    # forgetting measurement (fraction of in-scope probes currently retrieved).
-    for _k in ('gate_retain_mean', 'gate_write_mean', 'gate_delta_mean',
-               'seg_nonempty_count_mean', 'seg_nonempty_size_mean',
-               'mem_prior_loss', 'mem_prior_weight_now', 'mem_sampled_delta_norm_mean',
-               'star_kl', 'star_weight_now', 'star_n_probes', 'star_delta_ratio',
-               'replay_ce', 'replay_weight_now', 'replay_n_probes', 'replay_em_rate'):
-        if _k in inner_loop_stats:
-            metrics[_k] = float(inner_loop_stats[_k].mean())
+    # ---- generic catch-all: surface every remaining tensor stat ---- #
+    # Anything the model writes into inner_loop_stats as a (0-dim / per-batch)
+    # tensor and that is not already handled above is auto-forwarded as an
+    # eval metric -- adding a new model metric needs NO run-script edit (see
+    # AGENTS.md "How losses/stats flow to logs" for the recipe). This covers
+    # the adaptive/STAR/replay keys (gate_*, seg_*, mem_prior_*,
+    # star_*/replay_* -- note the train-only STAR/replay keys only appear here
+    # if the model ever emits them outside training, which it does not: they
+    # are surfaced as train_* metrics by CustomTrainer instead) plus anything
+    # added later.
+    for _k, _v in inner_loop_stats.items():
+        if _k in metrics or not torch.is_tensor(_v):
+            continue
+        try:
+            metrics[_k] = float(_v.float().mean())
+        except (TypeError, ValueError, RuntimeError):
+            pass  # non-scalar / non-numeric stats need explicit handling above
     return metrics
 
 
@@ -376,22 +375,24 @@ class CustomTrainer(Trainer):
             m = m.module
         if hasattr(m, "set_train_step"):
             m.set_train_step(self.state.global_step)
-        # Always fetch outputs so TRAIN-ONLY stats (STAR / replay boundary terms
-        # -- they never appear in eval forwards, so the eval-only
-        # preprocess_logits_for_metrics -> compute_metrics_fn path drops them)
-        # can be surfaced as train_* metrics at the next logging step.
+        # Always fetch outputs so inner_loop_stats can be surfaced as train_*
+        # metrics at the next logging step -- the standard eval-only
+        # preprocess_logits_for_metrics -> compute_metrics_fn path never sees
+        # train forwards. Every tensor stat is captured (no prefix filter), so
+        # a new model metric needs NO trainer edit: write it into
+        # inner_loop_stats and it appears as train_<key> (AGENTS.md, "How
+        # losses/stats flow to logs").
         loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
         stats = outputs.get('inner_loop_stats') if isinstance(outputs, dict) else None
         if stats:
             self._last_train_stats = {
-                k: float(v.detach().mean())
-                for k, v in stats.items()
-                if k.startswith(('star_', 'replay_')) and torch.is_tensor(v)
+                k: float(v.detach().float().mean())
+                for k, v in stats.items() if torch.is_tensor(v)
             }
         return (loss, outputs) if return_outputs else loss
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
-        # inject the latest training-step STAR/replay stats into TRAINING logs
+        # inject the latest training-step inner_loop_stats into TRAINING logs
         # only (eval logs carry eval_* keys; train logs carry bare 'loss')
         if 'loss' in logs and 'eval_loss' not in logs and hasattr(self, '_last_train_stats'):
             for k, v in self._last_train_stats.items():
