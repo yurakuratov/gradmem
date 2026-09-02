@@ -160,7 +160,7 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
         args.append('--no_context_eval')
         if training.get('no_context_data_path') is not None:
             args.append(f'--no_context_data_path={training["no_context_data_path"]}')
-    # Per-segment forgetting eval (adaptive model): builds the [n_seg,n_seg]
+    # Per-segment forgetting eval (both models): builds the [n_seg,n_seg]
     # forgetting matrix on its own cadence, logged as a table + 3 summary scalars.
     if training.get('per_segment_eval'):
         args.append('--per_segment_eval')

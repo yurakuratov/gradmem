@@ -1109,10 +1109,399 @@ class GradMemGPT(PreTrainedModel):
         del outs_q
         return features
 
-    def forward(self, input_ids, labels=None, return_mem=False):
+    # ---------------------------------------------------------------- #
+    # Per-segment forgetting evaluation (eval-only)
+    # ---------------------------------------------------------------- #
+    # After each model-segment is written, probe retrieval of every KV pair
+    # written so far (segments [0..k]) to track how older facts degrade as
+    # later segments are processed. Returns a per-probe lower-triangular
+    # correctness pattern (row = the segment a KV pair lives in, col = the
+    # segment-after-write at which it was probed); the trainer bins the flat
+    # (src, probe, em) triples into the [n_seg, n_seg] forgetting matrix.
+    # Eval-only, gradient-safe: the WRITE inner loop still runs under enable_grad
+    # (the memory update needs autograd.grad), but every retrieval READ is wrapped
+    # in no_grad + .detach() so it neither pollutes the inner-loop graph nor
+    # retains activations. See forward_per_segment_eval below.
+
+    @staticmethod
+    def _segment_bounds(seq_len, n_segments_cfg, segment_size_cfg):
+        """Same ceil-division chunking as forward() uses for the WRITE context.
+
+        NOTE (differs from grad_memgpt_adaptive): forward() honors
+        hopfield_segment_size only when use_hopfield_memory or
+        use_gated_delta_memory is set; the caller must pass segment_size_cfg=None
+        for plain runs to mirror that condition.
+
+        Returns (n_segments, segment_size, [(seg_start, seg_end), ...]) over the
+        REAL (un-padded) token positions [0, seq_len). KV-pair attribution and
+        the forward's segmentation must agree, so this mirrors the chunking the
+        collator's build_kv_probe_queries uses (modulo forward's extra LEFT-pad
+        to segment-aligned length, which the collator accounts for itself).
+        """
+        if segment_size_cfg is not None:
+            n_segments = math.ceil(seq_len / segment_size_cfg)
+            segment_size = segment_size_cfg
+        else:
+            n_segments = n_segments_cfg
+            segment_size = (seq_len + n_segments - 1) // n_segments  # ceil division
+        bounds = [(i * segment_size, min((i + 1) * segment_size, seq_len))
+                  for i in range(n_segments)]
+        return n_segments, segment_size, bounds
+
+    def _read_once(self, mem_batch, query_input_ids, read_st_batch, read_end_batch):
+        """One batched READ against the given memory state(s).
+
+        Faithful factor of the READ phase in forward(): project mem with the
+        READ-phase semantics ('proj_rw' uses read_mem_proj; 'per_sample'
+        re-uses the meta-learned mem_proj init, NOT the inner-loop fast
+        weights), concat [read_st?, mem, read_end?, query], pad for JVP Flash,
+        forward under the READ-phase LoRA adapter, slice out the per-query-token
+        logits. Batched over the query axis by flattening [B, n_q, Q] ->
+        [B*n_q, Q] so this is a single forward pass.
+
+        Args:
+            mem_batch: [B, M, d] memory shared by all probes (plain modes), or
+                [B, n_q, M, d] per-probe memories (Hopfield / Gated Delta, whose
+                retrieval is query-dependent).
+            query_input_ids: [B, n_q, Q] probe queries (already padded).
+        Returns:
+            logits [B, n_q, Q+1, V].
+        """
+        B, n_q, Q = query_input_ids.shape
+        emb_layer = self.model.get_input_embeddings()
+        qry_emb = emb_layer(query_input_ids.reshape(B * n_q, Q))            # [B*n_q, Q, d]
+        if mem_batch.dim() == 3:
+            mem_rep = mem_batch.unsqueeze(1).expand(-1, n_q, -1, -1).reshape(
+                B * n_q, *mem_batch.shape[1:])
+        else:  # [B, n_q, M, d] per-probe retrieved memories
+            mem_rep = mem_batch.reshape(B * n_q, *mem_batch.shape[2:])
+
+        if self.mem_proj_mode == "none":
+            mem_inp = mem_rep
+        elif self.mem_proj_mode == "proj":
+            mem_inp = self.mem_proj(mem_rep)
+        elif self.mem_proj_mode == "proj_rw":
+            mem_inp = self.read_mem_proj(mem_rep)
+        else:  # "per_sample": READ re-uses the meta-learned init, like forward()
+            W_read = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1)
+            b_read = self.mem_proj.bias.unsqueeze(0).expand(B, -1)
+            W_rep = W_read.unsqueeze(1).expand(-1, n_q, -1, -1).reshape(B * n_q, *W_read.shape[1:])
+            b_rep = b_read.unsqueeze(1).expand(-1, n_q, -1).reshape(B * n_q, -1)
+            mem_inp = self._apply_linear(mem_rep, W_rep, b_rep)
+
+        mem_offset = self.n_mem_tokens + self.n_ctrl_tokens * 2
+        if self.n_ctrl_tokens > 0:
+            # [B, C, d] -> [B, 1, C, d] -> [B, n_q, C, d] -> [B*n_q, C, d]
+            rs = read_st_batch.reshape(B, 1, self.n_ctrl_tokens, -1).expand(-1, n_q, -1, -1).reshape(B * n_q, self.n_ctrl_tokens, -1)
+            re_ = read_end_batch.reshape(B, 1, self.n_ctrl_tokens, -1).expand(-1, n_q, -1, -1).reshape(B * n_q, self.n_ctrl_tokens, -1)
+            x_qry = torch.cat([rs, mem_inp, re_, qry_emb], dim=1)
+        else:
+            x_qry = torch.cat([mem_inp, qry_emb], dim=1)                    # [B*n_q, M+Q, d]
+
+        # pad to multiple of 32 for compatibility with JVP Flash Attention
+        if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+            pad_list = [0, 0, 0, -x_qry.size(1) % 32]
+            x_qry = F.pad(x_qry, pad_list, "constant", 0)
+
+        self._set_phase_adapter("read")
+        logits = self.model(inputs_embeds=x_qry).logits                     # [B*n_q, M+Q, V]
+        logits = logits[:, mem_offset - 1:mem_offset + Q, :]                # [B*n_q, Q+1, V]
+        return logits.reshape(B, n_q, Q + 1, -1)
+
+    @staticmethod
+    def _probe_exact_match(logits, query_ids, target_mask, ignore_token_ids):
+        """Per-probe exact-match flag, teacher-forced (mirrors compute_metrics_fn).
+
+        The READ query is the teacher-forced sequence ``?!K:V!|`` (query + target
+        concatenated, exactly as collate_fn / build_kv_probe_queries build it).
+        logits[t] predicts token t+1, so the prediction AT a target position
+        predicts the NEXT target token. We score only the positions flagged by
+        ``target_mask`` (the ``V!|`` span, excluding structural '!'/'|' which
+        are in ignore_token_ids): a probe is correct iff argmax matches the
+        actual token id at every scored position.
+
+        Args:
+            logits: [n_q, Q+1, V] (the +1 is the next-token slot).
+            query_ids: [n_q, Q] the teacher-forced query tokens (?!K:V!|).
+            target_mask: [n_q, Q] bool, True at the V!| target positions.
+            ignore_token_ids: token ids to skip (e.g. '!','|') -- scored on the
+                remaining content tokens only.
+        Returns: [n_q] bool.
+        """
+        preds = logits.argmax(dim=-1)[:, :-1]                       # [n_q, Q]
+        n_q = logits.size(0)
+        correct = torch.ones(n_q, dtype=torch.bool, device=logits.device)
+        for i in range(n_q):
+            tmask = target_mask[i]                                   # [Q]
+            qids_i = query_ids[i]                                    # [Q]
+            # exclude ignored structural tokens from scoring
+            score = tmask.clone()
+            for ig in ignore_token_ids:
+                score &= (qids_i != ig)
+            if score.sum() == 0:
+                correct[i] = True                                    # nothing to score
+                continue
+            correct[i] = (preds[i][score] == qids_i[score]).all()
+        return correct
+
+    def _probe_boundary_memory(self, snap, stored_keys, stored_values, stored_masks,
+                               query_input_ids, target_mask, mem_batch_initial,
+                               read_st_batch, read_end_batch, B, device):
+        """Memory state READ would consume at one segment boundary, for probing.
+
+        Mirrors what forward()'s READ phase consumes if it stopped at this
+        boundary, per memory mode:
+          - plain (no associative store): the segment's carried mem
+            (snap['mem']) -> [B, M, d], shared by all probes. NOTE the plain
+            grad_memgpt memory is RESET per segment, so probing a KV from an
+            older segment against this mem measures reset-forgetting.
+          - Hopfield: retrieval over the segments stored so far
+            (stored_*[:snap['n_stored']]). Retrieval is QUERY-dependent, so it
+            is re-run per probe -> [B, n_q, M, d]. All retrieval modes
+            (raw/softmax/beta_softmax/mean), key/query/value projections,
+            direct queries and the unwritten-sample fallback mirror forward()'s
+            Hopfield RETRIEVE phase.
+          - Gated Delta: linear read o = S @ q against snap['S'] (also
+            query-dependent -> [B, n_q, M, d]), mirroring forward()'s Gated
+            Delta RETRIEVE phase incl. the unwritten-sample fallback.
+
+        The probe query compression is blind to the teacher-forced target span
+        (target_mask stands in for the labels >= 0 positions that forward's
+        _compress_query masks out), so retrieval cannot peek at the answer.
+        Must be called under no_grad (the snapshots are already detached).
+        """
+        if not (self.use_hopfield_memory or self.use_gated_delta_memory):
+            return snap['mem']                                        # [B, M, d]
+
+        qids = query_input_ids                                        # [B, n_q, Q]
+        n_q = qids.size(1)
+        pad_id = self.model.config.pad_token_id
+
+        # flatten probes to a [B*n_q] batch; _compress_query is batch-agnostic
+        flat_qids = qids.reshape(B * n_q, -1)
+        # blind the query compression to the teacher-forced 'V!|' span, exactly
+        # like labels >= 0 in forward's _compress_query
+        flat_labels = torch.where(target_mask, qids,
+                                  torch.full_like(qids, -100)).reshape(B * n_q, -1)
+        qry_emb = self.model.get_input_embeddings()(flat_qids)         # [B*n_q, Q, d]
+
+        if self.n_ctrl_tokens > 0:
+            rs_flat = read_st_batch.reshape(B, 1, self.n_ctrl_tokens, -1).expand(-1, n_q, -1, -1).reshape(B * n_q, self.n_ctrl_tokens, -1)
+            re_flat = read_end_batch.reshape(B, 1, self.n_ctrl_tokens, -1).expand(-1, n_q, -1, -1).reshape(B * n_q, self.n_ctrl_tokens, -1)
+        else:
+            rs_flat = re_flat = None
+
+        if self.use_hopfield_memory and snap['n_stored'] > 0:
+            c = snap['n_stored']
+            keys = torch.stack(stored_keys[:c], dim=1)                 # [B, c, M*d]
+            values = torch.stack(stored_values[:c], dim=1)             # [B, c, M*d]
+            mask = torch.stack(stored_masks[:c], dim=1).bool()         # [B, c]
+            stored = mask.any(dim=1)                                   # [B]
+
+            if self.hopfield_direct_query:
+                query_key = self.mem_query.unsqueeze(0).expand(B * n_q, -1, -1).reshape(B * n_q, -1)
+            else:
+                if self.use_separate_hopfield_mem:
+                    mem_query_prefix = self.mem_query.unsqueeze(0).expand(B, -1, -1)
+                else:
+                    mem_query_prefix = mem_batch_initial
+                mq_flat = mem_query_prefix.unsqueeze(1).expand(-1, n_q, -1, -1).reshape(B * n_q, *mem_query_prefix.shape[1:])
+                query_key = self._compress_query(qry_emb, flat_qids, flat_labels, pad_id,
+                                                 mq_flat, rs_flat, re_flat, B * n_q, device)
+            if self.hopfield_proj_dim is not None:
+                query_key = self.hopfield_query_proj(query_key)
+            query_key = F.normalize(query_key, dim=-1)                 # [B*n_q, M*d]
+
+            # replicate the per-sample store over the probe axis
+            keys_flat = keys.unsqueeze(1).expand(-1, n_q, -1, -1).reshape(B * n_q, c, -1)
+            values_flat = values.unsqueeze(1).expand(-1, n_q, -1, -1).reshape(B * n_q, c, -1)
+            mask_flat = mask.unsqueeze(1).expand(-1, n_q, -1).reshape(B * n_q, c)
+
+            if self.hopfield_retrieval_mode == "mean":
+                weights = mask.float() / mask.float().sum(dim=1, keepdim=True).clamp(min=1)
+                w_flat = weights.unsqueeze(1).expand(-1, n_q, -1).reshape(B * n_q, c)
+                retrieved_pattern = torch.bmm(w_flat.unsqueeze(2), values_flat).squeeze(1)
+            else:
+                scores = torch.bmm(query_key.unsqueeze(1), keys_flat.transpose(1, 2)).squeeze(1)  # [B*n_q, c]
+                if self.hopfield_retrieval_mode == "raw":
+                    scores = scores * mask_flat.float()
+                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values_flat).squeeze(1)
+                elif self.hopfield_retrieval_mode == "softmax":
+                    scores = scores.masked_fill(~mask_flat, float('-inf'))
+                    scores = F.softmax(scores, dim=-1)
+                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values_flat).squeeze(1)
+                elif self.hopfield_retrieval_mode == "beta_softmax":
+                    scores = scores * self.hopfield_beta
+                    scores = scores.masked_fill(~mask_flat, float('-inf'))
+                    scores = F.softmax(scores, dim=-1)
+                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values_flat).squeeze(1)
+                else:
+                    raise ValueError(f"Unknown hopfield_retrieval_mode: {self.hopfield_retrieval_mode}")
+
+            if self.hopfield_value_proj_dim is not None:
+                retrieved_pattern = self.hopfield_value_inv_proj(retrieved_pattern)
+
+            # samples with nothing stored yet: fall back to the initial memory
+            if not stored.all():
+                init_flat = mem_batch_initial.view(B, 1, -1).expand(-1, n_q, -1).reshape(B * n_q, -1)
+                retrieved_pattern = torch.where(stored.unsqueeze(1).expand(-1, n_q).reshape(B * n_q),
+                                                retrieved_pattern, init_flat)
+            return retrieved_pattern.view(B, n_q, self.n_mem_tokens, -1)  # [B, n_q, M, d]
+
+        # Gated Delta
+        written = snap['written']                                      # [B] bool
+        if written is None or not written.any():
+            # nothing written for ANY sample: forward's retrieval is skipped
+            # and READ consumes the plain carried memory
+            return snap['mem']
+        S_rep = snap['S'].to(dtype=qry_emb.dtype)
+        S_rep = S_rep.unsqueeze(1).expand(-1, n_q, -1, -1).reshape(B * n_q, *S_rep.shape[1:])
+        query_features = self._compress_query(qry_emb, flat_qids, flat_labels, pad_id,
+                                              mem_batch_initial.unsqueeze(1).expand(-1, n_q, -1, -1)
+                                              .reshape(B * n_q, *mem_batch_initial.shape[1:]),
+                                              rs_flat, re_flat, B * n_q, device)
+        q_t = F.normalize(self.gd_query_proj(query_features), dim=-1)  # [B*n_q, d]
+        retrieved = torch.bmm(S_rep, q_t.unsqueeze(2)).squeeze(2)      # [B*n_q, d]
+        retrieved_pattern = self.gd_value_inv_proj(retrieved)          # [B*n_q, M*d]
+
+        # samples with no writes: fall back to the initial memory
+        if not written.all():
+            init_flat = mem_batch_initial.view(B, 1, -1).expand(-1, n_q, -1).reshape(B * n_q, -1)
+            retrieved_pattern = torch.where(written.unsqueeze(1).expand(-1, n_q).reshape(B * n_q),
+                                            retrieved_pattern, init_flat)
+        return retrieved_pattern.view(B, n_q, self.n_mem_tokens, -1)   # [B, n_q, M, d]
+
+    def forward_per_segment_eval(self, input_ids, kv_queries):
+        """Eval-only: per-query retrieval results for the forgetting matrix.
+
+        Runs the normal segmented WRITE inner loop (memory identical to
+        training, via forward(collect_segment_mems=True)), and after each
+        model-segment's K steps probes retrieval of every KV pair whose source
+        segment <= the just-written segment (cumulative forgetting curve).
+
+        Boundary-memory semantics differ by memory mode (mirroring what
+        forward()'s READ consumes, see _probe_boundary_memory): plain modes
+        RESET mem per segment (cell (s,k), s<k, measures reset-forgetting --
+        an architecture property); Hopfield / Gated Delta ACCUMULATE the store
+        across segments, and their query-dependent retrieval is re-run per
+        probe against the store as of boundary k (interference-forgetting
+        inside one associative memory -- directly comparable to the adaptive
+        fork's forgetting matrix).
+
+        Returns FLAT per-probe arrays (not a [n_seg,n_seg] matrix) because a
+        segment can hold multiple KV pairs -- a cell would otherwise be
+        overwritten by the last query. The trainer bins these by (src, probe)
+        to build the matrix.
+
+        Args:
+            input_ids: {'context_input_ids': [B,S]} (the WRITE context).
+            kv_queries: {'query_input_ids': [B, n_q_max, Q],   # teacher-forced ?!K:V!|
+                         'target_mask':    [B, n_q_max, Q],   # True at the V!| positions
+                         'seg_idx':        [B, n_q_max],
+                         'mask':           [B, n_q_max] bool}
+        Returns:
+            src_seg:   [n_probes] long  -- source segment of each probed KV
+            probe_seg: [n_probes] long  -- segment-after-write at which it was probed
+            em:        [n_probes] bool  -- exact-match flag for that probe
+        """
+        context_input_ids = input_ids['context_input_ids']
+        pad_id = self.model.config.pad_token_id
+        device = context_input_ids.device
+        B = context_input_ids.size(0)
+
+        qids = kv_queries['query_input_ids']            # [B, n_q, Q]  teacher-forced
+        tmask = kv_queries['target_mask']               # [B, n_q, Q]
+        seg_idx = kv_queries['seg_idx']                 # [B, n_q]
+        qmask = kv_queries['mask']                      # [B, n_q]
+        ignore_token_ids = kv_queries.get('ignore_token_ids', [])
+
+        # segment bounds (padded length, matching forward). forward() honors
+        # hopfield_segment_size only for hopfield/gated-delta runs -- mirror
+        # that condition so the probe boundaries match the actual chunking.
+        seq_len_padded = context_input_ids.size(1)
+        use_seg_size = (self.use_hopfield_memory or self.use_gated_delta_memory) \
+            and self.hopfield_segment_size is not None
+        n_seg, seg_sz, _ = self._segment_bounds(
+            seq_len_padded, self.hopfield_n_segments,
+            self.hopfield_segment_size if use_seg_size else None)
+
+        src_seg_list, probe_seg_list, em_list = [], [], []
+
+        if not self.K or not (context_input_ids != pad_id).any() or qmask.sum() == 0:
+            return (torch.zeros(0, dtype=torch.long, device=device),
+                    torch.zeros(0, dtype=torch.long, device=device),
+                    torch.zeros(0, dtype=torch.bool, device=device))
+
+        # ---- get the EXACT per-boundary memory states from the real forward ---- #
+        # forward() requires a query_input_ids for its READ phase; pass a minimal
+        # single-token placeholder -- its READ output is discarded.
+        fwd_input = {'context_input_ids': context_input_ids,
+                     'query_input_ids': context_input_ids[:, :1]}
+        out = self.forward(fwd_input, labels=None, collect_segment_mems=True)
+        segment_mems = out['segment_mems']              # list[n_segments] of snap-dicts or None
+        stored_keys = out.get('stored_keys')
+        stored_values = out.get('stored_values')
+        stored_masks = out.get('stored_masks')
+        n_seg_actual = len(segment_mems)                # == n_segments (None placeholders keep alignment)
+
+        mem_batch_initial = self.mem.unsqueeze(0).expand(B, -1, -1)
+        if self.n_ctrl_tokens > 0:
+            read_st_batch = self.read_st.unsqueeze(0).expand(B, -1, -1)
+            read_end_batch = self.read_end.unsqueeze(0).expand(B, -1, -1)
+        else:
+            read_st_batch = read_end_batch = None
+
+        with torch.no_grad():
+            for seg_idx_loop in range(min(n_seg_actual, n_seg)):
+                # use the TRUE segment index: segment_mems is indexed by seg_idx,
+                # and empty segments are None (memory unchanged from the previous
+                # non-empty segment). Using the true index (not a list offset)
+                # keeps the probe-seg aligned with the KV's source-seg so the
+                # forgetting matrix diagonal is meaningful.
+                snap = segment_mems[seg_idx_loop]
+                if snap is None:
+                    # empty segment: no WRITE ran, memory state unchanged. Still
+                    # probe so KV pairs in segments <= seg_idx_loop are tested at
+                    # this probe point -- use the last available snapshot.
+                    snap = next((segment_mems[j] for j in range(seg_idx_loop, -1, -1)
+                                 if segment_mems[j] is not None), None)
+                    if snap is None:
+                        continue
+                probe_here = (seg_idx <= seg_idx_loop) & qmask             # [B, n_q]
+                if not probe_here.any():
+                    continue
+                mem_det = self._probe_boundary_memory(
+                    snap, stored_keys, stored_values, stored_masks,
+                    qids, tmask, mem_batch_initial, read_st_batch, read_end_batch,
+                    B, device)
+                logits_q = self._read_once(mem_det, qids, read_st_batch, read_end_batch)
+                # logits_q: [B, n_q, Q+1, V]
+                for b in range(B):
+                    active = probe_here[b]
+                    if not active.any():
+                        continue
+                    ai = active.nonzero(as_tuple=True)[0]
+                    for q_i in ai.tolist():
+                        s_src = int(seg_idx[b, q_i].item())
+                        em = self._probe_exact_match(
+                            logits_q[b:b+1, q_i],
+                            qids[b:b+1, q_i],
+                            tmask[b:b+1, q_i],
+                            ignore_token_ids)
+                        src_seg_list.append(s_src)
+                        probe_seg_list.append(seg_idx_loop)
+                        em_list.append(bool(em[0].item()))
+
+        return (torch.tensor(src_seg_list, dtype=torch.long, device=device),
+                torch.tensor(probe_seg_list, dtype=torch.long, device=device),
+                torch.tensor(em_list, dtype=torch.bool, device=device))
+
+    def forward(self, input_ids, labels=None, return_mem=False, collect_segment_mems=False):
         # context_input_ids : B × S   (segments only, each ends with `|`)
         # query_input_ids   : B × Q   (e.g.  "?!K:V!|") i.e. the last segment
         # labels            : B × Q   (‑100 everywhere except the target tokens (V!|))
+        # collect_segment_mems : eval-only; snapshot the memory state READ would
+        #     consume after each segment's WRITE (see forward_per_segment_eval)
 
         """
         All tensors already padded to the same length in the datacollator.
@@ -1168,6 +1557,9 @@ class GradMemGPT(PreTrainedModel):
         last_segment_inner_loss = None
         total_inner_steps = 0
         n_segments_with_context = 0
+        # per-boundary memory snapshots (eval-only forgetting probe); filled
+        # inside the segment loop, stays None when WRITE never runs
+        segment_mems = None
 
         # Per-segment inner-loss diagnostics: track the batch-mean inner loss of
         # each processed segment to report min/mean/max across segments. A low
@@ -1233,6 +1625,16 @@ class GradMemGPT(PreTrainedModel):
                     ctx_emb = F.pad(ctx_emb, [0, 0, pad_len, 0], "constant", 0)
                     mask = F.pad(mask, [pad_len, 0], "constant", 0)
                     lm_labels = F.pad(lm_labels, [pad_len, 0], "constant", -100)
+
+                # per-boundary memory snapshots (eval-only forgetting probe):
+                # one entry per segment index. Empty segments (all-pad, possible
+                # with the LEFT-padding above) are skipped by `continue` below,
+                # so we must NOT use append-order -- that would misalign
+                # snapshot[i] with segment i and corrupt the forgetting matrix
+                # diagonal. We store None for skipped segments so indices stay
+                # aligned (the eval falls back to the last non-None snapshot:
+                # an empty segment leaves the memory state unchanged).
+                segment_mems = ([None] * n_segments) if collect_segment_mems else None
 
                 for seg_idx in range(n_segments):
                     seg_start = seg_idx * segment_size
@@ -1877,6 +2279,23 @@ class GradMemGPT(PreTrainedModel):
                     # Keep last segment's mem_batch for stats and READ phase fallback
                     last_mem_batch = mem_batch
 
+                    # snapshot the memory state READ would consume at this
+                    # boundary (eval-only forgetting probe uses these EXACT
+                    # states so the measured retrieval matches what the model
+                    # actually produces). Plain modes: the segment's final mem.
+                    # Hopfield: only the store COUNT is needed (stored_keys/
+                    # values/masks are append-only within one forward, so
+                    # final_list[:n_stored] == the list as it was here; this
+                    # keeps the snapshot O(1) instead of O(n_seg^2)). Gated
+                    # Delta: the state matrix S and per-sample written flag.
+                    if collect_segment_mems:
+                        segment_mems[seg_idx] = {
+                            'mem': mem_batch.detach(),
+                            'n_stored': len(stored_keys) if self.use_hopfield_memory else 0,
+                            'S': S.detach() if self.use_gated_delta_memory else None,
+                            'written': gd_written.clone() if self.use_gated_delta_memory else None,
+                        }
+
         if total_inner_steps > 0:
             inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / total_inner_steps
             if n_segments_with_context > 0:
@@ -2112,6 +2531,14 @@ class GradMemGPT(PreTrainedModel):
         logits_q = logits_q[:, read_mem_offset-1:read_mem_offset+qry_emb.size(1), :]    # [B,Q+1,V]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
+        if collect_segment_mems:
+            output['segment_mems'] = segment_mems if segment_mems is not None else []
+            if self.use_hopfield_memory:
+                # final append-only store; a boundary snapshot is the first
+                # n_stored entries (see the snapshot block in the segment loop)
+                output['stored_keys'] = [k.detach() for k in stored_keys]
+                output['stored_values'] = [v.detach() for v in stored_values]
+                output['stored_masks'] = [m.detach() for m in stored_masks]
         if return_mem:
             output['mem'] = mem_batch
             if self.mem_proj_mode == "per_sample":

@@ -476,7 +476,8 @@ def _isnan(x):
         return False
 
 
-def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segment_size=None):
+def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segment_size=None,
+                           seg_pad_side='right'):
     """Build the `kv_queries` probe dict for one batch of raw samples.
 
     Shared by the per-segment forgetting eval (make_collate_fn_per_segment)
@@ -492,6 +493,12 @@ def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segmen
     position) via ceil(padded_len / n_segments). A pair straddling a segment
     boundary is attributed to the LATER segment (it is not fully written
     until then).
+
+    seg_pad_side selects which extra pad the consuming model adds to reach a
+    segment-aligned length: grad_memgpt_adaptive.py RIGHT-pads (real tokens
+    stay at the left, 'right'), while grad_memgpt.py LEFT-pads (real tokens
+    shift right by seg_sz*n_seg - padded_len, 'left'). The attribution offset
+    accounts for that shift, else cells near boundaries land one segment off.
 
     Returns {'query_input_ids': [B, n_q_max, Q], 'target_mask': [B, n_q_max, Q],
              'seg_idx': [B, n_q_max], 'mask': [B, n_q_max],
@@ -516,12 +523,15 @@ def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segmen
         else:
             n_seg = n_segments if n_segments else 1
             seg_sz = max(1, math.ceil(padded_len / n_seg))
+        # extra LEFT-pad grad_memgpt.py adds before chunking (0 for the
+        # right-padding adaptive fork)
+        seg_pad_len = (seg_sz * n_seg - padded_len) if seg_pad_side == 'left' else 0
         sample_pairs = []
         for ts, te, k, v in pairs:
             # Attribute the KV to the segment containing its LAST token (the
             # closing '!' of !K:V!): the pair is only fully written -- and thus
             # retrievable -- once the model has processed that segment.
-            src_seg = min((te - 1) // seg_sz, n_seg - 1)
+            src_seg = min((seg_pad_len + te - 1) // seg_sz, n_seg - 1)
             q_strs.append(f'?!{k}:')               # teacher-forced query '?!K:'
             t_strs.append(f'{v}!|')                # target 'V!|'
             sample_pairs.append(src_seg)
@@ -568,7 +578,7 @@ def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segmen
 
 
 def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=None,
-                                segment_size=None):
+                                segment_size=None, seg_pad_side='right'):
     """Build a collator that emits, per sample, the WRITE context PLUS one probe
     query per KV pair in the context (with the source model-segment of each KV).
 
@@ -583,7 +593,9 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
     The KV pair -> segment attribution matches the model's segmentation exactly
     (the model shares the same _segment_bounds logic). KV pairs straddling a
     segment boundary are attributed to the later segment (not fully written
-    until then).
+    until then). ``seg_pad_side`` selects the consuming model's extra-pad side
+    (see build_kv_probe_queries): 'right' for grad_memgpt_adaptive.py, 'left'
+    for grad_memgpt.py.
     """
 
     def collate_fn_per_segment(batch, tokenizer, max_context_length=None):
@@ -599,7 +611,8 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
         # build_kv_probe_queries. EM is scored at the target positions only,
         # mirroring compute_metrics_fn.
         kv_queries = build_kv_probe_queries(batch, tokenizer, context_input_ids.size(1),
-                                            n_segments=n_segments, segment_size=segment_size)
+                                            n_segments=n_segments, segment_size=segment_size,
+                                            seg_pad_side=seg_pad_side)
 
         return {
             'input_ids': {
@@ -979,13 +992,17 @@ class ExperimentArgs:
     # the no-context pass. If None, reuses the main dataset's valid_no_context /
     # valid split.
     no_context_data_path: Optional[str] = field(default=None)
-    # ---- per-segment forgetting eval (adaptive model only) ---- #
+    # ---- per-segment forgetting eval (both models) ---- #
     # On cadence (per_segment_eval_steps), after each model-segment is written to
     # memory, probe retrieval of every KV pair written so far to build a [n_seg,
     # n_seg] forgetting matrix (row = KV's source segment, col = probe-after-seg).
     # The full matrix is logged as a table artifact + comet table; only 3 summary
     # scalars hit the metric stream (forget_diag_mean / forget_seg0_final /
-    # forget_slope). Requires the adaptive model (an `adaptive:` config section).
+    # forget_slope). Works with the adaptive fork (segments from n_segments /
+    # segment_size) AND the main grad_memgpt model (segments from
+    # hopfield_n_segments / hopfield_segment_size; plain runs measure the
+    # per-segment memory RESET, hopfield/gated-delta runs measure retrieval
+    # interference in the accumulating store).
     per_segment_eval: Optional[bool] = field(default=False)
     per_segment_eval_steps: Optional[int] = field(default=None)  # default 5*eval_steps if None
     # ---- adaptive (segmented, gated-recurrence) fork (grad_memgpt_adaptive) ---- #
@@ -1414,6 +1431,32 @@ def main(config_path: Optional[str] = None):
         args_total_bs = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
         assert args.total_batch_size == args_total_bs
 
+    # ---- per-segment forgetting eval: per-model segmentation source ---- #
+    # The forgetting matrix probes the memory after each model-segment, so the
+    # KV -> segment attribution MUST use the segmentation the trained model
+    # actually chunks with: the adaptive fork chunks with n_segments /
+    # segment_size (right-pad), grad_memgpt.py with hopfield_n_segments /
+    # hopfield_segment_size (left-pad -> seg_pad_side='left' compensates the
+    # attribution offset). grad_memgpt.py honors hopfield_segment_size only
+    # when hopfield / gated-delta is enabled (mirror of forward()'s condition).
+    # NOTE (curriculum): hopfield_n_segments is stage-overridable
+    # (MODEL_PARAM_MAP) but the per-segment collator is built once below, so
+    # overriding it per stage would desync the probe attribution.
+    if use_adaptive_model:
+        per_seg_n_segments_arg = args.n_segments
+        per_seg_segment_size_arg = args.segment_size
+        per_seg_pad_side = 'right'
+    else:
+        per_seg_n_segments_arg = args.hopfield_n_segments
+        per_seg_segment_size_arg = (args.hopfield_segment_size
+                                    if (args.use_hopfield_memory or args.use_gated_delta_memory)
+                                    else None)
+        per_seg_pad_side = 'left'
+    # hopfield / gated-delta runs disable context truncation in the training
+    # collator; the forgetting collator must match or segments misalign
+    per_seg_max_context = None if (args.use_hopfield_memory or args.use_gated_delta_memory) \
+        else args.max_context_length
+
     if args.curriculum_enabled:
         raw_levels = [x.strip() for x in args.curriculum_levels.split(',')]
         curriculum_levels = []
@@ -1453,20 +1496,21 @@ def main(config_path: Optional[str] = None):
 
         data_dir = Path(args.curriculum_data_dir)
 
-        # ---- per-segment forgetting eval setup (adaptive model only) ---- #
+        # ---- per-segment forgetting eval setup (both models) ---- #
         # Under curriculum, the forgetting matrix fires both on its periodic
         # cadence (per_segment_eval_steps) AND is forced once at every stage
         # boundary (see force_forgetting_pass below the stage loop). Setup mirrors
         # the single-stage path so the two branches stay consistent.
-        use_per_segment_eval = bool(args.per_segment_eval) and use_adaptive_model
+        use_per_segment_eval = bool(args.per_segment_eval)
         per_segment_collator = None
         per_seg_n_segments = None
         per_seg_eval_steps = None
         if use_per_segment_eval:
-            per_seg_n_segments = args.n_segments if args.segment_size is None else None
+            per_seg_n_segments = per_seg_n_segments_arg if per_seg_segment_size_arg is None else None
             per_segment_collator = make_collate_fn_per_segment(
-                tokenizer, max_context_length=args.max_context_length,
-                n_segments=args.n_segments, segment_size=args.segment_size)
+                tokenizer, max_context_length=per_seg_max_context,
+                n_segments=per_seg_n_segments_arg, segment_size=per_seg_segment_size_arg,
+                seg_pad_side=per_seg_pad_side)
             per_seg_eval_steps = args.per_segment_eval_steps
             if per_seg_eval_steps is None:
                 per_seg_eval_steps = 5 * args.eval_steps
@@ -1474,7 +1518,8 @@ def main(config_path: Optional[str] = None):
                 f"per_segment_eval_steps ({per_seg_eval_steps}) must be a multiple of " \
                 f"eval_steps ({args.eval_steps})"
             logger.info(f'curriculum per-segment forgetting eval enabled: '
-                        f'n_segments={args.n_segments}, segment_size={args.segment_size}, '
+                        f'n_segments={per_seg_n_segments_arg}, segment_size={per_seg_segment_size_arg}, '
+                        f'pad_side={per_seg_pad_side}, '
                         f'cadence={per_seg_eval_steps} steps (+ forced at each stage boundary)')
 
         all_metrics = {}
@@ -1663,27 +1708,29 @@ def main(config_path: Optional[str] = None):
             seed=args.seed,
         )
 
-        # ---- per-segment forgetting eval setup (adaptive model only) ---- #
+        # ---- per-segment forgetting eval setup (both models) ---- #
         # On cadence, builds the [n_seg,n_seg] forgetting matrix and writes it to
         # exp_path/forgetting_matrix_step{N}.json + .csv. Per-cell values are also
         # emitted as metrics (forget_seg{s}_at_seg{k}) so they reach comet as charts.
-        use_per_segment_eval = bool(args.per_segment_eval) and use_adaptive_model
+        use_per_segment_eval = bool(args.per_segment_eval)
         per_segment_collator = None
         per_seg_n_segments = None
         per_seg_eval_steps = None
         if use_per_segment_eval:
-            per_seg_n_segments = args.n_segments if args.segment_size is None else None
+            per_seg_n_segments = per_seg_n_segments_arg if per_seg_segment_size_arg is None else None
             per_segment_collator = make_collate_fn_per_segment(
-                tokenizer, max_context_length=args.max_context_length,
-                n_segments=args.n_segments, segment_size=args.segment_size)
+                tokenizer, max_context_length=per_seg_max_context,
+                n_segments=per_seg_n_segments_arg, segment_size=per_seg_segment_size_arg,
+                seg_pad_side=per_seg_pad_side)
             per_seg_eval_steps = args.per_segment_eval_steps
             if per_seg_eval_steps is None:
                 per_seg_eval_steps = 5 * args.eval_steps
             assert per_seg_eval_steps % max(args.eval_steps, 1) == 0, \
                 f"per_segment_eval_steps ({per_seg_eval_steps}) must be a multiple of " \
                 f"eval_steps ({args.eval_steps})"
-            logger.info(f'per-segment forgetting eval enabled: n_segments={args.n_segments}, '
-                        f'segment_size={args.segment_size}, cadence={per_seg_eval_steps} steps')
+            logger.info(f'per-segment forgetting eval enabled: n_segments={per_seg_n_segments_arg}, '
+                        f'segment_size={per_seg_segment_size_arg}, pad_side={per_seg_pad_side}, '
+                        f'cadence={per_seg_eval_steps} steps')
 
         # ---- trainer selection ---- #
         if use_per_segment_eval:
