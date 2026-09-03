@@ -63,6 +63,11 @@ from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
 from contextlib import contextmanager
 import attn_double_bwd  # noqa: F401  # side-effect: registers attention kernels
 
+# Shared pair-aware segmentation helpers (kv-retrieval). The KV->segment
+# division must be identical in both forks and in the runner's collator, so
+# grad_memgpt.py owns one implementation and everyone imports it.
+from grad_memgpt import detect_pair_ends, divide_pairs, pair_segment_spans
+
 try:
     from peft import LoraConfig, TaskType, get_peft_model
 except ImportError:  # pragma: no cover - handled via runtime checks
@@ -125,6 +130,10 @@ class GradMemGPTConfig(PretrainedConfig):
                  n_segments=1,
                  segment_size=None,
                  seg_bptt=None,
+                 # ---- pair-aware segmentation (kv-retrieval; shared with grad_memgpt.py) ---- #
+                 pair_aware_segmentation=False,
+                 pairs_per_segment=None,
+                 pair_delim_token_ids=None,
                  # ---- adaptive memory update ---- #
                  memory_update_rule="sgd",
                  gate_features="grad_state",
@@ -177,6 +186,18 @@ class GradMemGPTConfig(PretrainedConfig):
                 segments, detach older segment boundaries. None = keep the full
                 graph (correct but memory-heavy for long unrollings under
                 grad_mode "first"/"second"). No effect under grad_mode "none".
+            pair_aware_segmentation: bool, chunk the WRITE context at !K:V! pair
+                boundaries instead of fixed-width token windows (kv-retrieval;
+                same semantics as grad_memgpt.py — see its docstring). With the
+                memory carried across segments, aligned boundaries mean each
+                gated update consumes whole pairs only.
+            pairs_per_segment: int|None, pair-aware mode: KV pairs per segment
+                (n_segments = ceil(n_pairs / pairs_per_segment) per sample).
+                None = divide each sample's pairs equally over n_segments (the
+                first n_pairs % n_segments groups get the extra pair).
+            pair_delim_token_ids: list[int]|None, [open/close '!' id, ':' id] used
+                to detect pairs in context_input_ids. Auto-filled by the runner
+                from the tokenizer when pair_aware_segmentation is on.
             memory_update_rule: str, inner-loop memory update operator.
                 "sgd"     : m = m + (-lr*g)                 (old pure-sum, no new params)
                 "convex"  : m = (1-a)*m + a*(-lr*g), a=sigmoid(lin(phi))   (Family 3)
@@ -309,6 +330,11 @@ class GradMemGPTConfig(PretrainedConfig):
         self.segment_size = segment_size
         self.seg_bptt = seg_bptt
 
+        # pair-aware segmentation (shared helpers imported from grad_memgpt)
+        self.pair_aware_segmentation = pair_aware_segmentation
+        self.pairs_per_segment = pairs_per_segment
+        self.pair_delim_token_ids = pair_delim_token_ids
+
         # adaptive update
         self.memory_update_rule = memory_update_rule
         self.gate_features = gate_features
@@ -355,6 +381,24 @@ class GradMemGPTConfig(PretrainedConfig):
             assert segment_size >= 1, f"segment_size must be >= 1, got {segment_size}"
         if seg_bptt is not None:
             assert seg_bptt >= 1, f"seg_bptt must be >= 1 or None, got {seg_bptt}"
+
+        # Validate pair-aware segmentation settings (mirrors grad_memgpt.py)
+        if pairs_per_segment is not None:
+            assert pair_aware_segmentation, \
+                "pairs_per_segment requires pair_aware_segmentation=True"
+            assert pairs_per_segment >= 1, \
+                f"pairs_per_segment must be >= 1, got {pairs_per_segment}"
+        if pair_aware_segmentation:
+            assert segment_size is None, \
+                "pair_aware_segmentation and segment_size are mutually exclusive " \
+                "(pair boundaries, not a token width, define the segments)"
+            assert pair_delim_token_ids is not None and len(pair_delim_token_ids) == 2, \
+                "pair_aware_segmentation requires pair_delim_token_ids=[bang_id, colon_id] " \
+                "(the runner auto-fills them from the tokenizer)"
+            assert all(isinstance(t, int) and t >= 0 for t in pair_delim_token_ids), \
+                f"pair_delim_token_ids must be two non-negative token ids, got {pair_delim_token_ids}"
+            assert pair_delim_token_ids[0] != pair_delim_token_ids[1], \
+                "pair_delim_token_ids entries must be distinct"
 
         # Validate adaptive-update settings
         assert memory_update_rule in ("sgd", "convex", "mamba"), \
@@ -483,6 +527,10 @@ class GradMemGPT(PreTrainedModel):
         self.n_segments = config.n_segments
         self.segment_size = config.segment_size
         self.seg_bptt = config.seg_bptt
+        # pair-aware segmentation (kv-retrieval); helpers shared with grad_memgpt.py
+        self.pair_aware_segmentation = getattr(config, "pair_aware_segmentation", False)
+        self.pairs_per_segment = getattr(config, "pairs_per_segment", None)
+        self.pair_delim_token_ids = getattr(config, "pair_delim_token_ids", None)
 
         # adaptive-update config
         self.memory_update_rule = config.memory_update_rule
@@ -1219,9 +1267,15 @@ class GradMemGPT(PreTrainedModel):
         n_q_max, Q = qids.shape[1], qids.shape[2]
         ignore_token_ids = kv_queries.get('ignore_token_ids', [])
 
-        # segment bounds (padded length, matching forward)
-        seq_len_padded = context_input_ids.size(1)
-        n_seg, seg_sz, _ = self._segment_bounds(seq_len_padded, self.n_segments, self.segment_size)
+        # segment count, matching forward's chunking. Pair-aware mode derives it
+        # from the detected pairs (same shared helper forward uses); otherwise
+        # mirror the fixed-width formula.
+        if self.pair_aware_segmentation:
+            n_seg, _ = pair_segment_spans(context_input_ids, pad_id, self.pair_delim_token_ids,
+                                          self.pairs_per_segment, self.n_segments)
+        else:
+            seq_len_padded = context_input_ids.size(1)
+            n_seg, seg_sz, _ = self._segment_bounds(seq_len_padded, self.n_segments, self.segment_size)
 
         src_seg_list, probe_seg_list, em_list = [], [], []
 
@@ -1389,20 +1443,32 @@ class GradMemGPT(PreTrainedModel):
                 # loss mask
                 mask = (lm_labels != -100)
 
-                # ---- split context into segments (ceil-padded to equal size) ---- #
-                seq_len = ctx_emb.size(1)
-                if self.segment_size is not None:
-                    n_segments = math.ceil(seq_len / self.segment_size)
-                    segment_size = self.segment_size
+                # ---- split context into segments ---- #
+                # Pair-aware mode (kv-retrieval): chunk at !K:V! pair boundaries
+                # (shared helpers from grad_memgpt.py) so a pair's key and value
+                # are never split across segments. Default: fixed-width windows,
+                # ceil-padded (RIGHT, so real tokens keep their trailing `|`
+                # boundary at segment ends).
+                if self.pair_aware_segmentation:
+                    n_segments, pair_spans = pair_segment_spans(
+                        context_input_ids, pad_id, self.pair_delim_token_ids,
+                        self.pairs_per_segment, self.n_segments)
+                    segment_size = None
                 else:
-                    n_segments = self.n_segments
-                    segment_size = (seq_len + n_segments - 1) // n_segments  # ceil division
-                pad_len = segment_size * n_segments - seq_len
-                if pad_len > 0:
-                    # right-pad so real tokens keep their trailing `|` boundary at segment ends
-                    ctx_emb = F.pad(ctx_emb, [0, 0, 0, pad_len], "constant", 0)
-                    mask = F.pad(mask, [0, pad_len], "constant", 0)
-                    lm_labels = F.pad(lm_labels, [0, pad_len], "constant", -100)
+                    pair_spans = None
+                    seq_len = ctx_emb.size(1)
+                    if self.segment_size is not None:
+                        n_segments = math.ceil(seq_len / self.segment_size)
+                        segment_size = self.segment_size
+                    else:
+                        n_segments = self.n_segments
+                        segment_size = (seq_len + n_segments - 1) // n_segments  # ceil division
+                    pad_len = segment_size * n_segments - seq_len
+                    if pad_len > 0:
+                        # right-pad so real tokens keep their trailing `|` boundary at segment ends
+                        ctx_emb = F.pad(ctx_emb, [0, 0, 0, pad_len], "constant", 0)
+                        mask = F.pad(mask, [0, pad_len], "constant", 0)
+                        lm_labels = F.pad(lm_labels, [0, pad_len], "constant", -100)
 
                 # per-segment memory snapshots (eval-only forgetting probe): one
                 # detached copy of the carried state after each segment's K steps,
@@ -1414,11 +1480,28 @@ class GradMemGPT(PreTrainedModel):
                 segment_mems = ([None] * n_segments) if collect_segment_mems else None
 
                 for seg_idx in range(n_segments):
-                    seg_start = seg_idx * segment_size
-                    seg_end = seg_start + segment_size
-                    seg_emb = ctx_emb[:, seg_start:seg_end, :]
-                    seg_mask = mask[:, seg_start:seg_end]
-                    seg_labels = lm_labels[:, seg_start:seg_end]
+                    if pair_spans is not None:
+                        # pair-aware: per-sample (start, end) token spans, right-
+                        # padded within the window to the batch-max group width
+                        # (real tokens at the left -> cumsum position ids give
+                        # them 0..k-1 exactly; pads are masked out anyway)
+                        starts, ends = pair_spans[seg_idx]
+                        width = max(e - s for s, e in zip(starts, ends))
+                        seg_emb = ctx_emb.new_zeros(B, width, ctx_emb.size(-1))
+                        seg_mask = torch.zeros(B, width, dtype=mask.dtype, device=device)
+                        seg_labels = torch.full((B, width), -100, dtype=lm_labels.dtype, device=device)
+                        for b in range(B):
+                            s, e = starts[b], ends[b]
+                            if e > s:
+                                seg_emb[b, :e - s] = ctx_emb[b, s:e]
+                                seg_mask[b, :e - s] = mask[b, s:e]
+                                seg_labels[b, :e - s] = lm_labels[b, s:e]
+                    else:
+                        seg_start = seg_idx * segment_size
+                        seg_end = seg_start + segment_size
+                        seg_emb = ctx_emb[:, seg_start:seg_end, :]
+                        seg_mask = mask[:, seg_start:seg_end]
+                        seg_labels = lm_labels[:, seg_start:seg_end]
 
                     # per-sample: does this segment have any real tokens?
                     seg_has_tokens = seg_mask.any(dim=1)  # [B]

@@ -34,6 +34,119 @@ def get_backbone(m):
     raise AttributeError("Could not locate backbone submodule")
 
 
+# ---------------------------------------------------------------- #
+# Shared pair-aware segmentation helpers (kv-retrieval).
+#
+# Module-level so BOTH grad_memgpt.py and grad_memgpt_adaptive.py (and the
+# runner's collator) share one implementation: the KV->segment division must
+# be identical everywhere or the forgetting-matrix attribution desyncs from
+# the model's actual chunking.
+# ---------------------------------------------------------------- #
+
+def detect_pair_ends(context_input_ids, pad_id, bang_id, colon_id):
+    """Per-sample ``!K:V!`` pair end positions, detected from the token ids.
+
+    Mirrors the collator's regex ``!([^!|:]+):([^!|]+)!`` with a small state
+    machine over the delimiter ids: a pair opens at ``!``, must see ``:``
+    before the closing ``!`` (bangs in between are ignored, matching the
+    regex's char classes for well-formed kv data). Scans only the real
+    (non-pad) prefix. The LAST pair's end is extended to the end of the
+    sample's real tokens so the trailing ``|`` (and any trailing noise)
+    belongs to the final segment instead of being dropped.
+
+    Returns list[B] of list[int] pair-end positions (exclusive, in token
+    coords of context_input_ids). Detection runs on CPU (one sync per
+    forward); the inner loop's backbone forwards dominate the cost anyway.
+    """
+    ids_cpu = context_input_ids.detach().to("cpu")
+    all_ends = []
+    for b in range(ids_cpu.size(0)):
+        row = ids_cpu[b].tolist()
+        real_len = len(row)
+        for p, t in enumerate(row):
+            if t == pad_id:
+                real_len = p
+                break
+        ends = []
+        in_pair = False
+        seen_colon = False
+        for p in range(real_len):
+            t = row[p]
+            if t == bang_id:
+                if not in_pair:
+                    in_pair, seen_colon = True, False
+                elif seen_colon:
+                    ends.append(p + 1)        # closing '!' included
+                    in_pair = False
+            elif t == colon_id and in_pair and not seen_colon:
+                seen_colon = True
+        if ends:
+            ends[-1] = real_len               # trailing '|' / noise -> last segment
+        all_ends.append(ends)
+    return all_ends
+
+
+def divide_pairs(n_pairs, pairs_per_segment, n_groups_cfg):
+    """Balanced pair->group sizes; the SAME logic must run collator-side.
+
+    pairs_per_segment mode: group g = pairs [g*P, (g+1)*P) -> ceil(n/P)
+    groups. Count mode: n_groups_cfg groups; the first n % n_groups_cfg
+    groups get one extra pair (8 pairs over 4 groups -> 2/2/2/2; 8 over 3
+    -> 3/3/2). Returns the list of group sizes (may contain zeros when
+    n_pairs < n_groups_cfg).
+    """
+    if pairs_per_segment is not None:
+        n_groups = (n_pairs + pairs_per_segment - 1) // pairs_per_segment
+        return [min(pairs_per_segment, n_pairs - g * pairs_per_segment)
+                for g in range(n_groups)]
+    base, rem = divmod(n_pairs, n_groups_cfg)
+    return [base + (1 if g < rem else 0) for g in range(n_groups_cfg)]
+
+
+def pair_segment_spans(context_input_ids, pad_id, delim_ids, pairs_per_segment, n_groups_cfg):
+    """Pair-aware chunking: per-segment (start, end) token spans per sample.
+
+    Segment g of a sample covers its group-g pairs contiguously
+    [end of pair group g-1, end of the group's last pair). The batch-global
+    segment count is the max over samples; samples with fewer groups get
+    empty (0, 0) spans for the tail indices (the segment loop's existing
+    all-pad skip handles them). Spans stay within each sample's real
+    tokens, so no whole-context padding is needed in this mode.
+
+    Returns (n_segments, list[n_segments] of (starts[B], ends[B]) int lists).
+    """
+    bang_id, colon_id = delim_ids
+    ends_per_sample = detect_pair_ends(context_input_ids, pad_id, bang_id, colon_id)
+    per_sample_groups = []
+    n_segments = 0
+    for ends in ends_per_sample:
+        n_pairs = len(ends)
+        sizes = divide_pairs(n_pairs, pairs_per_segment, n_groups_cfg)
+        spans = []
+        start_tok = 0          # token position where the current group starts
+        pair_idx = 0           # index of the group's first pair
+        for size in sizes:
+            if size > 0:
+                end_tok = ends[pair_idx + size - 1]   # token end of the group's last pair
+                spans.append((start_tok, end_tok))
+                start_tok = end_tok
+                pair_idx += size
+            else:
+                spans.append((0, 0))
+        per_sample_groups.append(spans)
+        n_segments = max(n_segments, len(spans))
+    B = context_input_ids.size(0)
+    spans_by_seg = []
+    for g in range(n_segments):
+        starts, ends_g = [], []
+        for spans in per_sample_groups:
+            s, e = spans[g] if g < len(spans) else (0, 0)
+            starts.append(s)
+            ends_g.append(e)
+        spans_by_seg.append((starts, ends_g))
+    return n_segments, spans_by_seg
+
+
 class GradMemGPTConfig(PretrainedConfig):
     """
     Configuration class for GradMemGPT.
@@ -111,6 +224,9 @@ class GradMemGPTConfig(PretrainedConfig):
                  learned_update_final_tanh=False,
                  learned_update_warmup_steps=0,
                  learned_update_normalize=False,
+                 pair_aware_segmentation=False,
+                 pairs_per_segment=None,
+                 pair_delim_token_ids=None,
                  **kwargs):
         """
         Args:
@@ -210,6 +326,20 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
                  equals self.lr exactly (under learned_update_treat_as_gradient), and total displacement is
                  bounded by K*lr. When on, the imitation warmup target is also normalized so warmup matches
                  directions. Same unidentifiable-scale rationale as stabilize_energy_head.
+             pair_aware_segmentation: bool, chunk the WRITE context at !K:V! pair boundaries instead of
+                 fixed-width token windows (kv-retrieval only). Pair boundaries are detected directly
+                 from context_input_ids via pair_delim_token_ids, so no extra batch plumbing is needed
+                 and eval paths (incl. forward_per_segment_eval) see the same chunking for free.
+                 Fixes the straddling pathology where a fixed window boundary falls between a pair's
+                 key and its value, making that pair unretrievable from any single Hopfield/GD slot.
+             pairs_per_segment: int|None, pair-aware mode: number of KV pairs per segment
+                 (n_segments = ceil(n_pairs / pairs_per_segment) per sample). None = divide this
+                 sample's pairs as equally as possible over hopfield_n_segments segments (the first
+                 n_pairs % hopfield_n_segments groups get the extra pair). Mutually exclusive with
+                 hopfield_segment_size.
+             pair_delim_token_ids: list[int]|None, [open/close '!' id, ':' id] used to detect pairs in
+                 context_input_ids. Auto-filled by the runner from the tokenizer when
+                 pair_aware_segmentation is on.
          """
         super().__init__(**kwargs)
 
@@ -308,6 +438,12 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.learned_update_final_tanh = learned_update_final_tanh
         self.learned_update_warmup_steps = learned_update_warmup_steps
         self.learned_update_normalize = learned_update_normalize
+
+        # Pair-aware segmentation (kv-retrieval): chunk the WRITE context at !K:V!
+        # pair boundaries instead of fixed token windows (see docstring above).
+        self.pair_aware_segmentation = pair_aware_segmentation
+        self.pairs_per_segment = pairs_per_segment
+        self.pair_delim_token_ids = pair_delim_token_ids
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample", "proj_rw"]
@@ -420,6 +556,24 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
             assert read_lora_alpha > 0, f"read_lora_alpha must be positive, got {read_lora_alpha}"
         assert freeze_backbone in (None, True, False), \
             f"freeze_backbone must be None/True/False, got {freeze_backbone}"
+
+        # Validate pair-aware segmentation settings (kv-retrieval)
+        if pairs_per_segment is not None:
+            assert pair_aware_segmentation, \
+                "pairs_per_segment requires pair_aware_segmentation=True"
+            assert pairs_per_segment >= 1, \
+                f"pairs_per_segment must be >= 1, got {pairs_per_segment}"
+        if pair_aware_segmentation:
+            assert hopfield_segment_size is None, \
+                "pair_aware_segmentation and hopfield_segment_size are mutually exclusive " \
+                "(pair boundaries, not a token width, define the segments)"
+            assert pair_delim_token_ids is not None and len(pair_delim_token_ids) == 2, \
+                "pair_aware_segmentation requires pair_delim_token_ids=[bang_id, colon_id] " \
+                "(the runner auto-fills them from the tokenizer)"
+            assert all(isinstance(t, int) and t >= 0 for t in pair_delim_token_ids), \
+                f"pair_delim_token_ids must be two non-negative token ids, got {pair_delim_token_ids}"
+            assert pair_delim_token_ids[0] != pair_delim_token_ids[1], \
+                "pair_delim_token_ids entries must be distinct"
 
 
 class GradMemGPT(PreTrainedModel):
@@ -550,6 +704,12 @@ class GradMemGPT(PreTrainedModel):
         self.learned_update_final_tanh = config.learned_update_final_tanh
         self.learned_update_warmup_steps = config.learned_update_warmup_steps
         self.learned_update_normalize = config.learned_update_normalize
+
+        # Pair-aware segmentation (kv-retrieval): chunk the WRITE context at !K:V!
+        # pair boundaries instead of fixed token windows.
+        self.pair_aware_segmentation = getattr(config, "pair_aware_segmentation", False)
+        self.pairs_per_segment = getattr(config, "pairs_per_segment", None)
+        self.pair_delim_token_ids = getattr(config, "pair_delim_token_ids", None)
 
         # current outer-loop step, stamped by the trainer before forward (for the recon schedule)
         self.current_train_step = 0
@@ -1102,7 +1262,11 @@ class GradMemGPT(PreTrainedModel):
             x_qry_comp = torch.cat([qry_emb, mem_prefix], dim=1)
             qry_attn_mask = torch.cat([qry_mask, hopf_mem_mask], dim=1)
 
-        position_ids = qry_attn_mask.cumsum(-1) - 1
+        # clamp to 0: an all-pad query (possible for INACTIVE probe slots when
+        # samples in a batch have different pair counts) would otherwise yield
+        # position_id = -1 and crash the position-embedding gather; real READ
+        # queries start with a non-pad token, so the clamp is a no-op there.
+        position_ids = (qry_attn_mask.cumsum(-1) - 1).clamp(min=0)
         outs_q = get_backbone(self.model)(inputs_embeds=x_qry_comp, attention_mask=qry_attn_mask,
                                           position_ids=position_ids, return_dict=True)
         features = outs_q.last_hidden_state[:, -self.n_mem_tokens:, :].view(B, -1)  # [B, M*d]
@@ -1147,6 +1311,30 @@ class GradMemGPT(PreTrainedModel):
         bounds = [(i * segment_size, min((i + 1) * segment_size, seq_len))
                   for i in range(n_segments)]
         return n_segments, segment_size, bounds
+
+    def _detect_pair_ends(self, context_input_ids, pad_id):
+        """Thin wrapper over the shared module-level detect_pair_ends."""
+        return detect_pair_ends(context_input_ids, pad_id, *self.pair_delim_token_ids)
+
+    @staticmethod
+    def _divide_pairs(n_pairs, pairs_per_segment, n_groups_cfg):
+        """Thin wrapper over the shared module-level divide_pairs.
+
+        Kept as the canonical entry point: the runner's collator
+        (build_kv_probe_queries) and the tests call GradMemGPT._divide_pairs so
+        the model-side division and the KV->segment attribution can never
+        diverge.
+        """
+        return divide_pairs(n_pairs, pairs_per_segment, n_groups_cfg)
+
+    def _pair_segment_spans(self, context_input_ids, pad_id):
+        """Thin wrapper over the shared module-level pair_segment_spans.
+
+        Count-mode grouping uses self.hopfield_n_segments (the main model's
+        segment-count knob).
+        """
+        return pair_segment_spans(context_input_ids, pad_id, self.pair_delim_token_ids,
+                                  self.pairs_per_segment, self.hopfield_n_segments)
 
     def _read_once(self, mem_batch, query_input_ids, read_st_batch, read_end_batch):
         """One batched READ against the given memory state(s).
@@ -1415,15 +1603,19 @@ class GradMemGPT(PreTrainedModel):
         qmask = kv_queries['mask']                      # [B, n_q]
         ignore_token_ids = kv_queries.get('ignore_token_ids', [])
 
-        # segment bounds (padded length, matching forward). forward() honors
-        # hopfield_segment_size only for hopfield/gated-delta runs -- mirror
-        # that condition so the probe boundaries match the actual chunking.
-        seq_len_padded = context_input_ids.size(1)
-        use_seg_size = (self.use_hopfield_memory or self.use_gated_delta_memory) \
-            and self.hopfield_segment_size is not None
-        n_seg, seg_sz, _ = self._segment_bounds(
-            seq_len_padded, self.hopfield_n_segments,
-            self.hopfield_segment_size if use_seg_size else None)
+        # segment count, matching forward's chunking. Pair-aware mode derives
+        # it from the detected pairs (same helper forward uses). Otherwise
+        # mirror the fixed-width formula (hopfield_segment_size honored only
+        # for hopfield/gated-delta runs).
+        if self.pair_aware_segmentation:
+            n_seg, _ = self._pair_segment_spans(context_input_ids, pad_id)
+        else:
+            seq_len_padded = context_input_ids.size(1)
+            use_seg_size = (self.use_hopfield_memory or self.use_gated_delta_memory) \
+                and self.hopfield_segment_size is not None
+            n_seg, seg_sz, _ = self._segment_bounds(
+                seq_len_padded, self.hopfield_n_segments,
+                self.hopfield_segment_size if use_seg_size else None)
 
         src_seg_list, probe_seg_list, em_list = [], [], []
 
@@ -1611,20 +1803,31 @@ class GradMemGPT(PreTrainedModel):
                 # loss mask
                 mask = (lm_labels != -100)
 
-                # Split context into segments (ceil-padded to equal size)
-                seq_len = ctx_emb.size(1)
-                if (self.use_hopfield_memory or self.use_gated_delta_memory) and self.hopfield_segment_size is not None:
-                    n_segments = math.ceil(seq_len / self.hopfield_segment_size)
-                    segment_size = self.hopfield_segment_size
+                # Split context into segments. Pair-aware mode (kv-retrieval):
+                # chunk at !K:V! pair boundaries so a pair's key and value are
+                # never split across segments -- a fixed window boundary between
+                # them makes the pair unretrievable from any single Hopfield/GD
+                # slot (its query matches the previous segment's stored key,
+                # which lacks the answer). Default: fixed-width windows,
+                # ceil-padded (LEFT) to equal size.
+                if self.pair_aware_segmentation:
+                    n_segments, pair_spans = self._pair_segment_spans(context_input_ids, pad_id)
+                    segment_size = None
                 else:
-                    n_segments = self.hopfield_n_segments
-                    segment_size = (seq_len + n_segments - 1) // n_segments  # ceil division
-                pad_len = segment_size * n_segments - seq_len
+                    pair_spans = None
+                    seq_len = ctx_emb.size(1)
+                    if (self.use_hopfield_memory or self.use_gated_delta_memory) and self.hopfield_segment_size is not None:
+                        n_segments = math.ceil(seq_len / self.hopfield_segment_size)
+                        segment_size = self.hopfield_segment_size
+                    else:
+                        n_segments = self.hopfield_n_segments
+                        segment_size = (seq_len + n_segments - 1) // n_segments  # ceil division
+                    pad_len = segment_size * n_segments - seq_len
 
-                if pad_len > 0:
-                    ctx_emb = F.pad(ctx_emb, [0, 0, pad_len, 0], "constant", 0)
-                    mask = F.pad(mask, [pad_len, 0], "constant", 0)
-                    lm_labels = F.pad(lm_labels, [pad_len, 0], "constant", -100)
+                    if pad_len > 0:
+                        ctx_emb = F.pad(ctx_emb, [0, 0, pad_len, 0], "constant", 0)
+                        mask = F.pad(mask, [pad_len, 0], "constant", 0)
+                        lm_labels = F.pad(lm_labels, [pad_len, 0], "constant", -100)
 
                 # per-boundary memory snapshots (eval-only forgetting probe):
                 # one entry per segment index. Empty segments (all-pad, possible
@@ -1637,11 +1840,28 @@ class GradMemGPT(PreTrainedModel):
                 segment_mems = ([None] * n_segments) if collect_segment_mems else None
 
                 for seg_idx in range(n_segments):
-                    seg_start = seg_idx * segment_size
-                    seg_end = seg_start + segment_size
-                    seg_emb = ctx_emb[:, seg_start:seg_end, :]
-                    seg_mask = mask[:, seg_start:seg_end]
-                    seg_labels = lm_labels[:, seg_start:seg_end]
+                    if pair_spans is not None:
+                        # pair-aware: per-sample (start, end) token spans, right-
+                        # padded within the window to the batch-max group width
+                        # (real tokens at the left, so cumsum position ids give
+                        # them 0..k-1 exactly; pads are masked out anyway)
+                        starts, ends = pair_spans[seg_idx]
+                        width = max(e - s for s, e in zip(starts, ends))
+                        seg_emb = ctx_emb.new_zeros(B, width, ctx_emb.size(-1))
+                        seg_mask = torch.zeros(B, width, dtype=mask.dtype, device=device)
+                        seg_labels = torch.full((B, width), -100, dtype=lm_labels.dtype, device=device)
+                        for b in range(B):
+                            s, e = starts[b], ends[b]
+                            if e > s:
+                                seg_emb[b, :e - s] = ctx_emb[b, s:e]
+                                seg_mask[b, :e - s] = mask[b, s:e]
+                                seg_labels[b, :e - s] = lm_labels[b, s:e]
+                    else:
+                        seg_start = seg_idx * segment_size
+                        seg_end = seg_start + segment_size
+                        seg_emb = ctx_emb[:, seg_start:seg_end, :]
+                        seg_mask = mask[:, seg_start:seg_end]
+                        seg_labels = lm_labels[:, seg_start:seg_end]
 
                     # Per-sample: does this segment have any real tokens?
                     seg_has_tokens = seg_mask.any(dim=1)  # [B]

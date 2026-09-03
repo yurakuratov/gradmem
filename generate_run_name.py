@@ -142,15 +142,22 @@ def generate_run_name_gradmemgpt(cfg: Dict[str, Any]) -> str:
     # Adaptive (segmented, gated-recurrence) fork. Encodes the cross-segment
     # carry + the gated memory update rule so runs are distinguishable:
     #   _seg<n>            n_segments (or seg<sz> if segment_size is used)
+    #   _pa<N>             pair-aware segmentation (N = pairs_per_segment if set)
     #   _<rule>            memory_update_rule (omitted for "sgd" -> identical to base)
     #   _<gate_features>/<granularity>/<retention>  gate config (only for gated rules)
     #   _bptt<n>           seg_bptt truncated-BPTT window (only if set)
+    # Segmentation knobs live in the unified `segmentation:` section (with the
+    # old `adaptive:` placement as fallback for un-migrated configs).
     adaptive = cfg.get('adaptive', {})
-    if adaptive:
-        seg_size = adaptive.get('segment_size')
-        n_seg = adaptive.get('n_segments', 1)
+    segmentation = cfg.get('segmentation', {})
+    if adaptive or segmentation:
+        seg_size = segmentation.get('segment_size', adaptive.get('segment_size'))
+        n_seg = segmentation.get('n_segments', adaptive.get('n_segments', 1))
         rule = adaptive.get('memory_update_rule', 'sgd')
         run_name += f"_seg{seg_size}" if seg_size else (f"_seg{n_seg}" if n_seg and n_seg != 1 else "")
+        if segmentation.get('pair_aware_segmentation') or adaptive.get('pair_aware_segmentation'):
+            pp = segmentation.get('pairs_per_segment', adaptive.get('pairs_per_segment'))
+            run_name += f"_pa{pp}" if pp else "_pa"
         if rule and rule != 'sgd':
             run_name += f"_{rule}"
             feats = adaptive.get('gate_features', 'grad_state')
@@ -212,7 +219,7 @@ def generate_run_name_rmt(cfg: Dict[str, Any]) -> str:
 
 # Sections searched when a bare (un-dotted) key is given to the generic builder.
 _KNOWN_SECTIONS = ['model', 'training', 'dataset', 'gradmem', 'rmt', 'hopfield',
-                   'gated_delta', 'curriculum', 'adaptive']
+                   'gated_delta', 'curriculum', 'adaptive', 'segmentation']
 
 
 def _resolve_key(cfg: Dict[str, Any], key: str):

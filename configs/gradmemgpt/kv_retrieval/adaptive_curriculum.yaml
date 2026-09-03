@@ -31,7 +31,7 @@
 run_naming:
   separator: "_"
   keys:
-    - {key: adaptive.segment_size, prefix: tk}
+    - {key: segmentation.segment_size, prefix: tk}
     - {key: adaptive.memory_update_rule, prefix: ur_}
     - {key: curriculum.threshold, prefix: thr}
     - {key: curriculum.levels, prefix: L}
@@ -83,11 +83,13 @@ gradmem:
   add_inner_loss_to_outer: true
   inner_loss_weight: 0.5
 
-adaptive:
-  # ---- segmentation (cross-segment carry) ---- #
-  # Exactly one of n_segments / segment_size should be set.
+# Unified segmentation (both models; see default.yaml for the full knob docs).
+# Exactly one of n_segments / segment_size should be set.
+segmentation:
   n_segments: 1            # equal-sized segments (segment_size = ceil(S / n_segments))
   segment_size: 16         # fixed tokens-per-segment (n_segments = ceil(S / segment_size))
+
+adaptive:
   seg_bptt: null           # truncated-BPTT window over segments (null = keep full graph)
 
   # ---- gated memory update ---- #

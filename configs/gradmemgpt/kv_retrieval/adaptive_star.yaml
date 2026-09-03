@@ -29,7 +29,7 @@
 run_naming:
   separator: "_"
   keys:
-    - {key: adaptive.n_segments, prefix: ns}
+    - {key: segmentation.n_segments, prefix: ns}
     - {key: adaptive.memory_update_rule, prefix: ur_}
     - {key: adaptive.star_perturbation, prefix: sp_}
     - {key: adaptive.star_weight, prefix: sw_}
@@ -80,14 +80,16 @@ gradmem:
   add_inner_loss_to_outer: true
   inner_loss_weight: 0.5
 
-adaptive:
-  # ---- segmentation ---- #
-  # kv4 context = BOS + 4x7 = 29 tokens, padded to 32. n_segments=2 ->
-  # boundary at 16: pairs {1,2} fully in seg 0, pair 3 straddles (attributed
-  # to seg 1, the later segment, per the collator convention), pair 4 in
-  # seg 1. (segment_size=14 would give ceil(32/14)=3 segments instead.)
+# Unified segmentation (both models; see default.yaml for the full knob docs).
+# kv4 context = BOS + 4x7 = 29 tokens, padded to 32. n_segments=2 ->
+# boundary at 16: pairs {1,2} fully in seg 0, pair 3 straddles (attributed
+# to seg 1, the later segment, per the collator convention), pair 4 in
+# seg 1. (segment_size=14 would give ceil(32/14)=3 segments instead.)
+# pair_aware_segmentation: true would move the boundary to a pair edge instead.
+segmentation:
   n_segments: 2
-  segment_size: null
+
+adaptive:
   seg_bptt: null
 
   # ---- memory update rule: plain SGD (STAR is orthogonal to the gated line) ---- #

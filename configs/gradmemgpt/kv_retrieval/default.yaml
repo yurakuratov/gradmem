@@ -70,3 +70,19 @@ gradmem:
   use_write_head: true
   add_inner_loss_to_outer: true
   inner_loss_weight: 0.5
+
+# Unified segmentation (both models): controls how the WRITE context is
+# chunked into segments. n_segments/segment_size are mutually exclusive
+# (segment_size wins: n_segments = ceil(S / segment_size)). Pair-aware mode
+# chunks at !K:V! pair boundaries instead of fixed-width token windows, so a
+# pair's key and value are never split across segments (a window boundary
+# between them makes the pair unretrievable from any single Hopfield/GD slot;
+# on N8-K2V2 with 4x16-token windows that hit pair 5 of 8 in every sample).
+# Delimiter token ids are auto-filled from the tokenizer. Exactly one sizing
+# mode: pairs_per_segment: N -> ceil(n_pairs/N) segments per sample; neither
+# -> divide n_pairs equally over n_segments (8 pairs / 4 -> 2/2/2/2).
+# segmentation:
+#   n_segments: 4
+#   segment_size: null
+#   pair_aware_segmentation: true
+#   pairs_per_segment: 2

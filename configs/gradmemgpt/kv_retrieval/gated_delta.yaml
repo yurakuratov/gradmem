@@ -40,9 +40,11 @@ gradmem:
   inner_loss_weight: 0.5
   memory_update: gradient  # gradient | forward (RMT style)
 
-hopfield:
-  hopfield_segment_size: 32  # shared segmenting logic (also used by gated_delta)
-  hopfield_n_segments: 1
+# Unified segmentation (both models; see default.yaml for the full knob docs).
+# segment_size is the shared segmenting logic (also used by gated_delta).
+segmentation:
+  n_segments: 1
+  segment_size: 32
 
 gated_delta:
   use_gated_delta_memory: true

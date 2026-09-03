@@ -99,7 +99,7 @@ def apply_overrides(cfg: dict, overrides: dict) -> dict:
 
     for key, value in overrides.items():
         applied = False
-        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'gated_delta', 'dataset', 'curriculum', 'adaptive']:
+        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'gated_delta', 'dataset', 'curriculum', 'adaptive', 'segmentation']:
             if section in result and key in result[section]:
                 result[section][key] = value
                 applied = True
@@ -247,6 +247,23 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
 
     adaptive = cfg.get('adaptive', {})
     for key, val in adaptive.items():
+        if val is None:
+            continue
+        cli_key = key.replace('_', '-')
+        if val is True:
+            args.append(f'--{cli_key}')
+        elif val is False:
+            args.append(f'--{cli_key}=False')
+        else:
+            args.append(f'--{cli_key}={val}')
+
+    # Unified segmentation section: ONE surface for WRITE-context chunking in
+    # BOTH models. Emits the unified CLI args; the runner maps them onto
+    # grad_memgpt.py's hopfield_n_segments/hopfield_segment_size knobs and uses
+    # them natively for the adaptive fork. (Old hopfield:/adaptive: placement
+    # of these keys still works via the deprecated CLI aliases.)
+    segmentation = cfg.get('segmentation', {})
+    for key, val in segmentation.items():
         if val is None:
             continue
         cli_key = key.replace('_', '-')

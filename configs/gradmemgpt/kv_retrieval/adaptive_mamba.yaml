@@ -31,7 +31,7 @@
 run_naming:
   separator: "_"
   keys:
-    - {key: adaptive.segment_size, prefix: tk}
+    - {key: segmentation.segment_size, prefix: tk}
     - {key: adaptive.memory_update_rule, prefix: ur_}
     - {key: adaptive.gate_features, prefix: gf_}
     - {key: gradmem.use_mem_proj, prefix: proj}
@@ -87,11 +87,13 @@ gradmem:
   add_inner_loss_to_outer: true
   inner_loss_weight: 0.5
 
-adaptive:
-  # ---- segmentation (cross-segment carry) ---- #
-  # Exactly one of n_segments / segment_size should be set.
+# Unified segmentation (both models; see default.yaml for the full knob docs).
+# Exactly one of n_segments / segment_size should be set.
+segmentation:
   n_segments: 1            # equal-sized segments (segment_size = ceil(S / n_segments))
-  segment_size: 16       # fixed tokens-per-segment (n_segments = ceil(S / segment_size))
+  segment_size: 16         # fixed tokens-per-segment (n_segments = ceil(S / segment_size))
+
+adaptive:
   seg_bptt: null           # truncated-BPTT window over segments (null = keep full graph)
 
   # ---- gated memory update ---- #
@@ -108,3 +110,10 @@ adaptive:
   convex_bias_init: 3.0           # convex rule: a = sigmoid(bias) -> 0.953
   mamba_retain_bias_init: -5.0    # exp retention Delta = softplus(bias) -> 0.007
   mamba_write_bias_init: 3.0      # write gate w = sigmoid(bias) -> 0.953
+
+  # ---- VAE-style memory regularisation (default-off; uncomment to enable) ---- #
+  # See "Recent additions" in AGENTS.md for the rationale. Both knobs are 0 by
+  # default, so omitting this block reproduces the pre-regulariser behaviour.
+  # mem_noise_std: 0.05          # sigma: Gaussian noise injected into mem before READ (train-only)
+  # mem_prior_weight: 0.1        # lambda: MSE(m_0, m_final) outer-loop prior (m_0 detached)
+  # mem_prior_anneal_steps: 2000 # lambda warmup 0 -> mem_prior_weight over this many steps

@@ -17,7 +17,7 @@
 run_naming:
   separator: "_"
   keys:
-    - {key: adaptive.n_segments, prefix: ns}
+    - {key: segmentation.n_segments, prefix: ns}
     - {key: gradmem.n_mem_tokens, prefix: m}
     - {key: gradmem.K, prefix: K}
     - {key: dataset.data_name, prefix: ds_}
@@ -62,9 +62,11 @@ gradmem:
   add_inner_loss_to_outer: true
   inner_loss_weight: 0.5
 
-adaptive:
+# Unified segmentation (both models; see default.yaml for the full knob docs)
+segmentation:
   n_segments: 2          # grid axis: 1 (one-shot control) vs 2 (sequential)
-  segment_size: null
+
+adaptive:
   seg_bptt: null
   memory_update_rule: "sgd"
   # STAR off: pure-SGD multi-segment baseline (the thing to beat / diagnose)

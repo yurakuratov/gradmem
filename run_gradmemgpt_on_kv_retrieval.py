@@ -478,7 +478,7 @@ def _isnan(x):
 
 
 def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segment_size=None,
-                           seg_pad_side='right'):
+                           seg_pad_side='right', pairs_per_segment=None, pair_aware_n_segments=None):
     """Build the `kv_queries` probe dict for one batch of raw samples.
 
     Shared by the per-segment forgetting eval (make_collate_fn_per_segment)
@@ -488,12 +488,19 @@ def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segmen
     the 'V!|' positions and the pair's source model-segment. EM / KL are
     scored only at target positions, mirroring compute_metrics_fn.
 
-    KV->segment attribution MUST match the model's forward chunking: the
-    model chunks the PADDED context (right-padded, so a KV's real char
-    position -- 1 char/token for the KV alphabet -- equals its padded token
-    position) via ceil(padded_len / n_segments). A pair straddling a segment
-    boundary is attributed to the LATER segment (it is not fully written
-    until then).
+    KV->segment attribution MUST match the model's forward chunking. Two
+    chunking regimes:
+
+    - Pair-aware (pairs_per_segment / pair_aware_n_segments given; takes
+      precedence): the model chunks at !K:V! pair boundaries and groups each
+      sample's pairs with GradMemGPT._divide_pairs -- attribution is by pair
+      INDEX through the SAME division, so it stays aligned by construction
+      (no token-window arithmetic at all).
+    - Fixed-width windows: the model chunks the PADDED context (right-padded,
+      so a KV's real char position -- 1 char/token for the KV alphabet --
+      equals its padded token position) via ceil(padded_len / n_segments). A
+      pair straddling a segment boundary is attributed to the LATER segment
+      (it is not fully written until then).
 
     seg_pad_side selects which extra pad the consuming model adds to reach a
     segment-aligned length: grad_memgpt_adaptive.py RIGHT-pads (real tokens
@@ -509,6 +516,7 @@ def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segmen
 
     pad_id = tokenizer.pad_token_id
     B = len(batch)
+    pair_aware = pairs_per_segment is not None or pair_aware_n_segments is not None
 
     per_sample = []  # list of [(q_ids, target_mask, seg_idx), ...]
     q_strs, t_strs = [], []   # batched through the tokenizer (one call each)
@@ -518,21 +526,33 @@ def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segmen
         for m in _re.finditer(r'!([^!|:]+):([^!|]+)!', text):
             k, v = m.group(1), m.group(2)
             pairs.append((m.start(), m.end(), k, v))
-        if segment_size is not None:
-            n_seg = max(1, math.ceil(padded_len / segment_size))
-            seg_sz = segment_size
+        if pair_aware:
+            # attribute by pair index through the model's exact division
+            sizes = GradMemGPT._divide_pairs(len(pairs), pairs_per_segment,
+                                             pair_aware_n_segments or 1)
+            pair_srcs = []
+            for g, size in enumerate(sizes):
+                pair_srcs.extend([g] * size)
         else:
-            n_seg = n_segments if n_segments else 1
-            seg_sz = max(1, math.ceil(padded_len / n_seg))
-        # extra LEFT-pad grad_memgpt.py adds before chunking (0 for the
-        # right-padding adaptive fork)
-        seg_pad_len = (seg_sz * n_seg - padded_len) if seg_pad_side == 'left' else 0
+            pair_srcs = None
+            if segment_size is not None:
+                n_seg = max(1, math.ceil(padded_len / segment_size))
+                seg_sz = segment_size
+            else:
+                n_seg = n_segments if n_segments else 1
+                seg_sz = max(1, math.ceil(padded_len / n_seg))
+            # extra LEFT-pad grad_memgpt.py adds before chunking (0 for the
+            # right-padding adaptive fork)
+            seg_pad_len = (seg_sz * n_seg - padded_len) if seg_pad_side == 'left' else 0
         sample_pairs = []
-        for ts, te, k, v in pairs:
-            # Attribute the KV to the segment containing its LAST token (the
-            # closing '!' of !K:V!): the pair is only fully written -- and thus
-            # retrievable -- once the model has processed that segment.
-            src_seg = min((seg_pad_len + te - 1) // seg_sz, n_seg - 1)
+        for j, (ts, te, k, v) in enumerate(pairs):
+            if pair_srcs is not None:
+                src_seg = pair_srcs[j]
+            else:
+                # Attribute the KV to the segment containing its LAST token (the
+                # closing '!' of !K:V!): the pair is only fully written -- and thus
+                # retrievable -- once the model has processed that segment.
+                src_seg = min((seg_pad_len + te - 1) // seg_sz, n_seg - 1)
             q_strs.append(f'?!{k}:')               # teacher-forced query '?!K:'
             t_strs.append(f'{v}!|')                # target 'V!|'
             sample_pairs.append(src_seg)
@@ -579,7 +599,8 @@ def build_kv_probe_queries(batch, tokenizer, padded_len, n_segments=None, segmen
 
 
 def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=None,
-                                segment_size=None, seg_pad_side='right'):
+                                segment_size=None, seg_pad_side='right',
+                                pairs_per_segment=None, pair_aware_n_segments=None):
     """Build a collator that emits, per sample, the WRITE context PLUS one probe
     query per KV pair in the context (with the source model-segment of each KV).
 
@@ -588,15 +609,13 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
       query_input_ids: [n_kv, Q]   tokenizing ``?!K:`` for each KV
       target_ids:      [n_kv, T]   tokenizing ``V!|`` for each KV
       seg_idx:         [n_kv]      source model-segment (computed with the same
-                                   ceil-division as the model's forward)
+                                   division as the model's forward)
     These are stacked into per-batch padded tensors so the model can batch-probe.
 
-    The KV pair -> segment attribution matches the model's segmentation exactly
-    (the model shares the same _segment_bounds logic). KV pairs straddling a
-    segment boundary are attributed to the later segment (not fully written
-    until then). ``seg_pad_side`` selects the consuming model's extra-pad side
-    (see build_kv_probe_queries): 'right' for grad_memgpt_adaptive.py, 'left'
-    for grad_memgpt.py.
+    The KV pair -> segment attribution matches the model's segmentation exactly:
+    pass pairs_per_segment / pair_aware_n_segments for the pair-aware chunking
+    mode (attribution by pair index), or n_segments / segment_size +
+    seg_pad_side for fixed-width windows (see build_kv_probe_queries).
     """
 
     def collate_fn_per_segment(batch, tokenizer, max_context_length=None):
@@ -613,7 +632,9 @@ def make_collate_fn_per_segment(tokenizer, max_context_length=None, n_segments=N
         # mirroring compute_metrics_fn.
         kv_queries = build_kv_probe_queries(batch, tokenizer, context_input_ids.size(1),
                                             n_segments=n_segments, segment_size=segment_size,
-                                            seg_pad_side=seg_pad_side)
+                                            seg_pad_side=seg_pad_side,
+                                            pairs_per_segment=pairs_per_segment,
+                                            pair_aware_n_segments=pair_aware_n_segments)
 
         return {
             'input_ids': {
@@ -937,6 +958,9 @@ class ExperimentArgs:
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
     inner_loss_weight: Optional[float] = field(default=None)
     use_hopfield_memory: Optional[bool] = field(default=False)
+    # DEPRECATED aliases of the unified --n-segments / --segment-size (the
+    # `segmentation:` YAML section). Kept so old configs/manifests/scripts keep
+    # working; adopted at startup unless the unified args are also set.
     hopfield_n_segments: Optional[int] = field(default=1)
     hopfield_segment_size: Optional[int] = field(default=None)
     hopfield_retrieval_mode: Optional[str] = field(default="softmax")
@@ -979,6 +1003,16 @@ class ExperimentArgs:
     learned_update_final_tanh: Optional[bool] = field(default=False)
     learned_update_warmup_steps: Optional[int] = field(default=0)
     learned_update_normalize: Optional[bool] = field(default=False)
+    # ---- pair-aware segmentation (kv-retrieval; both models) ---- #
+    # Chunk the WRITE context at !K:V! pair boundaries instead of fixed-width
+    # token windows, so a pair's key and value are never split across segments
+    # (a window boundary between them makes the pair unretrievable from any
+    # single Hopfield/GD slot). Exactly one sizing mode:
+    #   pairs_per_segment=N          -> n_segments = ceil(n_pairs / N) per sample
+    #   neither (default)            -> divide n_pairs equally over n_segments
+    # The delimiter token ids are auto-filled from the tokenizer.
+    pair_aware_segmentation: Optional[bool] = field(default=False)
+    pairs_per_segment: Optional[int] = field(default=None)
     # Curriculum learning parameters
     curriculum_enabled: Optional[bool] = field(default=False)
     curriculum_threshold: Optional[float] = field(default=0.95)
@@ -999,11 +1033,10 @@ class ExperimentArgs:
     # n_seg] forgetting matrix (row = KV's source segment, col = probe-after-seg).
     # The full matrix is logged as a table artifact + comet table; only 3 summary
     # scalars hit the metric stream (forget_diag_mean / forget_seg0_final /
-    # forget_slope). Works with the adaptive fork (segments from n_segments /
-    # segment_size) AND the main grad_memgpt model (segments from
-    # hopfield_n_segments / hopfield_segment_size; plain runs measure the
-    # per-segment memory RESET, hopfield/gated-delta runs measure retrieval
-    # interference in the accumulating store).
+    # forget_slope). Works with both models via the unified segmentation args
+    # (plain grad_memgpt runs measure the per-segment memory RESET;
+    # hopfield/gated-delta/adaptive carried-memory runs measure retrieval
+    # interference inside one memory).
     per_segment_eval: Optional[bool] = field(default=False)
     per_segment_eval_steps: Optional[int] = field(default=None)  # default 5*eval_steps if None
     # ---- adaptive (segmented, gated-recurrence) fork (grad_memgpt_adaptive) ---- #
@@ -1011,6 +1044,10 @@ class ExperimentArgs:
     # WRITE context into chunks written into the SAME memory (cross-segment
     # carry); memory_update_rule selects the gated recurrence. See
     # grad_memgpt_adaptive.py module docstring. Defaults reproduce the SGD path.
+    # n_segments/segment_size are the UNIFIED segmentation args: they control
+    # the adaptive fork natively and map onto grad_memgpt.py's
+    # hopfield_n_segments/hopfield_segment_size (the `segmentation:` YAML
+    # section emits them for both models).
     n_segments: Optional[int] = field(default=1)
     segment_size: Optional[int] = field(default=None)
     seg_bptt: Optional[int] = field(default=None)
@@ -1203,6 +1240,29 @@ def main(config_path: Optional[str] = None):
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
+    # ---- unified segmentation args --------------------------------------- #
+    # ONE segmentation surface (the `segmentation:` YAML section -> --n_segments
+    # / --segment_size / --pair_aware_segmentation / --pairs_per_segment) for
+    # BOTH models: grad_memgpt.py maps them onto its hopfield_n_segments /
+    # hopfield_segment_size config knobs, the adaptive fork uses them natively.
+    # The old --hopfield-n-segments / --hopfield-segment-size CLI args are
+    # deprecated aliases (old configs/manifests keep working); mixing old and
+    # new is rejected so the intent can't be ambiguous.
+    if (args.hopfield_n_segments not in (None, 1)) or (args.hopfield_segment_size is not None):
+        if (args.n_segments not in (None, 1)) or (args.segment_size is not None):
+            raise ValueError(
+                "both --hopfield-n-segments/--hopfield-segment-size (deprecated) and "
+                "--n-segments/--segment-size given; use only the unified segmentation args")
+        args.n_segments = args.hopfield_n_segments if args.hopfield_n_segments is not None else 1
+        args.segment_size = args.hopfield_segment_size
+        logger.info(f'deprecated hopfield segmentation args adopted: '
+                    f'n_segments={args.n_segments}, segment_size={args.segment_size}')
+    # delimiters auto-filled from the tokenizer (the models detect !K:V! pairs
+    # from context_input_ids; no extra batch plumbing needed)
+    pair_delim_ids = ([tokenizer.convert_tokens_to_ids('!'),
+                       tokenizer.convert_tokens_to_ids(':')]
+                      if args.pair_aware_segmentation else None)
+
     gradmem_config = GradMemGPTConfig(
         pretrained_model=args.pretrained_model, base_config=config,
         n_mem_tokens=args.n_mem_tokens, K=args.K,
@@ -1228,8 +1288,9 @@ def main(config_path: Optional[str] = None):
         add_inner_loss_to_outer=args.add_inner_loss_to_outer,
         inner_loss_weight=args.inner_loss_weight,
         use_hopfield_memory=args.use_hopfield_memory,
-        hopfield_n_segments=args.hopfield_n_segments,
-        hopfield_segment_size=args.hopfield_segment_size,
+        # unified segmentation surface -> the main model's config knobs
+        hopfield_n_segments=args.n_segments,
+        hopfield_segment_size=args.segment_size,
         hopfield_retrieval_mode=args.hopfield_retrieval_mode,
         hopfield_beta_init=args.hopfield_beta_init,
         use_separate_hopfield_mem=args.use_separate_hopfield_mem,
@@ -1267,7 +1328,10 @@ def main(config_path: Optional[str] = None):
         learned_update_treat_as_gradient=args.learned_update_treat_as_gradient,
         learned_update_final_tanh=args.learned_update_final_tanh,
         learned_update_warmup_steps=args.learned_update_warmup_steps,
-        learned_update_normalize=args.learned_update_normalize
+        learned_update_normalize=args.learned_update_normalize,
+        pair_aware_segmentation=args.pair_aware_segmentation,
+        pairs_per_segment=args.pairs_per_segment,
+        pair_delim_token_ids=pair_delim_ids,
     )
 
     # ---- model selection ------------------------------------------------ #
@@ -1303,6 +1367,10 @@ def main(config_path: Optional[str] = None):
             n_segments=args.n_segments,
             segment_size=args.segment_size,
             seg_bptt=args.seg_bptt,
+            # unified pair-aware segmentation (shared helpers with grad_memgpt.py)
+            pair_aware_segmentation=args.pair_aware_segmentation,
+            pairs_per_segment=args.pairs_per_segment,
+            pair_delim_token_ids=pair_delim_ids,
             memory_update_rule=args.memory_update_rule,
             gate_features=args.gate_features,
             gate_granularity=args.gate_granularity,
@@ -1333,8 +1401,9 @@ def main(config_path: Optional[str] = None):
         # Adaptive segments need the full (un-truncated) context so every
         # segment has real tokens. The shared collator already disables
         # truncation when use_hopfield_memory/use_gated_delta_memory is set, so
-        # set the gated_delta flag to reuse that path for segmented configs too.
-        if (args.n_segments > 1) or (args.segment_size is not None):
+        # set the gated_delta flag to reuse that path for segmented configs too
+        # (also under pair-aware chunking, whose boundaries assume full pairs).
+        if (args.n_segments > 1) or (args.segment_size is not None) or args.pair_aware_segmentation:
             args.use_gated_delta_memory = True
         model = AdaptiveGM(gradmem_config)
     else:
@@ -1380,7 +1449,7 @@ def main(config_path: Optional[str] = None):
 
     def data_collator(batch):
         out = collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
-                         hopfield=args.use_hopfield_memory or args.use_gated_delta_memory)
+                         hopfield=args.use_hopfield_memory or args.use_gated_delta_memory or args.pair_aware_segmentation)
         if use_probes:
             out['kv_queries'] = build_kv_probe_queries(
                 batch, tokenizer, out['input_ids']['context_input_ids'].size(1),
@@ -1432,30 +1501,39 @@ def main(config_path: Optional[str] = None):
         args_total_bs = args.per_device_batch_size * accel.num_processes * args.gradient_accumulation_steps
         assert args.total_batch_size == args_total_bs
 
-    # ---- per-segment forgetting eval: per-model segmentation source ---- #
+    # ---- per-segment forgetting eval: segmentation source (both models) ---- #
     # The forgetting matrix probes the memory after each model-segment, so the
     # KV -> segment attribution MUST use the segmentation the trained model
-    # actually chunks with: the adaptive fork chunks with n_segments /
-    # segment_size (right-pad), grad_memgpt.py with hopfield_n_segments /
-    # hopfield_segment_size (left-pad -> seg_pad_side='left' compensates the
-    # attribution offset). grad_memgpt.py honors hopfield_segment_size only
-    # when hopfield / gated-delta is enabled (mirror of forward()'s condition).
-    # NOTE (curriculum): hopfield_n_segments is stage-overridable
+    # actually chunks with. Both models share the unified args: pair-aware mode
+    # attributes by pair INDEX through the shared division (see
+    # build_kv_probe_queries); fixed-width windows use n_segments / segment_size
+    # with a per-model extra-pad side (adaptive right-pads, grad_memgpt.py
+    # left-pads -> seg_pad_side compensates the attribution offset). The main
+    # model honors segment_size only when hopfield / gated-delta is enabled
+    # (mirror of forward()'s condition).
+    # NOTE (curriculum): the segmentation knobs are stage-overridable
     # (MODEL_PARAM_MAP) but the per-segment collator is built once below, so
-    # overriding it per stage would desync the probe attribution.
-    if use_adaptive_model:
+    # overriding them per stage would desync the probe attribution.
+    if args.pair_aware_segmentation:
+        # attribution by pair index; segment count is data-driven, so the
+        # trainer accumulator grows dynamically (n_segments=None)
+        per_seg_pairs_per_segment = args.pairs_per_segment
+        per_seg_pair_aware_n = None if args.pairs_per_segment is not None else args.n_segments
+        per_seg_n_segments_arg = None
+        per_seg_segment_size_arg = None
+        per_seg_pad_side = 'right'   # unused in pair-aware mode
+    else:
+        per_seg_pairs_per_segment = None
+        per_seg_pair_aware_n = None
         per_seg_n_segments_arg = args.n_segments
         per_seg_segment_size_arg = args.segment_size
-        per_seg_pad_side = 'right'
-    else:
-        per_seg_n_segments_arg = args.hopfield_n_segments
-        per_seg_segment_size_arg = (args.hopfield_segment_size
-                                    if (args.use_hopfield_memory or args.use_gated_delta_memory)
-                                    else None)
-        per_seg_pad_side = 'left'
-    # hopfield / gated-delta runs disable context truncation in the training
-    # collator; the forgetting collator must match or segments misalign
-    per_seg_max_context = None if (args.use_hopfield_memory or args.use_gated_delta_memory) \
+        if not use_adaptive_model and not (args.use_hopfield_memory or args.use_gated_delta_memory):
+            per_seg_segment_size_arg = None   # main model honors segment_size only with hopfield/gd
+        per_seg_pad_side = 'right' if use_adaptive_model else 'left'
+    # hopfield / gated-delta / pair-aware runs disable context truncation in the
+    # training collator; the forgetting collator must match or segments misalign
+    per_seg_max_context = None if (args.use_hopfield_memory or args.use_gated_delta_memory
+                                   or args.pair_aware_segmentation) \
         else args.max_context_length
 
     if args.curriculum_enabled:
@@ -1475,13 +1553,20 @@ def main(config_path: Optional[str] = None):
             stage_overrides = {int(k): v for k, v in overrides_dict.items()}
             logger.info(f'curriculum stage overrides: {stage_overrides}')
 
+        # unified segmentation overrides route to each model's attr name; the
+        # deprecated hopfield_* names keep working
+        _seg_n_attr = 'n_segments' if use_adaptive_model else 'hopfield_n_segments'
+        _seg_sz_attr = 'segment_size' if use_adaptive_model else 'hopfield_segment_size'
         MODEL_PARAM_MAP = {
             'inner_lr': ('lr', 'lr'),
             'inner_clip_value': ('inner_clip_value', 'inner_clip_value'),
             'inner_clip_norm': ('inner_clip_norm', 'inner_clip_norm'),
             'hopfield_bptt_segments': ('hopfield_bptt_segments', 'hopfield_bptt_segments'),
-            'hopfield_n_segments': ('hopfield_n_segments', 'hopfield_n_segments'),
-            'hopfield_segment_size': ('hopfield_segment_size', 'hopfield_segment_size'),
+            'hopfield_n_segments': (_seg_n_attr, _seg_n_attr),
+            'hopfield_segment_size': (_seg_sz_attr, _seg_sz_attr),
+            'n_segments': (_seg_n_attr, _seg_n_attr),
+            'segment_size': (_seg_sz_attr, _seg_sz_attr),
+            'pairs_per_segment': ('pairs_per_segment', 'pairs_per_segment'),
             'hopfield_beta_init': ('hopfield_beta_init', 'hopfield_beta_init'),
             'hopfield_retrieval_mode': ('hopfield_retrieval_mode', 'hopfield_retrieval_mode'),
             'gated_delta_state_dim': ('gated_delta_state_dim', 'gated_delta_state_dim'),
@@ -1511,7 +1596,9 @@ def main(config_path: Optional[str] = None):
             per_segment_collator = make_collate_fn_per_segment(
                 tokenizer, max_context_length=per_seg_max_context,
                 n_segments=per_seg_n_segments_arg, segment_size=per_seg_segment_size_arg,
-                seg_pad_side=per_seg_pad_side)
+                seg_pad_side=per_seg_pad_side,
+                pairs_per_segment=per_seg_pairs_per_segment,
+                pair_aware_n_segments=per_seg_pair_aware_n)
             per_seg_eval_steps = args.per_segment_eval_steps
             if per_seg_eval_steps is None:
                 per_seg_eval_steps = 5 * args.eval_steps
@@ -1520,7 +1607,8 @@ def main(config_path: Optional[str] = None):
                 f"eval_steps ({args.eval_steps})"
             logger.info(f'curriculum per-segment forgetting eval enabled: '
                         f'n_segments={per_seg_n_segments_arg}, segment_size={per_seg_segment_size_arg}, '
-                        f'pad_side={per_seg_pad_side}, '
+                        f'pad_side={per_seg_pad_side}, pairs_per_segment={per_seg_pairs_per_segment}, '
+                        f'pair_aware_n_segments={per_seg_pair_aware_n}, '
                         f'cadence={per_seg_eval_steps} steps (+ forced at each stage boundary)')
 
         all_metrics = {}
@@ -1558,7 +1646,7 @@ def main(config_path: Optional[str] = None):
 
             def stage_data_collator(batch):
                 out = collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
-                                 hopfield=args.use_hopfield_memory or args.use_gated_delta_memory)
+                                 hopfield=args.use_hopfield_memory or args.use_gated_delta_memory or args.pair_aware_segmentation)
                 if use_probes:
                     out['kv_queries'] = build_kv_probe_queries(
                         batch, tokenizer, out['input_ids']['context_input_ids'].size(1),
@@ -1722,7 +1810,9 @@ def main(config_path: Optional[str] = None):
             per_segment_collator = make_collate_fn_per_segment(
                 tokenizer, max_context_length=per_seg_max_context,
                 n_segments=per_seg_n_segments_arg, segment_size=per_seg_segment_size_arg,
-                seg_pad_side=per_seg_pad_side)
+                seg_pad_side=per_seg_pad_side,
+                pairs_per_segment=per_seg_pairs_per_segment,
+                pair_aware_n_segments=per_seg_pair_aware_n)
             per_seg_eval_steps = args.per_segment_eval_steps
             if per_seg_eval_steps is None:
                 per_seg_eval_steps = 5 * args.eval_steps
@@ -1731,6 +1821,8 @@ def main(config_path: Optional[str] = None):
                 f"eval_steps ({args.eval_steps})"
             logger.info(f'per-segment forgetting eval enabled: n_segments={per_seg_n_segments_arg}, '
                         f'segment_size={per_seg_segment_size_arg}, pad_side={per_seg_pad_side}, '
+                        f'pairs_per_segment={per_seg_pairs_per_segment}, '
+                        f'pair_aware_n_segments={per_seg_pair_aware_n}, '
                         f'cadence={per_seg_eval_steps} steps')
 
         # ---- trainer selection ---- #
