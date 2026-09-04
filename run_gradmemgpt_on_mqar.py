@@ -20,6 +20,7 @@ from transformers import (
 )
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
+from resume_utils import restore_resume_args
 from zoology_mqar_data import (
     ZOOLOGY_MQAR_SOURCE,
     build_mqar_datasets,
@@ -449,19 +450,9 @@ if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
     args = parser.parse_args_into_dataclasses()[0]
 
+    restore_resume_args(args, logger)
     if args.init_checkpoint is not None and args.resume_from_checkpoint is not None:
         raise ValueError('--init_checkpoint and --resume_from_checkpoint are mutually exclusive')
-    if args.resume_from_checkpoint is not None:
-        resume_path = Path(args.resume_from_checkpoint).resolve()
-        output_path = Path(args.exp_path).resolve()
-        if not resume_path.is_dir():
-            raise ValueError(f'Resume checkpoint directory does not exist: {resume_path}')
-        if resume_path.parent != output_path:
-            raise ValueError(
-                '--resume_from_checkpoint must be a checkpoint directly inside --exp_path so logs continue '
-                f'in the same run: checkpoint={resume_path}, exp_path={output_path}'
-            )
-        args.resume_from_checkpoint = str(resume_path)
 
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
@@ -520,7 +511,7 @@ if __name__ == '__main__':
     valid_dataset = GradMemMQARDataset(source_valid, context_size=context_size)
     output_dir = Path(args.exp_path)
 
-    if accel.is_main_process:
+    if accel.is_main_process and args.resume_from_checkpoint is None:
         noise_enabled = dataset_metadata.get('noise_tokens', 0) > 0
         if args.dense_queries:
             query_layout = (

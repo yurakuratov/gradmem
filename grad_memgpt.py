@@ -1140,7 +1140,7 @@ class GradMemGPT(PreTrainedModel):
             for source_key in consumed_keys:
                 state_dict.pop(source_key)
 
-        # Checkpoints created before per-depth gain tracking stored scalar buffers.
+        # Preserve compatible per-depth gain state when loading checkpoints with a different K.
         for name in (
             "energy_memory_search_gain_ema",
             "energy_memory_search_gain_ema_initialized",
@@ -1148,8 +1148,16 @@ class GradMemGPT(PreTrainedModel):
             key = prefix + name
             value = state_dict.get(key)
             target = getattr(self, name)
-            if value is not None and value.numel() == 1 and value.shape != target.shape:
+            if value is None or value.shape == target.shape:
+                continue
+            if value.numel() == 1:
+                # Checkpoints created before per-depth gain tracking stored scalars.
                 state_dict[key] = value.reshape(1).expand_as(target).clone()
+            elif value.ndim == target.ndim == 1:
+                resized = target.detach().clone()
+                overlap = min(value.shape[0], target.shape[0])
+                resized[:overlap].copy_(value[:overlap])
+                state_dict[key] = resized
         super()._load_from_state_dict(
             state_dict,
             prefix,
