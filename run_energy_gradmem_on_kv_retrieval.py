@@ -101,6 +101,11 @@ class ExperimentArgs:
     segment_size: Optional[int] = field(default=None)
     memory_rotation: Optional[str] = field(default="none")
     memory_rotation_angle: Optional[float] = field(default=None)
+    reading_optimization: Optional[bool] = field(default=False)
+    K_read: Optional[int] = field(default=1)
+    read_lr: Optional[float] = field(default=0.1)
+    clip_read_norm: Optional[float] = field(default=None)
+    read_grad_mode: Optional[str] = field(default="second")
 
     inner_objective: Optional[str] = field(default="neural")
     energy_hidden_size: Optional[int] = field(default=None)
@@ -204,6 +209,11 @@ def build_model_config(args, base_config):
         segment_size=args.segment_size,
         memory_rotation=args.memory_rotation,
         memory_rotation_angle=args.memory_rotation_angle,
+        reading_optimization=args.reading_optimization,
+        K_read=args.K_read,
+        read_lr=args.read_lr,
+        clip_read_norm=args.clip_read_norm,
+        read_grad_mode=args.read_grad_mode,
         inner_objective=args.inner_objective,
         energy_hidden_size=args.energy_hidden_size,
         energy_num_layers=args.energy_num_layers,
@@ -374,6 +384,12 @@ if __name__ == "__main__":
             "segment_delta_norm_mean",
             "segment_delta_norm_max",
             "segment_state_norm_mean",
+            "read_energy_initial",
+            "read_energy_last_step",
+            "read_grad_norm_mean",
+            "read_grad_norm_max",
+            "read_hidden_delta_norm_mean",
+            "read_hidden_delta_norm_max",
         ):
             if key in inner_loop_stats:
                 metrics[key] = float(inner_loop_stats[key].mean())

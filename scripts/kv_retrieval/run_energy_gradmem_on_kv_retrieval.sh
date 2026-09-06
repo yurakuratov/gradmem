@@ -65,6 +65,11 @@ SEGMENT_WRITE_MODE=${SEGMENT_WRITE_MODE:-sequential}
 SEGMENT_SIZE=$((${N_PAIRS_IN_SEGMENT}*(${K_SIZE}+${V_SIZE}+3)))
 MEMORY_ROTATION=${MEMORY_ROTATION:-none}
 MEMORY_ROTATION_ANGLE=${MEMORY_ROTATION_ANGLE:-None}
+READING_OPTIMIZATION=${READING_OPTIMIZATION:-false}
+K_READ=${K_READ:-1}
+READ_LR=${READ_LR:-0.1}
+CLIP_READ_NORM=${CLIP_READ_NORM:-None}
+READ_GRAD_MODE=${READ_GRAD_MODE:-second}
 
 # LoRA / KV-cache memory backend options
 LORA_MEM_PLACEMENT=${LORA_MEM_PLACEMENT:-between_layers}
@@ -148,6 +153,13 @@ ENERGY_ARCH_SUFFIX=
 if [ "$ENERGY_MODEL_TYPE" = "segment_delta_gru" ]; then
   ENERGY_ARCH_SUFFIX=_energy${ENERGY_MODEL_TYPE}_state${ENERGY_SEGMENT_STATE_SIZE}
 fi
+if [ "$READING_OPTIMIZATION" = true ]; then
+  ENERGY_ARCH_SUFFIX=${ENERGY_ARCH_SUFFIX}_readK${K_READ}lr${READ_LR}
+  ENERGY_ARCH_SUFFIX=${ENERGY_ARCH_SUFFIX}_${READ_GRAD_MODE}
+  if [ "$CLIP_READ_NORM" != "None" ]; then
+    ENERGY_ARCH_SUFFIX=${ENERGY_ARCH_SUFFIX}_clip${CLIP_READ_NORM}
+  fi
+fi
 RUN_NAME=${RUN_NAME:-energy_gradmem_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}${ENERGY_ARCH_SUFFIX}}
 RUN_NAME_SUFFIX=${RUN_NAME_SUFFIX:-}
 if [ -n "$RUN_NAME_SUFFIX" ]; then
@@ -222,6 +234,11 @@ for N in $N_VALUES; do
     $( [ "$SEGMENT_SIZE" != "None" ] && echo "--segment_size $SEGMENT_SIZE" ) \
     --memory_rotation "$MEMORY_ROTATION" \
     $( [ "$MEMORY_ROTATION_ANGLE" != "None" ] && echo "--memory_rotation_angle $MEMORY_ROTATION_ANGLE" ) \
+    --reading_optimization "$READING_OPTIMIZATION" \
+    --K_read "$K_READ" \
+    --read_lr "$READ_LR" \
+    $( [ "$CLIP_READ_NORM" != "None" ] && echo "--clip_read_norm $CLIP_READ_NORM" ) \
+    --read_grad_mode "$READ_GRAD_MODE" \
     --inner_objective "$INNER_OBJECTIVE" \
     --energy_hidden_size "$ENERGY_HIDDEN_SIZE" \
     --energy_num_layers "$ENERGY_NUM_LAYERS" \

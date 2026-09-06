@@ -69,6 +69,33 @@ def _model(
     )
 
 
+class _FakeFlaCache:
+    def __init__(self, states=None):
+        self.states = [] if states is None else states
+
+    @classmethod
+    def from_legacy_cache(cls, states=None):
+        return cls([] if states is None else list(states))
+
+    def __len__(self):
+        return len(self.states)
+
+    def __getitem__(self, layer_idx):
+        return self.states[layer_idx]
+
+    def update(self, recurrent_state=None, conv_state=None, layer_idx=0, **kwargs):
+        del kwargs
+        state = {
+            "recurrent_state": recurrent_state,
+            "conv_state": conv_state,
+        }
+        if len(self.states) <= layer_idx:
+            self.states.append(state)
+        else:
+            self.states[layer_idx] = state
+        return state
+
+
 def test_strip_trailing_context_separator_removes_only_final_pipe():
     batch = [
         {"context": "!Tg:ON!!jr:Tk!|", "query": "Tg:", "target": "ON"},
@@ -182,6 +209,368 @@ def test_forward_identity_energy_model_prefix():
     output = model({"context_input_ids": context, "query_input_ids": query}, labels=labels)
 
     assert torch.isfinite(output["loss"]).item()
+
+
+@pytest.mark.parametrize(
+    "label_shift,pred_len,expected_positions",
+    [
+        (0, 5, [1, 3]),
+        (1, 4, [0, 2]),
+    ],
+)
+def test_read_optimization_mask_aligns_target_labels(
+    label_shift,
+    pred_len,
+    expected_positions,
+):
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        reading_optimization=True,
+    )
+    query = torch.tensor([[4, 5, 6, 7]])
+    label_mask = torch.tensor([[False, True, False, True]])
+    read_batch = {"pred_len": pred_len, "label_shift": label_shift}
+
+    mask = model._read_optimization_mask(query, label_mask, read_batch)
+
+    assert mask.nonzero(as_tuple=False)[:, 1].tolist() == expected_positions
+
+
+@pytest.mark.parametrize(
+    "label_shift,pred_len,expected_positions",
+    [
+        (0, 5, [2, 4]),
+        (1, 4, [1, 3]),
+    ],
+)
+def test_read_optimization_inference_mask_uses_last_valid_query_state(
+    label_shift,
+    pred_len,
+    expected_positions,
+):
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        reading_optimization=True,
+    )
+    query = torch.tensor(
+        [
+            [4, 5, 0, 0],
+            [4, 5, 6, 7],
+        ]
+    )
+    read_batch = {"pred_len": pred_len, "label_shift": label_shift}
+
+    mask = model._read_optimization_mask(query, None, read_batch)
+
+    assert mask.nonzero(as_tuple=False)[:, 1].tolist() == expected_positions
+
+
+def test_read_optimization_updates_only_masked_states_and_reuses_energy_state(monkeypatch):
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        reading_optimization=True,
+        K_read=3,
+        read_lr=0.1,
+    )
+    hidden = torch.ones(1, 4, 48)
+    read_mask = torch.tensor([[False, True, False, True]])
+    energy_state = object()
+    seen_states = []
+
+    def quadratic_energy(current_hidden, mask, state):
+        seen_states.append(state)
+        assert current_hidden.shape == (2, 1, 48)
+        assert mask.shape == (2, 1)
+        token_energy = current_hidden.pow(2).sum(dim=-1)
+        return (token_energy * mask).sum(), "discarded-state", token_energy
+
+    monkeypatch.setattr(model, "_energy_loss", quadratic_energy)
+
+    optimized, stats = model._optimize_read_hidden(
+        hidden,
+        read_mask,
+        energy_state,
+        create_graph=False,
+    )
+
+    assert seen_states == [energy_state] * (model.K_read + 1)
+    assert torch.equal(optimized[:, [0, 2]], hidden[:, [0, 2]])
+    assert torch.all(optimized[:, [1, 3]] < hidden[:, [1, 3]])
+    expected_final_energy = 48 * (1 - 2 * model.read_lr) ** (2 * model.K_read)
+    torch.testing.assert_close(
+        stats["read_energy_last_step"],
+        hidden.new_tensor(expected_final_energy),
+    )
+    assert stats["read_hidden_delta_norm_mean"] > 0
+
+
+def test_read_gradient_clipping_bounds_each_token_and_preserves_direction(monkeypatch):
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        reading_optimization=True,
+        K_read=1,
+        read_lr=0.2,
+        clip_read_norm=0.5,
+    )
+    hidden = torch.tensor(
+        [[[3.0] + [0.0] * 47, [0.0, 4.0] + [0.0] * 46]],
+    )
+    read_mask = torch.ones(1, 2, dtype=torch.bool)
+
+    def quadratic_energy(current_hidden, mask, state):
+        del state
+        token_energy = current_hidden.pow(2).sum(dim=-1)
+        return (token_energy * mask).sum(), None, token_energy
+
+    monkeypatch.setattr(model, "_energy_loss", quadratic_energy)
+    optimized, _ = model._optimize_read_hidden(
+        hidden,
+        read_mask,
+        energy_state=None,
+        create_graph=False,
+    )
+
+    raw_gradient = 2 * hidden
+    update = hidden - optimized
+    update_norm = update.norm(dim=-1)
+    assert torch.all(update_norm <= model.read_lr * model.clip_read_norm + 1e-6)
+    expected_direction = raw_gradient / raw_gradient.norm(dim=-1, keepdim=True)
+    actual_direction = update / update.norm(dim=-1, keepdim=True)
+    torch.testing.assert_close(actual_direction, expected_direction)
+
+
+def test_read_optimization_outer_loss_trains_energy_model():
+    torch.manual_seed(0)
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        reading_optimization=True,
+        K_read=2,
+        read_lr=0.1,
+    )
+    model.train()
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        labels=labels,
+    )
+    output["loss"].backward()
+
+    energy_gradients = [parameter.grad for parameter in model.energy_head.parameters()]
+    assert all(gradient is not None for gradient in energy_gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in energy_gradients)
+    assert any(torch.count_nonzero(gradient) > 0 for gradient in energy_gradients)
+    assert output["inner_loop_stats"]["read_hidden_delta_norm_mean"] > 0
+
+
+def test_first_order_read_mode_trains_energy_and_backbone_without_fast_weight_hessian(monkeypatch):
+    torch.manual_seed(0)
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        reading_optimization=True,
+        K_read=2,
+        read_lr=0.1,
+        read_grad_mode="first",
+    )
+    model.train()
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+    original_optimize = model._optimize_read_hidden
+    saw_detached_fast_variable = False
+
+    def capture_fast_variable(read_hidden, *args, **kwargs):
+        nonlocal saw_detached_fast_variable
+        saw_detached_fast_variable = read_hidden.is_leaf and read_hidden.grad_fn is None
+        return original_optimize(read_hidden, *args, **kwargs)
+
+    monkeypatch.setattr(model, "_optimize_read_hidden", capture_fast_variable)
+
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        labels=labels,
+    )
+    output["loss"].backward()
+
+    assert saw_detached_fast_variable
+    assert any(
+        parameter.grad is not None and torch.count_nonzero(parameter.grad) > 0
+        for parameter in model.energy_head.parameters()
+    )
+    backbone_embedding = model.model.get_input_embeddings().weight
+    assert backbone_embedding.grad is not None
+    assert torch.isfinite(backbone_embedding.grad).all()
+
+
+@pytest.mark.parametrize("energy_model_type", ["lstm", "segment_delta_gru"])
+def test_read_optimization_stateful_energy_models_backward(energy_model_type):
+    torch.manual_seed(0)
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type=energy_model_type,
+        energy_segment_state_size=8,
+        reading_optimization=True,
+        K_read=2,
+        read_lr=0.1,
+    )
+    model.train()
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model(
+        {"context_input_ids": segments, "query_input_ids": query},
+        labels=labels,
+    )
+    output["loss"].backward()
+
+    assert torch.isfinite(output["loss"])
+    assert output["inner_loop_stats"]["read_hidden_delta_norm_mean"] > 0
+    assert all(
+        parameter.grad is None or torch.isfinite(parameter.grad).all()
+        for parameter in model._energy_parameters()
+    )
+
+
+def test_read_optimization_runs_during_label_free_inference():
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        reading_optimization=True,
+        K_read=2,
+        read_lr=0.1,
+    )
+    model.eval()
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.tensor([[4, 5, 0, 0], [4, 5, 6, 7]])
+
+    with torch.no_grad():
+        output = model({"context_input_ids": context, "query_input_ids": query})
+
+    assert torch.isfinite(output["predictions"]).all()
+    assert output["inner_loop_stats"]["read_hidden_delta_norm_mean"] > 0
+
+
+def test_read_optimization_does_not_leak_future_teacher_forced_query_tokens():
+    torch.manual_seed(0)
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="lstm",
+        reading_optimization=True,
+        K_read=2,
+        read_lr=0.1,
+    )
+    model.eval()
+    context = torch.randint(1, 101, (1, 5)).expand(2, -1).clone()
+    query = torch.tensor(
+        [
+            [4, 5, 6, 7],
+            [4, 5, 37, 7],
+        ]
+    )
+    labels = torch.tensor(
+        [
+            [-100, 11, -100, 12],
+            [-100, 11, -100, 12],
+        ]
+    )
+
+    with torch.no_grad():
+        predictions = model(
+            {"context_input_ids": context, "query_input_ids": query},
+            labels=labels,
+        )["predictions"]
+
+    # Position 1 predicts the first selected target. The changed token at
+    # query position 2 is teacher-forced only into a later prediction state.
+    torch.testing.assert_close(predictions[0, 1], predictions[1, 1])
+
+
+def test_read_optimization_runs_inside_torch_inference_mode():
+    torch.manual_seed(0)
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        reading_optimization=True,
+        K_read=2,
+        read_lr=0.1,
+    )
+    model.eval()
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.tensor([[4, 5, 0, 0], [4, 5, 6, 7]])
+
+    with torch.inference_mode():
+        output = model({"context_input_ids": context, "query_input_ids": query})
+
+    assert torch.isfinite(output["predictions"]).all()
+    assert output["inner_loop_stats"]["read_hidden_delta_norm_mean"] > 0
+
+
+def test_read_optimization_does_not_rerun_backbone_for_read_steps():
+    model = _model(
+        K=0,
+        energy_future_mode="none",
+        energy_model_type="identity",
+        reading_optimization=True,
+        K_read=3,
+        read_lr=0.1,
+    )
+    model.eval()
+    backbone_calls = 0
+
+    def count_backbone_calls(_module, _args, _output):
+        nonlocal backbone_calls
+        backbone_calls += 1
+
+    hook = model.model.register_forward_hook(count_backbone_calls)
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    with torch.no_grad():
+        model({"context_input_ids": context, "query_input_ids": query})
+    hook.remove()
+
+    assert backbone_calls == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs,error",
+    [
+        ({"inner_objective": "cross_entropy", "energy_future_mode": "none"}, "inner_objective='neural'"),
+        ({"energy_future_mode": "next_token"}, "energy_future_mode='none'"),
+        ({"energy_future_mode": "none", "K_read": 0}, "K_read >= 1"),
+        ({"energy_future_mode": "none", "read_lr": 0.0}, "read_lr > 0"),
+        ({"energy_future_mode": "none", "clip_read_norm": 0.0}, "clip_read_norm"),
+        ({"energy_future_mode": "none", "read_grad_mode": "none"}, "read_grad_mode"),
+    ],
+)
+def test_read_optimization_rejects_unsupported_configuration(kwargs, error):
+    with pytest.raises(ValueError, match=error):
+        EnergyGradMemConfig(
+            base_config=_base_config(),
+            reading_optimization=True,
+            **kwargs,
+        )
 
 
 @pytest.mark.parametrize("memory_backend", ["lora", "kv_cache"])
@@ -600,10 +989,18 @@ def test_mamba2_energy_model_uses_fla_layer(monkeypatch):
             nonlocal seen_kwargs
             seen_kwargs = kwargs
 
-        def forward(self, hidden, **kwargs):
-            return hidden + 1.0, None, None
+        def forward(self, hidden, past_key_values, use_cache):
+            assert use_cache
+            batch_size = hidden.size(0)
+            past_key_values.update(
+                recurrent_state=hidden.new_ones(batch_size, 3, 16, 32),
+                conv_state=hidden.new_ones(batch_size, 112, 3),
+                layer_idx=0,
+            )
+            return hidden + 1.0, None, past_key_values
 
     monkeypatch.setattr(energy_gradmem_module, "FlaMamba2", FakeFlaMamba2)
+    monkeypatch.setattr(energy_gradmem_module, "FlaCache", _FakeFlaCache)
     model = _model(
         K=1,
         energy_future_mode="none",
@@ -617,10 +1014,11 @@ def test_mamba2_energy_model_uses_fla_layer(monkeypatch):
     )
 
     hidden = torch.zeros(2, 5, 48)
-    encoded, state = model.energy_encoder(hidden, state="ignored")
+    encoded, state = model.energy_encoder(hidden)
 
     assert torch.equal(encoded, torch.ones_like(hidden))
-    assert state == "ignored"
+    assert state["conv_state"].shape == (2, 112, 3)
+    assert state["recurrent_state"].shape == (2, 3, 16, 32)
     assert seen_kwargs == {
         "hidden_size": 48,
         "state_size": 32,
@@ -628,6 +1026,7 @@ def test_mamba2_energy_model_uses_fla_layer(monkeypatch):
         "expand": 1,
         "head_dim": 16,
         "chunk_size": 64,
+        "layer_idx": 0,
         "backend": "triton",
     }
     assert model.energy_head[0].in_features == 48
@@ -656,10 +1055,18 @@ def test_forward_mamba2_energy_model_prefix(monkeypatch):
             super().__init__()
             self.proj = torch.nn.Linear(kwargs["hidden_size"], kwargs["hidden_size"])
 
-        def forward(self, hidden, **kwargs):
-            return self.proj(hidden), None, None
+        def forward(self, hidden, past_key_values, use_cache):
+            assert use_cache
+            batch_size = hidden.size(0)
+            past_key_values.update(
+                recurrent_state=hidden.new_zeros(batch_size, 6, 16, 128),
+                conv_state=hidden.new_zeros(batch_size, 352, 4),
+                layer_idx=0,
+            )
+            return self.proj(hidden), None, past_key_values
 
     monkeypatch.setattr(energy_gradmem_module, "FlaMamba2", FakeFlaMamba2)
+    monkeypatch.setattr(energy_gradmem_module, "FlaCache", _FakeFlaCache)
     torch.manual_seed(0)
     model = _model(
         K=1,
@@ -679,6 +1086,84 @@ def test_forward_mamba2_energy_model_prefix(monkeypatch):
 
     assert torch.isfinite(output["loss"]).item()
     assert output["predictions"].shape == (B, Q + 1, 101)
+
+
+def test_mamba2_energy_state_persists_and_is_not_mutated(monkeypatch):
+    class StatefulFakeFlaMamba2(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            self.kwargs = kwargs
+
+        def forward(self, hidden, past_key_values, use_cache):
+            assert use_cache
+            batch_size = hidden.size(0)
+            if len(past_key_values):
+                previous = past_key_values[0]["recurrent_state"]
+                previous_value = previous[:, 0, 0, 0]
+            else:
+                previous_value = hidden.new_zeros(batch_size)
+            encoded = hidden + previous_value[:, None, None]
+            next_value = previous_value + hidden.sum(dim=(1, 2))
+            recurrent_state = next_value[:, None, None, None].expand(
+                batch_size, 3, 16, 32
+            ).clone()
+            conv_state = next_value[:, None, None].expand(
+                batch_size, 112, 3
+            ).clone()
+            past_key_values.update(
+                recurrent_state=recurrent_state,
+                conv_state=conv_state,
+                layer_idx=0,
+            )
+            return encoded, None, past_key_values
+
+    monkeypatch.setattr(energy_gradmem_module, "FlaMamba2", StatefulFakeFlaMamba2)
+    monkeypatch.setattr(energy_gradmem_module, "FlaCache", _FakeFlaCache)
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="mamba2",
+        energy_mamba_state_size=32,
+        energy_mamba_conv_kernel=3,
+        energy_mamba_expand=1,
+        energy_mamba_head_dim=16,
+    )
+
+    first_hidden = torch.ones(2, 2, 48, requires_grad=True)
+    _, first_state = model.energy_encoder(first_hidden)
+    saved_state = {name: value.clone() for name, value in first_state.items()}
+    second_hidden = torch.ones(2, 2, 48, requires_grad=True)
+    second_encoded, second_state = model.energy_encoder(second_hidden, first_state)
+
+    assert torch.count_nonzero(second_encoded) > 0
+    assert all(torch.equal(first_state[name], saved_state[name]) for name in first_state)
+    assert not torch.equal(second_state["recurrent_state"], first_state["recurrent_state"])
+    selected_state = model._select_read_energy_state(
+        second_state,
+        torch.tensor([1, 0, 1]),
+    )
+    assert selected_state["conv_state"].shape == (3, 112, 3)
+    torch.testing.assert_close(
+        selected_state["recurrent_state"][0],
+        second_state["recurrent_state"][1],
+    )
+    torch.testing.assert_close(
+        selected_state["recurrent_state"][2],
+        second_state["recurrent_state"][1],
+    )
+    mask = torch.tensor([[True, True], [False, False]])
+    _, masked_state, _ = model._energy_loss(second_hidden, mask, first_state)
+    assert not torch.equal(
+        masked_state["recurrent_state"][0],
+        first_state["recurrent_state"][0],
+    )
+    torch.testing.assert_close(
+        masked_state["recurrent_state"][1],
+        first_state["recurrent_state"][1],
+    )
+    second_encoded.sum().backward()
+    assert first_hidden.grad is not None
+    assert torch.isfinite(first_hidden.grad).all()
 
 
 def test_context_tensor_segment_size_returns_segment_list():

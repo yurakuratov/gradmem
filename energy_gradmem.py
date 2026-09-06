@@ -11,9 +11,11 @@ from grad_memgpt import GradMemGPT, GradMemGPTConfig, _is_main_process, get_back
 
 try:
     from fla.layers.mamba2 import Mamba2 as FlaMamba2
+    from fla.models.utils import Cache as FlaCache
     _fla_import_error = None
 except (ImportError, RuntimeError) as exc:
     FlaMamba2 = None
+    FlaCache = None
     _fla_import_error = exc
 
 
@@ -46,6 +48,12 @@ class FlaMamba2EnergyEncoder(nn.Module):
                 "energy_model_type='mamba2' requires a working flash-linear-attention package (`fla`)"
             ) from _fla_import_error
         self.input_size = int(input_size)
+        self.state_size = int(state_size)
+        self.conv_kernel = int(conv_kernel)
+        self.expand = int(expand)
+        self.head_dim = int(head_dim)
+        self.num_heads = self.expand * self.input_size // self.head_dim
+        self.conv_dim = self.expand * self.input_size + 2 * self.state_size
         self.mamba = FlaMamba2(
             hidden_size=self.input_size,
             state_size=int(state_size),
@@ -53,14 +61,39 @@ class FlaMamba2EnergyEncoder(nn.Module):
             expand=int(expand),
             head_dim=int(head_dim),
             chunk_size=int(chunk_size),
+            layer_idx=0,
             backend=backend,
         )
 
+    @staticmethod
+    def _clone_state(state):
+        if state is None:
+            return None
+        return {name: tensor.clone() for name, tensor in state.items()}
+
     def forward(self, hidden, state=None):
-        encoded = self.mamba(hidden)
-        if isinstance(encoded, tuple):
-            encoded = encoded[0]
-        return encoded, state
+        legacy_state = None if state is None else [self._clone_state(state)]
+        cache = FlaCache.from_legacy_cache(legacy_state)
+
+        # FLA accepts a complete sequence only while prefilling an empty cache.
+        # Once recurrent state exists, feed one token at a time through its
+        # supported cached-decoding path.
+        chunks = (hidden,) if state is None else hidden.split(1, dim=1)
+        outputs = []
+        for chunk in chunks:
+            encoded = self.mamba(
+                chunk,
+                past_key_values=cache,
+                use_cache=True,
+            )
+            outputs.append(encoded[0] if isinstance(encoded, tuple) else encoded)
+
+        next_layer_state = cache[0]
+        next_state = {
+            "conv_state": next_layer_state["conv_state"].clone(),
+            "recurrent_state": next_layer_state["recurrent_state"].clone(),
+        }
+        return torch.cat(outputs, dim=1), next_state
 
 
 class EnergyGradMemConfig(GradMemGPTConfig):
@@ -92,6 +125,11 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         segment_size=None,
         memory_rotation="none",
         memory_rotation_angle=None,
+        reading_optimization=False,
+        K_read=1,
+        read_lr=0.1,
+        clip_read_norm=None,
+        read_grad_mode="second",
         energy_pretrain_objective="ce",
         energy_pretrain_steps=0,
         energy_pretrain_batch_size=16,
@@ -163,6 +201,25 @@ class EnergyGradMemConfig(GradMemGPTConfig):
             raise ValueError("embedding_l1/embedding_l2 inner objectives require energy_future_mode='next_token'")
         if inner_objective == "cross_entropy" and energy_ce_guidance:
             raise ValueError("inner_objective='cross_entropy' does not support energy_ce_guidance")
+        if int(K_read) < 0:
+            raise ValueError("K_read must be a non-negative integer")
+        if not math.isfinite(float(read_lr)) or float(read_lr) < 0.0:
+            raise ValueError("read_lr must be finite and non-negative")
+        if clip_read_norm is not None and (
+            not math.isfinite(float(clip_read_norm)) or float(clip_read_norm) <= 0.0
+        ):
+            raise ValueError("clip_read_norm must be finite and positive when provided")
+        if read_grad_mode not in ("first", "second"):
+            raise ValueError("read_grad_mode must be one of: first, second")
+        if reading_optimization:
+            if inner_objective != "neural":
+                raise ValueError("reading_optimization requires inner_objective='neural'")
+            if energy_future_mode != "none":
+                raise ValueError("reading_optimization requires energy_future_mode='none'")
+            if int(K_read) < 1:
+                raise ValueError("reading_optimization requires K_read >= 1")
+            if float(read_lr) <= 0.0:
+                raise ValueError("reading_optimization requires read_lr > 0")
         regularization_values = {
             "energy_weight_rms_reg": energy_weight_rms_reg,
             "energy_weight_rms_threshold": energy_weight_rms_threshold,
@@ -229,6 +286,11 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         self.segment_size = segment_size
         self.memory_rotation = memory_rotation
         self.memory_rotation_angle = memory_rotation_angle
+        self.reading_optimization = reading_optimization
+        self.K_read = K_read
+        self.read_lr = read_lr
+        self.clip_read_norm = clip_read_norm
+        self.read_grad_mode = read_grad_mode
         self.energy_pretrain_objective = energy_pretrain_objective
         self.energy_pretrain_steps = energy_pretrain_steps
         self.energy_pretrain_batch_size = energy_pretrain_batch_size
@@ -279,6 +341,12 @@ class EnergyGradMem(GradMemGPT):
         self.memory_rotation = getattr(config, "memory_rotation", "none")
         memory_rotation_angle = getattr(config, "memory_rotation_angle", None)
         self.memory_rotation_angle = None if memory_rotation_angle is None else float(memory_rotation_angle)
+        self.reading_optimization = bool(getattr(config, "reading_optimization", False))
+        self.K_read = int(getattr(config, "K_read", 1))
+        self.read_lr = float(getattr(config, "read_lr", 0.1))
+        clip_read_norm = getattr(config, "clip_read_norm", None)
+        self.clip_read_norm = None if clip_read_norm is None else float(clip_read_norm)
+        self.read_grad_mode = getattr(config, "read_grad_mode", "second")
         self.energy_pretrain_objective = getattr(config, "energy_pretrain_objective", "ce")
         self.energy_pretrain_steps = int(getattr(config, "energy_pretrain_steps", 0))
         self.energy_pretrain_batch_size = int(getattr(config, "energy_pretrain_batch_size", 16))
@@ -449,7 +517,31 @@ class EnergyGradMem(GradMemGPT):
     def _energy_loss(self, hidden, mask, energy_state):
         # Eval still needs inner-loop gradients. cuDNN RNN backward rejects eval-mode
         # modules, so use the native autograd path for this small objective model.
+        previous_energy_state = energy_state
         energy, energy_state = self._energy_values(hidden, energy_state)
+
+        if self.energy_model_type == "mamba2" and energy_state is not None:
+            active_samples = mask.bool().any(dim=1)
+            if previous_energy_state is None:
+                energy_state = {
+                    name: value * active_samples.view(
+                        active_samples.size(0),
+                        *([1] * (value.ndim - 1)),
+                    ).to(value.dtype)
+                    for name, value in energy_state.items()
+                }
+            else:
+                energy_state = {
+                    name: torch.where(
+                        active_samples.view(
+                            active_samples.size(0),
+                            *([1] * (value.ndim - 1)),
+                        ),
+                        value,
+                        previous_energy_state[name],
+                    )
+                    for name, value in energy_state.items()
+                }
 
         mask = mask.to(dtype=energy.dtype)
         valid_lengths = mask.sum(dim=1)
@@ -497,6 +589,43 @@ class EnergyGradMem(GradMemGPT):
                 h.to(device=memory.device, dtype=self._energy_dtype()),
                 c.to(device=memory.device, dtype=self._energy_dtype()),
             )
+
+        if self.energy_model_type == "mamba2" and energy_state is not None:
+            expected_shapes = {
+                "conv_state": (
+                    batch_size,
+                    self.energy_encoder.conv_dim,
+                    self.energy_encoder.conv_kernel,
+                ),
+                "recurrent_state": (
+                    batch_size,
+                    self.energy_encoder.num_heads,
+                    self.energy_encoder.head_dim,
+                    self.energy_encoder.state_size,
+                ),
+            }
+            if not isinstance(energy_state, dict):
+                raise ValueError(
+                    "Mamba2 energy_state must be a dictionary containing "
+                    "conv_state and recurrent_state tensors"
+                )
+            if set(energy_state) != set(expected_shapes):
+                raise ValueError(
+                    "Mamba2 energy_state must contain exactly the keys "
+                    f"{sorted(expected_shapes)}; got {sorted(energy_state)}"
+                )
+            for name, expected_shape in expected_shapes.items():
+                value = energy_state[name]
+                if not isinstance(value, torch.Tensor) or tuple(value.shape) != expected_shape:
+                    actual_shape = tuple(value.shape) if isinstance(value, torch.Tensor) else type(value).__name__
+                    raise ValueError(
+                        f"Mamba2 energy_state[{name!r}] must have shape "
+                        f"{expected_shape}; got {actual_shape}"
+                    )
+            return {
+                name: value.to(device=memory.device)
+                for name, value in energy_state.items()
+            }
 
         return energy_state
 
@@ -1172,7 +1301,144 @@ class EnergyGradMem(GradMemGPT):
         stats["delta_mem_norm_max"] = delta_mem_norm.max()
         stats["delta_mem_norm_min"] = delta_mem_norm.min()
 
-    def _read_from_memory(self, memory_state, query_input_ids):
+    def _read_optimization_mask(self, query_input_ids, label_mask, read_batch):
+        pred_len = int(read_batch["pred_len"])
+        label_shift = int(read_batch.get("label_shift", 0))
+        mask = torch.zeros(
+            query_input_ids.size(0),
+            pred_len,
+            device=query_input_ids.device,
+            dtype=torch.bool,
+        )
+
+        if label_mask is not None:
+            aligned_mask = label_mask[:, label_shift:]
+            if aligned_mask.size(1) != pred_len - 1:
+                raise ValueError(
+                    "Mismatched read-optimization alignment: "
+                    f"pred_len={pred_len}, label_mask_len={aligned_mask.size(1)}, "
+                    f"label_shift={label_shift}"
+                )
+            mask[:, :aligned_mask.size(1)] = aligned_mask.bool()
+            return mask
+
+        pad_id = self.model.config.pad_token_id
+        valid_query_lengths = query_input_ids.ne(pad_id).sum(dim=1)
+        prediction_positions = valid_query_lengths - label_shift
+        active_samples = prediction_positions.ge(0) & prediction_positions.lt(pred_len)
+        if active_samples.any():
+            batch_indices = torch.arange(query_input_ids.size(0), device=query_input_ids.device)
+            mask[
+                batch_indices[active_samples],
+                prediction_positions[active_samples],
+            ] = True
+        return mask
+
+    def _select_read_energy_state(self, energy_state, sample_indices):
+        if energy_state is None:
+            return None
+        if self.energy_model_type == "segment_delta_gru":
+            return energy_state.index_select(0, sample_indices)
+        if self.energy_model_type == "lstm":
+            h, c = energy_state
+            return (
+                h.index_select(1, sample_indices),
+                c.index_select(1, sample_indices),
+            )
+        if self.energy_model_type == "mamba2":
+            return {
+                name: value.index_select(0, sample_indices)
+                for name, value in energy_state.items()
+            }
+        return energy_state
+
+    def _clip_read_gradient(self, hidden_grad):
+        if self.clip_read_norm is None:
+            return hidden_grad
+        grad_norm = hidden_grad.flatten(start_dim=1).norm(dim=1, keepdim=True)
+        scale = (self.clip_read_norm / grad_norm.clamp_min(1e-12)).clamp(max=1.0)
+        while scale.ndim < hidden_grad.ndim:
+            scale = scale.unsqueeze(-1)
+        return hidden_grad * scale
+
+    def _optimize_read_hidden(self, read_hidden, read_mask, energy_state, create_graph):
+        if not read_mask.any():
+            raise ValueError("reading_optimization requires at least one active prediction position")
+
+        initial_hidden = read_hidden
+        selected_positions = read_mask.nonzero(as_tuple=False)
+        sample_indices = selected_positions[:, 0]
+        token_indices = selected_positions[:, 1]
+        hidden = read_hidden[sample_indices, token_indices].unsqueeze(1)
+        if not hidden.requires_grad:
+            hidden = hidden.requires_grad_(True)
+        selected_energy_state = self._select_read_energy_state(energy_state, sample_indices)
+        selected_mask = torch.ones(
+            hidden.size(0),
+            1,
+            device=hidden.device,
+            dtype=torch.bool,
+        )
+        active_samples = read_mask.any(dim=1)
+        energy_initial = None
+        grad_norm_sum = hidden.new_zeros(())
+        grad_norm_max = hidden.new_zeros(())
+
+        for step in range(self.K_read):
+            energy_loss, _, _ = self._energy_loss(
+                hidden,
+                selected_mask,
+                selected_energy_state,
+            )
+            if energy_initial is None:
+                energy_initial = energy_loss.detach()
+            hidden_grad = torch.autograd.grad(
+                energy_loss,
+                hidden,
+                create_graph=create_graph,
+                retain_graph=create_graph or step < self.K_read - 1,
+            )[0]
+            grad_norms = hidden_grad.flatten(start_dim=1).norm(dim=1)
+            grad_norm_sum = grad_norm_sum + grad_norms.detach().mean()
+            grad_norm_max = torch.maximum(
+                grad_norm_max,
+                grad_norms.detach().max(),
+            )
+            hidden_grad = self._clip_read_gradient(hidden_grad)
+            hidden = hidden - self.read_lr * hidden_grad
+
+        # The energy used for the final update describes the pre-update state.
+        # Re-evaluate once so the diagnostic measures the optimized state.
+        with torch.no_grad():
+            energy_final, _, _ = self._energy_loss(
+                hidden,
+                selected_mask,
+                selected_energy_state,
+            )
+
+        selected_delta = hidden.squeeze(1) - initial_hidden[sample_indices, token_indices]
+        flat_positions = sample_indices * read_hidden.size(1) + token_indices
+        flat_delta = torch.zeros_like(read_hidden).flatten(end_dim=1)
+        flat_delta = torch.index_copy(flat_delta, 0, flat_positions, selected_delta)
+        optimized_hidden = read_hidden + flat_delta.view_as(read_hidden)
+        hidden_delta_norms = (
+            (optimized_hidden - initial_hidden)
+            .detach()
+            .flatten(start_dim=1)
+            .norm(dim=1)[active_samples]
+        )
+        selected_count = hidden.new_tensor(selected_mask.size(0))
+        stats = {
+            "read_energy_initial": energy_initial / selected_count,
+            "read_energy_last_step": energy_final.detach() / selected_count,
+            "read_grad_norm_mean": grad_norm_sum / self.K_read,
+            "read_grad_norm_max": grad_norm_max,
+            "read_hidden_delta_norm_mean": hidden_delta_norms.mean(),
+            "read_hidden_delta_norm_max": hidden_delta_norms.max(),
+        }
+        return optimized_hidden, stats
+
+    def _read_from_memory(self, memory_state, query_input_ids, energy_state, label_mask=None):
         backend = self.memory_backend_impl
         pad_id = self.model.config.pad_token_id
         dummy_context = query_input_ids[:, :1].clone()
@@ -1183,6 +1449,9 @@ class EnergyGradMem(GradMemGPT):
         if log_mem_attn:
             read_model_kwargs = dict(read_model_kwargs)
             read_model_kwargs["output_attentions"] = True
+        if self.reading_optimization:
+            read_model_kwargs = dict(read_model_kwargs)
+            read_model_kwargs["output_hidden_states"] = True
 
         with backend.activation_context(memory_state):
             with self._disable_write_lora():
@@ -1192,8 +1461,39 @@ class EnergyGradMem(GradMemGPT):
                     **read_model_kwargs,
                 )
 
-        logits = read_out.logits[:, read_batch["logits_start"]:read_batch["logits_start"] + read_batch["pred_len"], :]
-        return logits, read_batch, read_out if log_mem_attn else None
+        read_start = read_batch["logits_start"]
+        read_end = read_start + read_batch["pred_len"]
+        read_stats = {}
+        if self.reading_optimization:
+            if read_out.hidden_states is None:
+                raise ValueError("Base model did not return hidden states for reading_optimization")
+            read_hidden = read_out.hidden_states[-1][:, read_start:read_end, :]
+            read_mask = self._read_optimization_mask(query_input_ids, label_mask, read_batch)
+            outer_grad_enabled = torch.is_grad_enabled()
+            create_graph = self.training and outer_grad_enabled
+            with torch.enable_grad():
+                backbone_hidden = read_hidden
+                if self.read_grad_mode == "first" or not create_graph:
+                    read_hidden = backbone_hidden.detach().requires_grad_(True)
+                optimized_hidden, read_stats = self._optimize_read_hidden(
+                    read_hidden,
+                    read_mask,
+                    energy_state,
+                    create_graph=create_graph,
+                )
+                if self.read_grad_mode == "first" and create_graph:
+                    # Straight-through backbone path: the optimized delta still
+                    # trains the energy model, while its Hessian does not flow
+                    # into the backbone hidden states.
+                    optimized_hidden = backbone_hidden + (
+                        optimized_hidden - read_hidden.detach()
+                    )
+                logits = self.model.get_output_embeddings()(optimized_hidden)
+            if not outer_grad_enabled:
+                logits = logits.detach()
+        else:
+            logits = read_out.logits[:, read_start:read_end, :]
+        return logits, read_batch, read_out if log_mem_attn else None, read_stats
 
     def _add_read_attention_stats(self, stats, read_out):
         if read_out is None or read_out.attentions is None:
@@ -1236,6 +1536,27 @@ class EnergyGradMem(GradMemGPT):
         )
 
     def forward(self, input_ids, labels=None, return_mem=False, return_energy_state=False, energy_state=None):
+        if torch.is_inference_mode_enabled():
+            # Both memory writes and read optimization use autograd internally.
+            # Disable inference tensors for the complete computation while
+            # preserving the caller's no-gradient semantics.
+            with torch.inference_mode(False), torch.no_grad():
+                return self._forward_impl(
+                    input_ids,
+                    labels=labels,
+                    return_mem=return_mem,
+                    return_energy_state=return_energy_state,
+                    energy_state=energy_state,
+                )
+        return self._forward_impl(
+            input_ids,
+            labels=labels,
+            return_mem=return_mem,
+            return_energy_state=return_energy_state,
+            energy_state=energy_state,
+        )
+
+    def _forward_impl(self, input_ids, labels=None, return_mem=False, return_energy_state=False, energy_state=None):
         context_segments = self._context_segments(input_ids["context_input_ids"])
         query_input_ids = input_ids["query_input_ids"]
         if energy_state is None:
@@ -1272,7 +1593,13 @@ class EnergyGradMem(GradMemGPT):
         self._finalize_inner_stats(inner_loop_stats, inner_loss, write_steps, B)
         self._add_memory_stats(inner_loop_stats, memory_state, memory_state_initial)
 
-        logits_q, read_batch, read_out = self._read_from_memory(memory_state, query_input_ids)
+        logits_q, read_batch, read_out, read_stats = self._read_from_memory(
+            memory_state,
+            query_input_ids,
+            energy_state,
+            label_mask=None if labels is None else labels.ne(-100),
+        )
+        inner_loop_stats.update(read_stats)
         self._add_read_attention_stats(inner_loop_stats, read_out)
 
         output = {"predictions": logits_q, "inner_loop_stats": inner_loop_stats}
