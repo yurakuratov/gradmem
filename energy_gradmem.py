@@ -113,6 +113,7 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         energy_weight_rms_threshold=0.0,
         energy_delta_reg=0.0,
         energy_delta_max=1.0,
+        energy_replay_weight=0.0,
         energy_model_type="lstm",
         energy_segment_state_size=None,
         energy_mamba_state_size=128,
@@ -225,12 +226,15 @@ class EnergyGradMemConfig(GradMemGPTConfig):
             "energy_weight_rms_threshold": energy_weight_rms_threshold,
             "energy_delta_reg": energy_delta_reg,
             "energy_delta_max": energy_delta_max,
+            "energy_replay_weight": energy_replay_weight,
         }
         for name, value in regularization_values.items():
             if not math.isfinite(float(value)) or float(value) < 0.0:
                 raise ValueError(f"{name} must be finite and non-negative")
         if inner_objective != "neural" and float(energy_weight_rms_reg) != 0.0:
             raise ValueError("energy_weight_rms_reg requires inner_objective='neural'")
+        if float(energy_replay_weight) != 0.0 and energy_model_type != "segment_delta_gru":
+            raise ValueError("energy_replay_weight requires energy_model_type='segment_delta_gru'")
         if float(energy_delta_reg) != 0.0:
             if segment_write_mode != "sequential":
                 raise ValueError("energy_delta_reg requires segment_write_mode='sequential'")
@@ -274,6 +278,7 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         self.energy_weight_rms_threshold = energy_weight_rms_threshold
         self.energy_delta_reg = energy_delta_reg
         self.energy_delta_max = energy_delta_max
+        self.energy_replay_weight = energy_replay_weight
         self.energy_model_type = energy_model_type
         self.energy_segment_state_size = energy_segment_state_size
         self.energy_mamba_state_size = energy_mamba_state_size
@@ -327,6 +332,7 @@ class EnergyGradMem(GradMemGPT):
         self.energy_weight_rms_threshold = float(getattr(config, "energy_weight_rms_threshold", 0.0))
         self.energy_delta_reg = float(getattr(config, "energy_delta_reg", 0.0))
         self.energy_delta_max = float(getattr(config, "energy_delta_max", 1.0))
+        self.energy_replay_weight = float(getattr(config, "energy_replay_weight", 0.0))
         self.energy_model_type = getattr(config, "energy_model_type", "lstm")
         energy_segment_state_size = getattr(config, "energy_segment_state_size", None)
         self.energy_segment_state_size = int(
@@ -412,6 +418,16 @@ class EnergyGradMem(GradMemGPT):
                 )
                 with torch.no_grad():
                     self.token_energy_mlp[0].weight[:, energy_input_size:].zero_()
+                if self.energy_replay_weight > 0.0:
+                    self.replay_energy_mlp = nn.Sequential(
+                        nn.Linear(
+                            self.n_mem_tokens * memory_width + self.energy_segment_state_size,
+                            self.energy_hidden_size,
+                        ),
+                        nn.SiLU(),
+                        nn.Linear(self.energy_hidden_size, 1),
+                        nn.Softplus(beta=1, threshold=20),
+                    )
                 energy_head_input_size = None
             else:
                 raise ValueError(f"Unsupported energy_model_type={self.energy_model_type}")
@@ -424,7 +440,13 @@ class EnergyGradMem(GradMemGPT):
     def _named_energy_parameters(self):
         named_params = []
         seen = set()
-        for module_name in ("segment_state_gru", "token_energy_mlp", "energy_encoder", "energy_head"):
+        for module_name in (
+            "segment_state_gru",
+            "token_energy_mlp",
+            "replay_energy_mlp",
+            "energy_encoder",
+            "energy_head",
+        ):
             module = getattr(self, module_name, None)
             if module is None:
                 continue
@@ -1032,6 +1054,218 @@ class EnergyGradMem(GradMemGPT):
         )
         return torch.where(active_samples[:, None], candidate_state, segment_state)
 
+    def _replay_energy(self, memory, segment_state, replay_active):
+        zero_energy = memory.flatten(start_dim=1).sum(dim=1) * 0.0
+        if self.energy_replay_weight <= 0.0 or not replay_active.any():
+            return zero_energy
+        replay_input = torch.cat(
+            (
+                memory.flatten(start_dim=1),
+                segment_state.to(dtype=memory.dtype),
+            ),
+            dim=1,
+        )
+        replay_energy = self.replay_energy_mlp(replay_input).squeeze(-1)
+        return torch.where(replay_active, replay_energy, zero_energy)
+
+    @staticmethod
+    def _replay_gradient_metrics(
+        current_gradient,
+        weighted_replay_gradient,
+        active_samples,
+        complete_non_replay_gradient=None,
+    ):
+        current = current_gradient.detach().float().flatten(start_dim=1)[active_samples]
+        replay = weighted_replay_gradient.detach().float().flatten(start_dim=1)[active_samples]
+        current_norm = current.norm(dim=1)
+        replay_norm = replay.norm(dim=1)
+        eps = torch.finfo(current.dtype).eps
+
+        norm_ratio = replay_norm / current_norm.clamp_min(eps)
+        norm_product = current_norm * replay_norm
+        cosine = torch.where(
+            norm_product > 0,
+            (current * replay).sum(dim=1) / norm_product.clamp_min(eps),
+            torch.zeros_like(norm_product),
+        ).clamp(min=-1.0, max=1.0)
+        metrics = {
+            "current_norm": torch.nan_to_num(current_norm),
+            "replay_norm": torch.nan_to_num(replay_norm),
+            "norm_ratio": torch.nan_to_num(norm_ratio),
+            "cosine": torch.nan_to_num(cosine),
+        }
+        if complete_non_replay_gradient is not None:
+            complete = (
+                complete_non_replay_gradient.detach()
+                .float()
+                .flatten(start_dim=1)[active_samples]
+            )
+            complete_norm = complete.norm(dim=1)
+            metrics["complete_norm_ratio"] = torch.nan_to_num(
+                replay_norm / complete_norm.clamp_min(eps)
+            )
+        return metrics
+
+    @staticmethod
+    def _new_replay_diagnostics(reference):
+        zero = reference.new_zeros((), dtype=torch.float32)
+        return {
+            "force_count": 0,
+            "current_norm_sum": zero.clone(),
+            "current_norm_max": zero.clone(),
+            "replay_norm_sum": zero.clone(),
+            "replay_norm_max": zero.clone(),
+            "norm_ratio_sum": zero.clone(),
+            "norm_ratio_max": zero.clone(),
+            "cosine_sum": zero.clone(),
+            "cosine_min": None,
+            "conflict_count": 0,
+            "complete_ratio_count": 0,
+            "complete_ratio_sum": zero.clone(),
+            "complete_ratio_max": zero.clone(),
+            "state_count": 0,
+            "state_norm_sum": zero.clone(),
+            "state_norm_max": zero.clone(),
+            "state_change_norm_sum": zero.clone(),
+            "state_change_norm_max": zero.clone(),
+            "state_saturated_count": 0,
+            "state_element_count": 0,
+        }
+
+    def _accumulate_replay_gradient_metrics(
+        self,
+        diagnostics,
+        current_gradient,
+        weighted_replay_gradient,
+        replay_active,
+        complete_non_replay_gradient=None,
+    ):
+        metrics = self._replay_gradient_metrics(
+            current_gradient,
+            weighted_replay_gradient,
+            replay_active,
+            complete_non_replay_gradient,
+        )
+        count = metrics["current_norm"].numel()
+        if not count:
+            return
+        diagnostics["force_count"] += count
+        for metric_name, accumulator_prefix in (
+            ("current_norm", "current_norm"),
+            ("replay_norm", "replay_norm"),
+            ("norm_ratio", "norm_ratio"),
+        ):
+            values = metrics[metric_name]
+            diagnostics[f"{accumulator_prefix}_sum"] += values.sum()
+            diagnostics[f"{accumulator_prefix}_max"] = torch.maximum(
+                diagnostics[f"{accumulator_prefix}_max"],
+                values.max(),
+            )
+        cosine = metrics["cosine"]
+        diagnostics["cosine_sum"] += cosine.sum()
+        cosine_min = cosine.min()
+        diagnostics["cosine_min"] = (
+            cosine_min
+            if diagnostics["cosine_min"] is None
+            else torch.minimum(diagnostics["cosine_min"], cosine_min)
+        )
+        diagnostics["conflict_count"] += int((cosine < 0).sum().item())
+
+        complete_ratio = metrics.get("complete_norm_ratio")
+        if complete_ratio is not None:
+            diagnostics["complete_ratio_count"] += complete_ratio.numel()
+            diagnostics["complete_ratio_sum"] += complete_ratio.sum()
+            diagnostics["complete_ratio_max"] = torch.maximum(
+                diagnostics["complete_ratio_max"],
+                complete_ratio.max(),
+            )
+
+    @staticmethod
+    def _accumulate_replay_state_metrics(diagnostics, state_before, state_after, replay_active):
+        if not replay_active.any():
+            return
+        # Replay for the current segment is conditioned on state_before. Use
+        # that same state for norm and saturation diagnostics; state_after is
+        # relevant only to the boundary-update magnitude below.
+        active_state = state_before.detach().float()[replay_active]
+        active_change = (state_after - state_before).detach().float()[replay_active]
+        state_norm = active_state.norm(dim=1)
+        state_change_norm = active_change.norm(dim=1)
+        diagnostics["state_count"] += state_norm.numel()
+        diagnostics["state_norm_sum"] += state_norm.sum()
+        diagnostics["state_norm_max"] = torch.maximum(
+            diagnostics["state_norm_max"],
+            state_norm.max(),
+        )
+        diagnostics["state_change_norm_sum"] += state_change_norm.sum()
+        diagnostics["state_change_norm_max"] = torch.maximum(
+            diagnostics["state_change_norm_max"],
+            state_change_norm.max(),
+        )
+        diagnostics["state_saturated_count"] += int((active_state.abs() > 0.95).sum().item())
+        diagnostics["state_element_count"] += active_state.numel()
+
+    def _finalize_replay_diagnostics(self, stats, diagnostics):
+        if not hasattr(self, "replay_energy_mlp"):
+            return
+        zero = diagnostics["current_norm_sum"].new_zeros(())
+        force_count = diagnostics["force_count"]
+        stats["current_energy_memory_grad_norm_mean"] = (
+            diagnostics["current_norm_sum"] / force_count if force_count else zero
+        )
+        stats["current_energy_memory_grad_norm_max"] = diagnostics["current_norm_max"]
+        stats["weighted_replay_memory_grad_norm_mean"] = (
+            diagnostics["replay_norm_sum"] / force_count if force_count else zero
+        )
+        stats["weighted_replay_memory_grad_norm_max"] = diagnostics["replay_norm_max"]
+        stats["replay_current_grad_norm_ratio_mean"] = (
+            diagnostics["norm_ratio_sum"] / force_count if force_count else zero
+        )
+        stats["replay_current_grad_norm_ratio_max"] = diagnostics["norm_ratio_max"]
+        stats["replay_current_grad_cosine_mean"] = (
+            diagnostics["cosine_sum"] / force_count if force_count else zero
+        )
+        stats["replay_current_grad_cosine_min"] = (
+            diagnostics["cosine_min"] if diagnostics["cosine_min"] is not None else zero
+        )
+        stats["replay_current_grad_conflict_fraction"] = zero.new_tensor(
+            diagnostics["conflict_count"] / force_count if force_count else 0.0
+        )
+
+        complete_count = diagnostics["complete_ratio_count"]
+        if self.energy_inner_ce_weight != 0.0:
+            stats["weighted_replay_non_replay_grad_norm_ratio_mean"] = (
+                diagnostics["complete_ratio_sum"] / complete_count if complete_count else zero
+            )
+            stats["weighted_replay_non_replay_grad_norm_ratio_max"] = diagnostics[
+                "complete_ratio_max"
+            ]
+
+        state_count = diagnostics["state_count"]
+        stats["recurrent_state_norm_mean"] = (
+            diagnostics["state_norm_sum"] / state_count if state_count else zero
+        )
+        stats["recurrent_state_norm_max"] = diagnostics["state_norm_max"]
+        stats["recurrent_state_change_norm_mean"] = (
+            diagnostics["state_change_norm_sum"] / state_count if state_count else zero
+        )
+        stats["recurrent_state_change_norm_max"] = diagnostics["state_change_norm_max"]
+        state_element_count = diagnostics["state_element_count"]
+        stats["recurrent_state_saturation_fraction"] = zero.new_tensor(
+            diagnostics["state_saturated_count"] / state_element_count
+            if state_element_count
+            else 0.0
+        )
+
+        replay_input_weight = self.replay_energy_mlp[0].weight.detach().float()
+        memory_input_size = replay_input_weight.size(1) - self.energy_segment_state_size
+        stats["replay_memory_input_weight_rms"] = (
+            replay_input_weight[:, :memory_input_size].square().mean().sqrt()
+        )
+        stats["replay_state_input_weight_rms"] = (
+            replay_input_weight[:, memory_input_size:].square().mean().sqrt()
+        )
+
     @staticmethod
     def _validate_parallel_segments(context_segments):
         segment_len = context_segments[0].size(1)
@@ -1138,6 +1372,10 @@ class EnergyGradMem(GradMemGPT):
         segment_delta_count = 0
         segment_delta_exceed_count = 0
         segment_delta_penalty_sum = None
+        replay_energy_sum = torch.tensor(0.0, device=device)
+        replay_energy_count = 0
+        replay_diagnostics = self._new_replay_diagnostics(inner_loss)
+        collect_replay_diagnostics = hasattr(self, "replay_energy_mlp") and not self.training
 
         if not self.K and self.memory_rotation == "none":
             if self.inner_objective == "neural" or self.energy_delta_reg > 0.0:
@@ -1148,6 +1386,10 @@ class EnergyGradMem(GradMemGPT):
                 stats["segment_delta_norm_mean"] = segment_delta_norm_sum
                 stats["segment_delta_norm_max"] = segment_delta_norm_max
                 stats["segment_state_norm_mean"] = energy_state.detach().norm(dim=1).mean()
+                stats["replay_energy_mean"] = replay_energy_sum
+                stats["replay_energy_loss"] = replay_energy_sum
+                if collect_replay_diagnostics:
+                    self._finalize_replay_diagnostics(stats, replay_diagnostics)
             return memory_state, energy_state, inner_loss, guidance_loss, write_steps, stats
 
         with torch.enable_grad():
@@ -1156,10 +1398,16 @@ class EnergyGradMem(GradMemGPT):
             global_step = 0
             active_segment_counts = torch.stack(active_segment_masks).sum(dim=0)
             rotation_angle = self._segment_rotation_angle(active_segment_counts)
+            has_previous_segment = None
+            if self.energy_model_type == "segment_delta_gru":
+                has_previous_segment = energy_state.detach().ne(0).any(dim=1)
             for segment, active_samples in zip(context_segments, active_segment_masks):
                 batch_ctx = backend.prepare_batch(segment, query_input_ids, pad_id)
                 if not active_samples.any():
                     continue
+                replay_active = None
+                if has_previous_segment is not None:
+                    replay_active = active_samples & has_previous_segment
 
                 memory_before = None
                 if self.K and (
@@ -1171,10 +1419,15 @@ class EnergyGradMem(GradMemGPT):
                 for k in range(self.K):
                     write_batch = backend.build_write_inputs(memory_state, batch_ctx)
                     write_out = self._run_write_model(write_batch, memory_state)
+                    first_order_replay_grad = None
+                    current_energy_memory_grad = None
+                    weighted_replay_memory_grad = None
+                    complete_non_replay_memory_grad = None
                     if self.inner_objective == "cross_entropy":
                         step_ce_loss = self._write_inner_ce_loss(write_out, write_batch)
                         energy_loss = torch.zeros_like(step_ce_loss)
-                        inner_loss = step_ce_loss
+                        base_inner_loss = step_ce_loss
+                        inner_loss = base_inner_loss
                     else:
                         ctx_hidden = self._extract_context_hidden(write_out.hidden_states[-1], write_batch, batch_ctx)
                         energy_input = self._energy_input(ctx_hidden, segment, write_batch["mask"])
@@ -1183,12 +1436,73 @@ class EnergyGradMem(GradMemGPT):
                             write_batch["mask"],
                             energy_state,
                         )
+                        replay_loss = energy_loss.new_zeros(())
+                        if self.energy_replay_weight > 0.0:
+                            replay_memory = memory_state["mem_batch"]
+                            replay_state = energy_state
+                            if self.grad_mode == "first" and replay_active.any():
+                                # First-order writes normally detach the inner gradient, which
+                                # would leave a learned replay head with no target-loss signal.
+                                # Differentiate replay through detached probes instead: its
+                                # memory-gradient remains learnable with respect to replay-head
+                                # parameters, without introducing Hessian paths through memory
+                                # history or the recurrent segment state.
+                                replay_memory = replay_memory.detach().requires_grad_(True)
+                                replay_state = replay_state.detach()
+                            replay_energy = self._replay_energy(
+                                replay_memory,
+                                replay_state,
+                                replay_active,
+                            )
+                            replay_loss = replay_energy.sum()
+                            if self.grad_mode == "first" and replay_active.any():
+                                first_order_replay_grad = torch.autograd.grad(
+                                    self.energy_replay_weight * replay_loss,
+                                    replay_memory,
+                                    create_graph=True,
+                                    retain_graph=True,
+                                )[0]
+                                weighted_replay_memory_grad = first_order_replay_grad.detach()
+                            replay_energy_sum = replay_energy_sum + replay_energy.detach().sum()
+                            replay_energy_count += int(replay_active.sum().item())
                         step_ce_loss = torch.zeros_like(energy_loss)
                         if self.energy_ce_guidance:
                             token_ce, token_ce_mask = self._write_token_ce(write_out, write_batch)
                         if self.energy_inner_ce_weight != 0.0:
                             step_ce_loss = self._write_inner_ce_loss(write_out, write_batch)
-                        inner_loss = energy_loss + self.energy_inner_ce_weight * step_ce_loss
+                        base_inner_loss = (
+                            energy_loss
+                            + self.energy_inner_ce_weight * step_ce_loss
+                        )
+                        inner_loss = base_inner_loss + self.energy_replay_weight * replay_loss
+                        if collect_replay_diagnostics and replay_active.any():
+                            current_energy_memory_grad = torch.autograd.grad(
+                                energy_loss,
+                                memory_state["mem_batch"],
+                                create_graph=False,
+                                retain_graph=True,
+                            )[0].detach()
+                            if weighted_replay_memory_grad is None:
+                                weighted_replay_memory_grad = torch.autograd.grad(
+                                    self.energy_replay_weight * replay_loss,
+                                    memory_state["mem_batch"],
+                                    create_graph=False,
+                                    retain_graph=True,
+                                )[0].detach()
+                            if self.energy_inner_ce_weight != 0.0:
+                                complete_non_replay_memory_grad = torch.autograd.grad(
+                                    base_inner_loss,
+                                    memory_state["mem_batch"],
+                                    create_graph=False,
+                                    retain_graph=True,
+                                )[0].detach()
+                            self._accumulate_replay_gradient_metrics(
+                                replay_diagnostics,
+                                current_energy_memory_grad,
+                                weighted_replay_memory_grad,
+                                replay_active,
+                                complete_non_replay_memory_grad,
+                            )
                     inner_energy_loss = inner_energy_loss + energy_loss.detach()
                     inner_ce_loss = inner_ce_loss + step_ce_loss.detach()
                     if self.inner_objective != "cross_entropy" and self.energy_ce_guidance:
@@ -1206,12 +1520,15 @@ class EnergyGradMem(GradMemGPT):
                         carries_state_graph=self.inner_objective != "cross_entropy",
                     )
                     inner_params = backend.inner_params(memory_state)
+                    grad_loss = base_inner_loss if first_order_replay_grad is not None else inner_loss
                     grads = torch.autograd.grad(
-                        inner_loss,
+                        grad_loss,
                         inner_params,
                         create_graph=create_graph,
                         retain_graph=retain_graph,
                     )
+                    if first_order_replay_grad is not None:
+                        grads = (grads[0] + first_order_replay_grad, *grads[1:])
 
                     self._record_grad_stats(stats, grads, batch_size, device)
                     new_params = self._updated_inner_params(inner_params, grads, opt_state, global_step)
@@ -1224,11 +1541,19 @@ class EnergyGradMem(GradMemGPT):
                     raw_delta = memory_state["mem_batch"] - memory_before
                     if self.energy_model_type == "segment_delta_gru":
                         delta_for_state = self._rotate_active_tensor(raw_delta, rotation_angle, active_samples)
+                        state_before_update = energy_state
                         energy_state = self._update_segment_delta_state(
                             energy_state,
                             delta_for_state,
                             active_samples,
                         )
+                        if collect_replay_diagnostics:
+                            self._accumulate_replay_state_metrics(
+                                replay_diagnostics,
+                                state_before_update,
+                                energy_state,
+                                replay_active,
+                            )
 
                     active_delta_norms = raw_delta.flatten(start_dim=1).norm(dim=1)[active_samples]
                     delta_excess = torch.relu(active_delta_norms - self.energy_delta_max)
@@ -1255,6 +1580,8 @@ class EnergyGradMem(GradMemGPT):
                         rotation_angle,
                         active_samples,
                     )
+                if has_previous_segment is not None and self.K:
+                    has_previous_segment = has_previous_segment | active_samples
 
         if write_steps and self.energy_ce_guidance:
             guidance_loss = guidance_loss / write_steps
@@ -1282,6 +1609,14 @@ class EnergyGradMem(GradMemGPT):
             stats["energy_delta_reg_loss"] = delta_reg_loss.detach()
         if self.energy_model_type == "segment_delta_gru":
             stats["segment_state_norm_mean"] = energy_state.detach().norm(dim=1).mean()
+            if replay_energy_count:
+                replay_energy_mean = replay_energy_sum / replay_energy_count
+            else:
+                replay_energy_mean = replay_energy_sum
+            stats["replay_energy_mean"] = replay_energy_mean
+            stats["replay_energy_loss"] = self.energy_replay_weight * replay_energy_mean
+            if collect_replay_diagnostics:
+                self._finalize_replay_diagnostics(stats, replay_diagnostics)
         return memory_state, energy_state, inner_loss, guidance_loss, write_steps, stats
 
     @staticmethod

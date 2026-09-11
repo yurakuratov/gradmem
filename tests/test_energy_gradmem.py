@@ -6,7 +6,11 @@ from transformers import GPT2Config
 import energy_gradmem as energy_gradmem_module
 from energy_gradmem import EnergyGradMem, EnergyGradMemConfig
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
-from run_energy_gradmem_on_kv_retrieval import EnergyFreezeCallback, strip_trailing_context_separator
+from run_energy_gradmem_on_kv_retrieval import (
+    EnergyFreezeCallback,
+    reduce_inner_loop_stat,
+    strip_trailing_context_separator,
+)
 
 
 def _base_config():
@@ -35,6 +39,7 @@ def _model(
     memory_rotation_angle=None,
     inner_lr=0.01,
     inner_clip_norm=None,
+    grad_mode="second",
     use_adam=False,
     use_write_head=False,
     **kwargs,
@@ -47,7 +52,7 @@ def _model(
             K=K,
             lr=inner_lr,
             use_adam=use_adam,
-            grad_mode="second",
+            grad_mode=grad_mode,
             use_mem_proj=False,
             mem_proj_mode="none",
             use_write_head=use_write_head,
@@ -701,6 +706,474 @@ def test_segment_delta_gru_zero_initialized_state_columns_receive_gradients():
     assert torch.count_nonzero(model.token_energy_mlp[0].weight[:, 48:]) == 0
     assert torch.isfinite(state_column_grad).all()
     assert state_column_grad.norm() > 0
+
+
+def test_segment_replay_weight_zero_preserves_previous_behavior():
+    torch.manual_seed(7)
+    implicit_default = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+    )
+    torch.manual_seed(7)
+    explicit_zero = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_replay_weight=0.0,
+    )
+    assert not hasattr(implicit_default, "replay_energy_mlp")
+    assert not hasattr(explicit_zero, "replay_energy_mlp")
+    assert implicit_default.state_dict().keys() == explicit_zero.state_dict().keys()
+    for name, value in implicit_default.state_dict().items():
+        torch.testing.assert_close(value, explicit_zero.state_dict()[name])
+
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+    implicit_default.eval()
+    explicit_zero.eval()
+    output_default = implicit_default(
+        {"context_input_ids": segments, "query_input_ids": query},
+        return_mem=True,
+        return_energy_state=True,
+    )
+    output_zero = explicit_zero(
+        {"context_input_ids": segments, "query_input_ids": query},
+        return_mem=True,
+        return_energy_state=True,
+    )
+
+    torch.testing.assert_close(output_default["predictions"], output_zero["predictions"])
+    torch.testing.assert_close(output_default["mem"], output_zero["mem"])
+    torch.testing.assert_close(output_default["energy_state"], output_zero["energy_state"])
+
+
+def test_segment_replay_is_inactive_until_each_sample_has_history(monkeypatch):
+    torch.manual_seed(0)
+    replay_model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_replay_weight=0.5,
+    )
+    baseline_model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_replay_weight=0.0,
+    )
+    baseline_model.load_state_dict(
+        {
+            name: value
+            for name, value in replay_model.state_dict().items()
+            if not name.startswith("replay_energy_mlp.")
+        },
+        strict=True,
+    )
+    first_segment = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    replay_model.eval()
+    baseline_model.eval()
+
+    replay_first = replay_model(
+        {"context_input_ids": first_segment, "query_input_ids": query},
+        return_mem=True,
+    )
+    baseline_first = baseline_model(
+        {"context_input_ids": first_segment, "query_input_ids": query},
+        return_mem=True,
+    )
+    torch.testing.assert_close(replay_first["mem"], baseline_first["mem"])
+    assert replay_first["inner_loop_stats"]["replay_energy_mean"].item() == 0.0
+
+    seen_masks = []
+    original_replay_energy = replay_model._replay_energy
+
+    def capture_replay_mask(memory, state, replay_active):
+        seen_masks.append(replay_active.detach().clone())
+        return original_replay_energy(memory, state, replay_active)
+
+    monkeypatch.setattr(replay_model, "_replay_energy", capture_replay_mask)
+    mixed_segments = [
+        torch.tensor([[4, 5, 6], [0, 0, 0]]),
+        torch.tensor([[7, 8, 9], [10, 11, 12]]),
+    ]
+    mixed_output = replay_model(
+        {"context_input_ids": mixed_segments, "query_input_ids": query},
+        return_mem=True,
+    )
+
+    assert len(seen_masks) == 2
+    assert torch.equal(seen_masks[0], torch.tensor([False, False]))
+    assert torch.equal(seen_masks[1], torch.tensor([True, False]))
+    assert mixed_output["inner_loop_stats"]["replay_energy_mean"] > 0
+
+
+def test_segment_replay_depends_on_memory_and_state_and_has_memory_gradient():
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=8,
+        energy_replay_weight=1.0,
+    )
+    first_linear = model.replay_energy_mlp[0]
+    memory_width = model.mem.size(-1)
+    state_columns = first_linear.weight[:, model.n_mem_tokens * memory_width:]
+    assert torch.count_nonzero(state_columns) > 0
+    with torch.no_grad():
+        for parameter in model.replay_energy_mlp.parameters():
+            parameter.fill_(0.1)
+
+    memory = torch.ones(2, model.n_mem_tokens, memory_width, requires_grad=True)
+    state = torch.ones(2, 8)
+    active = torch.tensor([True, False])
+    replay = model._replay_energy(memory, state, active)
+    replay_changed_memory = model._replay_energy(memory + 1.0, state, active)
+    replay_changed_state = model._replay_energy(memory, state + 1.0, active)
+
+    assert replay[1].item() == 0.0
+    assert not torch.equal(replay[0], replay_changed_memory[0])
+    assert not torch.equal(replay[0], replay_changed_state[0])
+    memory_gradient = torch.autograd.grad(replay.sum(), memory)[0]
+    assert torch.count_nonzero(memory_gradient[0]) > 0
+    assert torch.count_nonzero(memory_gradient[1]) == 0
+
+
+def test_segment_replay_backward_is_finite_and_included_in_energy_parameters():
+    torch.manual_seed(0)
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=8,
+        energy_replay_weight=0.5,
+        energy_weight_rms_reg=0.1,
+        energy_weight_rms_threshold=0.0,
+    )
+    model.train()
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model(
+        {"context_input_ids": segments, "query_input_ids": query},
+        labels=labels,
+    )
+    output["loss"].backward()
+
+    replay_names = [
+        name
+        for name, _ in model._named_energy_parameters()
+        if name.startswith("replay_energy_mlp.")
+    ]
+    assert replay_names
+    assert all(name in model.state_dict() for name in replay_names)
+    energy_parameter_ids = {id(parameter) for parameter in model._energy_parameters()}
+    assert all(
+        id(parameter) in energy_parameter_ids
+        for parameter in model.replay_energy_mlp.parameters()
+    )
+    replay_weight_ids = {
+        id(parameter)
+        for name, parameter in model.replay_energy_mlp.named_parameters()
+        if "bias" not in name
+    }
+    assert replay_weight_ids.issubset(
+        {id(parameter) for parameter in model._energy_weight_parameters()}
+    )
+    assert output["inner_loop_stats"]["replay_energy_mean"] > 0
+    assert all(parameter.grad is not None for parameter in model.replay_energy_mlp.parameters())
+    assert all(torch.isfinite(parameter.grad).all() for parameter in model.replay_energy_mlp.parameters())
+    assert any(torch.count_nonzero(parameter.grad) > 0 for parameter in model.replay_energy_mlp.parameters())
+    assert model.mem.grad is not None
+    assert torch.isfinite(model.mem.grad).all()
+    model.set_energy_trainable(False)
+    assert all(not parameter.requires_grad for parameter in model.replay_energy_mlp.parameters())
+    model.set_energy_trainable(True)
+    assert all(parameter.requires_grad for parameter in model.replay_energy_mlp.parameters())
+
+
+def test_segment_replay_head_is_trained_by_target_loss_in_first_order_mode():
+    torch.manual_seed(0)
+    model = _model(
+        K=1,
+        grad_mode="first",
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=8,
+        energy_replay_weight=0.5,
+    )
+    model.train()
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model(
+        {"context_input_ids": segments, "query_input_ids": query},
+        labels=labels,
+    )
+    output["loss"].backward()
+
+    assert torch.isfinite(output["loss"])
+    replay_gradients = [parameter.grad for parameter in model.replay_energy_mlp.parameters()]
+    assert all(gradient is not None for gradient in replay_gradients)
+    assert all(torch.isfinite(gradient).all() for gradient in replay_gradients)
+    assert sum(gradient.square().sum() for gradient in replay_gradients) > 0
+    assert model.mem.grad is not None
+    assert torch.isfinite(model.mem.grad).all()
+
+
+def test_segment_replay_force_diagnostics_are_finite_with_ce_guidance():
+    torch.manual_seed(0)
+    model = _model(
+        K=2,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=8,
+        energy_replay_weight=0.5,
+        energy_inner_ce_weight=0.25,
+    )
+    model.eval()
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+
+    stats = model(
+        {"context_input_ids": segments, "query_input_ids": query}
+    )["inner_loop_stats"]
+    diagnostic_names = (
+        "current_energy_memory_grad_norm_mean",
+        "current_energy_memory_grad_norm_max",
+        "weighted_replay_memory_grad_norm_mean",
+        "weighted_replay_memory_grad_norm_max",
+        "replay_current_grad_norm_ratio_mean",
+        "replay_current_grad_norm_ratio_max",
+        "replay_current_grad_cosine_mean",
+        "replay_current_grad_cosine_min",
+        "replay_current_grad_conflict_fraction",
+        "weighted_replay_non_replay_grad_norm_ratio_mean",
+        "weighted_replay_non_replay_grad_norm_ratio_max",
+        "recurrent_state_norm_mean",
+        "recurrent_state_norm_max",
+        "recurrent_state_change_norm_mean",
+        "recurrent_state_change_norm_max",
+        "recurrent_state_saturation_fraction",
+        "replay_memory_input_weight_rms",
+        "replay_state_input_weight_rms",
+    )
+
+    assert all(name in stats for name in diagnostic_names)
+    assert all(torch.isfinite(stats[name]) for name in diagnostic_names)
+    assert 0 <= stats["replay_current_grad_conflict_fraction"] <= 1
+    assert 0 <= stats["recurrent_state_saturation_fraction"] <= 1
+
+
+def test_segment_replay_force_diagnostics_handle_zero_gradients():
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=8,
+        energy_replay_weight=0.5,
+    )
+    model.eval()
+    with torch.no_grad():
+        for parameter in model.token_energy_mlp.parameters():
+            parameter.zero_()
+        for parameter in model.replay_energy_mlp.parameters():
+            parameter.zero_()
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+
+    stats = model(
+        {"context_input_ids": segments, "query_input_ids": query}
+    )["inner_loop_stats"]
+
+    for name in (
+        "current_energy_memory_grad_norm_mean",
+        "weighted_replay_memory_grad_norm_mean",
+        "replay_current_grad_norm_ratio_mean",
+        "replay_current_grad_cosine_mean",
+        "replay_current_grad_conflict_fraction",
+    ):
+        assert torch.isfinite(stats[name])
+        assert stats[name].item() == 0.0
+
+
+def test_segment_replay_gradient_diagnostic_uses_weighted_force():
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+    torch.manual_seed(11)
+    low_weight_model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=8,
+        energy_replay_weight=0.25,
+    )
+    torch.manual_seed(11)
+    high_weight_model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=8,
+        energy_replay_weight=0.5,
+    )
+    low_weight_model.eval()
+    high_weight_model.eval()
+
+    low_stats = low_weight_model(
+        {"context_input_ids": segments, "query_input_ids": query}
+    )["inner_loop_stats"]
+    high_stats = high_weight_model(
+        {"context_input_ids": segments, "query_input_ids": query}
+    )["inner_loop_stats"]
+
+    torch.testing.assert_close(
+        high_stats["weighted_replay_memory_grad_norm_mean"],
+        2 * low_stats["weighted_replay_memory_grad_norm_mean"],
+    )
+    torch.testing.assert_close(
+        high_stats["weighted_replay_memory_grad_norm_max"],
+        2 * low_stats["weighted_replay_memory_grad_norm_max"],
+    )
+
+
+def test_segment_replay_input_weight_rms_splits_memory_and_state_columns():
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=8,
+        energy_replay_weight=0.5,
+    )
+    first_linear = model.replay_energy_mlp[0]
+    memory_input_size = first_linear.in_features - model.energy_segment_state_size
+    with torch.no_grad():
+        first_linear.weight[:, :memory_input_size].fill_(2.0)
+        first_linear.weight[:, memory_input_size:].fill_(3.0)
+    stats = {}
+
+    model._finalize_replay_diagnostics(
+        stats,
+        model._new_replay_diagnostics(model.mem),
+    )
+
+    torch.testing.assert_close(stats["replay_memory_input_weight_rms"], torch.tensor(2.0))
+    torch.testing.assert_close(stats["replay_state_input_weight_rms"], torch.tensor(3.0))
+
+
+def test_disabled_read_optimization_emits_no_read_statistics():
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_replay_weight=0.5,
+        reading_optimization=False,
+    )
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+
+    stats = model(
+        {"context_input_ids": segments, "query_input_ids": query}
+    )["inner_loop_stats"]
+
+    assert not any(name.startswith("read_") for name in stats)
+
+
+def test_training_skips_expensive_replay_diagnostic_gradients(monkeypatch):
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_replay_weight=0.5,
+    )
+    model.train()
+    segments = [
+        torch.randint(1, 101, (2, 5)),
+        torch.randint(1, 101, (2, 5)),
+    ]
+    query = torch.randint(1, 101, (2, 4))
+    grad_calls = 0
+    original_grad = torch.autograd.grad
+
+    def count_grad_calls(*args, **kwargs):
+        nonlocal grad_calls
+        grad_calls += 1
+        return original_grad(*args, **kwargs)
+
+    monkeypatch.setattr(torch.autograd, "grad", count_grad_calls)
+    stats = model(
+        {"context_input_ids": segments, "query_input_ids": query}
+    )["inner_loop_stats"]
+
+    assert grad_calls == 2
+    assert "current_energy_memory_grad_norm_mean" not in stats
+
+
+def test_replay_state_diagnostics_measure_the_state_used_by_replay():
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        energy_model_type="segment_delta_gru",
+        energy_segment_state_size=2,
+        energy_replay_weight=0.5,
+    )
+    diagnostics = model._new_replay_diagnostics(model.mem)
+    state_before = torch.tensor([[0.3, -0.4], [0.1, 0.2]])
+    state_after = torch.tensor([[0.96, -0.97], [0.8, 0.9]])
+    replay_active = torch.tensor([True, False])
+
+    model._accumulate_replay_state_metrics(
+        diagnostics,
+        state_before,
+        state_after,
+        replay_active,
+    )
+    stats = {}
+    model._finalize_replay_diagnostics(stats, diagnostics)
+
+    torch.testing.assert_close(stats["recurrent_state_norm_mean"], torch.tensor(0.5))
+    torch.testing.assert_close(
+        stats["recurrent_state_change_norm_mean"],
+        (state_after[0] - state_before[0]).norm(),
+    )
+    assert stats["recurrent_state_saturation_fraction"].item() == 0.0
+
+
+@pytest.mark.parametrize(
+    "name,values,expected",
+    [
+        ("current_energy_memory_grad_norm_max", [1.0, 3.0], 3.0),
+        ("replay_current_grad_cosine_min", [0.25, -0.5], -0.5),
+        ("current_energy_memory_grad_norm_mean", [1.0, 2.0], 1.5),
+        ("replay_current_grad_conflict_fraction", [0.25, 0.75], 0.5),
+    ],
+)
+def test_inner_loop_stat_reduction_matches_metric_semantics(name, values, expected):
+    assert reduce_inner_loop_stat(name, torch.tensor(values)) == expected
 
 
 def test_segment_delta_gru_preserves_flattened_memory_slot_order():
@@ -2082,6 +2555,7 @@ def test_outer_energy_weight_rms_regularization_is_added_to_main_objective():
         ({"energy_weight_rms_threshold": float("nan")}, "must be finite and non-negative"),
         ({"energy_delta_reg": float("inf")}, "must be finite and non-negative"),
         ({"energy_delta_max": -0.1}, "must be finite and non-negative"),
+        ({"energy_replay_weight": float("nan")}, "must be finite and non-negative"),
         (
             {"inner_objective": "cross_entropy", "energy_weight_rms_reg": 0.1},
             "requires inner_objective='neural'",
@@ -2406,6 +2880,16 @@ def test_segment_delta_gru_defaults_state_size_and_rejects_invalid_size():
             energy_future_mode="none",
             energy_model_type="segment_delta_gru",
             energy_segment_state_size=0,
+        )
+
+
+def test_energy_replay_rejects_other_energy_architectures():
+    with pytest.raises(ValueError, match="energy_model_type='segment_delta_gru'"):
+        _model(
+            K=1,
+            energy_future_mode="none",
+            energy_model_type="identity",
+            energy_replay_weight=0.1,
         )
 
 

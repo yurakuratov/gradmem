@@ -32,6 +32,14 @@ logger = logging.getLogger("")
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
+def reduce_inner_loop_stat(name, values):
+    if name.endswith("_max"):
+        return float(values.max())
+    if name.endswith("_min"):
+        return float(values.min())
+    return float(values.mean())
+
+
 @dataclass
 class ExperimentArgs:
     exp_path: str = field()
@@ -119,6 +127,7 @@ class ExperimentArgs:
     energy_weight_rms_threshold: Optional[float] = field(default=0.0)
     energy_delta_reg: Optional[float] = field(default=0.0)
     energy_delta_max: Optional[float] = field(default=1.0)
+    energy_replay_weight: Optional[float] = field(default=0.0)
     energy_model_type: Optional[str] = field(default="lstm")
     energy_segment_state_size: Optional[int] = field(default=None)
     energy_mamba_state_size: Optional[int] = field(default=128)
@@ -226,6 +235,7 @@ def build_model_config(args, base_config):
         energy_weight_rms_threshold=args.energy_weight_rms_threshold,
         energy_delta_reg=args.energy_delta_reg,
         energy_delta_max=args.energy_delta_max,
+        energy_replay_weight=args.energy_replay_weight,
         energy_model_type=args.energy_model_type,
         energy_segment_state_size=args.energy_segment_state_size,
         energy_mamba_state_size=args.energy_mamba_state_size,
@@ -381,6 +391,26 @@ if __name__ == "__main__":
             "energy_weight_rms",
             "energy_delta_reg_loss",
             "energy_delta_exceed_fraction",
+            "replay_energy_mean",
+            "replay_energy_loss",
+            "current_energy_memory_grad_norm_mean",
+            "current_energy_memory_grad_norm_max",
+            "weighted_replay_memory_grad_norm_mean",
+            "weighted_replay_memory_grad_norm_max",
+            "replay_current_grad_norm_ratio_mean",
+            "replay_current_grad_norm_ratio_max",
+            "replay_current_grad_cosine_mean",
+            "replay_current_grad_cosine_min",
+            "replay_current_grad_conflict_fraction",
+            "weighted_replay_non_replay_grad_norm_ratio_mean",
+            "weighted_replay_non_replay_grad_norm_ratio_max",
+            "recurrent_state_norm_mean",
+            "recurrent_state_norm_max",
+            "recurrent_state_change_norm_mean",
+            "recurrent_state_change_norm_max",
+            "recurrent_state_saturation_fraction",
+            "replay_memory_input_weight_rms",
+            "replay_state_input_weight_rms",
             "segment_delta_norm_mean",
             "segment_delta_norm_max",
             "segment_state_norm_mean",
@@ -392,7 +422,7 @@ if __name__ == "__main__":
             "read_hidden_delta_norm_max",
         ):
             if key in inner_loop_stats:
-                metrics[key] = float(inner_loop_stats[key].mean())
+                metrics[key] = reduce_inner_loop_stat(key, inner_loop_stats[key])
         return metrics
 
     if args.total_batch_size is None:
