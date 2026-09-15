@@ -14,7 +14,7 @@ cd "$REPO_ROOT"
 
 PYTHON_BIN=${PYTHON_BIN:-python}
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
-export WANDB_PROJECT=${WANDB_PROJECT:-gradmem_zoology_multihop}
+export WANDB_PROJECT=${WANDB_PROJECT:-zoology_multihop}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 
 if [ ${#CURRICULUM_N[@]} -eq 0 ]; then
@@ -70,21 +70,37 @@ READING_OPTIMIZATION=false
 
 LR=${LR:-1e-4}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
-LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-constant_with_warmup}
+LR_SCHEDULER_TYPE=${LR_SCHEDULER_TYPE:-linear}
+OUTER_LR_FINAL_RATIO=${OUTER_LR_FINAL_RATIO:-0.2}
 MAX_STEPS=${MAX_STEPS:-50000}
 EVAL_STEPS=${EVAL_STEPS:-100}
 LOGGING_STEPS=${LOGGING_STEPS:-100}
 WARMUP_STEPS=${WARMUP_STEPS:-1000}
 EARLY_STOPPING_PATIENCE=${EARLY_STOPPING_PATIENCE:-500}
-STOP_EXACT_MATCH_VALUE=${STOP_EXACT_MATCH_VALUE:-0.99}
+STOP_ALL_QUERIES_EXACT_MATCH_VALUE=${STOP_ALL_QUERIES_EXACT_MATCH_VALUE:-0.99}
 DATALOADER_NUM_WORKERS=${DATALOADER_NUM_WORKERS:-4}
 HF_DATASET=${HF_DATASET:-irodkin/zoology_multihop}
 OUTPUT_ROOT=${OUTPUT_ROOT:-$REPO_ROOT/runs/energy_gradmem_zoology_mh_curriculum}
 START_STAGE=${START_STAGE:-1}
 RUN_NUMBERS=${RUN_NUMBERS:-"1 2 3"}
+ENABLE_CURRICULUM_GATE=${ENABLE_CURRICULUM_GATE:-true}
+CURRICULUM_METRIC=${CURRICULUM_METRIC:-query_accuracy}
+CURRICULUM_METRIC_THRESHOLD=${CURRICULUM_METRIC_THRESHOLD:-0.9}
+CURRICULUM_LOWER_IS_BETTER=${CURRICULUM_LOWER_IS_BETTER:-false}
+PROGRESSION_METRICS_FILENAME=progression_metrics.json
 
 if ! [[ "$START_STAGE" =~ ^[0-9]+$ ]] || [ "$START_STAGE" -lt 1 ]; then
   echo "START_STAGE must be a positive 1-based integer" >&2
+  exit 1
+fi
+if [ "$ENABLE_CURRICULUM_GATE" != "true" ] \
+  && [ "$ENABLE_CURRICULUM_GATE" != "false" ]; then
+  echo "ENABLE_CURRICULUM_GATE must be true or false" >&2
+  exit 1
+fi
+if [ "$CURRICULUM_LOWER_IS_BETTER" != "true" ] \
+  && [ "$CURRICULUM_LOWER_IS_BETTER" != "false" ]; then
+  echo "CURRICULUM_LOWER_IS_BETTER must be true or false" >&2
   exit 1
 fi
 
@@ -146,13 +162,15 @@ for RUN_ID in $RUN_NUMBERS; do
     fi
     SEGMENT_COUNT=$(((DATASET_N + KV_PAIRS_PER_SEGMENT - 1) / KV_PAIRS_PER_SEGMENT))
 
-    RUN_NAME=energy_gradmem_zoology_mh_seg${SEGMENT_REGIME}_llama_L${L}H${N_HEAD}D${D}_attndrop${ATTENTION_DROPOUT}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_ce${CE_WEIGHT}_grad_${GRAD_MODE}_energy_${ENERGY_MODEL_TYPE}_state${ENERGY_SEGMENT_STATE_SIZE}_replay0
+    RUN_NAME=energy_gradmem_zoology_mh_seg${SEGMENT_REGIME}_llama_L${L}H${N_HEAD}D${D}_attndrop${ATTENTION_DROPOUT}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_ce${CE_WEIGHT}_olr${LR}_${LR_SCHEDULER_TYPE}final${OUTER_LR_FINAL_RATIO}_grad_${GRAD_MODE}_energy_${ENERGY_MODEL_TYPE}_state${ENERGY_SEGMENT_STATE_SIZE}_replay0
     STAGE_PATH=$OUTPUT_ROOT/seg${SEGMENT_REGIME}/${HF_SUBSET}/${RUN_NAME}/run_${RUN_ID}/stage_${STAGE}
     WANDB_NAME=energy_gradmem_zoology_mh_seg${SEGMENT_REGIME}_N${DATASET_N}_${SEGMENT_COUNT}segments_ce${CE_WEIGHT}_ilr${INNER_LR}_run${RUN_ID}
 
     if [ "$STAGE" -lt "$START_STAGE" ]; then
+      STAGE_WAS_TRAINED=false
       echo "Skipping stage $STAGE; resolving its best checkpoint from $STAGE_PATH"
     else
+      STAGE_WAS_TRAINED=true
       INIT_ARGS=()
       if [ -n "$INIT_CKPT" ]; then
         INIT_ARGS=(--init_checkpoint "$INIT_CKPT")
@@ -208,8 +226,9 @@ for RUN_ID in $RUN_NUMBERS; do
         --learning_rate "$LR" \
         --weight_decay "$WEIGHT_DECAY" \
         --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
+        --outer_lr_final_ratio "$OUTER_LR_FINAL_RATIO" \
         --metric_for_best_model query_accuracy \
-        --stop_exact_match_value "$STOP_EXACT_MATCH_VALUE" \
+        --stop_all_queries_exact_match_value "$STOP_ALL_QUERIES_EXACT_MATCH_VALUE" \
         --max_steps "$MAX_STEPS" \
         --eval_steps "$EVAL_STEPS" \
         --logging_steps "$LOGGING_STEPS" \
@@ -223,6 +242,20 @@ for RUN_ID in $RUN_NUMBERS; do
     if ! INIT_CKPT=$(resolve_progression_checkpoint "$STAGE_PATH"); then
       echo "Could not resolve a complete best checkpoint for stage $STAGE" >&2
       exit 1
+    fi
+
+    if [ "$STAGE_WAS_TRAINED" = "true" ]; then
+      if "$PYTHON_BIN" "$REPO_ROOT/zoology_curriculum_gate.py" \
+        --metrics-file "$STAGE_PATH/$PROGRESSION_METRICS_FILENAME" \
+        --metric "$CURRICULUM_METRIC" \
+        --threshold "$CURRICULUM_METRIC_THRESHOLD" \
+        --lower-is-better "$CURRICULUM_LOWER_IS_BETTER" \
+        --enabled "$ENABLE_CURRICULUM_GATE"; then
+        :
+      else
+        echo "Stopping remaining stages for run $RUN_ID after stage $STAGE; other run IDs will continue." >&2
+        break
+      fi
     fi
   done
 done

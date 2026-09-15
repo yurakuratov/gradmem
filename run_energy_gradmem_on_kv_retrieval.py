@@ -41,7 +41,9 @@ def reduce_inner_loop_stat(name, values):
 
 
 @dataclass
-class ExperimentArgs:
+class EnergyGradMemExperimentArgs:
+    """Arguments shared by EnergyGradMem task-specific runners."""
+
     exp_path: str = field()
     per_device_batch_size: int = field()
     data_path: Optional[str] = field(default=None)
@@ -57,7 +59,6 @@ class ExperimentArgs:
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default="token_accuracy")
-    stop_exact_match_value: Optional[float] = field(default=1.0)
     warmup_steps: Optional[int] = field(default=1000)
     max_steps: Optional[int] = field(default=50000)
     logging_steps: Optional[int] = field(default=100)
@@ -144,6 +145,13 @@ class ExperimentArgs:
     energy_pretrain_seed: Optional[int] = field(default=0)
     energy_pretrain_l2_reg: Optional[float] = field(default=0.0)
     energy_freezed_steps: Optional[int] = field(default=0)
+
+
+@dataclass
+class ExperimentArgs(EnergyGradMemExperimentArgs):
+    """KV-retrieval arguments, including its legacy exact-match stop metric."""
+
+    stop_exact_match_value: Optional[float] = field(default=1.0)
 
 
 def build_base_config(args, tokenizer):

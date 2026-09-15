@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,8 +26,8 @@ from transformers import (
 
 from energy_gradmem import EnergyGradMem
 from run_energy_gradmem_on_kv_retrieval import (
+    EnergyGradMemExperimentArgs,
     EnergyFreezeCallback,
-    ExperimentArgs,
     build_model_config,
     reduce_inner_loop_stat,
 )
@@ -52,10 +53,89 @@ os.environ.setdefault("WANDB_PROJECT", "gradmem")
 logger_fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 logging.basicConfig(format=logger_fmt, level=logging.INFO)
 logger = logging.getLogger("")
+PROGRESSION_METRICS_FILENAME = "progression_metrics.json"
+
+
+def warmup_linear_decay_to_ratio_lambda(
+    current_step: int,
+    *,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    final_ratio: float,
+) -> float:
+    """Return the LR multiplier for exact linear decay to a nonzero floor."""
+
+    if num_training_steps <= num_warmup_steps:
+        raise ValueError("num_training_steps must be greater than num_warmup_steps")
+    if num_warmup_steps < 0:
+        raise ValueError("num_warmup_steps must be non-negative")
+    if not math.isfinite(final_ratio) or not 0.0 < final_ratio <= 1.0:
+        raise ValueError("final_ratio must be finite and in (0, 1]")
+
+    if current_step < num_warmup_steps:
+        return float(current_step) / float(max(1, num_warmup_steps))
+
+    decay_steps = num_training_steps - num_warmup_steps
+    decay_progress = min(
+        max(float(current_step - num_warmup_steps) / float(decay_steps), 0.0),
+        1.0,
+    )
+    return 1.0 - (1.0 - final_ratio) * decay_progress
+
+
+def create_warmup_linear_decay_to_ratio_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    num_warmup_steps: int,
+    num_training_steps: int,
+    final_ratio: float,
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """Create a scheduler whose final-step LR is exactly ``final_ratio * LR``."""
+
+    def lr_lambda(current_step: int) -> float:
+        return warmup_linear_decay_to_ratio_lambda(
+            current_step,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            final_ratio=final_ratio,
+        )
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+class ZoologyTrainer(CustomTrainer):
+    """Trainer with an exact nonzero-floor linear scheduler for Zoology."""
+
+    def __init__(self, *args, outer_lr_final_ratio: float, **kwargs):
+        self.outer_lr_final_ratio = outer_lr_final_ratio
+        super().__init__(*args, **kwargs)
+
+    def create_scheduler(
+        self,
+        num_training_steps: int,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+    ):
+        scheduler_type = getattr(
+            self.args.lr_scheduler_type,
+            "value",
+            self.args.lr_scheduler_type,
+        )
+        if scheduler_type != "linear":
+            return super().create_scheduler(num_training_steps, optimizer)
+
+        if self.lr_scheduler is None:
+            optimizer = self.optimizer if optimizer is None else optimizer
+            self.lr_scheduler = create_warmup_linear_decay_to_ratio_scheduler(
+                optimizer,
+                num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
+                num_training_steps=num_training_steps,
+                final_ratio=self.outer_lr_final_ratio,
+            )
+        return self.lr_scheduler
 
 
 @dataclass
-class ZoologyExperimentArgs(ExperimentArgs):
+class ZoologyExperimentArgs(EnergyGradMemExperimentArgs):
     """EnergyGradMem arguments specialized for integer Zoology examples."""
 
     hf_dataset: Optional[str] = field(default="irodkin/zoology_multihop")
@@ -64,6 +144,7 @@ class ZoologyExperimentArgs(ExperimentArgs):
     kv_pairs_per_segment: int = field(default=8)
     vocab_size: Optional[int] = field(default=VOCAB_SIZE)
     metric_for_best_model: Optional[str] = field(default="query_accuracy")
+    stop_all_queries_exact_match_value: float = field(default=1.0)
     n_layer: Optional[int] = field(default=2)
     n_head: Optional[int] = field(default=1)
     n_embd: Optional[int] = field(default=128)
@@ -74,6 +155,7 @@ class ZoologyExperimentArgs(ExperimentArgs):
     reading_optimization: Optional[bool] = field(default=False)
     max_position_embeddings: int = field(default=2048)
     attention_dropout: float = field(default=0.1)
+    outer_lr_final_ratio: float = field(default=0.2)
     report_to: str = field(default="wandb")
     dataloader_num_workers: int = field(default=4)
 
@@ -95,6 +177,14 @@ def validate_zoology_args(args: ZoologyExperimentArgs) -> None:
         raise ValueError("max_position_embeddings must be positive")
     if not 0.0 <= float(args.attention_dropout) < 1.0:
         raise ValueError("attention_dropout must be in [0, 1)")
+    if not math.isfinite(float(args.outer_lr_final_ratio)) or not (
+        0.0 < float(args.outer_lr_final_ratio) <= 1.0
+    ):
+        raise ValueError("outer_lr_final_ratio must be finite and in (0, 1]")
+    if args.lr_scheduler_type == "linear" and args.warmup_steps >= args.max_steps:
+        raise ValueError(
+            "linear scheduling requires warmup_steps to be less than max_steps"
+        )
 
     expected_subset = configuration_name(args.n_pairs, args.hop_length)
     if args.hf_subset is None:
@@ -287,7 +377,7 @@ def compute_zoology_metrics(eval_pred) -> Dict[str, float]:
     query_correct = np.stack(query_correct_rows)
     metrics = {
         "query_accuracy": float(query_correct.mean()),
-        "exact_match": float(query_correct.all(axis=1).mean()),
+        "all_queries_exact_match": float(query_correct.all(axis=1).mean()),
     }
     for distance in sorted(np.unique(hop_distances)):
         distance_mask = hop_distances == distance
@@ -300,6 +390,28 @@ def compute_zoology_metrics(eval_pred) -> Dict[str, float]:
             continue
         metrics[name] = reduce_inner_loop_stat(name, np.asarray(values))
     return metrics
+
+
+def progression_metrics_for_json(metrics: Dict[str, float]) -> Dict[str, object]:
+    """Strip Trainer's prefix and replace non-finite values with JSON null."""
+
+    prefix = "progression_"
+    serialized = {}
+    for name, value in metrics.items():
+        output_name = name[len(prefix) :] if name.startswith(prefix) else name
+        numeric_value = float(value)
+        serialized[output_name] = numeric_value if math.isfinite(numeric_value) else None
+    return serialized
+
+
+def save_progression_metrics(output_dir: Path, metrics: Dict[str, float]) -> Path:
+    """Write the validation metrics for the exact model used for progression."""
+
+    metrics_path = output_dir / PROGRESSION_METRICS_FILENAME
+    with metrics_path.open("w", encoding="utf-8") as metrics_file:
+        json.dump(progression_metrics_for_json(metrics), metrics_file, indent=2)
+        metrics_file.write("\n")
+    return metrics_path
 
 
 def load_zoology_dataset(args: ZoologyExperimentArgs):
@@ -409,9 +521,10 @@ def main() -> None:
         dataloader_pin_memory=True,
         seed=args.seed,
     )
-    trainer = CustomTrainer(
+    trainer = ZoologyTrainer(
         model=model,
         args=training_args,
+        outer_lr_final_ratio=args.outer_lr_final_ratio,
         train_dataset=train_dataset,
         eval_dataset=validation_dataset,
         data_collator=data_collator,
@@ -422,27 +535,37 @@ def main() -> None:
                 early_stopping_patience=args.early_stopping_patience
             ),
             StopOnMetricValue(
-                metric_name="exact_match",
-                value=args.stop_exact_match_value,
+                metric_name="all_queries_exact_match",
+                value=args.stop_all_queries_exact_match_value,
                 higher_is_better=True,
             ),
             EnergyFreezeCallback(args.energy_freezed_steps),
         ],
     )
     trainer.train()
-    logger.info("training done; running held-out test evaluation with the best model")
     # Selection callbacks apply only to validation evaluations during training.
-    # Removing them prevents the held-out "test_*" metrics from being mistaken
-    # for a validation event or altering early-stopping state.
+    # Removing them prevents progression/test metrics from being mistaken for a
+    # checkpoint-selection event or altering early-stopping state.
     trainer.remove_callback(EarlyStoppingCallback)
     trainer.remove_callback(StopOnMetricValue)
-    test_metrics = trainer.evaluate(test_dataset, metric_key_prefix="test")
-    logger.info("%s", test_metrics)
-    trainer.save_metrics(split="test", metrics=test_metrics)
     # With load_best_model_at_end=True this is the selected best model. Saving a
     # stable stage-level copy also covers the case where eval-on-start triggers
     # early stopping before Trainer creates a numbered checkpoint.
     trainer.save_model(output_dir / "progression_checkpoint")
+
+    logger.info("evaluating the progression checkpoint on validation")
+    progression_metrics = trainer.evaluate(
+        validation_dataset,
+        metric_key_prefix="progression",
+    )
+    if accelerator.is_main_process:
+        metrics_path = save_progression_metrics(output_dir, progression_metrics)
+        logger.info("saved progression metrics to %s", metrics_path)
+
+    logger.info("running held-out test evaluation with the progression model")
+    test_metrics = trainer.evaluate(test_dataset, metric_key_prefix="test")
+    logger.info("%s", test_metrics)
+    trainer.save_metrics(split="test", metrics=test_metrics)
     trainer.state.save_to_json(output_dir / "trainer_state.json")
 
 
