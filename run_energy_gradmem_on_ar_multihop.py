@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train EnergyGradMem directly on integer-encoded Zoology multihop data."""
+"""Train EnergyGradMem directly on raw structured AR-multihop data."""
 
 from __future__ import annotations
 
@@ -32,28 +32,65 @@ from run_energy_gradmem_on_kv_retrieval import (
     reduce_inner_loop_stat,
 )
 from run_gradmemgpt_on_kv_retrieval import CustomTrainer, StopOnMetricValue
+from ar_multihop_dataset import (
+    ENTITY_ALPHABET_SIZE,
+    configuration_name as ar_multihop_configuration_name,
+    entity_length_for_configuration,
+)
 from zoology_multihop_dataset import (
-    BOS_ID,
-    CONTEXT_END_ID,
-    CONTEXT_START_ID,
-    EOS_ID,
-    KV_RECORD_WIDTH,
-    PAD_ID,
-    QUERY_RECORD_WIDTH,
-    VOCAB_SIZE,
-    configuration_name,
-    parse_context_records,
-    parse_query_keys,
+    KV_RECORD_WIDTH as ZOOLOGY_KV_RECORD_WIDTH,
+    QUERY_RECORD_WIDTH as ZOOLOGY_QUERY_RECORD_WIDTH,
+    VOCAB_SIZE as ZOOLOGY_VOCAB_SIZE,
+    configuration_name as zoology_configuration_name,
+    parse_context_records as parse_zoology_context_records,
+    parse_query_keys as parse_zoology_query_keys,
 )
 
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ.setdefault("WANDB_PROJECT", "gradmem")
+os.environ.setdefault("WANDB_PROJECT", "energy_gradmem_ar_multihop")
 
 logger_fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 logging.basicConfig(format=logger_fmt, level=logging.INFO)
 logger = logging.getLogger("")
 PROGRESSION_METRICS_FILENAME = "progression_metrics.json"
+
+SPECIAL_TOKENS = {
+    "PAD": 0,
+    "BOS": 1,
+    "EOS": 2,
+    "CONTEXT_START": 3,
+    "CONTEXT_END": 4,
+    "KV_START": 5,
+    "KV_SEPARATOR": 6,
+    "KV_END": 7,
+    "QUERY_START": 8,
+    "QUERY_END": 9,
+    "MASK": 10,
+}
+NUM_SPECIAL_TOKENS = len(SPECIAL_TOKENS)
+MODEL_VOCAB_SIZE = NUM_SPECIAL_TOKENS + ENTITY_ALPHABET_SIZE
+PAD_ID = SPECIAL_TOKENS["PAD"]
+BOS_ID = SPECIAL_TOKENS["BOS"]
+EOS_ID = SPECIAL_TOKENS["EOS"]
+CONTEXT_START_ID = SPECIAL_TOKENS["CONTEXT_START"]
+CONTEXT_END_ID = SPECIAL_TOKENS["CONTEXT_END"]
+KV_START_ID = SPECIAL_TOKENS["KV_START"]
+KV_SEPARATOR_ID = SPECIAL_TOKENS["KV_SEPARATOR"]
+KV_END_ID = SPECIAL_TOKENS["KV_END"]
+QUERY_START_ID = SPECIAL_TOKENS["QUERY_START"]
+QUERY_END_ID = SPECIAL_TOKENS["QUERY_END"]
+MASK_ID = SPECIAL_TOKENS["MASK"]
+
+if set(SPECIAL_TOKENS.values()) != set(range(NUM_SPECIAL_TOKENS)):
+    raise RuntimeError("model structural-token IDs must be a contiguous prefix")
+
+
+def model_entity_id(raw_symbol: int) -> int:
+    raw_symbol = int(raw_symbol)
+    if not 0 <= raw_symbol < ENTITY_ALPHABET_SIZE:
+        raise ValueError(f"raw entity symbol must be in [0, 16); got {raw_symbol}")
+    return NUM_SPECIAL_TOKENS + raw_symbol
 
 
 def warmup_linear_decay_to_ratio_lambda(
@@ -103,8 +140,8 @@ def create_warmup_linear_decay_to_ratio_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-class ZoologyTrainer(CustomTrainer):
-    """Trainer with an exact nonzero-floor linear scheduler for Zoology."""
+class ARMultihopTrainer(CustomTrainer):
+    """Trainer with an exact nonzero-floor linear scheduler for AR-multihop."""
 
     def __init__(self, *args, outer_lr_final_ratio: float, **kwargs):
         self.outer_lr_final_ratio = outer_lr_final_ratio
@@ -135,14 +172,15 @@ class ZoologyTrainer(CustomTrainer):
 
 
 @dataclass
-class ZoologyExperimentArgs(EnergyGradMemExperimentArgs):
-    """EnergyGradMem arguments specialized for integer Zoology examples."""
+class ARMultihopExperimentArgs(EnergyGradMemExperimentArgs):
+    """Shared EnergyGradMem arguments for both multihop dataset schemas."""
 
-    hf_dataset: Optional[str] = field(default="irodkin/zoology_multihop")
+    dataset_format: str = field(default="ar_multihop")
+    hf_dataset: Optional[str] = field(default=None)
     n_pairs: Optional[int] = field(default=8)
     hop_length: int = field(default=1)
     kv_pairs_per_segment: int = field(default=8)
-    vocab_size: Optional[int] = field(default=VOCAB_SIZE)
+    vocab_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default="query_accuracy")
     stop_all_queries_exact_match_value: float = field(default=1.0)
     n_layer: Optional[int] = field(default=2)
@@ -160,17 +198,43 @@ class ZoologyExperimentArgs(EnergyGradMemExperimentArgs):
     dataloader_num_workers: int = field(default=4)
 
 
-def validate_zoology_args(args: ZoologyExperimentArgs) -> None:
+def validate_ar_multihop_args(args: ARMultihopExperimentArgs) -> None:
+    if args.dataset_format not in ("ar_multihop", "zoology"):
+        raise ValueError("dataset_format must be 'ar_multihop' or 'zoology'")
     if args.pretrained_model is not None:
-        raise ValueError("The Zoology integer runner does not support pretrained_model")
+        raise ValueError("The multihop integer runner does not support pretrained_model")
     if args.base_model not in (None, "llama"):
-        raise ValueError("The first Zoology experiment supports base_model='llama' only")
-    if int(args.vocab_size) != VOCAB_SIZE:
-        raise ValueError(f"Zoology requires vocab_size={VOCAB_SIZE}")
+        raise ValueError("The multihop runner supports base_model='llama' only")
+    if args.n_pairs is None:
+        raise ValueError("n_pairs must be provided")
     if int(args.n_pairs) < 1:
         raise ValueError("n_pairs must be positive")
     if int(args.hop_length) < 1 or int(args.n_pairs) % int(args.hop_length):
         raise ValueError("hop_length must be positive and divide n_pairs")
+
+    if args.dataset_format == "ar_multihop":
+        defaults = {
+            "hf_dataset": "irodkin/ar_multihop",
+            "vocab_size": MODEL_VOCAB_SIZE,
+            "subset": ar_multihop_configuration_name(args.n_pairs, args.hop_length),
+        }
+    else:
+        defaults = {
+            "hf_dataset": "irodkin/zoology_multihop",
+            "vocab_size": ZOOLOGY_VOCAB_SIZE,
+            "subset": zoology_configuration_name(args.n_pairs, args.hop_length),
+        }
+    for field_name in ("hf_dataset", "vocab_size"):
+        expected = defaults[field_name]
+        actual = getattr(args, field_name)
+        if actual is None:
+            setattr(args, field_name, expected)
+        elif actual != expected:
+            raise ValueError(
+                f"{field_name}={actual!r} conflicts with dataset_format="
+                f"{args.dataset_format!r}; expected {expected!r}"
+            )
+
     if int(args.kv_pairs_per_segment) < 1:
         raise ValueError("kv_pairs_per_segment must be positive")
     if int(args.max_position_embeddings) < 1:
@@ -186,7 +250,7 @@ def validate_zoology_args(args: ZoologyExperimentArgs) -> None:
             "linear scheduling requires warmup_steps to be less than max_steps"
         )
 
-    expected_subset = configuration_name(args.n_pairs, args.hop_length)
+    expected_subset = defaults["subset"]
     if args.hf_subset is None:
         args.hf_subset = expected_subset
     elif args.hf_subset != expected_subset:
@@ -196,11 +260,11 @@ def validate_zoology_args(args: ZoologyExperimentArgs) -> None:
         )
 
 
-def build_zoology_base_config(args: ZoologyExperimentArgs) -> LlamaConfig:
-    """Build the small decoder used by the first Zoology experiments."""
+def build_ar_multihop_base_config(args: ARMultihopExperimentArgs) -> LlamaConfig:
+    """Build the small decoder with the validated dataset-dependent vocabulary."""
 
     return LlamaConfig(
-        vocab_size=VOCAB_SIZE,
+        vocab_size=int(args.vocab_size),
         hidden_size=int(args.n_embd),
         intermediate_size=4 * int(args.n_embd),
         num_hidden_layers=int(args.n_layer),
@@ -216,18 +280,18 @@ def build_zoology_base_config(args: ZoologyExperimentArgs) -> LlamaConfig:
     )
 
 
-def segment_context_input_ids(
+def segment_zoology_context_input_ids(
     context_input_ids: Sequence[int],
     *,
     n_pairs: int,
     kv_pairs_per_segment: int,
 ) -> list[list[int]]:
-    """Split one flat context only at KV-record boundaries."""
+    """Segment a preformatted Zoology context only between width-five records."""
 
     context = [int(token_id) for token_id in context_input_ids]
-    records = parse_context_records(context)
+    records = parse_zoology_context_records(context)
     if len(records) != int(n_pairs):
-        raise ValueError(f"expected {n_pairs} context records; found {len(records)}")
+        raise ValueError(f"expected {n_pairs} Zoology context records; found {len(records)}")
     if int(kv_pairs_per_segment) < 1:
         raise ValueError("kv_pairs_per_segment must be positive")
 
@@ -235,8 +299,8 @@ def segment_context_input_ids(
     segments = []
     for first_pair in range(0, int(n_pairs), int(kv_pairs_per_segment)):
         pair_count = min(int(kv_pairs_per_segment), int(n_pairs) - first_pair)
-        token_start = first_pair * KV_RECORD_WIDTH
-        token_stop = token_start + pair_count * KV_RECORD_WIDTH
+        token_start = first_pair * ZOOLOGY_KV_RECORD_WIDTH
+        token_stop = token_start + pair_count * ZOOLOGY_KV_RECORD_WIDTH
         segment = record_tokens[token_start:token_stop]
         if first_pair == 0:
             segment = [BOS_ID, CONTEXT_START_ID, *segment]
@@ -246,10 +310,13 @@ def segment_context_input_ids(
     return segments
 
 
-def query_target_label_positions(n_queries: int) -> list[int]:
-    """Return label positions predicted immediately after each QUERY_END."""
+def zoology_query_target_label_positions(n_queries: int) -> list[int]:
+    """Return scalar-target labels following each preformatted query record."""
 
-    return [1 + (query_index + 1) * QUERY_RECORD_WIDTH for query_index in range(n_queries)]
+    return [
+        1 + (query_index + 1) * ZOOLOGY_QUERY_RECORD_WIDTH
+        for query_index in range(int(n_queries))
+    ]
 
 
 def collate_zoology_batch(
@@ -258,16 +325,210 @@ def collate_zoology_batch(
     n_pairs: int,
     kv_pairs_per_segment: int,
 ) -> Dict[str, object]:
-    """Collate integer arrays without inserting target tokens into model input."""
+    """Collate the existing preformatted Zoology row schema unchanged."""
 
     if not batch:
         raise ValueError("cannot collate an empty batch")
-
+    n_pairs = int(n_pairs)
     segmented_contexts = [
-        segment_context_input_ids(
+        segment_zoology_context_input_ids(
             item["context_input_ids"],
             n_pairs=n_pairs,
             kv_pairs_per_segment=kv_pairs_per_segment,
+        )
+        for item in batch
+    ]
+    segment_count = len(segmented_contexts[0])
+    if any(len(segments) != segment_count for segments in segmented_contexts):
+        raise ValueError("all examples in a batch must have the same segment count")
+    context_segments = []
+    for segment_index in range(segment_count):
+        rows = [segments[segment_index] for segments in segmented_contexts]
+        if len({len(row) for row in rows}) != 1:
+            raise ValueError("corresponding Zoology context segments must have equal lengths")
+        context_segments.append(torch.tensor(rows, dtype=torch.long))
+
+    target_positions = zoology_query_target_label_positions(n_pairs)
+    query_rows = []
+    label_rows = []
+    hop_rows = []
+    for item in batch:
+        query_input_ids = [int(token_id) for token_id in item["query_input_ids"]]
+        targets = [int(target) for target in item["targets"]]
+        hop_distances = [int(distance) for distance in item["hop_distances"]]
+        if len(parse_zoology_query_keys(query_input_ids)) != n_pairs:
+            raise ValueError(f"expected {n_pairs} Zoology queries")
+        if len(targets) != n_pairs or len(hop_distances) != n_pairs:
+            raise ValueError("targets and hop_distances must align with every query")
+        if set(targets).intersection(query_input_ids):
+            raise ValueError("Zoology target entities must not occur in query_input_ids")
+        labels = [-100] * len(query_input_ids)
+        for position, target in zip(target_positions, targets):
+            labels[position] = target
+        query_rows.append(query_input_ids)
+        label_rows.append(labels)
+        hop_rows.append(hop_distances)
+
+    if len({len(row) for row in query_rows}) != 1:
+        raise ValueError("all Zoology query collections in a batch must have equal lengths")
+    return {
+        "input_ids": {
+            "context_input_ids": context_segments,
+            "query_input_ids": torch.tensor(query_rows, dtype=torch.long),
+            "hop_distances": torch.tensor(hop_rows, dtype=torch.long),
+        },
+        "labels": torch.tensor(label_rows, dtype=torch.long),
+    }
+
+
+def _validate_raw_entity(entity: Sequence[int], entity_length: int, name: str) -> list[int]:
+    digits = [int(digit) for digit in entity]
+    if len(digits) != entity_length:
+        raise ValueError(f"{name} must contain exactly {entity_length} symbols")
+    if any(not 0 <= digit < ENTITY_ALPHABET_SIZE for digit in digits):
+        raise ValueError(f"{name} contains a symbol outside [0, 16)")
+    return digits
+
+
+def format_kv_record(
+    key: Sequence[int],
+    value: Sequence[int],
+    *,
+    entity_length: int,
+) -> list[int]:
+    key_digits = _validate_raw_entity(key, entity_length, "context key")
+    value_digits = _validate_raw_entity(value, entity_length, "context value")
+    return [
+        KV_START_ID,
+        *(model_entity_id(digit) for digit in key_digits),
+        KV_SEPARATOR_ID,
+        *(model_entity_id(digit) for digit in value_digits),
+        KV_END_ID,
+    ]
+
+
+def formatted_kv_record_width(entity_length: int) -> int:
+    if int(entity_length) < 1:
+        raise ValueError("entity_length must be positive")
+    return 2 * int(entity_length) + 3
+
+
+def format_context_segments(
+    context_keys: Sequence[Sequence[int]],
+    context_values: Sequence[Sequence[int]],
+    *,
+    n_pairs: int,
+    kv_pairs_per_segment: int,
+    entity_length: int,
+) -> list[list[int]]:
+    """Format raw pairs and segment only at complete KV-record boundaries."""
+
+    n_pairs = int(n_pairs)
+    kv_pairs_per_segment = int(kv_pairs_per_segment)
+    if kv_pairs_per_segment < 1:
+        raise ValueError("kv_pairs_per_segment must be positive")
+    if len(context_keys) != n_pairs or len(context_values) != n_pairs:
+        raise ValueError(f"expected exactly {n_pairs} aligned context pairs")
+    records = [
+        format_kv_record(key, value, entity_length=entity_length)
+        for key, value in zip(context_keys, context_values)
+    ]
+
+    segments = []
+    for first_pair in range(0, n_pairs, kv_pairs_per_segment):
+        segment_records = records[first_pair : first_pair + kv_pairs_per_segment]
+        segment = [token for record in segment_records for token in record]
+        if first_pair == 0:
+            segment = [BOS_ID, CONTEXT_START_ID, *segment]
+        if first_pair + len(segment_records) == n_pairs:
+            segment = [*segment, CONTEXT_END_ID, EOS_ID]
+        segments.append(segment)
+    return segments
+
+
+def query_record_width(entity_length: int) -> int:
+    if int(entity_length) < 1:
+        raise ValueError("entity_length must be positive")
+    return 2 * int(entity_length) + 2
+
+
+def query_mask_positions(n_queries: int, entity_length: int) -> list[int]:
+    """Return model-input positions occupied by target-prediction MASK tokens."""
+
+    positions = []
+    record_width = query_record_width(entity_length)
+    for query_index in range(int(n_queries)):
+        record_start = 1 + query_index * record_width
+        first_mask = record_start + 1 + int(entity_length)
+        positions.extend(first_mask + offset for offset in range(int(entity_length)))
+    return positions
+
+
+def query_target_label_positions(n_queries: int, entity_length: int) -> list[int]:
+    """Return label positions predicted by the corresponding MASK hidden states."""
+
+    return [position + 1 for position in query_mask_positions(n_queries, entity_length)]
+
+
+def aligned_target_prediction_positions(
+    n_queries: int,
+    entity_length: int,
+    *,
+    label_shift: int,
+) -> list[int]:
+    """Return positions in EnergyGradMem's backend-aligned prediction tensor."""
+
+    if int(label_shift) not in (0, 1):
+        raise ValueError("label_shift must be 0 or 1")
+    return [
+        position - int(label_shift)
+        for position in query_target_label_positions(n_queries, entity_length)
+    ]
+
+
+def format_query_input_ids(
+    query_keys: Sequence[Sequence[int]],
+    *,
+    n_queries: int,
+    entity_length: int,
+) -> list[int]:
+    if len(query_keys) != int(n_queries):
+        raise ValueError(f"expected exactly {n_queries} query keys")
+    query_input_ids = [BOS_ID]
+    for query_key in query_keys:
+        key_digits = _validate_raw_entity(query_key, entity_length, "query key")
+        query_input_ids.extend(
+            [
+                QUERY_START_ID,
+                *(model_entity_id(digit) for digit in key_digits),
+                *([MASK_ID] * entity_length),
+                QUERY_END_ID,
+            ]
+        )
+    query_input_ids.append(EOS_ID)
+    return query_input_ids
+
+
+def collate_ar_multihop_batch(
+    batch: Sequence[Dict[str, object]],
+    *,
+    n_pairs: int,
+    hop_length: int,
+    kv_pairs_per_segment: int,
+) -> Dict[str, object]:
+    """Insert model tokens and labels without putting targets in query inputs."""
+
+    if not batch:
+        raise ValueError("cannot collate an empty batch")
+    n_pairs = int(n_pairs)
+    entity_length = entity_length_for_configuration(n_pairs, hop_length)
+    segmented_contexts = [
+        format_context_segments(
+            item["context_keys"],
+            item["context_values"],
+            n_pairs=n_pairs,
+            kv_pairs_per_segment=kv_pairs_per_segment,
+            entity_length=entity_length,
         )
         for item in batch
     ]
@@ -293,34 +554,40 @@ def collate_zoology_batch(
     query_rows = []
     label_rows = []
     hop_rows = []
-    target_positions = query_target_label_positions(int(n_pairs))
+    target_positions = query_target_label_positions(n_pairs, entity_length)
+    mask_positions = query_mask_positions(n_pairs, entity_length)
     for item in batch:
-        query_input_ids = [int(token_id) for token_id in item["query_input_ids"]]
-        targets = [int(token_id) for token_id in item["targets"]]
+        query_input_ids = format_query_input_ids(
+            item["query_keys"],
+            n_queries=n_pairs,
+            entity_length=entity_length,
+        )
+        target_rows = list(item["targets"])
         hop_distances = [int(distance) for distance in item["hop_distances"]]
-        if len(parse_query_keys(query_input_ids)) != int(n_pairs):
-            raise ValueError(f"expected {n_pairs} queries")
-        if len(targets) != int(n_pairs) or len(hop_distances) != int(n_pairs):
+        if len(target_rows) != n_pairs or len(hop_distances) != n_pairs:
             raise ValueError("targets and hop_distances must align with every query")
-        if set(targets).intersection(query_input_ids):
-            raise ValueError("target entities must not occur in query_input_ids")
+        target_ids = [
+            model_entity_id(digit)
+            for target in target_rows
+            for digit in _validate_raw_entity(target, entity_length, "target")
+        ]
+        if len(target_ids) != n_pairs * entity_length:
+            raise RuntimeError("internal target flattening error")
+        if any(query_input_ids[position] != MASK_ID for position in mask_positions):
+            raise RuntimeError("target prediction slots must contain MASK tokens")
 
         labels = [-100] * len(query_input_ids)
-        for position, target in zip(target_positions, targets):
-            labels[position] = target
+        for position, target_id in zip(target_positions, target_ids):
+            labels[position] = target_id
         query_rows.append(query_input_ids)
         label_rows.append(labels)
         hop_rows.append(hop_distances)
-
-    query_lengths = {len(row) for row in query_rows}
-    if len(query_lengths) != 1:
-        raise ValueError("all query collections in a batch must have equal lengths")
 
     return {
         "input_ids": {
             "context_input_ids": context_segments,
             "query_input_ids": torch.tensor(query_rows, dtype=torch.long),
-            # Kept inside input_ids so Trainer retains it for grouped metrics;
+            # Kept under input_ids so Trainer retains it for grouped metrics;
             # EnergyGradMem ignores this metadata during its forward pass.
             "hop_distances": torch.tensor(hop_rows, dtype=torch.long),
         },
@@ -328,37 +595,68 @@ def collate_zoology_batch(
     }
 
 
-def preprocess_zoology_logits(logits, labels):
+def collate_multihop_batch(
+    batch: Sequence[Dict[str, object]],
+    *,
+    dataset_format: str,
+    n_pairs: int,
+    hop_length: int,
+    kv_pairs_per_segment: int,
+) -> Dict[str, object]:
+    """Dispatch explicitly to the selected dataset schema's collator."""
+
+    if dataset_format == "zoology":
+        return collate_zoology_batch(
+            batch,
+            n_pairs=n_pairs,
+            kv_pairs_per_segment=kv_pairs_per_segment,
+        )
+    if dataset_format == "ar_multihop":
+        return collate_ar_multihop_batch(
+            batch,
+            n_pairs=n_pairs,
+            hop_length=hop_length,
+            kv_pairs_per_segment=kv_pairs_per_segment,
+        )
+    raise ValueError(f"unsupported dataset_format: {dataset_format!r}")
+
+
+def preprocess_ar_multihop_logits(logits, labels):
     del labels
     predictions, inner_loop_stats = logits
     return predictions.argmax(dim=-1), inner_loop_stats
 
 
-def _aligned_predictions(predictions: np.ndarray, labels: np.ndarray) -> np.ndarray:
+def _aligned_predictions_and_labels(
+    predictions: np.ndarray,
+    labels: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
     if predictions.shape[1] == labels.shape[1] + 1:
-        return predictions[:, :-1]
+        return predictions[:, :-1], labels
     if predictions.shape[1] == labels.shape[1]:
-        return predictions[:, :-1]
+        return predictions[:, :-1], labels[:, 1:]
     raise ValueError(
         "Unexpected prediction/label lengths: "
         f"predictions={predictions.shape[1]}, labels={labels.shape[1]}"
     )
 
 
-def compute_zoology_metrics(eval_pred) -> Dict[str, float]:
-    """Compute per-query, per-sample, and hop-stratified accuracy."""
+def compute_ar_multihop_metrics(eval_pred) -> Dict[str, float]:
+    """Compute target-token, complete-query, sample, and hop accuracy."""
 
     predictions, inner_loop_stats = eval_pred.predictions
     labels = np.asarray(eval_pred.label_ids)
-    predictions = _aligned_predictions(np.asarray(predictions), labels)
-    if predictions.shape != labels.shape:
-        labels = labels[:, 1:]
+    predictions, labels = _aligned_predictions_and_labels(
+        np.asarray(predictions),
+        labels,
+    )
     mask = labels != -100
 
     hop_distances = np.asarray(eval_pred.inputs["hop_distances"])
     if hop_distances.ndim != 2:
         raise ValueError("hop_distances must have shape [batch, queries]")
 
+    token_correct_rows = []
     query_correct_rows = []
     for sample_predictions, sample_labels, sample_mask, sample_hops in zip(
         predictions,
@@ -366,16 +664,23 @@ def compute_zoology_metrics(eval_pred) -> Dict[str, float]:
         mask,
         hop_distances,
     ):
-        query_correct = sample_predictions[sample_mask] == sample_labels[sample_mask]
-        if query_correct.size != sample_hops.size:
+        token_correct = sample_predictions[sample_mask] == sample_labels[sample_mask]
+        if token_correct.size % sample_hops.size:
             raise ValueError(
-                "each supervised query must have one hop distance; "
-                f"found {query_correct.size} predictions and {sample_hops.size} distances"
+                "supervised target-token count must be divisible by query count; "
+                f"found {token_correct.size} tokens and {sample_hops.size} queries"
             )
+        entity_length = token_correct.size // sample_hops.size
+        if entity_length < 1:
+            raise ValueError("every query must supervise at least one target token")
+        query_correct = token_correct.reshape(sample_hops.size, entity_length).all(axis=1)
+        token_correct_rows.append(token_correct)
         query_correct_rows.append(query_correct)
 
+    token_correct = np.stack(token_correct_rows)
     query_correct = np.stack(query_correct_rows)
     metrics = {
+        "token_accuracy": float(token_correct.mean()),
         "query_accuracy": float(query_correct.mean()),
         "all_queries_exact_match": float(query_correct.all(axis=1).mean()),
     }
@@ -414,7 +719,7 @@ def save_progression_metrics(output_dir: Path, metrics: Dict[str, float]) -> Pat
     return metrics_path
 
 
-def load_zoology_dataset(args: ZoologyExperimentArgs):
+def load_ar_multihop_dataset(args: ARMultihopExperimentArgs):
     if args.data_path is not None:
         return datasets.load_from_disk(args.data_path)
     return datasets.load_dataset(args.hf_dataset, args.hf_subset)
@@ -434,8 +739,8 @@ def split_dataset(dataset):
 
 
 def main() -> None:
-    args = HfArgumentParser(ZoologyExperimentArgs).parse_args_into_dataclasses()[0]
-    validate_zoology_args(args)
+    args = HfArgumentParser(ARMultihopExperimentArgs).parse_args_into_dataclasses()[0]
+    validate_ar_multihop_args(args)
     transformers.set_seed(args.seed)
 
     accelerator = accelerate.Accelerator()
@@ -449,7 +754,7 @@ def main() -> None:
         with (output_dir / "config.json").open("w", encoding="utf-8") as config_file:
             json.dump({"cli_args": dict(vars(args))}, config_file, indent=4)
 
-    base_config = build_zoology_base_config(args)
+    base_config = build_ar_multihop_base_config(args)
     model = EnergyGradMem(build_model_config(args, base_config))
     if args.init_checkpoint is not None:
         missing_keys, unexpected_keys = model.load_state_dict(
@@ -463,13 +768,15 @@ def main() -> None:
     model.to(accelerator.device)
 
     logger.info("model config: %s", model.config)
-    dataset = load_zoology_dataset(args)
+    dataset = load_ar_multihop_dataset(args)
     train_dataset, validation_dataset, test_dataset = split_dataset(dataset)
 
     def data_collator(batch):
-        return collate_zoology_batch(
+        return collate_multihop_batch(
             batch,
+            dataset_format=args.dataset_format,
             n_pairs=args.n_pairs,
+            hop_length=args.hop_length,
             kv_pairs_per_segment=args.kv_pairs_per_segment,
         )
 
@@ -521,15 +828,15 @@ def main() -> None:
         dataloader_pin_memory=True,
         seed=args.seed,
     )
-    trainer = ZoologyTrainer(
+    trainer = ARMultihopTrainer(
         model=model,
         args=training_args,
         outer_lr_final_ratio=args.outer_lr_final_ratio,
         train_dataset=train_dataset,
         eval_dataset=validation_dataset,
         data_collator=data_collator,
-        compute_metrics=compute_zoology_metrics,
-        preprocess_logits_for_metrics=preprocess_zoology_logits,
+        compute_metrics=compute_ar_multihop_metrics,
+        preprocess_logits_for_metrics=preprocess_ar_multihop_logits,
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=args.early_stopping_patience
