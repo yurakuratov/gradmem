@@ -1,6 +1,8 @@
 import json
 import math
+import os
 import re
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -397,7 +399,203 @@ def test_common_curriculum_uses_configured_h_and_ar_defaults():
     assert "CURRICULUM_METRIC=${CURRICULUM_METRIC:-query_accuracy}" in helper
     assert "CURRICULUM_METRIC_THRESHOLD=${CURRICULUM_METRIC_THRESHOLD:-0.9}" in helper
     assert "ENERGY_REPLAY_WEIGHT=0.0" in helper
-    assert "READING_OPTIMIZATION=false" in helper
+    assert "READING_OPTIMIZATION=${READING_OPTIMIZATION:-false}" in helper
+    assert "K_READ=${K_READ:-1}" in helper
+    assert "READ_LR=${READ_LR:-0.1}" in helper
+    assert "CLIP_READ_NORM=${CLIP_READ_NORM:-1.0}" in helper
+    assert "READ_GRAD_MODE=${READ_GRAD_MODE:-second}" in helper
+
+
+def _run_curriculum_until_fake_launch(tmp_path, entry_script, **environment):
+    capture_path = tmp_path / "launch.txt"
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        """#!/usr/bin/env bash
+{
+  printf 'WANDB_NAME=%s\\n' "${WANDB_NAME-}"
+  for argument in "$@"; do
+    printf 'ARG=%s\\n' "$argument"
+  done
+} > "$CAPTURE_FILE"
+exit 86
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    process_environment = os.environ.copy()
+    process_environment.update(
+        {
+            "PYTHON_BIN": str(fake_python),
+            "CAPTURE_FILE": str(capture_path),
+            "OUTPUT_ROOT": str(tmp_path / "runs"),
+            "NP": "1",
+            "TBS": "1",
+            "PER_DEVICE_BATCH_SIZE": "1",
+            **environment,
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(entry_script)],
+        cwd=REPO_ROOT,
+        env=process_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 86, result.stdout + result.stderr
+    captured_lines = capture_path.read_text(encoding="utf-8").splitlines()
+    wandb_name = captured_lines[0].removeprefix("WANDB_NAME=")
+    arguments = [line.removeprefix("ARG=") for line in captured_lines[1:]]
+    return wandb_name, arguments
+
+
+def _option_value(arguments, option):
+    return arguments[arguments.index(option) + 1]
+
+
+def test_enabled_ar_curriculum_forwards_complete_read_configuration_and_names(
+    tmp_path,
+):
+    entry_script = (
+        REPO_ROOT
+        / "scripts"
+        / "ar_multihop"
+        / "run_energy_gradmem_curriculum_seg8.sh"
+    )
+    wandb_name, arguments = _run_curriculum_until_fake_launch(
+        tmp_path,
+        entry_script,
+    )
+    expected_suffix = "_readK2lr0.1_second_clip1.0"
+    assert _option_value(arguments, "--reading_optimization") == "true"
+    assert _option_value(arguments, "--K_read") == "2"
+    assert _option_value(arguments, "--read_lr") == "0.1"
+    assert _option_value(arguments, "--clip_read_norm") == "1.0"
+    assert _option_value(arguments, "--read_grad_mode") == "second"
+    assert expected_suffix in _option_value(arguments, "--exp_path")
+    assert wandb_name.endswith(expected_suffix)
+
+
+def test_disabled_ar_curriculum_keeps_previous_names(tmp_path):
+    entry_script = (
+        REPO_ROOT
+        / "scripts"
+        / "ar_multihop"
+        / "run_energy_gradmem_curriculum_seg32.sh"
+    )
+    wandb_name, arguments = _run_curriculum_until_fake_launch(
+        tmp_path,
+        entry_script,
+        READING_OPTIMIZATION="false",
+    )
+    expected_run_name = (
+        "energy_gradmem_ar_multihop_seg32_llama_L2H1D128_attndrop0.1_"
+        "N8-H1-V16_mem4_K2_ilr1_ce1_olr1e-4_linearfinal0.2_grad_second_"
+        "energy_segment_delta_gru_state128_replay0"
+    )
+    assert Path(_option_value(arguments, "--exp_path")).parts[-3] == expected_run_name
+    assert wandb_name == "energy_gradmem_ar_multihop_seg32_N8_H1_1segments_ce1_ilr1_run1"
+
+
+def test_disabled_zoology_curriculum_keeps_names_and_forwards_defaults(tmp_path):
+    entry_script = (
+        REPO_ROOT
+        / "scripts"
+        / "zoology_mh"
+        / "run_energy_gradmem_curriculum_seg32.sh"
+    )
+    wandb_name, arguments = _run_curriculum_until_fake_launch(
+        tmp_path,
+        entry_script,
+        READING_OPTIMIZATION="false",
+    )
+    assert _option_value(arguments, "--dataset_format") == "zoology"
+    assert _option_value(arguments, "--reading_optimization") == "false"
+    assert _option_value(arguments, "--K_read") == "1"
+    assert _option_value(arguments, "--read_lr") == "0.1"
+    assert _option_value(arguments, "--clip_read_norm") == "1.0"
+    assert _option_value(arguments, "--read_grad_mode") == "second"
+    expected_run_name = (
+        "energy_gradmem_zoology_mh_seg32_llama_L2H1D128_attndrop0.1_"
+        "N8-H1-V4096_mem4_K2_ilr1_ce1_olr1e-4_linearfinal0.2_grad_second_"
+        "energy_segment_delta_gru_state128_replay0"
+    )
+    assert Path(_option_value(arguments, "--exp_path")).parts[-3] == expected_run_name
+    assert wandb_name == "energy_gradmem_zoology_mh_seg32_N8_1segments_ce1_ilr1_run1"
+
+
+@pytest.mark.parametrize(
+    ("environment", "diagnostic"),
+    [
+        ({"READING_OPTIMIZATION": "maybe"}, "READING_OPTIMIZATION"),
+        (
+            {"READING_OPTIMIZATION": "true", "K_READ": "0"},
+            "K_READ must be a positive integer",
+        ),
+        (
+            {"READING_OPTIMIZATION": "true", "READ_LR": "0"},
+            "READ_LR must be positive",
+        ),
+        (
+            {"READING_OPTIMIZATION": "true", "CLIP_READ_NORM": "nan"},
+            "CLIP_READ_NORM must be positive",
+        ),
+        ({"READ_GRAD_MODE": "third"}, "READ_GRAD_MODE must be first or second"),
+    ],
+)
+def test_invalid_read_configuration_fails_before_training_launch(
+    tmp_path,
+    environment,
+    diagnostic,
+):
+    common_script = (
+        REPO_ROOT
+        / "scripts"
+        / "ar_multihop"
+        / "run_energy_gradmem_curriculum_common.sh"
+    )
+    wrapper = tmp_path / "invalid-read-config.sh"
+    wrapper.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+SEGMENT_REGIME=8
+CURRICULUM_N=(8)
+CE_WEIGHTS=(0)
+INNER_LRS=(0.1)
+source "{}"
+""".format(common_script),
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    capture_path = tmp_path / "unexpected-launch.txt"
+    fake_python = tmp_path / "must-not-launch"
+    fake_python.write_text(
+        "#!/usr/bin/env bash\ntouch \"$CAPTURE_FILE\"\nexit 99\n",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    process_environment = os.environ.copy()
+    process_environment.update(
+        {
+            "PYTHON_BIN": str(fake_python),
+            "CAPTURE_FILE": str(capture_path),
+            "NP": "1",
+            "TBS": "1",
+            "PER_DEVICE_BATCH_SIZE": "1",
+            **environment,
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(wrapper)],
+        cwd=REPO_ROOT,
+        env=process_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert diagnostic in result.stderr
+    assert not capture_path.exists()
 
 
 def _write_gate_metrics(tmp_path, metrics):

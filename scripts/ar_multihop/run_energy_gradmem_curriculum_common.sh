@@ -76,7 +76,11 @@ ENERGY_WEIGHT_RMS_THRESHOLD=${ENERGY_WEIGHT_RMS_THRESHOLD:-$(awk "BEGIN { print 
 ENERGY_DELTA_REG=${ENERGY_DELTA_REG:-0.1}
 ENERGY_DELTA_MAX=${ENERGY_DELTA_MAX:-1.0}
 ENERGY_REPLAY_WEIGHT=0.0
-READING_OPTIMIZATION=false
+READING_OPTIMIZATION=${READING_OPTIMIZATION:-false}
+K_READ=${K_READ:-1}
+READ_LR=${READ_LR:-0.1}
+CLIP_READ_NORM=${CLIP_READ_NORM:-1.0}
+READ_GRAD_MODE=${READ_GRAD_MODE:-second}
 
 LR=${LR:-1e-4}
 WEIGHT_DECAY=${WEIGHT_DECAY:-0.0}
@@ -107,6 +111,38 @@ if ! [[ "$HOP_LENGTH" =~ ^[0-9]+$ ]] || [ "$HOP_LENGTH" -lt 1 ]; then
   echo "HOP_LENGTH must be a positive integer" >&2
   exit 1
 fi
+if [ "$READING_OPTIMIZATION" != "true" ] \
+  && [ "$READING_OPTIMIZATION" != "false" ]; then
+  echo "READING_OPTIMIZATION must be true or false" >&2
+  exit 1
+fi
+if [ "$READ_GRAD_MODE" != "first" ] && [ "$READ_GRAD_MODE" != "second" ]; then
+  echo "READ_GRAD_MODE must be first or second" >&2
+  exit 1
+fi
+is_positive_number() {
+  awk -v value="$1" 'BEGIN {
+    decimal = "([0-9]+([.][0-9]*)?|[.][0-9]+)"
+    if (value !~ ("^[+]?" decimal "([eE][+-]?[0-9]+)?$")) {
+      exit 1
+    }
+    exit !((value + 0) > 0)
+  }'
+}
+if [ "$READING_OPTIMIZATION" = "true" ]; then
+  if ! [[ "$K_READ" =~ ^[1-9][0-9]*$ ]]; then
+    echo "K_READ must be a positive integer when reading optimization is enabled" >&2
+    exit 1
+  fi
+  if ! is_positive_number "$READ_LR"; then
+    echo "READ_LR must be positive when reading optimization is enabled" >&2
+    exit 1
+  fi
+  if ! is_positive_number "$CLIP_READ_NORM"; then
+    echo "CLIP_READ_NORM must be positive when reading optimization is enabled" >&2
+    exit 1
+  fi
+fi
 if [ "$ENABLE_CURRICULUM_GATE" != "true" ] \
   && [ "$ENABLE_CURRICULUM_GATE" != "false" ]; then
   echo "ENABLE_CURRICULUM_GATE must be true or false" >&2
@@ -116,6 +152,11 @@ if [ "$CURRICULUM_LOWER_IS_BETTER" != "true" ] \
   && [ "$CURRICULUM_LOWER_IS_BETTER" != "false" ]; then
   echo "CURRICULUM_LOWER_IS_BETTER must be true or false" >&2
   exit 1
+fi
+
+READ_CONFIG_SUFFIX=""
+if [ "$READING_OPTIMIZATION" = "true" ]; then
+  READ_CONFIG_SUFFIX=_readK${K_READ}lr${READ_LR}_${READ_GRAD_MODE}_clip${CLIP_READ_NORM}
 fi
 
 resolve_progression_checkpoint() {
@@ -180,12 +221,12 @@ for RUN_ID in $RUN_NUMBERS; do
     fi
     SEGMENT_COUNT=$(((DATASET_N + KV_PAIRS_PER_SEGMENT - 1) / KV_PAIRS_PER_SEGMENT))
 
-    RUN_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_llama_L${L}H${N_HEAD}D${D}_attndrop${ATTENTION_DROPOUT}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_ce${CE_WEIGHT}_olr${LR}_${LR_SCHEDULER_TYPE}final${OUTER_LR_FINAL_RATIO}_grad_${GRAD_MODE}_energy_${ENERGY_MODEL_TYPE}_state${ENERGY_SEGMENT_STATE_SIZE}_replay0
+    RUN_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_llama_L${L}H${N_HEAD}D${D}_attndrop${ATTENTION_DROPOUT}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_ce${CE_WEIGHT}_olr${LR}_${LR_SCHEDULER_TYPE}final${OUTER_LR_FINAL_RATIO}_grad_${GRAD_MODE}_energy_${ENERGY_MODEL_TYPE}_state${ENERGY_SEGMENT_STATE_SIZE}_replay0${READ_CONFIG_SUFFIX}
     STAGE_PATH=$OUTPUT_ROOT/seg${SEGMENT_REGIME}/${HF_SUBSET}/${RUN_NAME}/run_${RUN_ID}/stage_${STAGE}
     if [ "$INCLUDE_HOP_IN_WANDB_NAME" = "true" ]; then
-      WANDB_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_N${DATASET_N}_H${HOP_LENGTH}_${SEGMENT_COUNT}segments_ce${CE_WEIGHT}_ilr${INNER_LR}_run${RUN_ID}
+      WANDB_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_N${DATASET_N}_H${HOP_LENGTH}_${SEGMENT_COUNT}segments_ce${CE_WEIGHT}_ilr${INNER_LR}_run${RUN_ID}${READ_CONFIG_SUFFIX}
     else
-      WANDB_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_N${DATASET_N}_${SEGMENT_COUNT}segments_ce${CE_WEIGHT}_ilr${INNER_LR}_run${RUN_ID}
+      WANDB_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_N${DATASET_N}_${SEGMENT_COUNT}segments_ce${CE_WEIGHT}_ilr${INNER_LR}_run${RUN_ID}${READ_CONFIG_SUFFIX}
     fi
 
     if [ "$STAGE" -lt "$START_STAGE" ]; then
@@ -246,6 +287,10 @@ for RUN_ID in $RUN_NUMBERS; do
         --energy_pretrain_steps 0 \
         --energy_freezed_steps 0 \
         --reading_optimization "$READING_OPTIMIZATION" \
+        --K_read "$K_READ" \
+        --read_lr "$READ_LR" \
+        --clip_read_norm "$CLIP_READ_NORM" \
+        --read_grad_mode "$READ_GRAD_MODE" \
         --learning_rate "$LR" \
         --weight_decay "$WEIGHT_DECAY" \
         --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
