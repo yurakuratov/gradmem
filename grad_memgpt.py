@@ -1700,6 +1700,12 @@ class GradMemGPT(PreTrainedModel):
         """
         context_input_ids = input_ids['context_input_ids']
         query_input_ids = input_ids['query_input_ids']
+        # Present only for ordered two-key concatenation evaluation.  They are
+        # deliberately nested under input_ids so Trainer preserves them for
+        # compute_metrics_fn, while this forward otherwise ignores metric-only
+        # metadata such as pair_value_token_index/source_segments.
+        single_query_input_ids = input_ids.get('single_query_input_ids')
+        single_labels = input_ids.get('single_labels')
 
         pad_id = self.model.config.pad_token_id
         device = context_input_ids.device
@@ -2813,4 +2819,24 @@ class GradMemGPT(PreTrainedModel):
         if learned_update_imitation_losses:
             combined_loss = combined_loss + torch.stack(learned_update_imitation_losses).mean()
         output['loss'] = combined_loss
+
+        # Conditional composition metric: evaluate each constituent key on
+        # exactly the same written context.  This is evaluation-only and runs
+        # two complete no-grad forwards rather than retaining WRITE graphs or
+        # changing the train-time objective.  The recursive calls omit these
+        # auxiliary tensors, so they cannot recurse again.
+        if (not self.training and labels is not None and not collect_segment_mems
+                and single_query_input_ids is not None and single_labels is not None):
+            single_predictions = []
+            with torch.no_grad():
+                for query_idx in range(single_query_input_ids.size(1)):
+                    single_out = self.forward(
+                        {
+                            'context_input_ids': context_input_ids,
+                            'query_input_ids': single_query_input_ids[:, query_idx, :],
+                        },
+                        labels=single_labels[:, query_idx, :],
+                    )
+                    single_predictions.append(single_out['predictions'])
+            output['single_predictions'] = torch.stack(single_predictions, dim=1)
         return output

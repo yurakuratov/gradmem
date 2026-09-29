@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -48,7 +49,60 @@ logger = logging.getLogger('')
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
 
 
-def collate_fn(batch, tokenizer, max_context_length=None, hopfield=False):
+_KV_PAIR_RE = re.compile(r'!([^!|:]+):([^!|]+)!')
+_TWO_KEY_QUERY_RE = re.compile(r'^\?!([^!:|]+):\?!([^!:|]+):$')
+_TWO_VALUE_TARGET_RE = re.compile(r'^([^!|:]+)!([^!|:]+)!\|$')
+
+
+def _ordered_two_key_spec(item):
+    """Return ``((K1, K2), (V1, V2))`` for the concat grammar, else None.
+
+    The saved KV datasets historically retain only context/query/target, not
+    generator metadata. Parsing the grammar here keeps metrics compatible with
+    those datasets and makes query order the sole source of target order.
+    """
+    query_match = _TWO_KEY_QUERY_RE.fullmatch(item['query'])
+    target_match = _TWO_VALUE_TARGET_RE.fullmatch(item['target'])
+    if query_match is None or target_match is None:
+        return None
+    return query_match.groups(), target_match.groups()
+
+
+def _kv_source_segments_by_key(context, padded_len, n_segments=None, segment_size=None,
+                               seg_pad_side='right', pairs_per_segment=None,
+                               pair_aware_n_segments=None):
+    """Map context KV keys to the segment that completely writes each pair.
+
+    This mirrors ``build_kv_probe_queries`` so same/cross-segment metrics
+    describe the model's actual storage segmentation, not the generator's
+    optional message segmentation metadata.
+    """
+    pairs = [(m.start(), m.end(), m.group(1)) for m in _KV_PAIR_RE.finditer(context)]
+    pair_aware = pairs_per_segment is not None or pair_aware_n_segments is not None
+    if pair_aware:
+        sizes = GradMemGPT._divide_pairs(
+            len(pairs), pairs_per_segment, pair_aware_n_segments or 1)
+        pair_sources = []
+        for segment_idx, size in enumerate(sizes):
+            pair_sources.extend([segment_idx] * size)
+    else:
+        if segment_size is not None:
+            n_seg = max(1, math.ceil(padded_len / segment_size))
+            seg_sz = segment_size
+        else:
+            n_seg = n_segments if n_segments else 1
+            seg_sz = max(1, math.ceil(padded_len / n_seg))
+        seg_pad_len = (seg_sz * n_seg - padded_len) if seg_pad_side == 'left' else 0
+        pair_sources = [
+            min((seg_pad_len + pair_end - 1) // seg_sz, n_seg - 1)
+            for _, pair_end, _ in pairs
+        ]
+    return {key: source for (_, _, key), source in zip(pairs, pair_sources)}
+
+
+def collate_fn(batch, tokenizer, max_context_length=None, hopfield=False,
+               n_segments=None, segment_size=None, seg_pad_side='right',
+               pairs_per_segment=None, pair_aware_n_segments=None):
     context = [item['context'] for item in batch]
     query = [item['query'] + item['target'] for item in batch]
 
@@ -84,24 +138,107 @@ def collate_fn(batch, tokenizer, max_context_length=None, hopfield=False):
                 break
 
     labels = query_input_ids * labels_mask + (1 - labels_mask) * -100
-    return {
-        'input_ids': {
-            'context_input_ids': context_input_ids,
-            'query_input_ids': query_input_ids,
-        },
-        'labels': labels,
+    input_ids = {
+        'context_input_ids': context_input_ids,
+        'query_input_ids': query_input_ids,
     }
+
+    # Ordered two-key concatenation diagnostics. These fields are emitted only
+    # when a batch contains the two-key query/target grammar; old single-key
+    # datasets retain the exact previous batch structure.
+    pair_specs = [_ordered_two_key_spec(item) for item in batch]
+    source_maps = [None] * len(batch)
+    if any(spec is not None for spec in pair_specs):
+        source_maps = [
+            _kv_source_segments_by_key(
+                item['context'], context_input_ids.size(1), n_segments=n_segments,
+                segment_size=segment_size, seg_pad_side=seg_pad_side,
+                pairs_per_segment=pairs_per_segment,
+                pair_aware_n_segments=pair_aware_n_segments)
+            for item in batch
+        ]
+    pair_rows = [
+        spec is not None and all(key in source_map for key in spec[0])
+        for spec, source_map in zip(pair_specs, source_maps)
+    ]
+    if any(pair_rows):
+        B = len(batch)
+        value_token_index = torch.full_like(query_input_ids, -1)
+        source_segments = torch.full((B, 2), -1, dtype=torch.long)
+
+        # The index labels only content tokens in V1 and V2, never the `!` / `|`
+        # separators. This makes per-value EM and reversal tests tokenizer-safe.
+        for i, (item, spec, source_map, is_pair) in enumerate(
+                zip(batch, pair_specs, source_maps, pair_rows)):
+            if not is_pair:
+                continue
+            query_keys, (first_value, second_value) = spec
+            first_st = len(item['query'])
+            first_end = first_st + len(first_value)
+            second_st = first_end + 1  # skip the `!` between the two values
+            second_end = second_st + len(second_value)
+            for j, (st, end) in enumerate(offsets_mapping[i]):
+                if st < first_end and end > first_st:
+                    value_token_index[i, j] = 0
+                elif st < second_end and end > second_st:
+                    value_token_index[i, j] = 1
+            source_segments[i] = torch.tensor(
+                [source_map[key] for key in query_keys], dtype=torch.long)
+
+        # Evaluate the two corresponding single-key queries as well.  They are
+        # eval-only in GradMemGPT.forward, so normal training has no extra
+        # WRITE/READ work. Non-pair rows are duplicated valid single queries;
+        # their results are masked out of all pair metrics.
+        single_query_parts = []
+        single_target_parts = []
+        for item, spec, is_pair in zip(batch, pair_specs, pair_rows):
+            if is_pair:
+                keys, values = spec
+                single_query_parts.extend([f'?!{key}:' for key in keys])
+                single_target_parts.extend([f'{value}!|' for value in values])
+            else:
+                single_query_parts.extend([item['query'], item['query']])
+                single_target_parts.extend([item['target'], item['target']])
+        single_texts = [q + t for q, t in zip(single_query_parts, single_target_parts)]
+        single_encoded = tokenizer(single_texts, return_tensors='pt', add_special_tokens=True,
+                                   padding=True, pad_to_multiple_of=8,
+                                   return_offsets_mapping=True)
+        single_ids = single_encoded['input_ids']
+        single_offsets = single_encoded['offset_mapping']
+        single_labels = torch.full_like(single_ids, -100)
+        for i, (query_part, target_part) in enumerate(zip(single_query_parts, single_target_parts)):
+            target_st = len(query_part)
+            target_end = target_st + len(target_part)
+            for j, (st, end) in enumerate(single_offsets[i]):
+                if st < target_end and end > target_st:
+                    single_labels[i, j] = single_ids[i, j]
+
+        Q_single = single_ids.size(1)
+        input_ids.update({
+            'pair_metric_mask': torch.tensor(pair_rows, dtype=torch.bool),
+            'pair_value_token_index': value_token_index,
+            'pair_source_segments': source_segments,
+            'single_query_input_ids': single_ids.view(B, 2, Q_single),
+            'single_labels': single_labels.view(B, 2, Q_single),
+        })
+
+    return {'input_ids': input_ids, 'labels': labels}
 
 
 def preprocess_logits_for_metrics(eval_pred, labels):
-    logits, inner_loop_stats = eval_pred
+    logits, inner_loop_stats, *extra_outputs = eval_pred
     # saves gpu RAM, as HF Trainer accumulates all eval logits on GPU
-    return (logits.argmax(dim=-1), inner_loop_stats)
+    predictions = [logits.argmax(dim=-1), inner_loop_stats]
+    if extra_outputs:
+        # Present only for ordered two-key eval batches.  The model produces
+        # [B, 2, Q+1, V], so preserve its two single-query axes for metrics.
+        predictions.append(extra_outputs[0].argmax(dim=-1))
+    return tuple(predictions)
 
 
 def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     predictions, labels, inputs = eval_pred.predictions, eval_pred.label_ids, eval_pred.inputs
-    preds, inner_loop_stats = predictions
+    preds, inner_loop_stats, *extra_predictions = predictions
     preds = preds[..., :-1]
     labels = labels[..., :]
 
@@ -150,6 +287,96 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         "delta_mem_norm_max": float(inner_loop_stats['delta_mem_norm_max'].max()),
         "delta_mem_norm_min": float(inner_loop_stats['delta_mem_norm_min'].min()),
     }
+
+    # ---- ordered two-key concatenation diagnostics -------------------- #
+    # The collator adds this metadata only for the new task.  Keeping the
+    # metrics here (rather than model inner_loop_stats) lets HF aggregate
+    # per-example exact-match events across the full validation split.
+    if isinstance(inputs, dict) and 'pair_metric_mask' in inputs:
+        pair_mask = np.asarray(inputs['pair_metric_mask'], dtype=bool)
+        value_index = np.asarray(inputs['pair_value_token_index'])
+        source_segments = np.asarray(inputs['pair_source_segments'])
+        pair_indices = np.flatnonzero(pair_mask)
+
+        def _value_em(value_id):
+            result = np.zeros(len(preds), dtype=bool)
+            for i in pair_indices:
+                token_mask = value_index[i] == value_id
+                result[i] = bool(token_mask.any()
+                                 and np.array_equal(preds[i][token_mask], labels[i][token_mask]))
+            return result
+
+        value1_em = _value_em(0)
+        value2_em = _value_em(1)
+        both_values_em = value1_em & value2_em
+        n_pairs = len(pair_indices)
+        metrics['two_key_count'] = float(n_pairs)
+        metrics['two_key_value1_exact_match'] = float(value1_em[pair_mask].mean()) if n_pairs else 0.0
+        metrics['two_key_value2_exact_match'] = float(value2_em[pair_mask].mean()) if n_pairs else 0.0
+        metrics['two_key_both_values_exact_match'] = \
+            float(both_values_em[pair_mask].mean()) if n_pairs else 0.0
+
+        segment_distance = np.abs(source_segments[:, 0] - source_segments[:, 1])
+        same_segment = pair_mask & (segment_distance == 0)
+        cross_segment = pair_mask & (segment_distance > 0)
+        metrics['two_key_same_segment_count'] = float(same_segment.sum())
+        metrics['two_key_cross_segment_count'] = float(cross_segment.sum())
+        metrics['two_key_same_segment_exact_match'] = \
+            float(both_values_em[same_segment].mean()) if same_segment.any() else 0.0
+        metrics['two_key_cross_segment_exact_match'] = \
+            float(both_values_em[cross_segment].mean()) if cross_segment.any() else 0.0
+        for distance in np.unique(segment_distance[cross_segment]):
+            distance_mask = cross_segment & (segment_distance == distance)
+            metrics[f'two_key_cross_segment_distance_{int(distance)}_count'] = float(distance_mask.sum())
+            metrics[f'two_key_cross_segment_distance_{int(distance)}_exact_match'] = \
+                float(both_values_em[distance_mask].mean())
+
+        # A reversal is specifically V2,V1 instead of V1,V2.  Do not count
+        # equal values as reversals: their target is unchanged under swapping.
+        reversal = np.zeros(len(preds), dtype=bool)
+        distinct_values = np.zeros(len(preds), dtype=bool)
+        for i in pair_indices:
+            first_mask = value_index[i] == 0
+            second_mask = value_index[i] == 1
+            first_target = labels[i][first_mask]
+            second_target = labels[i][second_mask]
+            distinct_values[i] = not np.array_equal(first_target, second_target)
+            reversal[i] = bool(
+                distinct_values[i]
+                and preds[i][first_mask].shape == second_target.shape
+                and preds[i][second_mask].shape == first_target.shape
+                and np.array_equal(preds[i][first_mask], second_target)
+                and np.array_equal(preds[i][second_mask], first_target)
+            )
+        reversal_mask = pair_mask & distinct_values
+        metrics['two_key_reversal_eligible_count'] = float(reversal_mask.sum())
+        metrics['two_key_reversal_error_rate'] = \
+            float(reversal[reversal_mask].mean()) if reversal_mask.any() else 0.0
+
+        # The paired single-key reads are emitted only for two-key batches.
+        # This is P(joint correct | both constituent single-key reads correct),
+        # not an independence approximation from aggregate EM values.
+        if extra_predictions and 'single_labels' in inputs:
+            single_preds = np.asarray(extra_predictions[0])[..., :-1]
+            single_labels = np.asarray(inputs['single_labels'])
+            single_em = np.zeros((len(preds), 2), dtype=bool)
+            for i in pair_indices:
+                for j in range(2):
+                    single_token_mask = single_labels[i, j] != -100
+                    for token_id in ignore_token_ids:
+                        single_token_mask &= single_labels[i, j] != token_id
+                    single_em[i, j] = bool(
+                        single_token_mask.any()
+                        and np.array_equal(single_preds[i, j][single_token_mask],
+                                           single_labels[i, j][single_token_mask])
+                    )
+            both_single_em = single_em[:, 0] & single_em[:, 1]
+            conditioned_mask = pair_mask & both_single_em
+            metrics['two_key_both_single_exact_match'] = \
+                float(both_single_em[pair_mask].mean()) if n_pairs else 0.0
+            metrics['two_key_both_single_correct_count'] = float(conditioned_mask.sum())
+            metrics['two_key_joint_exact_match_given_both_single_correct'] = \
+                float(both_values_em[conditioned_mask].mean()) if conditioned_mask.any() else 0.0
     if 'target_loss' in inner_loop_stats:
         metrics['target_loss'] = float(inner_loop_stats['target_loss'].mean())
     if 'rec_loss' in inner_loop_stats:
@@ -1449,7 +1676,12 @@ def main(config_path: Optional[str] = None):
 
     def data_collator(batch):
         out = collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
-                         hopfield=args.use_hopfield_memory or args.use_gated_delta_memory or args.pair_aware_segmentation)
+                         hopfield=args.use_hopfield_memory or args.use_gated_delta_memory or args.pair_aware_segmentation,
+                         n_segments=per_seg_n_segments_arg,
+                         segment_size=per_seg_segment_size_arg,
+                         seg_pad_side=per_seg_pad_side,
+                         pairs_per_segment=per_seg_pairs_per_segment,
+                         pair_aware_n_segments=per_seg_pair_aware_n)
         if use_probes:
             out['kv_queries'] = build_kv_probe_queries(
                 batch, tokenizer, out['input_ids']['context_input_ids'].size(1),
@@ -1646,7 +1878,12 @@ def main(config_path: Optional[str] = None):
 
             def stage_data_collator(batch):
                 out = collate_fn(batch, tokenizer, max_context_length=args.max_context_length,
-                                 hopfield=args.use_hopfield_memory or args.use_gated_delta_memory or args.pair_aware_segmentation)
+                                 hopfield=args.use_hopfield_memory or args.use_gated_delta_memory or args.pair_aware_segmentation,
+                                 n_segments=per_seg_n_segments_arg,
+                                 segment_size=per_seg_segment_size_arg,
+                                 seg_pad_side=per_seg_pad_side,
+                                 pairs_per_segment=per_seg_pairs_per_segment,
+                                 pair_aware_n_segments=per_seg_pair_aware_n)
                 if use_probes:
                     out['kv_queries'] = build_kv_probe_queries(
                         batch, tokenizer, out['input_ids']['context_input_ids'].size(1),

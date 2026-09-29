@@ -29,7 +29,8 @@ RANGES = [
 
 
 def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
-                      min_segment_len=32, max_segment_len=64, kv_alphabet=BASE_KV_ALPHABET):
+                      min_segment_len=32, max_segment_len=64, kv_alphabet=BASE_KV_ALPHABET,
+                      query_mode='single', query_pair_segment_relation='any'):
     """
     Generate a sequence with random text, key-value pairs, and a query.
 
@@ -37,7 +38,16 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
     Each message ends with '|'.
     Each message can contain random sequence of characters along with key-value pairs in format !K:V!.
     Total number of key-value pairs in the full sequence (all messages/segments) is set by num_kv_pairs.
-    The last segment requests one of the previous values by key: ?!K:
+    The last segment requests one or two of the previous values by key:
+
+    - ``query_mode='single'`` (default): ``?!K:`` -> ``V!|``.
+    - ``query_mode='ordered_pair_concat'``: ``?!K1:?!K2:`` -> ``V1!V2!|``.
+
+    The ordered-pair target follows the order in the query, not the context.
+    ``query_pair_segment_relation`` selects whether the two queried facts may
+    come from any segments, the same segment, or different segments.  It is
+    only used by ``ordered_pair_concat``; ``different`` is the cross-segment
+    retrieval condition and ``same`` is its control.
 
     ...!K:V!...|?!K_i:V_i!|
     ..context..|query:target|
@@ -57,16 +67,39 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
         n_segments: Number of segments/messages in the sequence
         min_segment_len: Minimum length of each segment
         max_segment_len: Maximum length of each segment
+        kv_alphabet: Characters used for keys, values, and filler text.
+        query_mode: ``'single'`` or ``'ordered_pair_concat'``.
+        query_pair_segment_relation: For ordered-pair queries, one of
+            ``'any'``, ``'same'``, or ``'different'``.  Ignored for a single
+            query.
 
     Returns:
         Dictionary containing:
         - kv_pairs: List of key-value pairs in format !K:V!
         - segment_ids_to_kv_ids: Mapping from segment IDs to key-value pair indices
         - context: Complete context string (all segments concatenated)
-        - query: Query string in format ?!K:
+        - query: Query string in the selected query-mode format
         - input_sequence: Complete sequence string (context + query)
-        - target: Target value for the query in format V!|
+        - target: Target value(s), terminated as ``V!|`` or ``V1!V2!|``
+        - query_key_indices/query_keys/query_values/query_segment_ids:
+          queried facts in query order, for source-aware evaluation
     """
+    valid_query_modes = {'single', 'ordered_pair_concat'}
+    if query_mode not in valid_query_modes:
+        raise ValueError(
+            f"Unknown query_mode={query_mode!r}; expected one of {sorted(valid_query_modes)}")
+    valid_relations = {'any', 'same', 'different'}
+    if query_pair_segment_relation not in valid_relations:
+        raise ValueError(
+            "Unknown query_pair_segment_relation="
+            f"{query_pair_segment_relation!r}; expected one of {sorted(valid_relations)}")
+    if query_mode == 'ordered_pair_concat' and num_kv_pairs < 2:
+        raise ValueError("ordered_pair_concat requires num_kv_pairs >= 2")
+    if (query_mode == 'ordered_pair_concat'
+            and query_pair_segment_relation == 'different'
+            and n_segments < 2):
+        raise ValueError("different-segment ordered_pair_concat requires n_segments >= 2")
+
     # generate unique keys and values
     keys = []
     values = []
@@ -81,9 +114,24 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
     kv_pairs_dict = dict(zip(keys, values))
     kv_pairs = [f'!{k}:{v}!' for k, v in kv_pairs_dict.items()]
 
+    # Pick ordered-pair keys before assigning segments only when a source
+    # relation must be enforced.  The default single-key path intentionally
+    # keeps the legacy RNG call order and output distribution unchanged.
+    if query_mode == 'ordered_pair_concat':
+        query_key_indices = random.sample(range(num_kv_pairs), k=2)
+    else:
+        query_key_indices = None
+
     # distribute facts by segments
     segments_ids = list(range(n_segments))
     segments_ids_with_kv_pairs = random.choices(segments_ids, k=len(kv_pairs))
+    if query_mode == 'ordered_pair_concat' and query_pair_segment_relation != 'any':
+        if query_pair_segment_relation == 'same':
+            source_segments = [random.choice(segments_ids)] * 2
+        else:  # 'different'; validated above that at least two segments exist
+            source_segments = random.sample(segments_ids, k=2)
+        for kv_idx, seg_id in zip(query_key_indices, source_segments):
+            segments_ids_with_kv_pairs[kv_idx] = seg_id
     # create a mapping from segment_id to list of fact indices
     # [1, 1, 0] -> {0: [2], 1: [0, 1], 2: [], ...}
     # [0, 3, 0] -> {0: [0, 2], 1: [], 2: [], 3: [1], ...}
@@ -115,17 +163,37 @@ def generate_sequence(num_kv_pairs=3, k_length=4, v_length=4, n_segments=4,
             random_chars = random_chars[:pos] + kv_pairs[kv_idx] + random_chars[pos:]
         segments += [random_chars + '|']
     context = ''.join(segments)
-    if num_kv_pairs > 0:
-        # sample random k for query:
+    if query_mode == 'single' and num_kv_pairs > 0:
+        # Keep the legacy single-key sampling behavior.
         k_for_query = random.choice(keys)
+        query_key_indices = [keys.index(k_for_query)]
         query = f'?!{k_for_query}:'
         target = f'{kv_pairs_dict[k_for_query]}!|'
+    elif query_mode == 'ordered_pair_concat':
+        # query_key_indices was sampled without replacement, so a target can
+        # never be answered by repeating one fact.  Its order is deliberately
+        # independent from context order and defines the output order.
+        query_keys = [keys[i] for i in query_key_indices]
+        query_values = [values[i] for i in query_key_indices]
+        query = ''.join(f'?!{key}:' for key in query_keys)
+        target = ''.join(f'{value}!' for value in query_values) + '|'
     else:
+        query_key_indices = []
         query = '?!:'
         target = ''
+
+    query_keys = [keys[i] for i in query_key_indices]
+    query_values = [values[i] for i in query_key_indices]
+    query_segment_ids = [segments_ids_with_kv_pairs[i] for i in query_key_indices]
     input_sequence = context + query
     return {'kv_pairs': kv_pairs, 'segment_ids_to_kv_ids': segment_ids_to_kv_ids,
-            'context': context, 'query': query, 'input_sequence': input_sequence, 'target': target}
+            'context': context, 'query': query, 'input_sequence': input_sequence, 'target': target,
+            'query_mode': query_mode,
+            'query_pair_segment_relation': query_pair_segment_relation,
+            'query_key_indices': query_key_indices,
+            'query_keys': query_keys,
+            'query_values': query_values,
+            'query_segment_ids': query_segment_ids}
 
 
 class KVDataset(Dataset):
