@@ -1,0 +1,36 @@
+# Example scheduler manifest: a small GradMemGPT grid on KV-retrieval.
+#
+# The scheduler emits one `<command> <base_config> <positional key=value
+# overrides>` command per grid combination. For this repo the command must END
+# with `--config` so that `base_config` becomes its value (run_from_config.py
+# requires `--config <path>`; a bare positional is rejected). Extra flags for
+# run_from_config.py (e.g. --debug) go in `command` BEFORE --config:
+#   command: "python run_from_config.py --debug --config"
+# See the docstring at the top of run_scheduler.py for the full schema.
+#
+# Dry run (print commands, execute nothing):
+#   python run_scheduler.py manifests/kv_retrieval_grid.yaml --dry-run
+#
+# Run for real:
+#   python run_scheduler.py manifests/kv_retrieval_grid.yaml
+
+max_parallel: 6          # only one run holds the GPU at a time
+schedule: interleaved
+
+experiments:
+  - name: hopfield
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/hopfield.yaml"
+    overrides:
+      gradmem.use_mem_proj: false
+      gradmem.mem_proj_mode: "none"
+      gradmem.add_inner_loss_to_outer: false
+      gradmem.n_mem_tokens: 2
+      segmentation.n_segments: 4
+      model.base_model: llama
+      dataset.data_name: N8-K2V2-V62_1M
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62_1M"
+    grid:
+      hopfield.hopfield_proj_dim: [64, 128]
+      training.seed: [4378, 43894, 2343]
+

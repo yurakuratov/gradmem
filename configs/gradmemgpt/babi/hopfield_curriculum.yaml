@@ -55,10 +55,11 @@ hopfield:
 
 curriculum:
   curriculum_enabled: true
-  curriculum_threshold: 0.95
-  curriculum_levels: "babilong_qa3_0k,babilong_qa3_1k,babilong_qa3_2k,babilong_qa3_4k"
-  curriculum_data_dir: "/home/jovyan/dzhivelikian/test_time_gd/data"
+  curriculum_threshold: 0.01
+  curriculum_levels: "babilong_qa3_0k,babilong_qa2_1k,babilong_qa3_2k,babilong_qa3_4k"
+  curriculum_data_dir: "./data"
   curriculum_stage_overrides:
-    1: {hopfield_bptt_segments: 10, per_device_batch_size: 16, total_batch_size: 16}
-    2: {hopfield_bptt_segments: 10, per_device_batch_size: 16, total_batch_size: 16}
-    3: {hopfield_bptt_segments: 10, per_device_batch_size: 16, total_batch_size: 16}
+    1: {hopfield_bptt_segments: null, per_device_batch_size: 7, total_batch_size: 7}
+    2: {hopfield_bptt_segments: 10, per_device_batch_size: 24, total_batch_size: 24}
+    3: {hopfield_bptt_segments: 10, per_device_batch_size: 24, total_batch_size: 24}
+    4: {hopfield_bptt_segments: 10, per_device_batch_size: 24, total_batch_size: 24}

@@ -17,8 +17,8 @@ training:
   seed: 142
 
 dataset:
-  data_name: "babilong_qa1_0k"
-  data_path: "./data/babilong_qa1_0k"
+  data_name: "babilong_qa1_1k"
+  data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/babilong_qa1_1k"
   tokenizer_path: "./tokenizers/kv_alphabet_62/"
 
 gradmem:

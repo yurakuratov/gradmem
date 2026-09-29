@@ -1,5 +1,15 @@
 # GradMemGPT with Hopfield-like external memory
 
+run_naming:
+  separator: "_"
+  keys:
+    - {key: segmentation.n_segments, prefix: ns}
+    - {key: gradmem.n_mem_tokens, prefix: m}
+    - {key: gradmem.K, prefix: K}
+    - {key: hopfield.use_hopfield_memory, prefix: hopfield}
+    - {key: hopfield.hopfield_proj_dim, prefix: dim}
+    - {key: dataset.data_name, prefix: ds_}
+
 model:
   base_model: gpt2
   n_layer: 4
@@ -10,12 +20,14 @@ training:
   per_device_batch_size: 64
   total_batch_size: 64
   learning_rate: 1.0e-4
-  max_steps: 1000000
+  max_steps: 300000
   eval_steps: 500
   logging_steps: 500
   warmup_steps: 10000
-  early_stopping_patience: 500
+  early_stopping_patience: 250
   seed: 143
+  per_segment_eval: true
+  per_segment_eval_steps: 2500
 
 dataset:
   data_path: "./data/N8-K2V2-V62_1M"
@@ -44,9 +56,9 @@ gradmem:
 
 # Unified segmentation (both models; see default.yaml for the full knob docs)
 segmentation:
-  n_segments: 1
-  segment_size: 32
-  # pair_aware_segmentation: true   # chunk at !K:V! pair boundaries
+  n_segments: 4
+  segment_size: null
+  pair_aware_segmentation: true   # chunk at !K:V! pair boundaries
   # pairs_per_segment: 2
 
 hopfield:

@@ -9,17 +9,39 @@
 #   - m=3 passes 1seg, fails 2seg -> interference     -> pilot uses m=3
 # Metrics: eval_exact_match per cell (forgetting gap G = EM_1seg - EM_2seg)
 # + forgetting matrices at each per_segment_eval cadence.
-max_parallel: 1
+max_parallel: 6
+schedule: interleaved
 experiments:
-  - name: stage0_capacity_vs_interference
-    command: "python run_from_config.py --debug --config"
-    base_config: "configs/gradmemgpt/kv_retrieval/adaptive_stage0.yaml"
-    grid:
-      gradmem.n_mem_tokens: [3, 4]
-      adaptive.n_segments: [1, 2]
-  - name: stage0_seed_repro
-    command: "python run_from_config.py --debug --config"
+  - name: interference
+    command: "python run_from_config.py --config"
     base_config: "configs/gradmemgpt/kv_retrieval/adaptive_stage0.yaml"
     overrides:
-      gradmem.n_mem_tokens: 4
-      adaptive.n_segments: 2
+      gradmem.use_mem_proj: false
+      gradmem.mem_proj_mode: "none"
+      gradmem.add_inner_loss_to_outer: false
+      gradmem.n_mem_tokens: 2
+      adaptive.n_segments: 4
+      model.base_model: llama
+      dataset.data_name: N8-K2V2-V62_1M
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62_1M"
+    grid:
+      adaptive.memory_update_rule: ["sgd"]
+      adaptive.star_weight: [0]
+      training.seed: [4378, 43894, 2343]
+
+  - name: star
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/adaptive_stage0.yaml"
+    overrides:
+      gradmem.use_mem_proj: false
+      gradmem.mem_proj_mode: "none"
+      gradmem.add_inner_loss_to_outer: false
+      gradmem.n_mem_tokens: 2
+      adaptive.n_segments: 4
+      model.base_model: llama
+      dataset.data_name: N8-K2V2-V62_1M
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62_1M"
+    grid:
+      adaptive.memory_update_rule: ["sgd", "mamba"]
+      adaptive.star_weight: [0.1, 0.01]
+      training.seed: [4378, 43894, 2343]

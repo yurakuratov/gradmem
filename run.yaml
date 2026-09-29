@@ -1,20 +1,22 @@
 container:
-  image: "cr.ai.cloud.ru/0be50883-779e-4f89-a2c2-6befd3879c6f/test-time-gd:latest"
+  image: "cr.ai.cloud.ru/aicloud-base-images/cuda12.3-torch2-py310:0.0.37"
 
   # CMD to run
-  command: "python run_from_config.py --config configs/gradmemgpt/babi/hopfield.yaml --debug"
+  command: 'python -m pip install --user uv && $HOME/.local/bin/uv cache dir && $HOME/.local/bin/uv sync && $HOME/.local/bin/uv run python run_scheduler.py manifests/kv_hopfield.yaml && rm -r .venv'
+
   # ENV vars
   environment:
     "HF_HOME": "$HF_HOME"
+    "HF_TOKEN": "$HF_TOKEN"
     "TRITON_CACHE_DIR": "$TRITON_CACHE_DIR"
     "COMET_API_KEY": "$COMET_API_KEY"
-    "COMET_PROJECT_NAME": "babilong"
-    "COMET_EXPERIMENT_NAME": "base_64tk_q3"
+    "COMET_PROJECT_NAME": "gradmem-mem-stage0-inter"
     "COMET_WORKSPACE": "$COMET_WORKSPACE"
     "COMET_MODE": "online"
     # Added to job description
     "TEAM_NAME": "gradmem/$ME"
     "MY_HOME": "$MY_HOME"
+    "UV_CACHE_DIR": "$UV_CACHE_DIR"
   
   # Local working directory, recommend leaving as default
   work_dir: '.'
@@ -26,12 +28,9 @@ container:
   cry_copy_dir: "$MY_HOME/.cryri"
   exclude_from_copy:
     - ".venv"
-    - "uv.lock"
-    - "pyproject.toml"
-    - ".git/"
-    - "notebooks/"
-    - "build/"
-    - "lolora.egg-info"
+    - ".git"
+    - "notebooks"
+    - "data"
 
 cloud:
   region: "SR006"
@@ -43,4 +42,4 @@ cloud:
   n_workers: 1
   
   # Job description 
-  description: "hopfield_babi_64tk_q3"
+  description: "hopfield"
