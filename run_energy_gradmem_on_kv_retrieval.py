@@ -115,6 +115,7 @@ class EnergyGradMemExperimentArgs:
     read_lr: Optional[float] = field(default=0.1)
     clip_read_norm: Optional[float] = field(default=None)
     read_grad_mode: Optional[str] = field(default="second")
+    separate_write_model: Optional[bool] = field(default=False)
 
     inner_objective: Optional[str] = field(default="neural")
     energy_hidden_size: Optional[int] = field(default=None)
@@ -231,6 +232,7 @@ def build_model_config(args, base_config):
         read_lr=args.read_lr,
         clip_read_norm=args.clip_read_norm,
         read_grad_mode=args.read_grad_mode,
+        separate_write_model=args.separate_write_model,
         inner_objective=args.inner_objective,
         energy_hidden_size=args.energy_hidden_size,
         energy_num_layers=args.energy_num_layers,

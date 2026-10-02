@@ -399,6 +399,8 @@ def test_common_curriculum_uses_configured_h_and_ar_defaults():
     assert "CURRICULUM_METRIC=${CURRICULUM_METRIC:-query_accuracy}" in helper
     assert "CURRICULUM_METRIC_THRESHOLD=${CURRICULUM_METRIC_THRESHOLD:-0.9}" in helper
     assert "ENERGY_REPLAY_WEIGHT=0.0" in helper
+    assert "SEPARATE_WRITE_MODEL=${SEPARATE_WRITE_MODEL:-false}" in helper
+    assert '--separate_write_model "$SEPARATE_WRITE_MODEL"' in helper
     assert "READING_OPTIMIZATION=${READING_OPTIMIZATION:-false}" in helper
     assert "K_READ=${K_READ:-1}" in helper
     assert "READ_LR=${READ_LR:-0.1}" in helper
@@ -466,14 +468,31 @@ def test_enabled_ar_curriculum_forwards_complete_read_configuration_and_names(
         tmp_path,
         entry_script,
     )
-    expected_suffix = "_readK2lr0.1_second_clip1.0"
+    expected_suffix = "_readK2lr5.0_second_clip1.0"
     assert _option_value(arguments, "--reading_optimization") == "true"
     assert _option_value(arguments, "--K_read") == "2"
-    assert _option_value(arguments, "--read_lr") == "0.1"
+    assert _option_value(arguments, "--read_lr") == "5.0"
     assert _option_value(arguments, "--clip_read_norm") == "1.0"
     assert _option_value(arguments, "--read_grad_mode") == "second"
     assert expected_suffix in _option_value(arguments, "--exp_path")
     assert wandb_name.endswith(expected_suffix)
+
+
+def test_enabled_separate_write_model_receives_collision_safe_ar_names(tmp_path):
+    entry_script = (
+        REPO_ROOT
+        / "scripts"
+        / "ar_multihop"
+        / "run_energy_gradmem_curriculum_seg32.sh"
+    )
+    wandb_name, arguments = _run_curriculum_until_fake_launch(
+        tmp_path,
+        entry_script,
+        SEPARATE_WRITE_MODEL="true",
+    )
+    assert _option_value(arguments, "--separate_write_model") == "true"
+    assert "_separatewrite" in _option_value(arguments, "--exp_path")
+    assert wandb_name.endswith("_separatewrite")
 
 
 def test_disabled_ar_curriculum_keeps_previous_names(tmp_path):
@@ -510,6 +529,7 @@ def test_disabled_zoology_curriculum_keeps_names_and_forwards_defaults(tmp_path)
         READING_OPTIMIZATION="false",
     )
     assert _option_value(arguments, "--dataset_format") == "zoology"
+    assert _option_value(arguments, "--separate_write_model") == "false"
     assert _option_value(arguments, "--reading_optimization") == "false"
     assert _option_value(arguments, "--K_read") == "1"
     assert _option_value(arguments, "--read_lr") == "0.1"
@@ -522,6 +542,28 @@ def test_disabled_zoology_curriculum_keeps_names_and_forwards_defaults(tmp_path)
     )
     assert Path(_option_value(arguments, "--exp_path")).parts[-3] == expected_run_name
     assert wandb_name == "energy_gradmem_zoology_mh_seg32_N8_1segments_ce1_ilr1_run1"
+
+
+def test_kv_launchers_expose_separate_write_model_and_collision_safe_names():
+    script_dir = REPO_ROOT / "scripts" / "kv_retrieval"
+    base_script = (script_dir / "run_energy_gradmem_on_kv_retrieval.sh").read_text()
+    assert "SEPARATE_WRITE_MODEL=${SEPARATE_WRITE_MODEL:-false}" in base_script
+    assert '--separate_write_model "$SEPARATE_WRITE_MODEL"' in base_script
+    assert "ENERGY_ARCH_SUFFIX=${ENERGY_ARCH_SUFFIX}_separatewrite" in base_script
+
+    curriculum_names = (
+        "run_energy_gradmem_curriculum_on_kv_retrieval.sh",
+        "run_energy_gradmem_curriculum_on_ckv_retrieval.sh",
+        "run_energy_gradmem_id_curriculum_on_kv_retrieval.sh",
+        "run_energy_gradmem_parallel_curriculum_on_kv_retrieval.sh",
+        "run_energy_gradmem_cross_entropy_curriculum_on_kv_retrieval.sh",
+        "run_energy_gradmem_cross_entropy_curriculum_on_ckv_retrieval.sh",
+    )
+    for script_name in curriculum_names:
+        script = (script_dir / script_name).read_text()
+        assert "SEPARATE_WRITE_MODEL=${SEPARATE_WRITE_MODEL:-false}" in script
+        assert "_separatewrite" in script
+        assert 'SEPARATE_WRITE_MODEL="$SEPARATE_WRITE_MODEL"' in script
 
 
 @pytest.mark.parametrize(

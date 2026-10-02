@@ -1,5 +1,6 @@
 import pytest
 import torch
+from safetensors.torch import load_file
 from types import SimpleNamespace
 from transformers import GPT2Config
 
@@ -7,7 +8,9 @@ import energy_gradmem as energy_gradmem_module
 from energy_gradmem import EnergyGradMem, EnergyGradMemConfig
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
 from run_energy_gradmem_on_kv_retrieval import (
+    EnergyGradMemExperimentArgs,
     EnergyFreezeCallback,
+    build_model_config,
     reduce_inner_loop_stat,
     strip_trailing_context_separator,
 )
@@ -112,6 +115,239 @@ def test_strip_trailing_context_separator_removes_only_final_pipe():
     assert stripped[0]["context"] == "!Tg:ON!!jr:Tk!"
     assert stripped[1]["context"] == "!Tg:ON!!jr:Tk!"
     assert batch[0]["context"] == "!Tg:ON!!jr:Tk!|"
+
+
+def test_separate_write_model_starts_equal_without_shared_parameter_storage():
+    torch.manual_seed(0)
+    model = _model(K=1, separate_write_model=True)
+    read_parameters = dict(model.model.named_parameters())
+    write_parameters = dict(model.write_model.named_parameters())
+
+    assert read_parameters.keys() == write_parameters.keys()
+    for name, read_parameter in read_parameters.items():
+        write_parameter = write_parameters[name]
+        torch.testing.assert_close(read_parameter, write_parameter)
+        assert read_parameter.data_ptr() != write_parameter.data_ptr()
+
+    parameter_name = next(iter(read_parameters))
+    read_before = read_parameters[parameter_name].detach().clone()
+    with torch.no_grad():
+        write_parameters[parameter_name].add_(1.0)
+    torch.testing.assert_close(read_parameters[parameter_name], read_before)
+    assert not torch.equal(
+        read_parameters[parameter_name],
+        write_parameters[parameter_name],
+    )
+
+
+def test_separate_write_model_routes_context_and_query_to_distinct_backbones():
+    torch.manual_seed(0)
+    model = _model(K=1, separate_write_model=True)
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    write_embedding_inputs = []
+    read_embedding_inputs = []
+    write_forward_count = 0
+    read_forward_count = 0
+
+    def capture_write_embedding(_module, inputs, _output):
+        write_embedding_inputs.append(inputs[0].detach().clone())
+
+    def capture_read_embedding(_module, inputs, _output):
+        read_embedding_inputs.append(inputs[0].detach().clone())
+
+    def capture_write_forward(_module, _inputs, _output):
+        nonlocal write_forward_count
+        write_forward_count += 1
+
+    def capture_read_forward(_module, _inputs, _output):
+        nonlocal read_forward_count
+        read_forward_count += 1
+
+    handles = [
+        model.write_model.get_input_embeddings().register_forward_hook(
+            capture_write_embedding
+        ),
+        model.model.get_input_embeddings().register_forward_hook(
+            capture_read_embedding
+        ),
+        model.write_model.register_forward_hook(capture_write_forward),
+        model.model.register_forward_hook(capture_read_forward),
+    ]
+    try:
+        model({"context_input_ids": context, "query_input_ids": query})
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    assert any(torch.equal(seen, context) for seen in write_embedding_inputs)
+    assert not any(torch.equal(seen, context) for seen in read_embedding_inputs)
+    assert any(torch.equal(seen, query) for seen in read_embedding_inputs)
+    assert not any(torch.equal(seen, query) for seen in write_embedding_inputs)
+    assert write_forward_count == model.K
+    assert read_forward_count == 1
+
+
+def test_separate_write_model_end_to_end_backward_trains_both_backbones():
+    torch.manual_seed(0)
+    model = _model(
+        K=1,
+        energy_future_mode="none",
+        separate_write_model=True,
+    )
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    labels = torch.randint(1, 101, (2, 4))
+
+    output = model(
+        {"context_input_ids": context, "query_input_ids": query},
+        labels=labels,
+    )
+    output["loss"].backward()
+
+    for backbone in (model.model, model.write_model):
+        gradients = [
+            parameter.grad
+            for parameter in backbone.parameters()
+            if parameter.grad is not None
+        ]
+        assert gradients
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
+        assert any(gradient.abs().sum().item() > 0.0 for gradient in gradients)
+
+
+def test_separate_write_model_checkpoint_round_trip_preserves_both_models(tmp_path):
+    torch.manual_seed(0)
+    model = _model(K=1, separate_write_model=True)
+    with torch.no_grad():
+        next(model.model.parameters()).fill_(0.25)
+        next(model.write_model.parameters()).fill_(-0.75)
+    model.save_pretrained(tmp_path, safe_serialization=True)
+
+    restored = _model(K=1, separate_write_model=True)
+    restored.load_state_dict(
+        load_file(tmp_path / "model.safetensors"),
+        strict=False,
+    )
+    for name, expected in model.model.state_dict().items():
+        torch.testing.assert_close(restored.model.state_dict()[name], expected)
+    for name, expected in model.write_model.state_dict().items():
+        torch.testing.assert_close(restored.write_model.state_dict()[name], expected)
+
+
+def test_legacy_checkpoint_initializes_write_model_from_loaded_read_weights():
+    torch.manual_seed(0)
+    legacy_model = _model(K=1)
+    with torch.no_grad():
+        next(legacy_model.model.parameters()).fill_(0.375)
+
+    torch.manual_seed(123)
+    dual_model = _model(K=1, separate_write_model=True)
+    incompatible = dual_model.load_state_dict(legacy_model.state_dict(), strict=True)
+
+    assert not incompatible.missing_keys
+    assert not incompatible.unexpected_keys
+    for name, expected in legacy_model.model.state_dict().items():
+        torch.testing.assert_close(dual_model.model.state_dict()[name], expected)
+        torch.testing.assert_close(dual_model.write_model.state_dict()[name], expected)
+
+
+def test_dual_checkpoint_load_does_not_overwrite_trained_write_model():
+    source = _model(K=1, separate_write_model=True)
+    with torch.no_grad():
+        next(source.model.parameters()).fill_(0.125)
+        next(source.write_model.parameters()).fill_(-0.625)
+
+    restored = _model(K=1, separate_write_model=True)
+    restored.load_state_dict(source.state_dict(), strict=True)
+
+    torch.testing.assert_close(
+        next(restored.model.parameters()),
+        next(source.model.parameters()),
+    )
+    torch.testing.assert_close(
+        next(restored.write_model.parameters()),
+        next(source.write_model.parameters()),
+    )
+    assert not torch.equal(
+        next(restored.model.parameters()),
+        next(restored.write_model.parameters()),
+    )
+
+
+def test_separate_write_model_false_preserves_single_model_structure_and_behavior():
+    torch.manual_seed(0)
+    implicit = _model(K=1)
+    torch.manual_seed(0)
+    explicit = _model(K=1, separate_write_model=False)
+    explicit.load_state_dict(implicit.state_dict(), strict=True)
+
+    assert not hasattr(implicit, "write_model")
+    assert not hasattr(explicit, "write_model")
+    assert not any(name.startswith("write_model.") for name in explicit.state_dict())
+
+    context = torch.randint(1, 101, (2, 5))
+    query = torch.randint(1, 101, (2, 4))
+    implicit.eval()
+    explicit.eval()
+    implicit_output = implicit(
+        {"context_input_ids": context, "query_input_ids": query},
+        return_mem=True,
+    )
+    explicit_output = explicit(
+        {"context_input_ids": context, "query_input_ids": query},
+        return_mem=True,
+    )
+    torch.testing.assert_close(
+        implicit_output["predictions"],
+        explicit_output["predictions"],
+    )
+    torch.testing.assert_close(implicit_output["mem"], explicit_output["mem"])
+
+
+@pytest.mark.parametrize("memory_backend", ["lora", "kv_cache"])
+def test_separate_write_model_rejects_unsupported_memory_backends(memory_backend):
+    with pytest.raises(ValueError, match="memory_backend='prefix'"):
+        EnergyGradMemConfig(
+            base_config=_base_config(),
+            memory_backend=memory_backend,
+            separate_write_model=True,
+        )
+
+
+def test_separate_write_model_rejects_write_lora():
+    with pytest.raises(ValueError, match="use_write_lora"):
+        EnergyGradMemConfig(
+            base_config=_base_config(),
+            separate_write_model=True,
+            use_write_lora=True,
+        )
+
+
+def test_separate_write_model_applies_freezing_and_gradient_checkpointing_to_both():
+    frozen = _model(K=1, separate_write_model=True, freeze_backbone=True)
+    assert all(not parameter.requires_grad for parameter in frozen.model.parameters())
+    assert all(
+        not parameter.requires_grad for parameter in frozen.write_model.parameters()
+    )
+
+    checkpointed = _model(
+        K=1,
+        separate_write_model=True,
+        use_gradient_checkpointing=True,
+    )
+    assert checkpointed.model.is_gradient_checkpointing
+    assert checkpointed.write_model.is_gradient_checkpointing
+
+
+def test_separate_write_model_experiment_argument_reaches_model_config():
+    args = EnergyGradMemExperimentArgs(
+        exp_path="unused",
+        per_device_batch_size=1,
+        separate_write_model=True,
+    )
+    config = build_model_config(args, _base_config())
+    assert config.separate_write_model is True
 
 
 def test_forward_single_segment_prefix():

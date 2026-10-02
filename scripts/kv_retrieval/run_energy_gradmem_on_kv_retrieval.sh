@@ -51,6 +51,7 @@ GRAD_MODE=${GRAD_MODE:-second}
 USE_MEM_PROJ=${USE_MEM_PROJ:-false}
 MEM_PROJ_MODE=${MEM_PROJ_MODE:-none}
 USE_WRITE_HEAD=${USE_WRITE_HEAD:-false}
+SEPARATE_WRITE_MODEL=${SEPARATE_WRITE_MODEL:-false}
 USE_WRITE_LORA=${USE_WRITE_LORA:-false}
 WRITE_LORA_R=${WRITE_LORA_R:-8}
 WRITE_LORA_ALPHA=${WRITE_LORA_ALPHA:-16}
@@ -151,11 +152,19 @@ STOP_EXACT_MATCH_VALUE=${STOP_EXACT_MATCH_VALUE:-1.0}
 INIT_CHECKPOINT=${INIT_CHECKPOINT:-}
 
 ENERGY_ARCH_SUFFIX=
+if [ "$SEPARATE_WRITE_MODEL" != "true" ] \
+  && [ "$SEPARATE_WRITE_MODEL" != "false" ]; then
+  echo "SEPARATE_WRITE_MODEL must be true or false" >&2
+  exit 1
+fi
 if [ "$ENERGY_MODEL_TYPE" = "segment_delta_gru" ]; then
   ENERGY_ARCH_SUFFIX=_energy${ENERGY_MODEL_TYPE}_state${ENERGY_SEGMENT_STATE_SIZE}
   if [ "$ENERGY_REPLAY_WEIGHT" != "0.0" ] && [ "$ENERGY_REPLAY_WEIGHT" != "0" ]; then
     ENERGY_ARCH_SUFFIX=${ENERGY_ARCH_SUFFIX}_replay${ENERGY_REPLAY_WEIGHT}
   fi
+fi
+if [ "$SEPARATE_WRITE_MODEL" = true ]; then
+  ENERGY_ARCH_SUFFIX=${ENERGY_ARCH_SUFFIX}_separatewrite
 fi
 if [ "$READING_OPTIMIZATION" = true ]; then
   ENERGY_ARCH_SUFFIX=${ENERGY_ARCH_SUFFIX}_readK${K_READ}lr${READ_LR}
@@ -206,6 +215,7 @@ for N in $N_VALUES; do
     $( [ "$MAX_CONTEXT_LENGTH" != "None" ] && echo "--max_context_length $MAX_CONTEXT_LENGTH" ) \
     --memory_backend "$MEMORY_BACKEND" \
     --n_mem_tokens "$N_MEM_TOKENS" \
+    --separate_write_model "$SEPARATE_WRITE_MODEL" \
     --K "$K" \
     --last_K_second_order "$LAST_K_SECOND_ORDER" \
     --inner_lr "$INNER_LR" \

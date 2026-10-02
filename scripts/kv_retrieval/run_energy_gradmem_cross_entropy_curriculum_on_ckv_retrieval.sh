@@ -21,6 +21,7 @@ COMPLEXITY=1
 VOCAB_SIZE=62
 
 N_MEM_TOKENS=8
+SEPARATE_WRITE_MODEL=${SEPARATE_WRITE_MODEL:-false}
 K=2
 INNER_LRS=(1.0 0.1 0.1 0.03)
 MEMORY_ROTATION_ANGLES=(None None None None)
@@ -94,10 +95,14 @@ for N in ${N_VALUES[@]}; do
     N_SEGMENTS_IN_CONTEXT=${N_SEGMENTSS_IN_CONTEXT[$STAGE_INDEX]}
     N_PAIRS=$((N_PAIRS_IN_SEGMENT * N_SEGMENTS_IN_CONTEXT))
     HF_SUBSET=N${N_PAIRS}-K${K_SIZE}V${V_SIZE}C${COMPLEXITY}-V${VOCAB_SIZE}
-    RUN_NAME=energy_gradmem_cross_entropy_curriculum_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}
+    WRITE_MODEL_SUFFIX=""
+    if [ "$SEPARATE_WRITE_MODEL" = true ]; then
+      WRITE_MODEL_SUFFIX=_separatewrite
+    fi
+    RUN_NAME=energy_gradmem_cross_entropy_curriculum_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}${WRITE_MODEL_SUFFIX}
     EXP_ROOT=./runs/energy_gradmem_kv_cross_entropy_curriculum/${HF_SUBSET}/${RUN_NAME}
     STAGE_EXP_PATH=${EXP_ROOT}/run_${N}/stage_${STAGE}_cross_entropy
-    STAGE_WANDB_NAME=${MODEL}_cross_entropy_curriculum_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}_ilr${INNER_LR}_rot_${MEMORY_ROTATION}_run${N}
+    STAGE_WANDB_NAME=${MODEL}_cross_entropy_curriculum_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}_ilr${INNER_LR}_rot_${MEMORY_ROTATION}${WRITE_MODEL_SUFFIX}_run${N}
 
     if [ "$STAGE" -lt "$START_ITERATION" ]; then
       echo "Skipping stage $STAGE; reading checkpoint from $STAGE_EXP_PATH"
@@ -111,6 +116,7 @@ for N in ${N_VALUES[@]}; do
       N_PAIRS="$N_PAIRS" \
       N_PAIRS_IN_SEGMENT="$N_PAIRS_IN_SEGMENT" \
       N_SEGMENTS_IN_CONTEXT="$N_SEGMENTS_IN_CONTEXT" \
+      SEPARATE_WRITE_MODEL="$SEPARATE_WRITE_MODEL" \
       INNER_LR="$INNER_LR" \
       INNER_CLIP_NORM="$INNER_CLIP_NORM" \
       GRAD_MODE="$GRAD_MODE" \

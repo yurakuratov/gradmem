@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-CUDA_VISIBLE_DEVICES=0
+CUDA_VISIBLE_DEVICES=1
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -12,9 +12,12 @@ START_STAGE=1
 RUN_NUMBERS=(1)
 MAX_STEPS=200000
 HOP_LENGTH=2
+
 READING_OPTIMIZATION=true
 K_READ=2
 READ_LR=5.0
 CLIP_READ_NORM=1.0
 READ_GRAD_MODE=second
+
+SEPARATE_WRITE_MODEL=false
 source "$SCRIPT_DIR/run_energy_gradmem_curriculum_common.sh"

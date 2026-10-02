@@ -21,6 +21,7 @@ K_SIZE=2
 V_SIZE=2
 VOCAB_SIZE=62
 N_MEM_TOKENS=8
+SEPARATE_WRITE_MODEL=${SEPARATE_WRITE_MODEL:-false}
 K=2
 INNER_LRS=(1.0 1.0 1.0 1.0)
 GRAD_MODE=second
@@ -89,10 +90,14 @@ for N in $N_VALUES; do
     N_SEGMENTS_IN_CONTEXT=${N_SEGMENTSS_IN_CONTEXT[$STAGE_INDEX]}
     N_PAIRS=$((N_PAIRS_IN_SEGMENT * N_SEGMENTS_IN_CONTEXT))
     HF_SUBSET=N${N_PAIRS}-K${K_SIZE}V${V_SIZE}-V${VOCAB_SIZE}
-    RUN_NAME=energy_gradmem_parallel_curriculum_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}
+    WRITE_MODEL_SUFFIX=""
+    if [ "$SEPARATE_WRITE_MODEL" = true ]; then
+      WRITE_MODEL_SUFFIX=_separatewrite
+    fi
+    RUN_NAME=energy_gradmem_parallel_curriculum_${BASE_MODEL}_L${L}H${H}D${D}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_grad_${GRAD_MODE}_bs_${TBS}_lr_${LR}${WRITE_MODEL_SUFFIX}
     EXP_ROOT=./runs/energy_gradmem_kv_parallel_curriculum/${HF_SUBSET}/${RUN_NAME}
     STAGE_EXP_PATH=${EXP_ROOT}/run_${N}/stage_${STAGE}_ce_${CE_WEIGHT}
-    STAGE_WANDB_NAME=${MODEL}_parallel_curriculum_ce${CE_WEIGHT}_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}
+    STAGE_WANDB_NAME=${MODEL}_parallel_curriculum_ce${CE_WEIGHT}_N${N_PAIRS_IN_SEGMENT}x${N_SEGMENTS_IN_CONTEXT}${WRITE_MODEL_SUFFIX}
 
     if [ "$STAGE" -lt "$START_ITERATION" ]; then
       echo "Skipping stage $STAGE; reading checkpoint from $STAGE_EXP_PATH"
@@ -106,6 +111,7 @@ for N in $N_VALUES; do
       N_PAIRS="$N_PAIRS" \
       N_PAIRS_IN_SEGMENT="$N_PAIRS_IN_SEGMENT" \
       N_SEGMENTS_IN_CONTEXT="$N_SEGMENTS_IN_CONTEXT" \
+      SEPARATE_WRITE_MODEL="$SEPARATE_WRITE_MODEL" \
       INNER_LR="$INNER_LR" \
       SEGMENT_WRITE_MODE=parallel \
       INNER_OBJECTIVE="$INNER_OBJECTIVE" \

@@ -1,3 +1,4 @@
+import copy
 import logging
 import math
 import warnings
@@ -131,6 +132,7 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         read_lr=0.1,
         clip_read_norm=None,
         read_grad_mode="second",
+        separate_write_model=False,
         energy_pretrain_objective="ce",
         energy_pretrain_steps=0,
         energy_pretrain_batch_size=16,
@@ -221,6 +223,15 @@ class EnergyGradMemConfig(GradMemGPTConfig):
                 raise ValueError("reading_optimization requires K_read >= 1")
             if float(read_lr) <= 0.0:
                 raise ValueError("reading_optimization requires read_lr > 0")
+        if separate_write_model:
+            if self.memory_backend != "prefix":
+                raise ValueError(
+                    "separate_write_model currently requires memory_backend='prefix'"
+                )
+            if self.use_write_lora:
+                raise ValueError(
+                    "separate_write_model does not support use_write_lora=True"
+                )
         regularization_values = {
             "energy_weight_rms_reg": energy_weight_rms_reg,
             "energy_weight_rms_threshold": energy_weight_rms_threshold,
@@ -296,6 +307,7 @@ class EnergyGradMemConfig(GradMemGPTConfig):
         self.read_lr = read_lr
         self.clip_read_norm = clip_read_norm
         self.read_grad_mode = read_grad_mode
+        self.separate_write_model = bool(separate_write_model)
         self.energy_pretrain_objective = energy_pretrain_objective
         self.energy_pretrain_steps = energy_pretrain_steps
         self.energy_pretrain_batch_size = energy_pretrain_batch_size
@@ -311,6 +323,16 @@ class EnergyGradMem(GradMemGPT):
 
     def __init__(self, config):
         super().__init__(config)
+
+        self.separate_write_model = bool(
+            getattr(config, "separate_write_model", False)
+        )
+        if self.separate_write_model:
+            # Copy only after the read backbone has completed its full initialization
+            # (including pretrained weights, tying, freezing, and checkpointing).
+            self.write_model = copy.deepcopy(self.model)
+            if getattr(config, "use_gradient_checkpointing", False):
+                self.gradient_checkpointing_enable()
 
         model_hidden_size = getattr(self.model.config, "n_embd", getattr(self.model.config, "hidden_size", None))
         if model_hidden_size is None:
@@ -436,6 +458,64 @@ class EnergyGradMem(GradMemGPT):
                     nn.Linear(energy_head_input_size, 1),
                     nn.Softplus(beta=1, threshold=20),
                 )
+
+    def tie_weights(self):
+        super().tie_weights()
+        write_model = getattr(self, "write_model", None)
+        if write_model is not None:
+            write_model.tie_weights()
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        super().gradient_checkpointing_enable(gradient_checkpointing_kwargs)
+        write_model = getattr(self, "write_model", None)
+        if write_model is None or not hasattr(
+            write_model, "gradient_checkpointing_enable"
+        ):
+            return
+        try:
+            write_model.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        except TypeError:
+            write_model.gradient_checkpointing_enable()
+
+    def _freeze_backbone_params(self):
+        super()._freeze_backbone_params()
+        write_model = getattr(self, "write_model", None)
+        if write_model is not None:
+            for parameter in write_model.parameters():
+                parameter.requires_grad = False
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Load dual-model checkpoints and upgrade legacy single-model weights."""
+
+        has_write_model_state = any(
+            name.startswith("write_model.") for name in state_dict
+        )
+        legacy_single_model = self.separate_write_model and not has_write_model_state
+        result = super().load_state_dict(
+            state_dict,
+            strict=False if legacy_single_model else strict,
+            assign=assign,
+        )
+        if not legacy_single_model:
+            return result
+
+        # The read model now contains the checkpoint values. Copy from it only for
+        # legacy checkpoints; a checkpoint that contains any write-model state is
+        # never overwritten here.
+        self.write_model.load_state_dict(self.model.state_dict(), strict=True)
+        missing_keys = [
+            name for name in result.missing_keys if not name.startswith("write_model.")
+        ]
+        if strict and (missing_keys or result.unexpected_keys):
+            problems = []
+            if missing_keys:
+                problems.append(f"Missing key(s): {missing_keys}")
+            if result.unexpected_keys:
+                problems.append(f"Unexpected key(s): {result.unexpected_keys}")
+            raise RuntimeError("Error(s) in loading state_dict: " + "; ".join(problems))
+        return type(result)(missing_keys, result.unexpected_keys)
 
     def _named_energy_parameters(self):
         named_params = []
@@ -652,17 +732,18 @@ class EnergyGradMem(GradMemGPT):
         return energy_state
 
     def _run_write_model(self, write_batch, memory_state):
+        write_model = self.write_model if self.separate_write_model else self.model
         write_model_kwargs = write_batch.get("model_kwargs", {})
         with self.memory_backend_impl.activation_context(memory_state):
             if self.use_write_head:
-                outs = get_backbone(self.model)(
+                outs = get_backbone(write_model)(
                     inputs_embeds=write_batch["inputs_embeds"],
                     return_dict=True,
                     **write_model_kwargs,
                 )
                 hidden = outs.last_hidden_state[:, write_batch["logits_start"]:, :]
                 return SimpleNamespace(logits=self.write_head(hidden), hidden_states=None, logits_start_override=0)
-            outs = self.model(
+            outs = write_model(
                 inputs_embeds=write_batch["inputs_embeds"],
                 output_hidden_states=True,
                 return_dict=True,
@@ -946,7 +1027,8 @@ class EnergyGradMem(GradMemGPT):
         if self.energy_future_mode != "next_token":
             raise ValueError(f"Unsupported energy_future_mode={self.energy_future_mode}")
 
-        emb_layer = self.model.get_input_embeddings()
+        write_model = self.write_model if self.separate_write_model else self.model
+        emb_layer = write_model.get_input_embeddings()
         target_len = mask.size(1)
         emb_dim = emb_layer.embedding_dim
         future = emb_layer.weight.new_zeros(segment.size(0), target_len, emb_dim)

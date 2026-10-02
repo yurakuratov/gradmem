@@ -226,11 +226,12 @@ class InputPrefixMemoryBackend(MemoryBackend):
         o = self.owner
         B = context_input_ids.size(0)
         mem_offset = o.n_mem_tokens + o.n_ctrl_tokens * 2
+        write_model = getattr(o, "write_model", o.model)
 
         batch_ctx = {
             "context_input_ids": context_input_ids,
             "query_input_ids": query_input_ids,
-            "ctx_emb": o.model.get_input_embeddings()(context_input_ids),
+            "ctx_emb": write_model.get_input_embeddings()(context_input_ids),
             "qry_emb": o.model.get_input_embeddings()(query_input_ids),
             "mem_offset": mem_offset,
         }

@@ -62,6 +62,7 @@ D=${D:-128}
 N_MEM_TOKENS=${N_MEM_TOKENS:-4}
 ATTENTION_DROPOUT=${ATTENTION_DROPOUT:-0.1}
 HOP_LENGTH=${HOP_LENGTH:-1}
+SEPARATE_WRITE_MODEL=${SEPARATE_WRITE_MODEL:-false}
 
 # Established EnergyGradMem curriculum defaults.
 K=${K:-2}
@@ -111,6 +112,11 @@ if ! [[ "$HOP_LENGTH" =~ ^[0-9]+$ ]] || [ "$HOP_LENGTH" -lt 1 ]; then
   echo "HOP_LENGTH must be a positive integer" >&2
   exit 1
 fi
+if [ "$SEPARATE_WRITE_MODEL" != "true" ] \
+  && [ "$SEPARATE_WRITE_MODEL" != "false" ]; then
+  echo "SEPARATE_WRITE_MODEL must be true or false" >&2
+  exit 1
+fi
 if [ "$READING_OPTIMIZATION" != "true" ] \
   && [ "$READING_OPTIMIZATION" != "false" ]; then
   echo "READING_OPTIMIZATION must be true or false" >&2
@@ -157,6 +163,10 @@ fi
 READ_CONFIG_SUFFIX=""
 if [ "$READING_OPTIMIZATION" = "true" ]; then
   READ_CONFIG_SUFFIX=_readK${K_READ}lr${READ_LR}_${READ_GRAD_MODE}_clip${CLIP_READ_NORM}
+fi
+WRITE_MODEL_SUFFIX=""
+if [ "$SEPARATE_WRITE_MODEL" = "true" ]; then
+  WRITE_MODEL_SUFFIX=_separatewrite
 fi
 
 resolve_progression_checkpoint() {
@@ -221,12 +231,12 @@ for RUN_ID in $RUN_NUMBERS; do
     fi
     SEGMENT_COUNT=$(((DATASET_N + KV_PAIRS_PER_SEGMENT - 1) / KV_PAIRS_PER_SEGMENT))
 
-    RUN_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_llama_L${L}H${N_HEAD}D${D}_attndrop${ATTENTION_DROPOUT}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_ce${CE_WEIGHT}_olr${LR}_${LR_SCHEDULER_TYPE}final${OUTER_LR_FINAL_RATIO}_grad_${GRAD_MODE}_energy_${ENERGY_MODEL_TYPE}_state${ENERGY_SEGMENT_STATE_SIZE}_replay0${READ_CONFIG_SUFFIX}
+    RUN_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_llama_L${L}H${N_HEAD}D${D}_attndrop${ATTENTION_DROPOUT}_${HF_SUBSET}_mem${N_MEM_TOKENS}_K${K}_ilr${INNER_LR}_ce${CE_WEIGHT}_olr${LR}_${LR_SCHEDULER_TYPE}final${OUTER_LR_FINAL_RATIO}_grad_${GRAD_MODE}_energy_${ENERGY_MODEL_TYPE}_state${ENERGY_SEGMENT_STATE_SIZE}_replay0${WRITE_MODEL_SUFFIX}${READ_CONFIG_SUFFIX}
     STAGE_PATH=$OUTPUT_ROOT/seg${SEGMENT_REGIME}/${HF_SUBSET}/${RUN_NAME}/run_${RUN_ID}/stage_${STAGE}
     if [ "$INCLUDE_HOP_IN_WANDB_NAME" = "true" ]; then
-      WANDB_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_N${DATASET_N}_H${HOP_LENGTH}_${SEGMENT_COUNT}segments_ce${CE_WEIGHT}_ilr${INNER_LR}_run${RUN_ID}${READ_CONFIG_SUFFIX}
+      WANDB_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_N${DATASET_N}_H${HOP_LENGTH}_${SEGMENT_COUNT}segments_ce${CE_WEIGHT}_ilr${INNER_LR}_run${RUN_ID}${WRITE_MODEL_SUFFIX}${READ_CONFIG_SUFFIX}
     else
-      WANDB_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_N${DATASET_N}_${SEGMENT_COUNT}segments_ce${CE_WEIGHT}_ilr${INNER_LR}_run${RUN_ID}${READ_CONFIG_SUFFIX}
+      WANDB_NAME=${RUN_NAME_PREFIX}_seg${SEGMENT_REGIME}_N${DATASET_N}_${SEGMENT_COUNT}segments_ce${CE_WEIGHT}_ilr${INNER_LR}_run${RUN_ID}${WRITE_MODEL_SUFFIX}${READ_CONFIG_SUFFIX}
     fi
 
     if [ "$STAGE" -lt "$START_STAGE" ]; then
@@ -264,6 +274,7 @@ for RUN_ID in $RUN_NUMBERS; do
         --attention_dropout "$ATTENTION_DROPOUT" \
         --memory_backend prefix \
         --n_mem_tokens "$N_MEM_TOKENS" \
+        --separate_write_model "$SEPARATE_WRITE_MODEL" \
         --K "$K" \
         --last_K_second_order "$LAST_K_SECOND_ORDER" \
         --inner_lr "$INNER_LR" \
