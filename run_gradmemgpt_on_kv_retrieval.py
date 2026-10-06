@@ -1198,6 +1198,12 @@ class ExperimentArgs:
     hopfield_value_as_key: Optional[bool] = field(default=False)
     hopfield_value_proj_dim: Optional[int] = field(default=None)
     hopfield_bptt_segments: Optional[int] = field(default=None)
+    # Nonlinear/sparse value codes (linear = original behavior). Any non-linear
+    # mode requires use_hopfield_memory + hopfield_value_proj_dim.
+    hopfield_value_activation: Optional[str] = field(default="linear")
+    hopfield_value_topk: Optional[int] = field(default=None)
+    hopfield_value_l1_weight: Optional[float] = field(default=0.0)
+    hopfield_value_gate_init: Optional[float] = field(default=0.5)
     use_gated_delta_memory: Optional[bool] = field(default=False)
     gated_delta_state_dim: Optional[int] = field(default=128)
     gated_delta_alpha_init: Optional[float] = field(default=0.9)
@@ -1526,6 +1532,10 @@ def main(config_path: Optional[str] = None):
         hopfield_value_as_key=args.hopfield_value_as_key,
         hopfield_value_proj_dim=args.hopfield_value_proj_dim,
         hopfield_bptt_segments=args.hopfield_bptt_segments,
+        hopfield_value_activation=args.hopfield_value_activation,
+        hopfield_value_topk=args.hopfield_value_topk,
+        hopfield_value_l1_weight=args.hopfield_value_l1_weight,
+        hopfield_value_gate_init=args.hopfield_value_gate_init,
         use_gated_delta_memory=args.use_gated_delta_memory,
         gated_delta_state_dim=args.gated_delta_state_dim,
         gated_delta_alpha_init=args.gated_delta_alpha_init,

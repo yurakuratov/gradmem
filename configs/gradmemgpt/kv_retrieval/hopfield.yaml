@@ -71,3 +71,16 @@ hopfield:
   hopfield_value_as_key: false  # skip forward pass for key, use value_pattern or its projection as key
   hopfield_value_proj_dim: null  # value projection dim in Hopfield STORE/RETRIEVE (null = disabled, M*d = identity init)
   hopfield_bptt_segments: null  # number of last segments to keep in BPTT graph (null = all segments)
+  # --- nonlinear/sparse value codes (all default-off; linear = original behavior) ---
+  # Activation applied to the projected value code in STORE; the stored tensor is the
+  # activated code, and both retrieval paths decode it. Any non-linear mode requires
+  # hopfield_value_proj_dim. See hopfield_value_activation.yaml for a runnable example.
+  hopfield_value_activation: linear  # linear | topk | relu | gated
+  hopfield_value_topk: null  # topk only: keep the k largest positive coords (1 <= k <= hopfield_value_proj_dim)
+  # relu only: weight of the OUTER L1 sparsity loss mean(abs(z)) on the value codes
+  # (never part of the K-step inner update; BPTT-detached old segments never re-enter
+  # its graph). A positive weight ALSO unit-normalizes the decoder columns
+  # (F.normalize(weight, dim=0)) in both retrieval paths, so the model cannot cancel
+  # the L1 pressure by shrinking the encoder and growing decoder columns.
+  hopfield_value_l1_weight: 0.0
+  hopfield_value_gate_init: 0.5  # gated only: initial constant gate (bias = logit(gate_init), zero weight -> initial code == h)

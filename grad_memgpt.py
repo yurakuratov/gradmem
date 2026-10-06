@@ -194,6 +194,10 @@ class GradMemGPTConfig(PretrainedConfig):
                  hopfield_value_as_key=False,
                  hopfield_value_proj_dim=None,
                  hopfield_bptt_segments=None,
+                 hopfield_value_activation="linear",
+                 hopfield_value_topk=None,
+                 hopfield_value_l1_weight=0.0,
+                 hopfield_value_gate_init=0.5,
                  memory_update="gradient",
                  use_mem_residual=False,
                  use_reconstruction_loss=False,
@@ -270,6 +274,25 @@ use_hopfield_memory: bool, enable Hopfield-like external memory
              hopfield_value_as_key: bool, use value pattern as key in Hopfield STORE instead of forward pass
 hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield STORE/RETRIEVE (None = no projection)
               hopfield_bptt_segments: int|None, number of last segments to keep in backprop graph for Hopfield (None = all segments)
+             hopfield_value_activation: str, activation applied to the projected value code in Hopfield STORE
+                 ("linear" = z = h, the original behavior; "topk" = keep the k largest positive coords;
+                 "relu" = z = relu(h); "gated" = z = h * sigmoid(gate(v)) / hopfield_value_gate_init).
+                 Any non-linear mode requires use_hopfield_memory=True and a non-null hopfield_value_proj_dim,
+                 and is applied once in STORE: the stored tensor is the activated code, and both retrieval
+                 paths decode it with the matching helper.
+             hopfield_value_topk: int|None, k of the top-k winner code (only used with
+                 hopfield_value_activation="topk"; requires 1 <= k <= hopfield_value_proj_dim). The actual
+                 nnz may be < k when fewer than k coords are positive. Must be None in other modes.
+             hopfield_value_l1_weight: float >= 0, weight of the OUTER L1 sparsity loss mean(abs(z)) on the
+                 value codes (positive only supported with "relu"; the term never enters the K-step inner
+                 update, and old BPTT-detached segments never re-enter the graph through it). With a
+                 positive weight the DECODER is functionally unit-column-normalized
+                 (F.normalize(weight, dim=0)) so the model cannot cancel the L1 pressure by shrinking the
+                 encoder and growing decoder columns; "relu" with weight 0 and all other modes keep the
+                 plain nn.Linear decoder.
+             hopfield_value_gate_init: float in (0, 1), initial constant gate value for the "gated" mode
+                 (the gate Linear is zero-weight/logit-bias initialized, so the initial activated code is
+                 exactly h). Inert (but still validated) in the other modes.
               memory_update: str, how to update memory in inner loop ("gradient" for SGD/Adam, "forward" for RMT-style forward pass)
              use_mem_residual: bool, use residual connection in forward memory update: mem = mem + LN(mem_out) (requires memory_update="forward")
               use_reconstruction_loss: bool, add reconstruction loss (context LM loss) to outer loss during forward inner loop
@@ -392,6 +415,10 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.hopfield_value_as_key = hopfield_value_as_key
         self.hopfield_value_proj_dim = hopfield_value_proj_dim
         self.hopfield_bptt_segments = hopfield_bptt_segments
+        self.hopfield_value_activation = hopfield_value_activation
+        self.hopfield_value_topk = hopfield_value_topk
+        self.hopfield_value_l1_weight = hopfield_value_l1_weight
+        self.hopfield_value_gate_init = hopfield_value_gate_init
         self.memory_update = memory_update
         self.use_mem_residual = use_mem_residual
         self.use_reconstruction_loss = use_reconstruction_loss
@@ -459,6 +486,29 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         if hopfield_value_proj_dim is not None:
             assert use_hopfield_memory, "hopfield_value_proj_dim requires use_hopfield_memory=True"
             assert hopfield_value_proj_dim > 0, f"hopfield_value_proj_dim must be positive, got {hopfield_value_proj_dim}"
+        # Nonlinear/sparse value codes (see the docstring above for semantics).
+        assert hopfield_value_activation in ("linear", "topk", "relu", "gated"), \
+            f"hopfield_value_activation must be 'linear', 'topk', 'relu', or 'gated', got '{hopfield_value_activation}'"
+        if hopfield_value_activation != "linear":
+            assert use_hopfield_memory, \
+                f"hopfield_value_activation='{hopfield_value_activation}' requires use_hopfield_memory=True"
+            assert hopfield_value_proj_dim is not None, \
+                f"hopfield_value_activation='{hopfield_value_activation}' requires hopfield_value_proj_dim " \
+                f"(the activation applies to the projected value code)"
+        assert not (hopfield_value_topk is not None and hopfield_value_activation != "topk"), \
+            f"hopfield_value_topk is only used with hopfield_value_activation='topk', got " \
+            f"activation='{hopfield_value_activation}' with topk={hopfield_value_topk}"
+        if hopfield_value_activation == "topk":
+            assert hopfield_value_topk is not None and 1 <= hopfield_value_topk <= hopfield_value_proj_dim, \
+                f"topk activation requires 1 <= hopfield_value_topk <= hopfield_value_proj_dim, got " \
+                f"k={hopfield_value_topk}, proj_dim={hopfield_value_proj_dim}"
+        assert hopfield_value_l1_weight >= 0, \
+            f"hopfield_value_l1_weight must be >= 0, got {hopfield_value_l1_weight}"
+        assert not (hopfield_value_l1_weight > 0 and hopfield_value_activation != "relu"), \
+            f"a positive hopfield_value_l1_weight is only supported with hopfield_value_activation='relu', " \
+            f"got activation='{hopfield_value_activation}' with l1_weight={hopfield_value_l1_weight}"
+        assert 0 < hopfield_value_gate_init < 1, \
+            f"hopfield_value_gate_init must be in (0, 1), got {hopfield_value_gate_init}"
         if hopfield_segment_size is not None:
             assert hopfield_n_segments == 1, \
                 f"hopfield_segment_size and hopfield_n_segments are mutually exclusive, got segment_size={hopfield_segment_size} and n_segments={hopfield_n_segments}"
@@ -830,6 +880,16 @@ class GradMemGPT(PreTrainedModel):
         self.hopfield_value_as_key = getattr(config, "hopfield_value_as_key", False)
         self.hopfield_value_proj_dim = getattr(config, "hopfield_value_proj_dim", None)
         self.hopfield_bptt_segments = getattr(config, "hopfield_bptt_segments", None)
+        # Nonlinear/sparse value codes. getattr defaults keep old serialized
+        # configs (without these fields) loading as linear with no aux loss.
+        self.hopfield_value_activation = getattr(config, "hopfield_value_activation", "linear")
+        self.hopfield_value_topk = getattr(config, "hopfield_value_topk", None)
+        self.hopfield_value_l1_weight = getattr(config, "hopfield_value_l1_weight", 0.0)
+        self.hopfield_value_gate_init = getattr(config, "hopfield_value_gate_init", 0.5)
+        # ReLU L1 sparsity is active (and switches the decoder to unit-normalized
+        # columns) only for activation="relu" with a positive weight.
+        self.hopfield_value_l1_active = (self.hopfield_value_activation == "relu"
+                                         and self.hopfield_value_l1_weight > 0)
 
         if self.use_hopfield_memory:
             if self.hopfield_n_segments < 1:
@@ -841,12 +901,20 @@ class GradMemGPT(PreTrainedModel):
                 self.mem_query = nn.Parameter(torch.randn(self.n_mem_tokens, n_embd) * 0.02)
             if self.hopfield_proj_dim is not None:
                 pattern_dim = self.n_mem_tokens * n_embd
-                self.hopfield_key_proj = nn.Linear(pattern_dim, self.hopfield_proj_dim, bias=True)
+                # When the activated value code doubles as the STORE key
+                # (hopfield_value_as_key with a projected value), the key
+                # projection's source is the widened code dim Dv, not P = M*d.
+                key_src_dim = self.hopfield_value_proj_dim \
+                    if (self.hopfield_value_as_key and self.hopfield_value_proj_dim is not None) \
+                    else pattern_dim
+                self.hopfield_key_proj = nn.Linear(key_src_dim, self.hopfield_proj_dim, bias=True)
                 self.hopfield_query_proj = nn.Linear(pattern_dim, self.hopfield_proj_dim, bias=True)
-                if self.hopfield_proj_dim == pattern_dim:
+                if self.hopfield_proj_dim == key_src_dim:
                     with torch.no_grad():
                         nn.init.eye_(self.hopfield_key_proj.weight)
                         self.hopfield_key_proj.bias.zero_()
+                if self.hopfield_proj_dim == pattern_dim:
+                    with torch.no_grad():
                         nn.init.eye_(self.hopfield_query_proj.weight)
                         self.hopfield_query_proj.bias.zero_()
 
@@ -860,6 +928,28 @@ class GradMemGPT(PreTrainedModel):
                         self.hopfield_value_proj.bias.zero_()
                         nn.init.eye_(self.hopfield_value_inv_proj.weight)
                         self.hopfield_value_inv_proj.bias.zero_()
+                if self.hopfield_value_activation == "gated":
+                    # Input-dependent elementwise soft gate. Zero weight +
+                    # logit(gate_init) bias => the initial gate is constantly
+                    # gate_init, so the division by gate_init below makes the
+                    # initial activated code exactly h, while gradients train
+                    # the gate immediately.
+                    self.hopfield_value_gate = nn.Linear(pattern_dim, self.hopfield_value_proj_dim, bias=True)
+                    with torch.no_grad():
+                        self.hopfield_value_gate.weight.zero_()
+                        g = self.hopfield_value_gate_init
+                        self.hopfield_value_gate.bias.fill_(math.log(g / (1.0 - g)))
+
+            # Without a key projection the value-as-key source must already be
+            # P-sized; fail here (with the dims spelled out) instead of at bmm.
+            if self.hopfield_value_as_key and self.hopfield_value_proj_dim is not None \
+                    and self.hopfield_proj_dim is None \
+                    and self.hopfield_value_proj_dim != self.n_mem_tokens * n_embd:
+                raise ValueError(
+                    f"hopfield_value_as_key with hopfield_value_proj_dim={self.hopfield_value_proj_dim} "
+                    f"requires hopfield_proj_dim to be set: without a key projection the key source dim "
+                    f"({self.hopfield_value_proj_dim}) must equal the memory pattern dim "
+                    f"M*d ({self.n_mem_tokens * n_embd}).")
 
         if self.use_hopfield_memory and self.hopfield_segment_size is not None:
             max_pos = getattr(self.model.config, 'n_positions',
@@ -1432,6 +1522,92 @@ class GradMemGPT(PreTrainedModel):
             correct[i] = (preds[i][score] == qids_i[score]).all()
         return correct
 
+    def _encode_hopfield_value(self, value_pattern):
+        """Flattened segment memory [B, P] -> activated value code ([B, Dv] when projected, else [B, P]).
+
+        The single activation point of the Hopfield STORE path: the stored
+        tensor is the activated code z (never the preactivation h), and both
+        retrieval paths (forward RETRIEVE + _probe_boundary_memory) decode it
+        with _decode_hopfield_value. Modes (hopfield_value_activation):
+          linear: z = h (the original, exactly backward-compatible behavior)
+          topk:   nonnegative k-winner code -- the k largest positive coords of
+                  relu(h) per sample, zero elsewhere (nnz < k when fewer coords
+                  are positive)
+          relu:   z = relu(h)
+          gated:  z = h * sigmoid(gate(v)) / hopfield_value_gate_init (zero-init
+                  gate weight + logit(gate_init) bias => initially exactly h)
+        """
+        if self.hopfield_value_proj_dim is None:
+            return value_pattern
+        h = self.hopfield_value_proj(value_pattern)
+        mode = self.hopfield_value_activation
+        if mode == "linear":
+            return h
+        if mode == "topk":
+            positive = F.relu(h)
+            vals, idx = positive.topk(min(self.hopfield_value_topk, positive.size(-1)), dim=-1)
+            z = torch.zeros_like(positive)
+            z.scatter_(-1, idx, vals)
+            return z
+        if mode == "relu":
+            return F.relu(h)
+        if mode == "gated":
+            gate = torch.sigmoid(self.hopfield_value_gate(value_pattern))
+            return h * (gate / self.hopfield_value_gate_init)
+        raise ValueError(f"Unknown hopfield_value_activation: {mode}")
+
+    def _decode_hopfield_value(self, value_code):
+        """Retrieved value code [B, Dv] -> flattened memory pattern [B, P].
+
+        With ReLU L1 sparsity enabled the decoder is applied with functionally
+        unit-normalized columns (F.normalize(weight, dim=0)): an unconstrained
+        decoder would let the model cancel the L1 pressure by shrinking encoder
+        activations and growing decoder columns at a constant decoded result.
+        Other modes (and relu with l1_weight == 0) use the plain nn.Linear.
+        """
+        if self.hopfield_value_proj_dim is None:
+            return value_code
+        if self.hopfield_value_l1_active:
+            weight = F.normalize(self.hopfield_value_inv_proj.weight, dim=0)
+            return F.linear(value_code, weight, self.hopfield_value_inv_proj.bias)
+        return self.hopfield_value_inv_proj(value_code)
+
+    @staticmethod
+    def _hopfield_value_code_active(z, activation, eps=1e-12):
+        """Boolean activity mask used by the hopfield_value_active_frac / feature-utilization stats."""
+        if activation in ("relu", "topk"):
+            return z > 0
+        return z.abs() > eps
+
+    def _accumulate_hopfield_value_stats(self, acc, value_code, value_pattern, seg_has_tokens):
+        """Per-segment accumulation for the hopfield_value_* diagnostics.
+
+        acc is the per-forward dict built in forward(); everything stays
+        detached so BPTT graph lifetimes are unaffected, and only the
+        seg_has_tokens rows contribute (padded/empty sample-segments never
+        enter any denominator).
+        """
+        with torch.no_grad():
+            if not seg_has_tokens.any():
+                return
+            zv = value_code.detach()[seg_has_tokens]            # [n_valid, Dv]
+            active = self._hopfield_value_code_active(zv, self.hopfield_value_activation)
+            acc['abs_sum'] = acc['abs_sum'] + zv.abs().sum()
+            acc['norm_sum'] = acc['norm_sum'] + zv.norm(dim=-1).sum()
+            acc['active'] = acc['active'] + active.sum()
+            acc['count'] += zv.size(0)
+            util = active.any(dim=0)                            # [Dv] bool
+            acc['util_any'] = util if acc['util_any'] is None else (acc['util_any'] | util)
+            if self.hopfield_value_activation == "gated":
+                g = torch.sigmoid(self.hopfield_value_gate(value_pattern[seg_has_tokens].detach()))
+                acc['gate_sum'] = acc['gate_sum'] + g.sum()
+                acc['gate_sat'] = acc['gate_sat'] + ((g < 0.05) | (g > 0.95)).sum()
+            if self.hopfield_value_l1_active:
+                # detached diagnostic over ALL processed segments (graph-
+                # retained or not); the trainable accumulator lives in forward.
+                acc['l1_all_sum'] = acc['l1_all_sum'] + zv.abs().mean(dim=-1).sum()
+                acc['l1_all_count'] += zv.size(0)
+
     def _probe_boundary_memory(self, snap, stored_keys, stored_values, stored_masks,
                                query_input_ids, target_mask, mem_batch_initial,
                                read_st_batch, read_end_batch, B, device):
@@ -1481,8 +1657,8 @@ class GradMemGPT(PreTrainedModel):
 
         if self.use_hopfield_memory and snap['n_stored'] > 0:
             c = snap['n_stored']
-            keys = torch.stack(stored_keys[:c], dim=1)                 # [B, c, M*d]
-            values = torch.stack(stored_values[:c], dim=1)             # [B, c, M*d]
+            keys = torch.stack(stored_keys[:c], dim=1)                 # [B, c, M*d] (Dv when value-as-key)
+            values = torch.stack(stored_values[:c], dim=1)             # [B, c, Dv] (activated codes; M*d unprojected)
             mask = torch.stack(stored_masks[:c], dim=1).bool()         # [B, c]
             stored = mask.any(dim=1)                                   # [B]
 
@@ -1508,7 +1684,9 @@ class GradMemGPT(PreTrainedModel):
             if self.hopfield_retrieval_mode == "mean":
                 weights = mask.float() / mask.float().sum(dim=1, keepdim=True).clamp(min=1)
                 w_flat = weights.unsqueeze(1).expand(-1, n_q, -1).reshape(B * n_q, c)
-                retrieved_pattern = torch.bmm(w_flat.unsqueeze(2), values_flat).squeeze(1)
+                # [B*n_q, 1, c] @ [B*n_q, c, Dv] -> [B*n_q, Dv] (the row-vector
+                # form; unsqueeze(2) here produced mismatched bmm inner dims)
+                retrieved_pattern = torch.bmm(w_flat.unsqueeze(1), values_flat).squeeze(1)
             else:
                 scores = torch.bmm(query_key.unsqueeze(1), keys_flat.transpose(1, 2)).squeeze(1)  # [B*n_q, c]
                 if self.hopfield_retrieval_mode == "raw":
@@ -1527,7 +1705,9 @@ class GradMemGPT(PreTrainedModel):
                     raise ValueError(f"Unknown hopfield_retrieval_mode: {self.hopfield_retrieval_mode}")
 
             if self.hopfield_value_proj_dim is not None:
-                retrieved_pattern = self.hopfield_value_inv_proj(retrieved_pattern)
+                # decode the retrieved activated code (unit-normalized decoder
+                # columns when ReLU L1 is active -- same helper as forward)
+                retrieved_pattern = self._decode_hopfield_value(retrieved_pattern)
 
             # samples with nothing stored yet: fall back to the initial memory
             if not stored.all():
@@ -1739,6 +1919,24 @@ class GradMemGPT(PreTrainedModel):
             stored_values = []
             stored_masks = []
             hopfield_stored = torch.zeros(B, dtype=torch.bool, device=device)
+        # Nonlinear value-code accumulators (fresh each forward call, detached):
+        # `hv` feeds the hopfield_value_* diagnostics, the L1 pair feeds the
+        # trainable sparse-loss term (graph-retained segments only, see STORE).
+        hv = None
+        if self.use_hopfield_memory and self.hopfield_value_proj_dim is not None:
+            hv = {'abs_sum': torch.zeros((), device=device),
+                  'norm_sum': torch.zeros((), device=device),
+                  'active': torch.zeros((), device=device),
+                  'count': 0,
+                  'util_any': None,
+                  'gate_sum': torch.zeros((), device=device),
+                  'gate_sat': torch.zeros((), device=device),
+                  'l1_all_sum': torch.zeros((), device=device),
+                  'l1_all_count': 0}
+        hopfield_l1_train_sum = None
+        hopfield_l1_train_count = 0
+        if self.use_hopfield_memory and self.hopfield_value_l1_active:
+            hopfield_l1_train_sum = torch.zeros((), device=device)
 
         # Gated Delta state matrix (fresh each forward call, S_0 = 0)
         if self.use_gated_delta_memory:
@@ -2430,15 +2628,16 @@ class GradMemGPT(PreTrainedModel):
 
                     # Per-segment Hopfield STORE
                     if self.use_hopfield_memory and seg_has_tokens.any():
-                        # Value: gradient-connected mem_batch after inner loop on this segment
+                        # Value: gradient-connected mem_batch after inner loop on this segment,
+                        # encoded+activated into the stored value code z ([B, Dv] when projected).
+                        # The STORED tensor is the activated code, never the preactivation.
                         value_pattern = mem_batch.view(B, -1)  # [B, M*d]
-
-                        if self.hopfield_value_proj_dim is not None:
-                            value_pattern = self.hopfield_value_proj(value_pattern)
+                        value_code = self._encode_hopfield_value(value_pattern)
 
                         if self.hopfield_value_as_key:
-                            # Use value pattern directly as key (no forward pass)
-                            seg_key = value_pattern
+                            # Use the activated value code directly as key (the
+                            # activation is applied exactly once -- here)
+                            seg_key = value_code
                         else:
                             # Key: causal forward-pass to compress segment into mem tokens
                             # mem_key at END so it can attend to all preceding content tokens
@@ -2460,13 +2659,25 @@ class GradMemGPT(PreTrainedModel):
                         # to reduce peak memory by cutting the computation graph
                         if self.hopfield_bptt_segments is not None and (n_segments - seg_idx - 1) >= self.hopfield_bptt_segments:
                             seg_key = seg_key.detach()
-                            value_pattern = value_pattern.detach()
+                            value_code = value_code.detach()
 
                         # Store for attention-based retrieval
                         stored_keys.append(seg_key)
-                        stored_values.append(value_pattern)
+                        stored_values.append(value_code)
                         stored_masks.append(seg_has_tokens)
                         hopfield_stored = hopfield_stored | seg_has_tokens
+
+                        # Nonlinear value-code diagnostics (detached) + ReLU L1
+                        # sparse-loss accumulator. Only graph-retained segments
+                        # enter the trainable accumulator: BPTT-detached codes
+                        # have requires_grad=False, so the L1 term can never
+                        # retain or restore an old computation graph.
+                        if hv is not None:
+                            self._accumulate_hopfield_value_stats(hv, value_code, value_pattern, seg_has_tokens)
+                            if hopfield_l1_train_sum is not None and value_code.requires_grad:
+                                l1_seg = value_code.abs().mean(dim=-1)[seg_has_tokens]
+                                hopfield_l1_train_sum = hopfield_l1_train_sum + l1_seg.sum()
+                                hopfield_l1_train_count += l1_seg.numel()
 
                     # Per-segment Gated Delta WRITE (state recurrence)
                     if self.use_gated_delta_memory and seg_has_tokens.any():
@@ -2582,20 +2793,56 @@ class GradMemGPT(PreTrainedModel):
             inner_loop_stats['seg_nonempty_size_max'] = torch.tensor(0.0, device=device)
             inner_loop_stats['seg_nonempty_size_min'] = torch.tensor(0.0, device=device)
 
+        # Nonlinear Hopfield value-code diagnostics (projected codes only).
+        # Enabled-but-idle stats are explicit zeros; all values detached.
+        if hv is not None:
+            Dv = self.hopfield_value_proj_dim
+            if hv['count'] > 0:
+                n_elem = hv['count'] * Dv
+                inner_loop_stats['hopfield_value_code_abs_mean'] = (hv['abs_sum'] / n_elem).detach()
+                inner_loop_stats['hopfield_value_code_norm_mean'] = (hv['norm_sum'] / hv['count']).detach()
+                inner_loop_stats['hopfield_value_active_frac'] = (hv['active'] / n_elem).detach()
+                inner_loop_stats['hopfield_value_feature_utilization'] = hv['util_any'].float().mean().detach()
+            else:
+                inner_loop_stats['hopfield_value_code_abs_mean'] = torch.zeros((), device=device)
+                inner_loop_stats['hopfield_value_code_norm_mean'] = torch.zeros((), device=device)
+                inner_loop_stats['hopfield_value_active_frac'] = torch.zeros((), device=device)
+                inner_loop_stats['hopfield_value_feature_utilization'] = torch.zeros((), device=device)
+            with torch.no_grad():
+                # column norms of the decoder AS USED: unit-normalized columns
+                # when ReLU L1 is active (pinned at 1.0), raw nn.Linear otherwise
+                dec_w = self.hopfield_value_inv_proj.weight
+                if self.hopfield_value_l1_active:
+                    dec_w = F.normalize(dec_w, dim=0)
+                inner_loop_stats['hopfield_value_decoder_col_norm_mean'] = dec_w.norm(dim=0).mean().detach()
+            if self.hopfield_value_l1_active:
+                inner_loop_stats['hopfield_value_l1'] = \
+                    (hv['l1_all_sum'] / max(hv['l1_all_count'], 1)).detach()
+                inner_loop_stats['hopfield_value_l1_weight'] = \
+                    torch.tensor(float(self.hopfield_value_l1_weight), device=device)
+            if self.hopfield_value_activation == "gated":
+                if hv['count'] > 0:
+                    n_gate = hv['count'] * Dv
+                    inner_loop_stats['hopfield_value_gate_mean'] = (hv['gate_sum'] / n_gate).detach()
+                    inner_loop_stats['hopfield_value_gate_saturation'] = (hv['gate_sat'] / n_gate).detach()
+                else:
+                    inner_loop_stats['hopfield_value_gate_mean'] = torch.zeros((), device=device)
+                    inner_loop_stats['hopfield_value_gate_saturation'] = torch.zeros((), device=device)
+
         qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
         # ---------------------------------------------------------------- #
         # Hopfield RETRIEVE phase (if enabled)
         # ---------------------------------------------------------------- #
         if self.use_hopfield_memory and self.K and hopfield_stored.any():
             # Stack stored keys and values for attention-based retrieval
-            keys = torch.stack(stored_keys, dim=1)    # [B, n_stored, M*d]
-            values = torch.stack(stored_values, dim=1)  # [B, n_stored, M*d]
+            keys = torch.stack(stored_keys, dim=1)      # [B, n_stored, M*d] (Dv when value-as-key)
+            values = torch.stack(stored_values, dim=1)  # [B, n_stored, Dv] (activated codes; M*d unprojected)
             mask = torch.stack(stored_masks, dim=1)      # [B, n_stored]
 
             if self.hopfield_retrieval_mode == "mean":
                 # Average all stored value patterns with equal weight
                 weights = mask.float() / mask.float().sum(dim=1, keepdim=True).clamp(min=1)
-                retrieved_pattern = (weights.unsqueeze(2) * values).sum(dim=1)  # [B, M*d]
+                retrieved_pattern = (weights.unsqueeze(2) * values).sum(dim=1)  # [B, Dv] value code (M*d unprojected); decoded below
                 probs = weights  # [B, n_stored]
             else:
                 if self.hopfield_direct_query:
@@ -2619,18 +2866,18 @@ class GradMemGPT(PreTrainedModel):
                 if self.hopfield_retrieval_mode == "raw":
                     probs = F.softmax(scores.masked_fill(~mask.bool(), float('-inf')), dim=-1)  # [B, n_stored]
                     scores = scores * mask.float()
-                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
+                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, Dv] value code (M*d unprojected); decoded below
                 elif self.hopfield_retrieval_mode == "softmax":
                     scores = scores.masked_fill(~mask.bool(), float('-inf'))
                     scores = F.softmax(scores, dim=-1)
                     probs = scores  # [B, n_stored]
-                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
+                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, Dv] value code (M*d unprojected); decoded below
                 elif self.hopfield_retrieval_mode == "beta_softmax":
                     scores = scores * self.hopfield_beta
                     scores = scores.masked_fill(~mask.bool(), float('-inf'))
                     scores = F.softmax(scores, dim=-1)
                     probs = scores  # [B, n_stored]
-                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, M*d]
+                    retrieved_pattern = torch.bmm(scores.unsqueeze(1), values).squeeze(1)  # [B, Dv] value code (M*d unprojected); decoded below
                 else:
                     raise ValueError(f"Unknown hopfield_retrieval_mode: {self.hopfield_retrieval_mode}")
 
@@ -2670,7 +2917,10 @@ class GradMemGPT(PreTrainedModel):
                 inner_loop_stats['hopfield_n_seg_95_min'] = n_seg_95.float().min().detach()
 
             if self.hopfield_value_proj_dim is not None:
-                retrieved_pattern = self.hopfield_value_inv_proj(retrieved_pattern)
+                # decode the retrieved activated code (unit-normalized decoder
+                # columns when ReLU L1 is active -- same helper as the
+                # forgetting probe path)
+                retrieved_pattern = self._decode_hopfield_value(retrieved_pattern)
 
             # Handle samples with no stored segments: fall back to initial memory
             if not hopfield_stored.all():
@@ -2818,6 +3068,18 @@ class GradMemGPT(PreTrainedModel):
         # empty and this is a no-op.
         if learned_update_imitation_losses:
             combined_loss = combined_loss + torch.stack(learned_update_imitation_losses).mean()
+        # ReLU L1 sparsity on the value codes: a pure OUTER loss (it never
+        # enters the K-step inner update), added after the mutually exclusive
+        # target/recon loss assembly above. Only graph-retained segments
+        # contribute (see the STORE accumulation -- BPTT-detached codes cannot
+        # re-enter the graph); the mean runs over exactly the valid
+        # sample-segments that contributed, so padded/empty ones never inflate
+        # the denominator. With labels absent, forward returned above: the
+        # detached diagnostics (hopfield_value_l1) are still reported, but no
+        # standalone loss is invented.
+        if hopfield_l1_train_sum is not None and hopfield_l1_train_count > 0:
+            l_sparse = hopfield_l1_train_sum / hopfield_l1_train_count
+            combined_loss = combined_loss + self.hopfield_value_l1_weight * l_sparse
         output['loss'] = combined_loss
 
         # Conditional composition metric: evaluate each constituent key on

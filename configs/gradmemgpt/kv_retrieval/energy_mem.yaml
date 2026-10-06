@@ -31,9 +31,9 @@ gradmem:
   n_ctrl_tokens: 0
   K: 2
   last_K_second_order: 2  # full second-order (== K); energy head is trained via this path
-  inner_lr: 0.04
+  inner_lr: 0.01
   inner_clip_value: null
-  inner_clip_norm: null
+  inner_clip_norm: 10
   use_adam: false
   grad_mode: "second"      # required for use_energy_inner_loss
   use_mem_proj: false
