@@ -1,9 +1,9 @@
 # Curriculum Learning for GradMemGPT
 
-> Implementation: [`run_gradmemgpt_on_kv_retrieval.py`](./run_gradmemgpt_on_kv_retrieval.py) — `CurriculumCallback`, `CurriculumTrainer`, and the stage loop in `main()`.
-> Example config (adaptive model): [`configs/gradmemgpt/kv_retrieval/adaptive_curriculum.yaml`](./configs/gradmemgpt/kv_retrieval/adaptive_curriculum.yaml)
-> Example config (base + Hopfield): [`configs/gradmemgpt/kv_retrieval/hopfield_curriculum.yaml`](./configs/gradmemgpt/kv_retrieval/hopfield_curriculum.yaml)
-> Tests: [`test_curriculum_mechanics.py`](./test_curriculum_mechanics.py)
+> Implementation: [`run_gradmemgpt_on_kv_retrieval.py`](../run_gradmemgpt_on_kv_retrieval.py) — `CurriculumCallback`, `CurriculumTrainer`, and the stage loop in `main()`.
+> Example config (adaptive model): [`configs/gradmemgpt/kv_retrieval/adaptive_curriculum.yaml`](../configs/gradmemgpt/kv_retrieval/adaptive_curriculum.yaml)
+> Example config (base + Hopfield): [`configs/gradmemgpt/kv_retrieval/hopfield_curriculum.yaml`](../configs/gradmemgpt/kv_retrieval/hopfield_curriculum.yaml)
+> Tests: [`test_curriculum_mechanics.py`](../test_curriculum_mechanics.py)
 
 ## What it does
 
@@ -96,7 +96,7 @@ A common pattern is annealing the inner learning rate as N grows, since longer c
 
 ## How the mechanics work
 
-Three pieces collaborate (see [`test_curriculum_mechanics.py`](./test_curriculum_mechanics.py) for executable specs):
+Three pieces collaborate (see [`test_curriculum_mechanics.py`](../test_curriculum_mechanics.py) for executable specs):
 
 1. **`CurriculumCallback`** — an `on_evaluate` callback. At every eval it looks up `eval_exact_match`; if `>= curriculum_threshold`, it sets `threshold_reached = True` and flips `control.should_training_stop` (ending the stage's `trainer.train()`). A missing metric key is a silent no-op.
 

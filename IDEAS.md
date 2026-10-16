@@ -21,6 +21,15 @@ on another result).
     (cosine semantics — same lesson as `stabilize_energy_head`), gates
     small-but-nonzero init (zero-init may never escape), per-layer query
     projections but shared K/V (state built once).
+- **Interface-token reads (the middle rung)** — the same linear state, but
+  only M learnable interface tokens (separate M_0, two-pass layout) read it
+  per layer; everything else reaches memory via softmax attention to those
+  tokens. Resampler pattern (Flamingo/Q-Former). Decides whether
+  cross-segment integration needs per-token reads or only per-layer reads
+  through a small interface; the placement/causality trap (query-blind
+  left-prefix reads) and its two-pass resolution are specified in the spec's
+  Variant section. *specified ([docs/TOKENWISE_READ.md](docs/TOKENWISE_READ.md)
+  § Variant); module not written.*
 - **Bank-prefix read (diagnostic control)** — prepend all stored per-segment
   memory tokens at READ, let the backbone's own attention retrieve. Recall
   upper bound; context grows linearly in n_stored·M, so never the deployable

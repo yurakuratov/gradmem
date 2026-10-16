@@ -117,6 +117,9 @@ frozen backbone is untouched (forward hooks on each block suffice).
   compressed query, one read, reshaped into the prefix. This proposal
   generalizes that line to token-wise, level-wise, additive.
 
+The [Variant](#variant-interface-token-reads--the-same-state-read-only-by-m-special-tokens)
+below restricts the same read to $M$ learnable interface tokens.
+
 ## Why this fixes the three failures
 
 1. **Routing** — the query distribution over the bank is computed per position
@@ -156,6 +159,81 @@ measurement, and the pinned mitigation when it binds is coarse top-k segment
 routing: select segments with the existing compressed-query scores, build
 $S_r$ from the selected subset only. A second lever: fewer, wider memory
 heads ($d_h \uparrow$) since state cost is $O(d^2/H_r)$ either way.
+
+## Variant: interface-token reads — the same state, read only by M special tokens
+
+Restrict the additive bias above to **$M$ learnable interface tokens** (a
+dedicated $M_0$, cf. the existing `mem_query` parameter): those tokens read
+the state at each layer — same $S_r$, same normalized queries, same gated
+additive injection, masked to the $M$ interface positions — and every other
+position reaches memory only through ordinary softmax attention to the
+interface tokens. This is the **resampler pattern** (Flamingo's gated
+cross-attention / Q-Former) applied to the Hopfield state, and it sits on the
+same read-site ladder: one compressed query, one shot (current) →
+$M{\cdot}L$ interface reads (this variant) → $T{\cdot}L{\cdot}H_r$ reads
+(the default design above).
+
+### The placement / causality trap (decides the layout)
+
+- **Appended right, causal**: the interface tokens see the query, but answer
+  positions (earlier) can never attend to them — memory unreachable exactly
+  where the answer is emitted. Broken as stated.
+- **Prefix left, causal** (the current READ layout): answer positions see the
+  interface tokens, but the interface tokens never see the query — their
+  per-layer reads are **query-blind**. Retrieval degenerates to query-agnostic
+  compression: a *silent* regression to today's architecture with extra
+  steps. This is the failure mode to guard against (query-sensitivity
+  diagnostic below).
+
+Resolutions: **(1) two-pass — recommended**; (2) single pass with a relaxed
+attention mask (query positions may attend leftward-only into right-appended
+interface tokens; interface tokens must be blinded to the target span or the
+answer leaks through them) — feasible on the eager-attention path but needs a
+4D mask, footgun-heavy; (3) read the answer out at interface positions —
+changes the output interface, rejected.
+
+**Two-pass layout (the spec):**
+
+- **Pass 1 — conditioning**: exactly `_compress_query`'s layout
+  $[\text{query (target-span blinded)},\, M_0]$ — the interface tokens attend
+  to the query *and* read the state at each layer, arriving query-conditioned.
+  The `labels ≥ 0` blinding machinery already exists in `_compress_query`.
+- **Pass 2 — answering**: exactly the current READ layout
+  $[\text{read}_{st}?,\, \text{interface},\, \text{read}_{end}?,\,
+  \text{query}]$, with the pass-1 interface states as the interface positions'
+  embeddings, still reading the state per layer. I.e. the current read phase
+  with two swaps: learnable $M_0$ + per-level state reads replace the one-shot
+  retrieved mixture. `mem_proj`, ctrl tokens, and reader training all carry
+  over — the "closer architecturally" rationale in its strongest form.
+
+### Gains / risks vs the read-everywhere design
+
+**Gains.** Read sites $M{\cdot}L$ instead of $T{\cdot}L{\cdot}H_r$ — compute
+back to ≈ the current read cost (state construction unchanged), and far less
+outer-gradient pressure on the stored values (the stability risk in
+*Training & gradient flow*). The interface tokens **restore the prefix
+workspace** the no-prefix design gave up: multi-hop can happen inside them
+across layers (retrieve $K_2$'s segment at layer 3, re-query with it at
+layer 5). And the reader side is not a convex mixture: answer positions
+softmax over $M$ *separate* interface tokens, so per-position selection
+survives — at the reader level.
+
+**Risks.** The $M$ tokens are again a fixed $M{\cdot}d$ channel between state
+and answer. For concat, the optimistic picture is specialization (token A ↔
+segment 1, token B ↔ segment 2, answer positions pick accordingly; diversified
+$M_0$ inits plus reader-side competition make it plausible), but with $M{=}2$
+over many segments each token holds mixtures again, and nothing guarantees
+specialization. Honest prediction: between the one-shot read and full
+per-token reads, with **under-specialized interface tokens** as the named
+failure mode.
+
+### Why run it
+
+It turns "does cross-segment integration need per-token reads, or only
+per-layer reads through a small interface?" into one knob
+(`read_state_read_sites: interface | all`). Either outcome is a claim: the
+cheaper architecture suffices (read-everywhere is over-engineering), or the
+read-site count is the load-bearing factor.
 
 ## Design decisions (pinned 2026-10-15, with rationale)
 
@@ -204,6 +282,7 @@ requires the Hopfield STORE):
 | `use_linear_state_read` | `false` | replace Hopfield RETRIEVE + memory prefix with per-level additive reads |
 | `read_state_heads` | 4 | $H_r$ (wider heads than the backbone's are fine and reduce cross-talk) |
 | `read_state_layers` | `"all"` | which blocks instrument; list of indices to restrict |
+| `read_state_read_sites` | `"all"` | `all` = bias at every position; `interface` = only on the $M$ learnable interface tokens (Variant above; count = `n_mem_tokens`, two-pass layout) |
 | `read_state_beta_init` | 1.0 | initial retrieval sharpness per layer |
 | `read_state_gate_init` | 0.1 | initial $\gamma^\ell$ |
 | `read_state_segment_emb` | `false` | optional learnable per-segment embedding added before $\kappa/\nu$ |
@@ -223,6 +302,15 @@ requires the Hopfield STORE):
   at eval, log which stored segment(s) each query position's read most
   aligns with ($\arg\max_s \sum_j q \cdot k_{s,j}$).
 
+Interface mode (`read_state_read_sites: interface`) additionally:
+
+- `read_state_reader_attn_interface` — eval-only reader attention mass on
+  the interface tokens, split by answer vs non-answer positions
+  (specialization/routing watch; flat mass = under-specialization);
+- **query-sensitivity check** — perturb the query text, measure the change
+  in the interface tokens' $\mu$; a left-prefix single-pass implementation
+  (query-blind reads) fails this check by construction.
+
 ## Experimental plan (decision criteria pre-agreed)
 
 Ladder that isolates *where* the loss comes from:
@@ -233,6 +321,7 @@ Ladder that isolates *where* the loss comes from:
 | (b) bank-prefix control | backbone attn | separate tokens | $O(N)$ context | recall **upper bound**; decides H2 |
 | (c) exact-softmax memory heads | per token | separate tokens, normalized | $O(N)$ compute | isolates prefix-vs-head |
 | (d) **linear-state read (this doc)** | per token | superposed state, unnormalized | $O(1)$ | the deployable design |
+| (d′) interface-token linear-state read | $M{\cdot}L$ (query-conditioned via pass 1) | separate interface tokens, mixtures within | ≈ current read cost | read-site ablation |
 
 1. (b) vs (a) on ordered-concat: if (b) also fails, **write quality** is
    implicated and H2 is rejected — stop, revisit the writer.
@@ -241,7 +330,11 @@ Ladder that isolates *where* the loss comes from:
    must not degrade (token-wise reads should make single-key *easier*).
 4. (c) vs (d) tells whether the $O(1)$ state costs accuracy that exact
    per-token attention would recover.
-5. Then the writer×read factorial with a forward writer (IDEAS.md baseline)
+5. (d′) vs (d) tells whether integration needs per-token reads at all, or
+   only per-layer reads through a small interface; if (d′) solves concat at
+   (d)-level accuracy, the read-site count was the load-bearing factor and
+   the cheaper architecture wins.
+6. Then the writer×read factorial with a forward writer (IDEAS.md baseline)
    and the pointer-chasing benchmark (depth-bounded iteration is the claim).
 
 ## Risks & mitigations
@@ -273,6 +366,11 @@ Ladder that isolates *where* the loss comes from:
   $\ell \ge 2$ where hidden states already aggregate query context?
 - Segment-identity signal: is a learnable segment embedding needed for
   ordered tasks, or does query-position causality suffice?
+- Interface mode: what makes the interface tokens specialize (M sizing, $M_0$
+  init diversity, an auxiliary diversity loss on their reads)?
+- Interface mode: should pass-1 tokens read the state (bidirectional
+  conditioning: query shapes tokens, state content shapes them back), or is
+  conditioning-only cleaner for the first experiment?
 
 ## Prior art
 
@@ -284,7 +382,9 @@ Ladder that isolates *where* the loss comes from:
 - **Based** (Arora et al., 2024) — global linear attention summed with local
   softmax attention per layer; the additive-combination precedent.
 - **Flamingo** — gated additive cross-attention into a frozen model; the
-  gating pattern.
+  gating pattern — and, for the interface-token variant, the resampler
+  pattern (a small learnable token set cross-attending to memory, everything
+  else reading them via attention; cf. Q-Former).
 - **Fast weights / DeltaNet / GDN** — associative state read $o = Sq$; the
   in-repo Gated-Delta RETRIEVE is this at compressed-query granularity.
 - **Linear attention** (Katharopoulos et al., 2020) and **modern Hopfield

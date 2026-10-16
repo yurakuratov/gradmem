@@ -7,6 +7,28 @@ rationale), verification status. Current state and hypotheses live in
 **Maintenance rule:** every merged change updates this journal and, when it
 changes the evidence picture, `PROGRESS.md` in the same commit.
 
+## 2026-10-15 (d) — interface-token read variant folded into the H3 spec
+
+**Added** — the *Variant* section in
+[`docs/TOKENWISE_READ.md`](docs/TOKENWISE_READ.md): the same linear state,
+read only by M learnable interface tokens (dedicated M_0; per-layer state
+reads masked to those positions; all other positions reach memory via
+softmax attention to them — the Flamingo-resampler/Q-Former pattern). The
+three read designs now form a read-site ladder: one-shot (current) → M·L
+interface → T·L·H all positions.
+
+**Decisions** — the placement/causality trap is documented and resolved:
+right-appended causal = memory unreachable at answer positions; left-prefix
+causal = query-blind reads (silent regression to today's architecture).
+Pinned resolution: the **two-pass layout** (pass 1 = `_compress_query`
+layout with target-span blinding, for query-conditioning; pass 2 = the
+current READ layout with M_0 + per-level state reads replacing the one-shot
+mixture). New knob `read_state_read_sites: all | interface`; ladder arm (d′)
+with decision criterion "(d′) vs (d) decides whether integration needs
+per-token reads or only per-layer reads through a small interface"; new
+diagnostics (reader attention mass on interface tokens by answer/non-answer
+positions; query-sensitivity check of interface reads).
+
 ## 2026-10-15 (c) — H3 spec written: token-wise reads via linear attention
 
 **Added** — [`docs/TOKENWISE_READ.md`](docs/TOKENWISE_READ.md): the formal

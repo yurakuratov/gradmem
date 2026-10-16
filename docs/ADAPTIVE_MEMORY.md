@@ -1,7 +1,7 @@
 # Adaptive Memory Updates — Mamba-style gated recurrence
 
-> Implementation: [`grad_memgpt_adaptive.py`](./grad_memgpt_adaptive.py)
-> Config: [`configs/gradmemgpt/kv_retrieval/adaptive_mamba.yaml`](./configs/gradmemgpt/kv_retrieval/adaptive_mamba.yaml)
+> Implementation: [`grad_memgpt_adaptive.py`](../grad_memgpt_adaptive.py)
+> Config: [`configs/gradmemgpt/kv_retrieval/adaptive_mamba.yaml`](../configs/gradmemgpt/kv_retrieval/adaptive_mamba.yaml)
 
 ## The problem
 

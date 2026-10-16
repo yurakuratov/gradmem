@@ -25,8 +25,8 @@ the current Hopfield read fails (b).
 1. **Carried-memory multi-segment gradmem forgets.** The inner loop over
    segments is a running sum of gradient steps with no protection of stored
    directions; forgetting matrices show old pairs degrading as later segments
-   are written (2026-09-10; see also [`STAR.md`](STAR.md),
-   [`ADAPTIVE_MEMORY.md`](ADAPTIVE_MEMORY.md) for the analysis).
+   are written (2026-09-10; see also [`STAR.md`](STAR.md) and
+   [`docs/ADAPTIVE_MEMORY.md`](docs/ADAPTIVE_MEMORY.md) for the analysis).
 2. **Independent per-segment writes + attention retrieval mitigate
    forgetting.** Hopfield mode (per-segment K-step gradient write into M
    tokens; store key = segment compression, value = post-inner-loop memory;
@@ -85,8 +85,11 @@ the current Hopfield read fails (b).
    stored memory tokens, per-layer normalized queries with learnable β,
    Flamingo-style per-layer gate, parallel additive injection
    (`h = x + attn(x) + g·qS`); write side untouched. The spec's experimental
-   ladder also fixes the exact-softmax memory-head arm (c) that separates
-   prefix-vs-head from exact-vs-superposed.
+   ladder also fixes the exact-softmax memory-head arm (c) separating
+   prefix-vs-head from exact-vs-superposed, and the interface-token arm (d′)
+   — the same state read only by M learnable tokens — which decides whether
+   integration needs per-token reads or only per-layer reads through a small
+   interface.
 4. **Regression guards** for any new read mode: forgetting matrix + single-key
    KV retrieval must not degrade (token-wise reads should make single-key
    *easier*).
@@ -103,9 +106,10 @@ the current Hopfield read fails (b).
 
 - Working files (repo root): `README.md` (repo & harness overview) · this file
   · `STATUS.md` · `IDEAS.md` · `AGENTS.md` (agent conventions).
-- Topic docs (root): [`ADAPTIVE_MEMORY.md`](ADAPTIVE_MEMORY.md) (gated
-  carried-memory updates) · [`STAR.md`](STAR.md) (worst-case stability
-  regularizer) · [`CURRICULUM.md`](CURRICULUM.md) (stage-wise N curriculum).
+- Topic docs: [`docs/ADAPTIVE_MEMORY.md`](docs/ADAPTIVE_MEMORY.md) (gated
+  carried-memory updates) · [`docs/CURRICULUM.md`](docs/CURRICULUM.md)
+  (stage-wise N curriculum) · [`STAR.md`](STAR.md) (worst-case stability
+  regularizer, still at root).
 - Design specs & workflow (docs/): [`docs/TOKENWISE_READ.md`](docs/TOKENWISE_READ.md)
   (the H3 read-interface spec) · [`docs/REMOTE.md`](docs/REMOTE.md)
   (cluster workflow).
