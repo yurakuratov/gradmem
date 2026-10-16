@@ -188,3 +188,6 @@ notebooks/tasks_1-20_v1-2
 *.checkpoint.json
 # run_scheduler.py per-run captured output (failure backtraces land here)
 *.logs/
+*.cometml-runs
+.idea
+*.json

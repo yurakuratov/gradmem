@@ -1,0 +1,94 @@
+# GradMemGPT Hopfield with a NONLINEAR / SPARSE value code.
+#
+# Active example: WIDENED top-k value code. The value projection maps the
+# flattened segment memory (P = n_mem_tokens * n_embd = 8*128 = 1024) up to a
+# 2048-dim latent; the top-k activation keeps the 256 largest positive coords
+# of each stored code, so the widened space implements a genuinely nonlinear,
+# sparsely-adding value memory (a purely linear path would collapse to a
+# learned P x P adapter regardless of width).
+#
+# Config docs for every knob: hopfield.yaml (hopfield: section).
+#
+# Alternatives (comment/uncomment in the hopfield: section below):
+#   ReLU + outer L1 sparsity (decoder becomes unit-column-normalized):
+#     hopfield_value_activation: relu
+#     hopfield_value_l1_weight: 0.01
+#   Learned input-dependent soft gate (initial code == h):
+#     hopfield_value_activation: gated
+#     hopfield_value_gate_init: 0.5
+#
+# Dry-run first (do not launch blind):
+#   python run_from_config.py --config configs/gradmemgpt/kv_retrieval/hopfield_value_activation.yaml --dry-run
+
+# Run name built generically from the activation settings (see AGENTS.md
+# "Output-folder naming"): e.g. hva_topk_dvp2048_k256_l10.0_g0.5_K2_ilr0.04
+run_naming:
+  keys:
+    - {key: hopfield.hopfield_value_activation, prefix: hva}
+    - {key: hopfield.hopfield_value_proj_dim, prefix: dvp}
+    - {key: hopfield.hopfield_value_topk, prefix: k}
+    - {key: hopfield.hopfield_value_l1_weight, prefix: l1}
+    - {key: hopfield.hopfield_value_gate_init, prefix: g}
+    - {key: gradmem.K, prefix: K}
+    - {key: gradmem.inner_lr, prefix: ilr}
+
+model:
+  base_model: gpt2
+  n_layer: 4
+  n_head: 4
+  n_embd: 128
+
+training:
+  per_device_batch_size: 64
+  total_batch_size: 64
+  learning_rate: 1.0e-4
+  max_steps: 1000000
+  eval_steps: 500
+  logging_steps: 500
+  warmup_steps: 10000
+  early_stopping_patience: 500
+  seed: 143
+
+dataset:
+  data_path: "./data/N8-K2V2-V62_1M"
+  tokenizer_path: "./tokenizers/kv_alphabet_62/"
+
+gradmem:
+  n_mem_tokens: 8
+  n_ctrl_tokens: 0
+  K: 2
+  last_K_second_order: null
+  inner_lr: 0.04
+  inner_clip_value: null
+  inner_clip_norm: null
+  use_adam: false
+  grad_mode: "second"
+  use_mem_proj: false
+  mem_proj_mode: "none"
+  use_write_head: true
+  add_inner_loss_to_outer: true
+  inner_loss_weight: 0.5
+  memory_update: gradient
+  use_mem_residual: false
+  use_reconstruction_loss: false
+  reconstruction_loss_weight: 1.0
+
+segmentation:
+  n_segments: 1
+  segment_size: 32
+
+hopfield:
+  use_hopfield_memory: true
+  hopfield_retrieval_mode: raw
+  hopfield_beta_init: 1.0
+  use_separate_hopfield_mem: true
+  hopfield_proj_dim: null
+  hopfield_direct_query: false
+  hopfield_value_as_key: false
+  # --- widened nonlinear value code (the active example) ---
+  hopfield_value_proj_dim: 2048  # widened latent: P = 8*128 = 1024 -> Dv = 2048
+  hopfield_value_activation: topk  # linear | topk | relu | gated
+  hopfield_value_topk: 256  # keep the 256 largest positive coords of each code
+  hopfield_value_l1_weight: 0.0  # relu alternative: 0.01 (enables L1 + normalized decoder)
+  hopfield_value_gate_init: 0.5  # gated alternative: initial constant gate
+  hopfield_bptt_segments: null
