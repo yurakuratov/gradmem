@@ -1,9 +1,12 @@
 # Token-wise memory reads via linear attention — the linear-state per-level read
 
-> Status: **specified, not implemented** (2026-10-15). Target implementation:
-> `grad_memgpt.py` (a config-gated READ mode next to the Hopfield retrieval).
-> Evidence context: [PROGRESS.md](../PROGRESS.md) facts 5–7, hypothesis H3;
-> journal: [STATUS.md](../STATUS.md) 2026-10-15.
+> Status: **implemented** (2026-10-18; config-gated READ mode in
+> `grad_memgpt.py`, `use_linear_state_read` — see the journal
+> [STATUS.md](../STATUS.md) 2026-10-18 (b) for decisions/deviations and
+> `manifests/kv_linear_read.yaml` for the evidence ladder). Originally
+> specified 2026-10-15. Executor brief (phases, contract, acceptance
+> criteria): [TOKENWISE_READ_TASK.md](TOKENWISE_READ_TASK.md). Evidence
+> context: [PROGRESS.md](../PROGRESS.md) facts 5–7, hypothesis H3.
 
 ## The problem
 

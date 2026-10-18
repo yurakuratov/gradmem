@@ -8,9 +8,9 @@ linear-attention retrieval (the Hopfield mode) solve catastrophic forgetting on
 single-key KV retrieval, but the one-shot read interface fails any task that
 must **integrate content from two segments** (ordered pair concatenation), and
 non-linear/sparse value codes do not help — the read architecture itself is the
-bottleneck. Next step: per-token, per-level reads from the Hopfield state
-(Titan-style linear-state bias), with a bank-prefix read as the diagnostic
-upper bound.
+bottleneck. The per-token, per-level linear-state read (H3, Titan-style) is now
+**implemented** (config-gated, write side untouched); what is unverified is
+whether it actually fixes concat — run the ladder in `manifests/kv_linear_read.yaml`.
 
 ## The challenge
 
@@ -69,7 +69,7 @@ the current Hopfield read fails (b).
 |---|---|---|---|
 | **H1** independently written per-segment memories + attention retrieval beat carried memory on forgetting | **supported** (KV single-key) | fact 2: all pairs stored with 2 tokens / 8 pairs / 4 segments; clean forgetting matrices | not yet shown at large segment counts; carried-memory controls with matched budget not tabulated here |
 | **H2** the concat failure is a **read-interface** bottleneck, not a write-quality one | **working hypothesis** | facts 5–7: fails across all retrieval modes and all value codes; the mixture/superposition argument | decisive control missing: bank-prefix read (all stored tokens as prefix) — if that also fails, write side is implicated |
-| **H3** per-token, per-level linear-attention reads from a shared state (`S = Σkᵢvᵢᵀ`), added as a bias to softmax attention over the query context, fix routing + payload + iteration at O(1) read cost | **specified** ([docs/TOKENWISE_READ.md](docs/TOKENWISE_READ.md)); design argument; Titan/Based precedent | per-token/per-head queries remove the compromise query; unnormalized weights are not convex; depth gives iterative retrieval; S=0 is a graceful no-store fallback | not implemented; scale calibration (LayerNorm + gates) is the practical risk; state interference grows with n_stored |
+| **H3** per-token, per-level linear-attention reads from a shared state (`S = Σkᵢvᵢᵀ`), added as a bias to softmax attention over the query context, fix routing + payload + iteration at O(1) read cost | **implemented** ([docs/TOKENWISE_READ.md](docs/TOKENWISE_READ.md) + `grad_memgpt.py` `use_linear_state_read`; STATUS.md 2026-10-18 (b)) | per-token/per-head queries remove the compromise query; unnormalized weights are not convex; depth gives iterative retrieval; S=0 is a graceful no-store fallback; locked by 13 unit tests (state==explicit attention, gate-zero inertness, site masks, blinding, boundary-k==truncated forward, write-side purity) | accuracy unverified: the concat ladder (all / interface / exact-softmax vs the Hopfield control) + single-key regression guard are queued in `manifests/kv_linear_read.yaml`; scale calibration (LayerNorm + gates) remains the practical risk; state interference grows with n_stored |
 
 ## Missing experiments (decision-critical, in priority order)
 
@@ -80,14 +80,14 @@ the current Hopfield read fails (b).
    if concatenation fixes concat where mixing fails, H2 is confirmed directly.
 2. **Retrieval-mode ladder on concat** (`mean` / `softmax` / `beta_softmax` /
    `raw`): config-only; documents that no one-shot mixture setting solves it.
-3. **Implement H3** — linear-state per-level read, per the spec in
-   [`docs/TOKENWISE_READ.md`](docs/TOKENWISE_READ.md): per-head states from
-   stored memory tokens, per-layer normalized queries with learnable β,
-   Flamingo-style per-layer gate, parallel additive injection
-   (`h = x + attn(x) + g·qS`); write side untouched. The spec's experimental
-   ladder also fixes the exact-softmax memory-head arm (c) separating
-   prefix-vs-head from exact-vs-superposed, and the interface-token arm (d′)
-   — the same state read only by M learnable tokens — which decides whether
+3. **Run the H3 ladder** — the linear-state per-level read is IMPLEMENTED
+   (`use_linear_state_read` in [`grad_memgpt.py`](grad_memgpt.py); brief:
+   [`docs/TOKENWISE_READ_TASK.md`](docs/TOKENWISE_READ_TASK.md), journal:
+   STATUS.md 2026-10-18 (b)). Missing is only the **evidence**: run
+   `manifests/kv_linear_read.yaml` (Hopfield control / linear all / linear
+   interface / exact-softmax × seeds 4378/43894/2343 on the ordered-concat
+   data, plus the single-key regression guard). (c) vs (d) separates
+   prefix-vs-head from exact-vs-superposed; (d′) vs (d) decides whether
    integration needs per-token reads or only per-layer reads through a small
    interface.
 4. **Regression guards** for any new read mode: forgetting matrix + single-key

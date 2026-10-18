@@ -7,6 +7,109 @@ rationale), verification status. Current state and hypotheses live in
 **Maintenance rule:** every merged change updates this journal and, when it
 changes the evidence picture, `PROGRESS.md` in the same commit.
 
+## 2026-10-18 (b) — H3 implemented: the linear-state per-level read
+
+**Added** — `use_linear_state_read` in
+[`grad_memgpt.py`](grad_memgpt.py): a config-gated READ mode replacing the
+Hopfield RETRIEVE + memory-prefix READ per
+[`docs/TOKENWISE_READ.md`](docs/TOKENWISE_READ.md). The stored per-segment
+memories are folded once into per-head linear-attention states
+(`S_r = Σ k v^T`, k = L2-normalized `read_state_key_proj` of each stored
+memory TOKEN, v = `read_state_value_proj`); a forward hook on each
+instrumented decoder block injects `γ^ℓ ⊙ W_o(concat_r β_r ·
+normalize(Q_r(LN(x))) @ S_r)` at the block OUTPUT (parallel additive; the
+frozen backbone attention path is bitwise untouched). Per-layer Q/β/γ/LN,
+shared κ/ν, `read_state_layers` subset support, read-site masks excluding
+pads (incl. the jvp %32 padding), and the S=0 no-store fallback (zero bias,
+no fallback prefix). Three arms on the same modules: `read_sites="all"`
+(every real position), `read_sites="interface"` (the two-pass Variant:
+pass 1 conditions learnable M_0 on the target-span-blinded query, pass 2
+answers `[read_st?, interface, read_end?, query]` with the conditioned
+embeddings), and `read_state_exact_softmax` (per-token softmax over the
+unfolded bank). Eval mirrors: `_read_once_linear` +
+`forward_per_segment_eval` serve the state read against
+`stored_*[:n_stored]`, so the forgetting matrix works in all arms.
+Diagnostics (detached, train+eval): `read_state_gate_abs_mean`,
+`read_state_beta_mean`, `read_state_mu_over_x_norm_ratio` (‖μ‖/‖x‖ — see
+deviations), `read_state_cross_talk` (eval-only, mean |q·k| over non-top
+bank items). Configs `linear_state_read.yaml` /
+`linear_state_read_interface.yaml` (ordered-concat data), manifest
+`kv_linear_read.yaml` (control / all / interface / exact-softmax × 3 seeds +
+single-key regression guard). `read_linear:` yaml section plumbed through
+`run_from_config.py` (flattening + overrides), the runner argparse
+(`read_state_layers` parsed from a comma-separated string),
+`compute_metrics_fn` (explicit `read_state_*` block) and
+`generate_run_name._KNOWN_SECTIONS`.
+
+**STORE change (linear mode only)** — STORE skips the segment-key
+`_compress_segment` forward pass and value encoding (raw `mem_batch` is
+appended; `stored_keys` gets `None` entries, guarded where detached); with
+the flag off the STORE code path is byte-identical to before.
+
+**Decisions** — (1) `W_o` is bias-free: a bias term would leak `γ·b` into
+every read site even with an empty bank, breaking the pinned "S = 0 ⇒ zero
+bias" contract. (2) Linear-mode READ forwards pass an explicit
+attention_mask + cumsum-1-clamped position ids (needed for interface
+blinding; with no prefix and C=0 the [Q+1, V] logit layout is preserved by a
+zero row for the unpredictable query position 0, whose label is always
+-100). (3) `use_linear_state_read` asserts `use_gradient_checkpointing=False`
+— checkpoint recompute re-runs blocks outside the active read pass, so the
+hooks would silently drop the bias during backward. (4)
+`read_state_segment_emb` is a stubbed `NotImplementedError`: the per-segment
+count is dynamic under pair-aware / segment_size chunking, so the embedding
+would need lazy sizing (spec-sanctioned deferral). (5) The exact-softmax arm
+shares κ/ν/Q/β/γ/W_o and the site masks with the state arm — only the read
+kernel differs.
+
+**Deviations from the spec** — `read_state_mu_norm_ratio` is logged as
+`read_state_mu_over_x_norm_ratio` = ‖μ‖/‖x‖ (mean over sites, averaged over
+layers): the attention sub-output norm would need a second hook per block on
+the attention submodule; the block-input norm is the documented fallback
+from the task brief. The per-position retrieval probe (argmax segment per
+query position) is reduced to the `read_state_cross_talk` scalar for now;
+the full probe is left for the interference-curve task.
+
+**Verification** — `test_grad_memgpt_linear_state_read.py` (13 tests): state
+read == explicit `Σ (q·k) v` in float64 (this caught a real einsum bug: the
+output subscript labelled the head axis with S's FIRST matrix index, i.e.
+the read computed `q Sᵀ` — fixed); gate-zero bitwise inert; no-stored ⇒ zero
+bias (bitwise vs hooks-disabled); site masks exact at the injecting block
+(all + interface, both passes); exact arm == manual softmax (and ≠ state
+arm); interface pass-1 blinding (target-span perturbation leaves the
+interface embeddings bitwise unchanged) + query sensitivity (non-target
+perturbation changes them); boundary-k probe == truncated forward (logits
+allclose, EM flags identical); WRITE side bitwise untouched by the hooks +
+outer grads reach every read module under `grad_mode="second"`;
+`collect_segment_mems` purity; layer-subset + config guards. Full suite:
+61 existing + 13 new green under `uv run --extra dev pytest`. Smoke runs
+(2 training steps, batch 8, GPU): all four arms complete, log
+`train_/eval_read_state_*`, and write `forgetting_matrix_step*.json/csv`
+(artifacts under `runs/default/…`, logs under `/tmp/kv_smoke_logs/`).
+`run_from_config.py --dry-run` clean for both configs;
+`run_scheduler.py manifests/kv_linear_read.yaml --dry-run` clean (15 runs).
+NOT yet verified: training-scale behavior (gate/β drift, stability) and the
+actual concat accuracy — that is the ladder in `kv_linear_read.yaml`, to run
+on the cluster.
+
+## 2026-10-18 — executor brief for the H3 implementation
+
+**Added** — [`docs/TOKENWISE_READ_TASK.md`](docs/TOKENWISE_READ_TASK.md):
+the implementation task for the linear-state read spec, written for an
+executor agent with no conversation context. Grounds the spec in the
+codebase (config flow yaml → `run_from_config.py` section flattening →
+runner argparse → `GradMemGPTConfig`; stats via `inner_loop_stats` →
+`compute_metrics`; block access for gpt2 `h[i]` / llama `layers[i]`), fixes
+the v1 contract (raw stored tokens only — asserts
+`hopfield_value_proj_dim=None`; STORE skips key/encoding work in this mode;
+hooks parallel-inject at block outputs with read-site masks incl. the
+jvp_flash %32 padding; interface two-pass with `labels ≥ 0` blinding), and
+sets an 8-phase plan (recon → config/state → default mode → exact-softmax →
+interface → eval mirrors → diagnostics → configs/manifest/smoke → docs)
+with named unit tests as per-phase exit conditions and six final acceptance
+criteria (flag-off bitwise inertness; write side untouched; forgetting
+matrix works in the new mode; all four arms smoke-run). Bank-prefix control,
+top-k routing, and the pointer-chasing dataset are explicitly out of scope.
+
 ## 2026-10-15 (d) — interface-token read variant folded into the H3 spec
 
 **Added** — the *Variant* section in

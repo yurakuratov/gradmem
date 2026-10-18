@@ -99,7 +99,7 @@ def apply_overrides(cfg: dict, overrides: dict) -> dict:
 
     for key, value in overrides.items():
         applied = False
-        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'gated_delta', 'dataset', 'curriculum', 'adaptive', 'segmentation']:
+        for section in ['model', 'training', 'gradmem', 'rmt', 'hopfield', 'gated_delta', 'read_linear', 'dataset', 'curriculum', 'adaptive', 'segmentation']:
             if section in result and key in result[section]:
                 result[section][key] = value
                 applied = True
@@ -238,6 +238,23 @@ def build_cli_args(cfg: dict, overrides: dict = None) -> list[str]:
         if val is None:
             continue
         cli_key = key.replace('_', '-')
+        if val is True:
+            args.append(f'--{cli_key}')
+        elif val is False:
+            args.append(f'--{cli_key}=False')
+        else:
+            args.append(f'--{cli_key}={val}')
+
+    # Linear-state per-level read (docs/TOKENWISE_READ.md). A list
+    # read_state_layers is rendered as a comma-separated string (the runner
+    # parses it back into ints).
+    read_linear = cfg.get('read_linear', {})
+    for key, val in read_linear.items():
+        if val is None:
+            continue
+        cli_key = key.replace('_', '-')
+        if isinstance(val, (list, tuple)):
+            val = ','.join(str(v) for v in val)
         if val is True:
             args.append(f'--{cli_key}')
         elif val is False:

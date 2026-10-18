@@ -231,6 +231,14 @@ class GradMemGPTConfig(PretrainedConfig):
                  pair_aware_segmentation=False,
                  pairs_per_segment=None,
                  pair_delim_token_ids=None,
+                 use_linear_state_read=False,
+                 read_state_heads=4,
+                 read_state_layers="all",
+                 read_state_beta_init=1.0,
+                 read_state_gate_init=0.1,
+                 read_state_read_sites="all",
+                 read_state_segment_emb=False,
+                 read_state_exact_softmax=False,
                  **kwargs):
         """
         Args:
@@ -363,6 +371,41 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
              pair_delim_token_ids: list[int]|None, [open/close '!' id, ':' id] used to detect pairs in
                  context_input_ids. Auto-filled by the runner from the tokenizer when
                  pair_aware_segmentation is on.
+             use_linear_state_read: bool, replace the Hopfield RETRIEVE + memory-prefix READ with
+                 per-level linear-attention reads of the stored bank (TOKENWISE_READ.md; requires
+                 use_hopfield_memory=True, mutually exclusive with use_gated_delta_memory and with
+                 hopfield_value_proj_dim -- values are the raw post-inner-loop memories). The bank
+                 is folded once into per-head states S_r = sum k v^T (k = L2-normalized
+                 read_state_key_proj of each stored memory TOKEN, v = read_state_value_proj); at
+                 every instrumented decoder block a forward hook injects
+                 gamma_l * W_o(concat_r beta_r * normalize(Q_r(LN(x))) @ S_r) at the read sites of
+                 the block OUTPUT (parallel, Flamingo/Titan-style; the frozen backbone pathway is
+                 untouched). The READ sequence drops the memory prefix: [read_st?, read_end?, query]
+                 (read_sites="all") or the two-pass interface layout (read_sites="interface").
+                 Read-module params are outer-loop only; stored values join the outer graph through
+                 the reads (detached per hopfield_bptt_segments exactly as today). Incompatible
+                 with use_gradient_checkpointing (block hooks must fire during the READ forward,
+                 which checkpoint-recompute would run outside the active read pass).
+             read_state_heads: int >= 1, number of read heads H_r; head dim d_h = n_embd / H_r.
+                 Wider heads reduce state cross-talk (state cost O(d^2/H_r) either way).
+             read_state_layers: "all" or list[int], which decoder blocks get the read hook.
+                 Indices refer to backbone blocks (gpt2 backbone.h, llama backbone.layers).
+             read_state_beta_init: float, initial retrieval sharpness beta_r^l per head/layer
+                 (scales the L2-normalized query; learnable per layer).
+             read_state_gate_init: float > 0, initial per-layer gate gamma^l (LayerScale-style
+                 small-positive init: 0 could never escape, 1.0 would perturb the frozen reader).
+             read_state_read_sites: str, "all" = the bias is injected at every real (non-pad)
+                 position of the read sequence; "interface" = only at the M learnable interface
+                 tokens (count = n_mem_tokens, two-pass layout: pass 1 conditions [query
+                 (target-span blinded), M_0] with the reads on; pass 2 answers
+                 [read_st?, interface, read_end?, query] with the pass-1 interface states).
+             read_state_segment_emb: stub (must stay False in v1): optional learnable per-segment
+                 embedding before kappa/nu. Not implemented -- the per-segment count is dynamic
+                 (pair-aware / segment_size modes), so the parameter would need lazy sizing.
+             read_state_exact_softmax: bool, ablation arm: replace the superposed state read
+                 q @ S_r with exact per-token softmax attention over the unfolded bank
+                 softmax(q . K_r^T) @ V_r (O(N) per token, stored-out segments/pads masked).
+                 Shares all projections/gates/site masks with the state arm.
          """
         super().__init__(**kwargs)
 
@@ -471,6 +514,16 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.pair_aware_segmentation = pair_aware_segmentation
         self.pairs_per_segment = pairs_per_segment
         self.pair_delim_token_ids = pair_delim_token_ids
+
+        # Linear-state per-level read (TOKENWISE_READ.md; see docstring above).
+        self.use_linear_state_read = use_linear_state_read
+        self.read_state_heads = read_state_heads
+        self.read_state_layers = read_state_layers
+        self.read_state_beta_init = read_state_beta_init
+        self.read_state_gate_init = read_state_gate_init
+        self.read_state_read_sites = read_state_read_sites
+        self.read_state_segment_emb = read_state_segment_emb
+        self.read_state_exact_softmax = read_state_exact_softmax
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample", "proj_rw"]
@@ -624,6 +677,44 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
                 f"pair_delim_token_ids must be two non-negative token ids, got {pair_delim_token_ids}"
             assert pair_delim_token_ids[0] != pair_delim_token_ids[1], \
                 "pair_delim_token_ids entries must be distinct"
+
+        # Validate linear-state read settings (TOKENWISE_READ.md).
+        assert read_state_read_sites in ("all", "interface"), \
+            f"read_state_read_sites must be 'all' or 'interface', got '{read_state_read_sites}'"
+        assert isinstance(read_state_heads, int) and read_state_heads >= 1, \
+            f"read_state_heads must be an int >= 1, got {read_state_heads}"
+        assert read_state_gate_init > 0, \
+            f"read_state_gate_init must be > 0, got {read_state_gate_init}"
+        if isinstance(read_state_layers, str):
+            assert read_state_layers == "all", \
+                f"read_state_layers must be 'all' or a list of block indices, got {read_state_layers!r}"
+        else:
+            assert isinstance(read_state_layers, (list, tuple)) and len(read_state_layers) > 0, \
+                f"read_state_layers must be 'all' or a non-empty list of block indices, got {read_state_layers!r}"
+            assert all(isinstance(i, int) and i >= 0 for i in read_state_layers), \
+                f"read_state_layers entries must be non-negative ints, got {read_state_layers!r}"
+            assert len(set(read_state_layers)) == len(list(read_state_layers)), \
+                f"read_state_layers entries must be distinct, got {read_state_layers!r}"
+        if read_state_segment_emb:
+            # Stub (v1): the per-segment count is dynamic under pair-aware /
+            # segment_size chunking, so the embedding would need lazy sizing.
+            raise NotImplementedError(
+                "read_state_segment_emb is not implemented in v1 (see TOKENWISE_READ.md); keep it False")
+        if read_state_exact_softmax:
+            assert use_linear_state_read, \
+                "read_state_exact_softmax is an ablation arm of use_linear_state_read and requires it"
+        if use_linear_state_read:
+            assert use_hopfield_memory, \
+                "use_linear_state_read requires use_hopfield_memory=True (it reads the Hopfield STORE bank)"
+            assert not use_gated_delta_memory, \
+                "use_linear_state_read is mutually exclusive with use_gated_delta_memory"
+            assert hopfield_value_proj_dim is None, \
+                "use_linear_state_read requires hopfield_value_proj_dim=None " \
+                "(values are the raw post-inner-loop memory tokens; the encoded-code pathway is for the one-shot mixture)"
+            assert not use_gradient_checkpointing, \
+                "use_linear_state_read is incompatible with use_gradient_checkpointing " \
+                "(the block hooks must fire during the READ forward; checkpoint recompute would re-run the blocks " \
+                "outside the active read pass and drop the injected bias)"
 
 
 class GradMemGPT(PreTrainedModel):
@@ -1002,6 +1093,89 @@ class GradMemGPT(PreTrainedModel):
                     f"({max_pos}). Reduce hopfield_segment_size or increase max_position_embeddings."
                 )
 
+        # Linear-state per-level read (TOKENWISE_READ.md): replaces the Hopfield
+        # RETRIEVE + memory-prefix READ when enabled. The read modules are
+        # OUTER-LOOP ONLY params (like the read LoRA): they never enter the
+        # inner loop, whose autograd.grad calls only ever target mem_batch /
+        # per-sample proj tensors.
+        self.use_linear_state_read = getattr(config, "use_linear_state_read", False)
+        self.read_state_heads = getattr(config, "read_state_heads", 4)
+        self.read_state_layers_cfg = getattr(config, "read_state_layers", "all")
+        self.read_state_beta_init = getattr(config, "read_state_beta_init", 1.0)
+        self.read_state_gate_init = getattr(config, "read_state_gate_init", 0.1)
+        self.read_state_read_sites = getattr(config, "read_state_read_sites", "all")
+        self.read_state_exact_softmax = getattr(config, "read_state_exact_softmax", False)
+        # Escape hatch for tests/debugging: when True the registered hooks are
+        # a no-op (same read layout, no injected bias).
+        self._read_state_hooks_disabled = False
+        # Active read-pass context (set around READ-phase forwards, else None):
+        # carries the built state, the site mask and the stats accumulators the
+        # block hooks read. WRITE-phase / compression forwards see it None.
+        self._read_state_ctx = None
+
+        if self.use_linear_state_read:
+            if n_embd % self.read_state_heads != 0:
+                raise ValueError(
+                    f"read_state_heads={self.read_state_heads} must divide n_embd={n_embd}")
+            # Layer subset: "all" or explicit block indices; validate against
+            # the backbone now (the config only sees the raw list).
+            backbone = get_backbone(self.model)
+            if hasattr(backbone, "h"):          # GPT-2
+                blocks = backbone.h
+            elif hasattr(backbone, "layers"):   # Llama
+                blocks = backbone.layers
+            else:
+                raise AttributeError(
+                    "Could not locate decoder blocks on the backbone "
+                    "(expected backbone.h for GPT-2 or backbone.layers for Llama).")
+            n_blocks = len(blocks)
+            if self.read_state_layers_cfg == "all":
+                layer_ids = list(range(n_blocks))
+            else:
+                layer_ids = list(self.read_state_layers_cfg)
+                bad = [i for i in layer_ids if i >= n_blocks]
+                if bad:
+                    raise ValueError(
+                        f"read_state_layers indices {bad} out of range for backbone with "
+                        f"{n_blocks} blocks")
+            self.read_state_layer_ids = layer_ids
+
+            d_h = n_embd // self.read_state_heads
+            self.read_state_head_dim = d_h
+            # Shared-across-layers bank projections kappa_r, nu_r: R^d -> R^{d_h}
+            # per head (one Linear d->d, reshaped to [H, d_h, d] — equivalent to
+            # per-head linears). The state is built once from these.
+            self.read_state_key_proj = nn.Linear(n_embd, n_embd, bias=False)
+            self.read_state_value_proj = nn.Linear(n_embd, n_embd, bias=False)
+            # No bias on W_o: a zero state (nothing stored) must give exactly a
+            # zero injected bias (grad_memgpt contract; a bias term would leak
+            # gamma * b into every read even with an empty bank).
+            self.read_state_out_proj = nn.Linear(n_embd, n_embd, bias=False)
+            # Per-layer Q, beta, gamma, LN. LN matches ln_1 placement on the
+            # block INPUT; it is deliberately a NEW LayerNorm (not the
+            # backbone's own ln_1) so the query path is independent of it.
+            self.read_state_q_proj = nn.ModuleList(
+                [nn.Linear(n_embd, n_embd, bias=False) for _ in layer_ids])
+            self.read_state_ln = nn.ModuleList(
+                [nn.LayerNorm(n_embd) for _ in layer_ids])
+            self.read_state_beta = nn.ParameterList(
+                [nn.Parameter(torch.full((self.read_state_heads,), float(self.read_state_beta_init)))
+                 for _ in layer_ids])
+            self.read_state_gamma = nn.ParameterList(
+                [nn.Parameter(torch.full((n_embd,), float(self.read_state_gate_init)))
+                 for _ in layer_ids])
+            # Interface tokens M_0 (read_sites="interface"): count = n_mem_tokens.
+            if self.read_state_read_sites == "interface":
+                self.read_state_interface_mem = nn.Parameter(
+                    torch.randn(self.n_mem_tokens, n_embd) * 0.02)
+            # map backbone block index -> position in the per-layer ModuleLists
+            self.read_state_layer_pos = {blk: pos for pos, blk in enumerate(layer_ids)}
+            # Register the block hooks once; they no-op unless the read-pass
+            # context is active (see _read_state_ctx / _read_state_pass).
+            for blk_idx in layer_ids:
+                blocks[blk_idx].register_forward_hook(
+                    self._make_read_state_hook(blk_idx), with_kwargs=True)
+
         self.tie_weights()
         self.main_input_name = "input_ids"
         self.model.config.use_cache = False
@@ -1364,6 +1538,190 @@ class GradMemGPT(PreTrainedModel):
         return features
 
     # ---------------------------------------------------------------- #
+    # Linear-state per-level read (TOKENWISE_READ.md; use_linear_state_read).
+    #
+    # The stored bank never enters the read sequence: it is folded once into
+    # per-head associative states S_r = sum_(s,j) k_(s,j) v_(s,j)^T, and a
+    # forward hook on each instrumented decoder block injects
+    #   gamma_l * W_o(concat_r beta_r * normalize(Q_r(LN(x))) @ S_r)
+    # at the read sites of the block OUTPUT (parallel additive injection; the
+    # pretrained attention pathway is bitwise untouched). All read-module
+    # params are outer-loop only; the hooks no-op unless a READ pass is
+    # active (see _read_state_ctx / _read_state_pass), so WRITE-phase and
+    # compression forwards are unaffected.
+    # ---------------------------------------------------------------- #
+
+    def _build_linear_state(self, values_stack, masks_stack):
+        """Fold the stored bank into per-head linear-attention states.
+
+        values_stack: [B, c, M*d] raw stored memories (the linear-state STORE
+            appends the raw post-inner-loop mem_batch per segment);
+        masks_stack: [B, c] bool, False where a sample had no tokens in that
+            segment (those items contribute nothing -- S = 0 for a sample with
+            no stored segments at all, i.e. zero bias, no fallback prefix).
+
+        Returns a dict:
+            S:         [B, H, d_h, d_h] per-head states
+            K, V:      [B, H, N, d_h]    unfolded bank keys/values (N = c*M);
+                       used by the exact-softmax arm and the cross-talk diag
+            item_mask: [B, N] bool, False for stored-out items
+        """
+        B, c, P = values_stack.shape
+        d = P // self.n_mem_tokens
+        H, d_h = self.read_state_heads, self.read_state_head_dim
+        N = c * self.n_mem_tokens
+        bank = values_stack.reshape(B, N, d)
+        item_mask = masks_stack.unsqueeze(-1).expand(B, c, self.n_mem_tokens).reshape(B, N)
+        k = self.read_state_key_proj(bank).view(B, N, H, d_h)
+        k = F.normalize(k, dim=-1)
+        v = self.read_state_value_proj(bank).view(B, N, H, d_h)
+        keep = item_mask.view(B, N, 1, 1).to(k.dtype)
+        k, v = k * keep, v * keep
+        k = k.permute(0, 2, 1, 3)                       # [B, H, N, d_h]
+        v = v.permute(0, 2, 1, 3)
+        S = torch.einsum('bhnd,bhne->bhde', k, v)       # [B, H, d_h, d_h]
+        return {'S': S, 'K': k, 'V': v, 'item_mask': item_mask}
+
+    @staticmethod
+    def _expand_linear_state(state, n_q):
+        """Replicate a per-sample read state over the probe axis ([B,*] -> [B*n_q,*])."""
+        def rep(t):
+            return t.unsqueeze(1).expand(-1, n_q, *([-1] * (t.dim() - 1))).reshape(
+                t.size(0) * n_q, *t.shape[1:])
+        return {'S': rep(state['S']), 'K': rep(state['K']), 'V': rep(state['V']),
+                'item_mask': rep(state['item_mask'])}
+
+    @contextmanager
+    def _read_state_pass(self, state, site_mask, collect_stats=False, want_cross_talk=False,
+                         stats=None):
+        """Activate the block hooks for one READ forward.
+
+        site_mask: [B*, T, 1] float, 1 at the read sites (0 at pads / non-sites).
+        `stats` is the accumulator dict the hooks fill (pass a shared dict to
+        merge stats across the two interface passes). Nested passes (interface
+        two-pass) stack and restore the previous ctx.
+        """
+        prev = self._read_state_ctx
+        ctx = dict(state)
+        ctx.update({'active': True,
+                    'site_mask': site_mask,
+                    'collect_stats': collect_stats,
+                    'want_cross_talk': want_cross_talk,
+                    'cross_talk_layer_pos': len(self.read_state_layer_ids) - 1,
+                    'stats': stats if stats is not None else {}})
+        self._read_state_ctx = ctx
+        try:
+            yield ctx
+        finally:
+            self._read_state_ctx = prev
+
+    def _make_read_state_hook(self, block_idx):
+        """Forward hook for decoder block `block_idx` (registered once in __init__)."""
+        layer_pos = self.read_state_layer_pos[block_idx]
+
+        def _hook(module, args, kwargs, output):
+            ctx = self._read_state_ctx
+            if ctx is None or not ctx.get('active') or self._read_state_hooks_disabled:
+                return None
+            x = args[0] if args else kwargs.get('hidden_states')
+            mu = self._linear_state_read_bias(layer_pos, x, ctx)
+            mu = mu * ctx['site_mask'].to(mu.dtype)
+            if ctx.get('collect_stats'):
+                with torch.no_grad():
+                    acc = ctx['stats'].setdefault(layer_pos, {'mu_sum': None, 'x_sum': None, 'count': 0})
+                    acc['mu_sum'] = mu.detach().float().norm(dim=-1).sum() if acc['mu_sum'] is None \
+                        else acc['mu_sum'] + mu.detach().float().norm(dim=-1).sum()
+                    acc['x_sum'] = x.detach().float().norm(dim=-1).sum() if acc['x_sum'] is None \
+                        else acc['x_sum'] + x.detach().float().norm(dim=-1).sum()
+                    acc['count'] += mu.size(0) * mu.size(1)
+            if isinstance(output, tuple):
+                return (output[0] + mu.to(output[0].dtype),) + tuple(output[1:])
+            return output + mu.to(output.dtype)
+
+        return _hook
+
+    def _linear_state_read_bias(self, layer_pos, x, ctx):
+        """Memory bias injected at one instrumented block.
+
+        x: [B*, T, d] block INPUT hidden state; q_r = beta_r * norm(Q_r(LN(x)))
+        per head, then mu = q_r @ S_r (state arm) or softmax(q_r K_r^T) V_r
+        (exact-softmax arm, stored-out items masked); heads concatenated,
+        projected by W_o, gated by gamma_l. Site masking is the hook's job.
+        """
+        d_h, H = self.read_state_head_dim, self.read_state_heads
+        h = self.read_state_ln[layer_pos](x)
+        q = self.read_state_q_proj[layer_pos](h)                     # [B*, T, d]
+        Bt, T = q.shape[0], q.shape[1]
+        q = q.view(Bt, T, H, d_h)
+        q_hat = F.normalize(q, dim=-1)
+        q_s = q_hat * self.read_state_beta[layer_pos].view(1, 1, H, 1)
+        if self.read_state_exact_softmax:
+            scores = torch.einsum('bthd,bhnd->bthn', q_s, ctx['K'])  # [B*, T, H, N]
+            scores = scores.masked_fill(~ctx['item_mask'][:, None, None, :], float('-inf'))
+            # A sample with NO stored items would softmax over all -inf (NaN);
+            # give it zero scores and zero the weights -> zero read, like the
+            # state arm's S = 0.
+            any_item = ctx['item_mask'].any(dim=-1)                  # [B*]
+            scores = torch.where(any_item[:, None, None, None], scores,
+                                 torch.zeros_like(scores))
+            w = F.softmax(scores, dim=-1) * any_item[:, None, None, None].to(scores.dtype)
+            mu = torch.einsum('bthn,bhnd->bthd', w, ctx['V'])
+        else:
+            # mu[...,e] = sum_d q[d] S[d,e]  (q S, not q S^T: the output's head
+            # axis must be labelled with S's SECOND matrix index)
+            mu = torch.einsum('bthd,bhde->bthe', q_s, ctx['S'])      # [B*, T, H, d_h]
+        if ctx.get('want_cross_talk') and layer_pos == ctx['cross_talk_layer_pos']:
+            self._accumulate_read_state_cross_talk(q_hat, ctx)
+        mu = mu.reshape(Bt, T, -1)
+        mu = self.read_state_out_proj(mu)
+        return mu * self.read_state_gamma[layer_pos]
+
+    @staticmethod
+    def _accumulate_read_state_cross_talk(q_hat, ctx):
+        """Eval diagnostic: mean |q.k| over NON-top bank items (interference floor).
+
+        Detached; accumulated on the last instrumented layer only. Valid items
+        are filled with -1 before sorting so the per-position top-1 drops out
+        (|q.k| in [0, 1] for normalized q, k).
+        """
+        with torch.no_grad():
+            scores = torch.einsum('bthd,bhnd->bthn', q_hat, ctx['K']).abs().detach()
+            scores = scores.masked_fill(~ctx['item_mask'][:, None, None, :], -1.0)
+            sorted_scores, _ = scores.sort(dim=-1, descending=True)
+            valid = sorted_scores > -0.5
+            n_valid = valid.sum(dim=-1)
+            rest = sorted_scores[..., 1:]
+            acc = ctx['stats'].setdefault('cross_talk', {'sum': None, 'count': 0})
+            seg_sum = (rest * valid[..., 1:]).sum()
+            acc['sum'] = seg_sum if acc['sum'] is None else acc['sum'] + seg_sum
+            acc['count'] = acc['count'] + (n_valid - 1).clamp(min=0).sum()
+
+    def _drain_read_state_stats(self, ctx, inner_loop_stats, device):
+        """Fold the read-pass accumulators into inner_loop_stats (all detached).
+
+        Enabled-but-idle stats are explicit zeros so 'off' vs 'idle' stays
+        distinguishable on the metric stream (see AGENTS.md).
+        """
+        H = self.read_state_heads
+        gammas = torch.stack([g.abs().mean() for g in self.read_state_gamma])
+        betas = torch.stack([b.mean() for b in self.read_state_beta])
+        inner_loop_stats['read_state_gate_abs_mean'] = gammas.mean().detach()
+        inner_loop_stats['read_state_beta_mean'] = betas.mean().detach()
+        mu_ratios = []
+        for layer_pos, acc in ctx['stats'].items():
+            if not isinstance(layer_pos, int):
+                continue
+            if acc['count'] > 0 and acc['x_sum'] is not None and float(acc['x_sum']) > 0:
+                mu_ratios.append((acc['mu_sum'] / acc['x_sum']).detach())
+        inner_loop_stats['read_state_mu_over_x_norm_ratio'] = \
+            torch.stack(mu_ratios).mean() if mu_ratios else torch.zeros((), device=device)
+        ct = ctx['stats'].get('cross_talk')
+        if ct is not None:
+            inner_loop_stats['read_state_cross_talk'] = \
+                (ct['sum'] / ct['count'].clamp(min=1)).detach() if ct['count'] > 0 \
+                else torch.zeros((), device=device)
+
+    # ---------------------------------------------------------------- #
     # Per-segment forgetting evaluation (eval-only)
     # ---------------------------------------------------------------- #
     # After each model-segment is written, probe retrieval of every KV pair
@@ -1484,6 +1842,161 @@ class GradMemGPT(PreTrainedModel):
         self._set_phase_adapter("read")
         logits = self.model(inputs_embeds=x_qry).logits                     # [B*n_q, M+Q, V]
         logits = logits[:, mem_offset - 1:mem_offset + Q, :]                # [B*n_q, Q+1, V]
+        return logits.reshape(B, n_q, Q + 1, -1)
+
+    # ---------------------------------------------------------------- #
+    # Linear-state READ forwards (use_linear_state_read)
+    # ---------------------------------------------------------------- #
+
+    def _linear_read_forward_pass(self, x, attn_mask, site_mask, state,
+                                  collect_stats=False, want_cross_talk=False, stats=None,
+                                  need_logits=True):
+        """One forward with the read hooks active on `site_mask`.
+
+        x: [B*, T, d]; attn_mask: [B*, T] long; site_mask: [B*, T, 1] float.
+        Pads to a multiple of 32 on the jvp paths (embeddings AND mask), runs
+        the READ-phase adapter. need_logits=True runs the full CausalLM (call
+        .logits on the result); False runs the bare backbone (call
+        .last_hidden_state -- the interface pass-1 conditioning needs only
+        hidden states).
+        """
+        T = x.size(1)
+        if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual') and T % 32:
+            pad_len = 32 - T % 32
+            x = F.pad(x, [0, 0, 0, pad_len], "constant", 0)
+            attn_mask = F.pad(attn_mask, [0, pad_len], "constant", 0)
+        # cumsum-1 clamp: masked positions (blinded target span / pads) must
+        # not produce position_id = -1 (same pattern as _compress_query).
+        position_ids = (attn_mask.cumsum(-1) - 1).clamp(min=0)
+        runner = self.model if need_logits else get_backbone(self.model)
+        with self._read_state_pass(state, site_mask, collect_stats=collect_stats,
+                                   want_cross_talk=want_cross_talk, stats=stats):
+            self._set_phase_adapter("read")
+            return runner(inputs_embeds=x, attention_mask=attn_mask,
+                          position_ids=position_ids, return_dict=True)
+
+    @staticmethod
+    def _slice_read_logits(logits_full, read_offset, q_len):
+        """[B*, T, V] -> [B*, Q+1, V]: row j predicts query token j.
+
+        `read_offset` prefix tokens (ctrl / interface) precede the query, so
+        row j = logits at position read_offset-1+j (matching the memory-prefix
+        READ's slicing). With NO prefix (read_offset == 0) nothing predicts
+        query token 0 -- pad a zero row; every scored layout has label -100 at
+        query position 0, so CE never consumes it.
+        """
+        if read_offset > 0:
+            return logits_full[:, read_offset - 1:read_offset + q_len, :]
+        head = torch.zeros(logits_full.size(0), 1, logits_full.size(-1),
+                           dtype=logits_full.dtype, device=logits_full.device)
+        return torch.cat([head, logits_full[:, :q_len, :]], dim=1)
+
+    def _linear_state_read_logits(self, qry_emb, query_input_ids, labels,
+                                  read_st_batch, read_end_batch, state,
+                                  collect_stats=False, collect_cross_talk=False, stats=None,
+                                  return_interface=False):
+        """READ-phase logits for the linear-state mode -> [B, Q+1, V].
+
+        qry_emb: [B, Q, d]; query_input_ids: [B, Q]; state: read state already
+        expanded to the batching of qry_emb. read_sites="all": one pass over
+        [read_st?, read_end?, query], bias at every real position.
+        read_sites="interface": pass 1 conditions the learnable interface
+        tokens M_0 on the target-span-blinded query (reads active on the M_0
+        positions); pass 2 answers [read_st?, interface, read_end?, query]
+        with the pass-1 interface states (reads active on the interface
+        positions only). The blinding reuses _compress_query's labels >= 0
+        pattern so pass 1 cannot peek at the answer. return_interface=True
+        additionally returns the pass-1 interface embeddings [B, M, d]
+        (diagnostics/tests: the query-sensitivity and blinding checks).
+        """
+        pad_id = self.model.config.pad_token_id
+        device = qry_emb.device
+        C = self.n_ctrl_tokens
+        M = self.n_mem_tokens
+        query_real = (query_input_ids != pad_id).long()                  # [B, Q]
+        if C > 0:
+            ctrl_ones = torch.ones(query_real.size(0), C, dtype=torch.long, device=device)
+        if self.read_state_read_sites == "all":
+            if C > 0:
+                x = torch.cat([read_st_batch, read_end_batch, qry_emb], dim=1)
+                attn = torch.cat([ctrl_ones, query_real], dim=1)
+            else:
+                x = qry_emb
+                attn = query_real
+            site_mask = attn.float().unsqueeze(-1)                       # every real position
+            out = self._linear_read_forward_pass(x, attn, site_mask, state,
+                                                 collect_stats=collect_stats,
+                                                 want_cross_talk=collect_cross_talk,
+                                                 stats=stats)
+            logits = self._slice_read_logits(out.logits, C, query_input_ids.size(1))
+            return (logits, None) if return_interface else logits
+
+        # ---- interface mode, pass 1: condition M_0 on the blinded query ----
+        qry_mask = query_real.clone()
+        if labels is not None:
+            qry_mask[labels >= 0] = 0
+        m0 = self.read_state_interface_mem.unsqueeze(0).expand(query_real.size(0), -1, -1)
+        mem_ones = torch.ones(query_real.size(0), M, dtype=torch.long, device=device)
+        if C > 0:
+            x1 = torch.cat([read_st_batch, qry_emb, read_end_batch, m0], dim=1)
+            a1 = torch.cat([ctrl_ones, qry_mask, ctrl_ones, mem_ones], dim=1)
+        else:
+            x1 = torch.cat([qry_emb, m0], dim=1)
+            a1 = torch.cat([qry_mask, mem_ones], dim=1)
+        T1 = x1.size(1)
+        site1 = torch.zeros(query_real.size(0), T1, 1, device=device)
+        site1[:, -M:] = 1.0
+        out1 = self._linear_read_forward_pass(x1, a1, site1, state,
+                                              collect_stats=collect_stats, stats=stats,
+                                              need_logits=False)
+        iface = out1.last_hidden_state[:, T1 - M:T1, :]                  # [B, M, d]
+
+        # ---- pass 2: answer with the conditioned interface embeddings ----
+        if C > 0:
+            x2 = torch.cat([read_st_batch, iface, read_end_batch, qry_emb], dim=1)
+            a2 = torch.cat([ctrl_ones, mem_ones, ctrl_ones, query_real], dim=1)
+        else:
+            x2 = torch.cat([iface, qry_emb], dim=1)
+            a2 = torch.cat([mem_ones, query_real], dim=1)
+        T2 = x2.size(1)
+        site2 = torch.zeros(query_real.size(0), T2, 1, device=device)
+        site2[:, C:C + M] = 1.0
+        out2 = self._linear_read_forward_pass(x2, a2, site2, state,
+                                              collect_stats=collect_stats,
+                                              want_cross_talk=collect_cross_talk,
+                                              stats=stats)
+        logits = self._slice_read_logits(out2.logits, C + M, query_input_ids.size(1))
+        return (logits, iface) if return_interface else logits
+
+    def _read_once_linear(self, state, query_input_ids, read_st_batch, read_end_batch,
+                          target_mask=None):
+        """Batched linear-state READ for the forgetting probes (mirrors _read_once).
+
+        state: [B, ...] per-sample read state (built from stored_*[:n_stored]);
+        query_input_ids: [B, n_q, Q]. Flattens the probe axis, drops the memory
+        prefix, and serves the state read (all mode) or the interface two-pass
+        (interface mode). target_mask blinds the teacher-forced target span in
+        the interface pass-1 conditioning (the _compress_query pattern).
+        Returns logits [B, n_q, Q+1, V].
+        """
+        B, n_q, Q = query_input_ids.shape
+        device = query_input_ids.device
+        flat_qids = query_input_ids.reshape(B * n_q, -1)
+        qry_emb = self.model.get_input_embeddings()(flat_qids)           # [B*n_q, Q, d]
+        labels = None
+        if target_mask is not None:
+            labels = torch.where(target_mask.reshape(B * n_q, -1), flat_qids,
+                                 torch.full_like(flat_qids, -100))
+        if self.n_ctrl_tokens > 0:
+            rs = read_st_batch.reshape(B, 1, self.n_ctrl_tokens, -1) \
+                .expand(-1, n_q, -1, -1).reshape(B * n_q, self.n_ctrl_tokens, -1)
+            re_ = read_end_batch.reshape(B, 1, self.n_ctrl_tokens, -1) \
+                .expand(-1, n_q, -1, -1).reshape(B * n_q, self.n_ctrl_tokens, -1)
+        else:
+            rs = re_ = None
+        state_exp = self._expand_linear_state(state, n_q)
+        logits = self._linear_state_read_logits(qry_emb, flat_qids, labels, rs, re_,
+                                                state_exp)
         return logits.reshape(B, n_q, Q + 1, -1)
 
     @staticmethod
@@ -1842,11 +2355,27 @@ class GradMemGPT(PreTrainedModel):
                 probe_here = (seg_idx <= seg_idx_loop) & qmask             # [B, n_q]
                 if not probe_here.any():
                     continue
-                mem_det = self._probe_boundary_memory(
-                    snap, stored_keys, stored_values, stored_masks,
-                    qids, tmask, mem_batch_initial, read_st_batch, read_end_batch,
-                    B, device)
-                logits_q = self._read_once(mem_det, qids, read_st_batch, read_end_batch)
+                if self.use_linear_state_read:
+                    # Linear-state probe: there is no retrieved pattern to
+                    # compress -- the probe read IS the state read (or interface
+                    # two-pass) against the bank as of this boundary
+                    # (stored_*[:n_stored]), batched over the probe axis.
+                    c = snap['n_stored']
+                    if c > 0:
+                        values_stack = torch.stack(stored_values[:c], dim=1)
+                        masks_stack = torch.stack(stored_masks[:c], dim=1).bool()
+                    else:
+                        values_stack = mem_batch_initial.view(B, 1, -1)
+                        masks_stack = torch.zeros(B, 1, dtype=torch.bool, device=device)
+                    state = self._build_linear_state(values_stack, masks_stack)
+                    logits_q = self._read_once_linear(state, qids, read_st_batch,
+                                                      read_end_batch, target_mask=tmask)
+                else:
+                    mem_det = self._probe_boundary_memory(
+                        snap, stored_keys, stored_values, stored_masks,
+                        qids, tmask, mem_batch_initial, read_st_batch, read_end_batch,
+                        B, device)
+                    logits_q = self._read_once(mem_det, qids, read_st_batch, read_end_batch)
                 # logits_q: [B, n_q, Q+1, V]
                 for b in range(B):
                     active = probe_here[b]
@@ -2628,56 +3157,74 @@ class GradMemGPT(PreTrainedModel):
 
                     # Per-segment Hopfield STORE
                     if self.use_hopfield_memory and seg_has_tokens.any():
-                        # Value: gradient-connected mem_batch after inner loop on this segment,
-                        # encoded+activated into the stored value code z ([B, Dv] when projected).
-                        # The STORED tensor is the activated code, never the preactivation.
-                        value_pattern = mem_batch.view(B, -1)  # [B, M*d]
-                        value_code = self._encode_hopfield_value(value_pattern)
-
-                        if self.hopfield_value_as_key:
-                            # Use the activated value code directly as key (the
-                            # activation is applied exactly once -- here)
-                            seg_key = value_code
+                        if self.use_linear_state_read:
+                            # Raw-token STORE for the linear-state read
+                            # (TOKENWISE_READ.md): values are the raw
+                            # post-inner-loop memories, no value encoding
+                            # (hopfield_value_proj_dim is None by assertion)
+                            # and no segment-key forward pass -- the read
+                            # builds token-level keys from the bank itself.
+                            # hopfield_bptt_segments detaches the raw tensors
+                            # exactly as it detaches keys/values today.
+                            value_code = mem_batch.view(B, -1)            # [B, M*d]
+                            if self.hopfield_bptt_segments is not None and \
+                                    (n_segments - seg_idx - 1) >= self.hopfield_bptt_segments:
+                                value_code = value_code.detach()
+                            stored_keys.append(None)
+                            stored_values.append(value_code)
+                            stored_masks.append(seg_has_tokens)
+                            hopfield_stored = hopfield_stored | seg_has_tokens
                         else:
-                            # Key: causal forward-pass to compress segment into mem tokens
-                            # mem_key at END so it can attend to all preceding content tokens
-                            if self.use_separate_hopfield_mem:
-                                mem_key_prefix = self.mem_key.unsqueeze(0).expand(B, -1, -1)
+                            # Value: gradient-connected mem_batch after inner loop on this segment,
+                            # encoded+activated into the stored value code z ([B, Dv] when projected).
+                            # The STORED tensor is the activated code, never the preactivation.
+                            value_pattern = mem_batch.view(B, -1)  # [B, M*d]
+                            value_code = self._encode_hopfield_value(value_pattern)
+
+                            if self.hopfield_value_as_key:
+                                # Use the activated value code directly as key (the
+                                # activation is applied exactly once -- here)
+                                seg_key = value_code
                             else:
-                                mem_key_prefix = mem_batch_initial
-                            seg_key = self._compress_segment(seg_emb, seg_mask, seg_has_tokens, mem_key_prefix,
-                                                              write_st_batch, write_end_batch, B, device)
+                                # Key: causal forward-pass to compress segment into mem tokens
+                                # mem_key at END so it can attend to all preceding content tokens
+                                if self.use_separate_hopfield_mem:
+                                    mem_key_prefix = self.mem_key.unsqueeze(0).expand(B, -1, -1)
+                                else:
+                                    mem_key_prefix = mem_batch_initial
+                                seg_key = self._compress_segment(seg_emb, seg_mask, seg_has_tokens, mem_key_prefix,
+                                                                  write_st_batch, write_end_batch, B, device)
 
-                        # Apply key projection if configured
-                        if self.hopfield_proj_dim is not None:
-                            seg_key = self.hopfield_key_proj(seg_key)
+                            # Apply key projection if configured
+                            if self.hopfield_proj_dim is not None:
+                                seg_key = self.hopfield_key_proj(seg_key)
 
-                        # L2-normalize keys only (values keep their magnitude)
-                        seg_key = F.normalize(seg_key, dim=-1)
+                            # L2-normalize keys only (values keep their magnitude)
+                            seg_key = F.normalize(seg_key, dim=-1)
 
-                        # Detach keys/values for segments outside the BPTT window
-                        # to reduce peak memory by cutting the computation graph
-                        if self.hopfield_bptt_segments is not None and (n_segments - seg_idx - 1) >= self.hopfield_bptt_segments:
-                            seg_key = seg_key.detach()
-                            value_code = value_code.detach()
+                            # Detach keys/values for segments outside the BPTT window
+                            # to reduce peak memory by cutting the computation graph
+                            if self.hopfield_bptt_segments is not None and (n_segments - seg_idx - 1) >= self.hopfield_bptt_segments:
+                                seg_key = seg_key.detach()
+                                value_code = value_code.detach()
 
-                        # Store for attention-based retrieval
-                        stored_keys.append(seg_key)
-                        stored_values.append(value_code)
-                        stored_masks.append(seg_has_tokens)
-                        hopfield_stored = hopfield_stored | seg_has_tokens
+                            # Store for attention-based retrieval
+                            stored_keys.append(seg_key)
+                            stored_values.append(value_code)
+                            stored_masks.append(seg_has_tokens)
+                            hopfield_stored = hopfield_stored | seg_has_tokens
 
-                        # Nonlinear value-code diagnostics (detached) + ReLU L1
-                        # sparse-loss accumulator. Only graph-retained segments
-                        # enter the trainable accumulator: BPTT-detached codes
-                        # have requires_grad=False, so the L1 term can never
-                        # retain or restore an old computation graph.
-                        if hv is not None:
-                            self._accumulate_hopfield_value_stats(hv, value_code, value_pattern, seg_has_tokens)
-                            if hopfield_l1_train_sum is not None and value_code.requires_grad:
-                                l1_seg = value_code.abs().mean(dim=-1)[seg_has_tokens]
-                                hopfield_l1_train_sum = hopfield_l1_train_sum + l1_seg.sum()
-                                hopfield_l1_train_count += l1_seg.numel()
+                            # Nonlinear value-code diagnostics (detached) + ReLU L1
+                            # sparse-loss accumulator. Only graph-retained segments
+                            # enter the trainable accumulator: BPTT-detached codes
+                            # have requires_grad=False, so the L1 term can never
+                            # retain or restore an old computation graph.
+                            if hv is not None:
+                                self._accumulate_hopfield_value_stats(hv, value_code, value_pattern, seg_has_tokens)
+                                if hopfield_l1_train_sum is not None and value_code.requires_grad:
+                                    l1_seg = value_code.abs().mean(dim=-1)[seg_has_tokens]
+                                    hopfield_l1_train_sum = hopfield_l1_train_sum + l1_seg.sum()
+                                    hopfield_l1_train_count += l1_seg.numel()
 
                     # Per-segment Gated Delta WRITE (state recurrence)
                     if self.use_gated_delta_memory and seg_has_tokens.any():
@@ -2831,9 +3378,11 @@ class GradMemGPT(PreTrainedModel):
 
         qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
         # ---------------------------------------------------------------- #
-        # Hopfield RETRIEVE phase (if enabled)
+        # Hopfield RETRIEVE phase (if enabled; skipped entirely by the
+        # linear-state read -- its one-shot mixture is what that mode replaces)
         # ---------------------------------------------------------------- #
-        if self.use_hopfield_memory and self.K and hopfield_stored.any():
+        if self.use_hopfield_memory and self.K and hopfield_stored.any() \
+                and not self.use_linear_state_read:
             # Stack stored keys and values for attention-based retrieval
             keys = torch.stack(stored_keys, dim=1)      # [B, n_stored, M*d] (Dv when value-as-key)
             values = torch.stack(stored_values, dim=1)  # [B, n_stored, Dv] (activated codes; M*d unprojected)
@@ -2979,40 +3528,60 @@ class GradMemGPT(PreTrainedModel):
         # ---------------------------------------------------------------- #
         mem_batch = last_mem_batch
 
-        if self.mem_proj_mode == "none":
-            mem_inp = mem_batch
-        elif self.mem_proj_mode == "proj":
-            mem_inp = self.mem_proj(mem_batch)
-        elif self.mem_proj_mode == "proj_rw":
-            mem_inp = self.read_mem_proj(mem_batch)
-        else:  # "per_sample"
-            W_read = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1)
-            b_read = self.mem_proj.bias.unsqueeze(0).expand(B, -1)
-            mem_inp = self._apply_linear(mem_batch, W_read, b_read)
-        read_mem_offset = mem_offset
-
-        if self.n_ctrl_tokens > 0:
-            # add params that can control read operation from mem
-            x_qry = torch.cat([read_st_batch, mem_inp, read_end_batch, qry_emb], dim=1)
+        if self.use_linear_state_read:
+            # Linear-state READ (TOKENWISE_READ.md): the bank is folded into
+            # per-head states and injected per layer by the block hooks; the
+            # read sequence drops the memory prefix. Nothing stored -> zero
+            # state -> zero bias (per sample; no fallback prefix in this mode).
+            if self.K and hopfield_stored.any():
+                values_stack = torch.stack(stored_values, dim=1)           # [B, c, M*d] raw
+                masks_stack = torch.stack(stored_masks, dim=1).bool()      # [B, c]
+            else:
+                values_stack = mem_batch_initial.view(B, 1, -1)
+                masks_stack = torch.zeros(B, 1, dtype=torch.bool, device=device)
+            linear_state = self._build_linear_state(values_stack, masks_stack)
+            stats_acc = {}
+            logits_q = self._linear_state_read_logits(
+                qry_emb, query_input_ids, labels, read_st_batch, read_end_batch,
+                linear_state, collect_stats=True,
+                collect_cross_talk=not self.training, stats=stats_acc)
+            self._drain_read_state_stats({'stats': stats_acc}, inner_loop_stats, device)
         else:
-            x_qry = torch.cat([mem_inp, qry_emb], dim=1)                      # [B,M+Q,d]
+            if self.mem_proj_mode == "none":
+                mem_inp = mem_batch
+            elif self.mem_proj_mode == "proj":
+                mem_inp = self.mem_proj(mem_batch)
+            elif self.mem_proj_mode == "proj_rw":
+                mem_inp = self.read_mem_proj(mem_batch)
+            else:  # "per_sample"
+                W_read = self.mem_proj.weight.unsqueeze(0).expand(B, -1, -1)
+                b_read = self.mem_proj.bias.unsqueeze(0).expand(B, -1)
+                mem_inp = self._apply_linear(mem_batch, W_read, b_read)
+            read_mem_offset = mem_offset
 
-        # pad to multiple of 32 for compatibility with JVP Flash Attention
-        if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
-            pad_list = [0, 0, 0, -x_qry.size(1) % 32]
-            x_qry = F.pad(x_qry, pad_list, "constant", 0)
+            if self.n_ctrl_tokens > 0:
+                # add params that can control read operation from mem
+                x_qry = torch.cat([read_st_batch, mem_inp, read_end_batch, qry_emb], dim=1)
+            else:
+                x_qry = torch.cat([mem_inp, qry_emb], dim=1)                      # [B,M+Q,d]
 
-        self._set_phase_adapter("read")
-        logits_q = self.model(inputs_embeds=x_qry).logits                 # [B,M+Q,V]
-        logits_q = logits_q[:, read_mem_offset-1:read_mem_offset+qry_emb.size(1), :]    # [B,Q+1,V]
+            # pad to multiple of 32 for compatibility with JVP Flash Attention
+            if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+                pad_list = [0, 0, 0, -x_qry.size(1) % 32]
+                x_qry = F.pad(x_qry, pad_list, "constant", 0)
+
+            self._set_phase_adapter("read")
+            logits_q = self.model(inputs_embeds=x_qry).logits                 # [B,M+Q,V]
+            logits_q = logits_q[:, read_mem_offset-1:read_mem_offset+qry_emb.size(1), :]    # [B,Q+1,V]
 
         output = {'predictions': logits_q, 'inner_loop_stats': inner_loop_stats}
         if collect_segment_mems:
             output['segment_mems'] = segment_mems if segment_mems is not None else []
             if self.use_hopfield_memory:
                 # final append-only store; a boundary snapshot is the first
-                # n_stored entries (see the snapshot block in the segment loop)
-                output['stored_keys'] = [k.detach() for k in stored_keys]
+                # n_stored entries (see the snapshot block in the segment loop).
+                # Linear-state STORE appends None keys (no segment-key pass).
+                output['stored_keys'] = [k.detach() if k is not None else None for k in stored_keys]
                 output['stored_values'] = [v.detach() for v in stored_values]
                 output['stored_masks'] = [m.detach() for m in stored_masks]
         if return_mem:

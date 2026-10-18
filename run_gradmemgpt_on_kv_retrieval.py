@@ -430,6 +430,16 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
         metrics['gd_S_norm_max'] = float(inner_loop_stats['gd_S_norm_max'].max())
         metrics['gd_S_norm_min'] = float(inner_loop_stats['gd_S_norm_min'].min())
         metrics['gd_n_written_mean'] = float(inner_loop_stats['gd_n_written_mean'].mean())
+    if 'read_state_gate_abs_mean' in inner_loop_stats:
+        # linear-state read diagnostics (all detached scalars from the model;
+        # see grad_memgpt.py _drain_read_state_stats). gate -> 0 = the read is
+        # being switched off; mu_over_x calibrates the injected bias scale;
+        # cross_talk is the interference floor over non-top bank items.
+        metrics['read_state_gate_abs_mean'] = float(inner_loop_stats['read_state_gate_abs_mean'].mean())
+        metrics['read_state_beta_mean'] = float(inner_loop_stats['read_state_beta_mean'].mean())
+        metrics['read_state_mu_over_x_norm_ratio'] = float(inner_loop_stats['read_state_mu_over_x_norm_ratio'].mean())
+    if 'read_state_cross_talk' in inner_loop_stats:
+        metrics['read_state_cross_talk'] = float(inner_loop_stats['read_state_cross_talk'].mean())
     if 'learned_update_delta_norm_mean' in inner_loop_stats:
         metrics['learned_update_delta_norm_mean'] = float(inner_loop_stats['learned_update_delta_norm_mean'].mean())
         metrics['learned_update_delta_norm_max'] = float(inner_loop_stats['learned_update_delta_norm_max'].max())
@@ -1246,6 +1256,21 @@ class ExperimentArgs:
     # The delimiter token ids are auto-filled from the tokenizer.
     pair_aware_segmentation: Optional[bool] = field(default=False)
     pairs_per_segment: Optional[int] = field(default=None)
+    # ---- linear-state per-level read (docs/TOKENWISE_READ.md; default-off) ---- #
+    # Replaces the Hopfield RETRIEVE + memory-prefix READ with per-level
+    # linear-attention reads of the stored bank (requires use_hopfield_memory,
+    # mutually exclusive with use_gated_delta_memory and
+    # hopfield_value_proj_dim). Read modules are outer-loop only; the WRITE
+    # side (per-segment inner loops, STORE) is untouched apart from skipping
+    # the now-unused segment-key compression.
+    use_linear_state_read: Optional[bool] = field(default=False)
+    read_state_heads: Optional[int] = field(default=4)
+    # "all" or comma-separated block indices (e.g. "0,3,6")
+    read_state_layers: Optional[str] = field(default="all")
+    read_state_beta_init: Optional[float] = field(default=1.0)
+    read_state_gate_init: Optional[float] = field(default=0.1)
+    read_state_read_sites: Optional[str] = field(default="all")
+    read_state_exact_softmax: Optional[bool] = field(default=False)
     # Curriculum learning parameters
     curriculum_enabled: Optional[bool] = field(default=False)
     curriculum_threshold: Optional[float] = field(default=0.95)
@@ -1379,7 +1404,7 @@ def main(config_path: Optional[str] = None):
             cfg = yaml.safe_load(f)
 
 # Flatten config to args (YAML values override ExperimentArgs defaults)
-        for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield', 'gated_delta', 'curriculum', 'adaptive']:
+        for section in ['model', 'training', 'dataset', 'gradmem', 'hopfield', 'gated_delta', 'read_linear', 'curriculum', 'adaptive']:
             if section in cfg:
                 for key, value in cfg[section].items():
                     if key == 'stage_overrides':
@@ -1496,6 +1521,12 @@ def main(config_path: Optional[str] = None):
                        tokenizer.convert_tokens_to_ids(':')]
                       if args.pair_aware_segmentation else None)
 
+    # linear-state read: parse the layer subset ("all" or comma-separated ids)
+    if args.read_state_layers.strip().lower() == "all":
+        read_state_layers_arg = "all"
+    else:
+        read_state_layers_arg = [int(t) for t in args.read_state_layers.split(',') if t.strip()]
+
     gradmem_config = GradMemGPTConfig(
         pretrained_model=args.pretrained_model, base_config=config,
         n_mem_tokens=args.n_mem_tokens, K=args.K,
@@ -1569,6 +1600,13 @@ def main(config_path: Optional[str] = None):
         pair_aware_segmentation=args.pair_aware_segmentation,
         pairs_per_segment=args.pairs_per_segment,
         pair_delim_token_ids=pair_delim_ids,
+        use_linear_state_read=args.use_linear_state_read,
+        read_state_heads=args.read_state_heads,
+        read_state_layers=read_state_layers_arg,
+        read_state_beta_init=args.read_state_beta_init,
+        read_state_gate_init=args.read_state_gate_init,
+        read_state_read_sites=args.read_state_read_sites,
+        read_state_exact_softmax=args.read_state_exact_softmax,
     )
 
     # ---- model selection ------------------------------------------------ #
@@ -1580,6 +1618,10 @@ def main(config_path: Optional[str] = None):
     # above (which are ignored if present under adaptive). Routing/collator/
     # metrics are shared -- only the config class + constructor differ.
     use_adaptive_model = isinstance(cfg, dict) and 'adaptive' in cfg if args.config is not None else False
+    if use_adaptive_model and args.use_linear_state_read:
+        raise ValueError(
+            "read_linear.use_linear_state_read is not supported by the adaptive fork "
+            "(grad_memgpt_adaptive.py); it requires the Hopfield STORE of grad_memgpt.py")
     if use_adaptive_model:
         AdaptiveGM, AdaptiveGMConfig = _load_adaptive()
         gradmem_config = AdaptiveGMConfig(

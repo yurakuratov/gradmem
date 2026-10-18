@@ -219,7 +219,7 @@ def generate_run_name_rmt(cfg: Dict[str, Any]) -> str:
 
 # Sections searched when a bare (un-dotted) key is given to the generic builder.
 _KNOWN_SECTIONS = ['model', 'training', 'dataset', 'gradmem', 'rmt', 'hopfield',
-                   'gated_delta', 'curriculum', 'adaptive', 'segmentation']
+                   'gated_delta', 'read_linear', 'curriculum', 'adaptive', 'segmentation']
 
 
 def _resolve_key(cfg: Dict[str, Any], key: str):

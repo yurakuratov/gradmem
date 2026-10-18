@@ -1,0 +1,73 @@
+# The linear-state read ladder on ordered pair concatenation
+# (docs/TOKENWISE_READ.md, "Experimental plan"): hopfield one-shot control,
+# linear-state reads at every position ("all"), the interface-token variant,
+# and the exact-softmax ablation -- plus the single-key regression guard.
+#
+# Dry run (print commands, execute nothing):
+#   python run_scheduler.py manifests/kv_linear_read.yaml --dry-run
+#
+# Run for real:
+#   python run_scheduler.py manifests/kv_linear_read.yaml
+
+max_parallel: 6
+schedule: interleaved
+
+experiments:
+  # (a) current one-shot retrieval -- control (known to fail concat)
+  - name: hopfield_control
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/hopfield.yaml"
+    overrides:
+      gradmem.use_mem_proj: false
+      gradmem.mem_proj_mode: "none"
+      gradmem.add_inner_loss_to_outer: false
+      gradmem.n_mem_tokens: 2
+      segmentation.n_segments: 4
+      model.base_model: llama
+      dataset.data_name: N8-K2V2-V62-S4-ordered_pair_cross_1M
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62-S4-ordered_pair_cross_1M"
+    grid:
+      training.seed: [4378, 43894, 2343]
+
+  # (d) linear-state read, bias at every position
+  - name: linear_all
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/linear_state_read.yaml"
+    overrides:
+      model.base_model: llama
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62-S4-ordered_pair_cross_1M"
+    grid:
+      training.seed: [4378, 43894, 2343]
+
+  # (d') interface-token linear-state read (the read-site ablation)
+  - name: linear_interface
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/linear_state_read_interface.yaml"
+    overrides:
+      model.base_model: llama
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62-S4-ordered_pair_cross_1M"
+    grid:
+      training.seed: [4378, 43894, 2343]
+
+  # (c) exact-softmax memory heads -- isolates superposition-vs-exact
+  - name: linear_exact_softmax
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/linear_state_read.yaml"
+    overrides:
+      read_linear.read_state_exact_softmax: true
+      model.base_model: llama
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62-S4-ordered_pair_cross_1M"
+    grid:
+      training.seed: [4378, 43894, 2343]
+
+  # Regression guard: single-key KV (the task the Hopfield mode already
+  # solves; token-wise reads should not degrade it -- PROGRESS.md missing #4)
+  - name: linear_single_key_regression
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/linear_state_read.yaml"
+    overrides:
+      model.base_model: llama
+      dataset.data_name: N8-K2V2-V62_1M
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62_1M"
+    grid:
+      training.seed: [4378, 43894, 2343]
