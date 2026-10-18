@@ -1865,6 +1865,10 @@ class GradMemGPT(PreTrainedModel):
             pad_len = 32 - T % 32
             x = F.pad(x, [0, 0, 0, pad_len], "constant", 0)
             attn_mask = F.pad(attn_mask, [0, pad_len], "constant", 0)
+            # site_mask must grow with the sequence, else the hooks'
+            # mu * site_mask shape-mismatches at the first instrumented block
+            # (the padded sites are zeroed, so the pads contribute no bias).
+            site_mask = F.pad(site_mask, [0, 0, 0, pad_len], "constant", 0)
         # cumsum-1 clamp: masked positions (blinded target span / pads) must
         # not produce position_id = -1 (same pattern as _compress_query).
         position_ids = (attn_mask.cumsum(-1) - 1).clamp(min=0)

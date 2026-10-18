@@ -7,6 +7,41 @@ rationale), verification status. Current state and hypotheses live in
 **Maintenance rule:** every merged change updates this journal and, when it
 changes the evidence picture, `PROGRESS.md` in the same commit.
 
+## 2026-10-18 (c) — implementation review of 8b69397: verdict + one fix
+
+**Reviewed** — the H3 implementation against
+[`docs/TOKENWISE_READ.md`](docs/TOKENWISE_READ.md) /
+[TOKENWISE_READ_TASK.md](docs/TOKENWISE_READ_TASK.md). Verified in code:
+config validation (all pinned asserts, plus a sensible extra — incompatible
+with `use_gradient_checkpointing`, with rationale), module construction
+(shared bias-free κ/ν, per-layer Q/β/γ/LN, bias-free `W_o` with the S=0
+rationale), state construction (per-head normalized keys, stored-out item
+masking, S=0 for empty banks), hook injection (parallel from the block
+input, tuple/non-tuple outputs, site masks, detached stats, ctx-gated so
+WRITE/compression forwards are untouched), READ rewiring (no-prefix "all"
+mode; interface two-pass with the `labels ≥ 0` blinding; zero-row slicing
+for the unpredictable query position 0), the flag-gated raw-token STORE
+branch (BPTT detach semantics preserved, `stored_keys` None entries
+guarded), eval mirrors (`_read_once_linear`, boundary probes → forgetting
+matrix in all arms), runner/`run_from_config`/run-naming plumbing, configs,
+and the 15-run manifest. Suite rerun independently: 13 new + 61 existing
+green.
+
+**Fixed** — one latent bug: `_linear_read_forward_pass` padded `x` and
+`attn_mask` for the jvp %32 alignment but **not** `site_mask`, so the hooks'
+`mu * site_mask` would shape-mismatch on
+`attn_implementation ∈ {jvp_flash, hvp_semi_manual}` whenever `T % 32 ≠ 0`.
+No config uses those paths today (everything is eager), so nothing was
+broken at runtime — it would have bitten the first second-order jvp run.
+One-line fix (zero-pad `site_mask` alongside) + regression test
+`test_jvp_padding_site_mask_aligned`, verified to fail without the fix and
+pass with it (file now 14 tests).
+
+**Gap for the experiment plan** — ladder arm (b) bank-prefix control is not
+implemented (out of the task's scope by design). It is the H2 decider but
+is only decisive if (d)/(d′) fail; implement it while the 15-run manifest
+executes. PROGRESS missing-experiments rewritten into the run plan.
+
 ## 2026-10-18 (b) — H3 implemented: the linear-state per-level read
 
 **Added** — `use_linear_state_read` in

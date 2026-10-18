@@ -255,6 +255,26 @@ def test_read_sites_masking():
     assert float(diff[:, real_pos, :].abs().max()) > 0.0, "no bias at real read sites"
 
 
+def test_jvp_padding_site_mask_aligned():
+    """The %32 jvp read padding must extend site_mask with the sequence, and
+    the zeroed pad sites must leave the real-position logits unchanged
+    (before the fix the hooks' mu * site_mask shape-mismatched at the first
+    instrumented block as soon as T % 32 != 0)."""
+    model = _make_model()
+    state = _random_state(model, B=1, c=2, seed=5)
+    batch, labels = _inputs()
+    qry = batch["query_input_ids"]
+    qry_emb = model.model.get_input_embeddings()(qry)     # T = 5 -> pad branch fires
+
+    with torch.no_grad():
+        logits_eager = model._linear_state_read_logits(qry_emb, qry, labels, None, None, state)
+        model.attn_implementation = "jvp_flash"           # simulate the padding branch only
+        logits_jvp = model._linear_state_read_logits(qry_emb, qry, labels, None, None, state)
+    assert logits_jvp.shape == logits_eager.shape
+    assert torch.allclose(logits_eager, logits_jvp, atol=1e-5), \
+        (logits_eager - logits_jvp).abs().max()
+
+
 # --------------------------------------------------------------------- #
 # P3 — exact-softmax ablation arm
 # --------------------------------------------------------------------- #
