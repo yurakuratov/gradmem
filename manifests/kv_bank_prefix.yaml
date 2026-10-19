@@ -1,0 +1,20 @@
+# Fast-follow: the bank-prefix control arm (docs/TOKENWISE_READ.md arm (b))
+# alone -- 3 seeds on the ordered-concat data. Submitted while the main
+# ladder (manifests/kv_linear_read.yaml, submitted without this arm) runs;
+# decisive only in the failure branch, so it does not block the ladder.
+#
+#   python run_scheduler.py manifests/kv_bank_prefix.yaml --dry-run
+
+max_parallel: 3
+schedule: interleaved
+
+experiments:
+  - name: bank_prefix_control
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/bank_prefix_read.yaml"
+    overrides:
+      model.base_model: llama
+      dataset.data_name: N8-K2V2-V62-S4-ordered_pair_cross_1M
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62-S4-ordered_pair_cross_1M"
+    grid:
+      training.seed: [4378, 43894, 2343]

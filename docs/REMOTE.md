@@ -13,20 +13,40 @@ From the laptop, in one ssh call per step:
 ```bash
 # 1. sync code (repo root -> remote project dir). data/ and runs/ live on the
 #    remote and are NOT overwritten by this tar (they are excluded); .venv is
-#    rebuilt by the job's `uv sync`.
+#    rebuilt by the job's `uv sync`. *.checkpoint.json is excluded because a
+#    LOCAL dry-run's checkpoint tar-synced to the project dir makes the job's
+#    scheduler abort on a manifest-hash mismatch.
 tar czf - --exclude=.venv --exclude=.git --exclude=runs --exclude=data \
     --exclude=notebooks --exclude=__pycache__ --exclude=.pytest_cache \
-    --exclude=.idea --exclude=.cometml-runs --exclude='*.log' . \
+    --exclude=.idea --exclude=.cometml-runs --exclude='*.log' \
+    --exclude='*.checkpoint.json' . \
   | ssh -o RemoteCommand=none cloud-lolora 'tar xzf - -C /home/jovyan/dzhivelikian/test_time_gd'
 
-# 2. submit (MY_HOME/ME/UV_CACHE_DIR must be exported; the tmux server that
-#    normally carries GWAPI_* is often down — the helper pulls them from the
-#    running jupyter-lab process environment instead)
-ssh -o RemoteCommand=none cloud-lolora 'bash -c "
-  export MY_HOME=/home/jovyan/dzhivelikian ME=dzhivelikian \
-         UV_CACHE_DIR=/home/jovyan/dzhivelikian/.cache/uv
+# 2. submit. The shell MUST have the HF_*/COMET_*/MY_HOME env — .dzhivelikian.bashrc
+#    has an INTERACTIVITY GUARD (case $- in *i*) ;; *) return;; esac), so sourcing it
+#    from a plain `ssh host bash -c '...'` silently sets NOTHING and run.yaml's
+#    "$HF_TOKEN" stays a literal string in the job env (-> 401 GatedRepoError on the
+#    llama config, comet auth broken). Run the submit through an interactive shell:
+ssh -o RemoteCommand=none cloud-lolora 'bash -i -c "
+  source /home/jovyan/dzhivelikian/.dzhivelikian.bashrc
   cd /home/jovyan/dzhivelikian/test_time_gd
   bash /home/jovyan/dzhivelikian/.cr_env.sh submit run.yaml -y"'
+
+#    !! SUBMIT-TIMEOUT FAN-OUT (seen 2026-10-19) !! When the API gateway is
+#    slow, `cr submit` prints "Failed to submit job: API error 0: ... Read
+#    timed out (read timeout=30)" but has CREATED a job per internal retry
+#    attempt server-side (4-8 jobs observed, plus late spawns MINUTES after
+#    the client exited) — all pinned to the ONE run copy made before the
+#    retry loop, so the racing `uv sync`s corrupt the shared .venv.
+#    - NEVER resubmit on that error without first auditing `cr jobs`
+#      (ours are identifiable by description in the platform UI, or by
+#      creation-time clustering right after the submit).
+#    - run.yaml's command starts with a flock guard: `exec 9>.job_lock &&
+#      { flock -n 9 || { echo DUPLICATE_SPAWN_LOCK_HELD_EXITING; exit 0; } }
+#      && ...`. Duplicates self-exit (status "Completed" in ~40 s); exactly
+#      one job runs. KEEP THE GUARD when editing the command.
+#    - Do not `cr kill` jobs without checking the description — the
+#      namespace is shared; other users' jobs look identical in `cr jobs`.
 
 # 3. monitor / fetch artifacts (cr logs can hang; read the run copy instead)
 ssh -o RemoteCommand=none cloud-lolora 'bash /home/jovyan/dzhivelikian/.cr_env.sh status <hash-prefix>'

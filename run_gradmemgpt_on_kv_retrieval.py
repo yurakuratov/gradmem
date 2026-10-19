@@ -1271,6 +1271,9 @@ class ExperimentArgs:
     read_state_gate_init: Optional[float] = field(default=0.1)
     read_state_read_sites: Optional[str] = field(default="all")
     read_state_exact_softmax: Optional[bool] = field(default=False)
+    # bank-prefix control arm (ladder (b)): the whole stored bank as an
+    # ordinary causal prefix at READ -- the recall upper bound deciding H2.
+    use_bank_prefix_read: Optional[bool] = field(default=False)
     # Curriculum learning parameters
     curriculum_enabled: Optional[bool] = field(default=False)
     curriculum_threshold: Optional[float] = field(default=0.95)
@@ -1607,6 +1610,7 @@ def main(config_path: Optional[str] = None):
         read_state_gate_init=args.read_state_gate_init,
         read_state_read_sites=args.read_state_read_sites,
         read_state_exact_softmax=args.read_state_exact_softmax,
+        use_bank_prefix_read=args.use_bank_prefix_read,
     )
 
     # ---- model selection ------------------------------------------------ #
@@ -1618,10 +1622,11 @@ def main(config_path: Optional[str] = None):
     # above (which are ignored if present under adaptive). Routing/collator/
     # metrics are shared -- only the config class + constructor differ.
     use_adaptive_model = isinstance(cfg, dict) and 'adaptive' in cfg if args.config is not None else False
-    if use_adaptive_model and args.use_linear_state_read:
+    if use_adaptive_model and (args.use_linear_state_read or args.use_bank_prefix_read):
         raise ValueError(
-            "read_linear.use_linear_state_read is not supported by the adaptive fork "
-            "(grad_memgpt_adaptive.py); it requires the Hopfield STORE of grad_memgpt.py")
+            "read_linear.use_linear_state_read / use_bank_prefix_read are not supported by "
+            "the adaptive fork (grad_memgpt_adaptive.py); they require the Hopfield STORE "
+            "of grad_memgpt.py")
     if use_adaptive_model:
         AdaptiveGM, AdaptiveGMConfig = _load_adaptive()
         gradmem_config = AdaptiveGMConfig(

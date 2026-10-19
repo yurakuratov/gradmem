@@ -7,6 +7,100 @@ rationale), verification status. Current state and hypotheses live in
 **Maintenance rule:** every merged change updates this journal and, when it
 changes the evidence picture, `PROGRESS.md` in the same commit.
 
+## 2026-10-19 (b) — submission postmortem #2: API-timeout fan-out; flock guard; ladder RUNNING
+
+**What happened** — resubmitting per the (a) postmortem, every `cr submit`
+13:36–14:05 printed "Failed to submit job: API error 0: Request failed after
+4 attempts: Read timed out (read timeout=30)" yet the gateway had created a
+job PER attempt server-side (4–8 observed; late spawns even minutes after the
+client exited — the 13:48 pair, a 14:14 job), ALL pinned to the single
+`.cryri/run_*` copy made before the client's retry loop. The concurrent
+containers raced `uv sync` on the shared `.venv` (log evidence: `failed to
+remove .venv/lib: Directory not empty`) and the scheduler then burned all 18
+runs in ~40 s, each dying with `accelerate: command not found` /
+`ModuleNotFoundError: accelerate.commands.launch`. Two storms (13:36, 13:46)
+plus the 13:48 pair were stopped and their poisoned copies deleted; the
+June-era `stage0` checkpoint leftover was also removed from the remote
+project dir and the code re-synced + md5-verified (run.yaml, manifest,
+grad_memgpt.py, run_scheduler.py, run_from_config.py identical
+local↔remote).
+
+**Fix — flock guard in `run.yaml`** (no retry/timeout knob exists in `cr
+submit`): the job command now begins `exec 9>.job_lock && { flock -n 9 ||
+{ echo DUPLICATE_SPAWN_LOCK_HELD_EXITING; exit 0; }; } && …`. First job to
+start holds the lock; duplicate spawns exit 0 at ~40 s instead of racing the
+venv; real failures still propagate their exit codes (only "lock held" maps
+to 0). Verified live on the 14:05 submit: 5 jobs fanned out → 3 exited
+cleanly within a minute, exactly 1 is running the ladder, 1 (`f23ce671`)
+is wedged in worker boot and can only ever self-exit by the guard (stop it
+manually via the UI if it lingers).
+
+**Current state — the ladder is RUNNING** (first healthy submission): job
+`9a6c630c` on copy `run_2026_10_19_1405_fe03b2` since ~14:07; env correct
+(HF_TOKEN expanded — submitted from an interactive shell with the env, per
+REMOTE.md); scheduler checkpoint shows 6 runs `running` (all arms, seed 0 —
+run_scheduler parallelizes arms on the one GPU) + 12 `pending`; per-run logs
+under `manifests/kv_linear_read.yaml.logs/` advancing with no tracebacks
+(`bank_prefix_control__0` past its step-0 eval, eval_loss 6.12). A 14:14
+Pending job of unknown provenance may be another late spawn — the guard
+covers it if ours. Monitor: `bash .cr_env.sh status 9a6c630c`; do NOT
+resubmit on a submit-timeout error without auditing `cr jobs` + the
+scheduler checkpoint first. Also: never `cr kill` in the shared namespace
+without checking the description — ours are identifiable in the platform UI.
+
+## 2026-10-19 — E2: bank-prefix control arm (b) implemented; E1 ladder submission postmortem
+
+**Added (E2)** — `use_bank_prefix_read` in [`grad_memgpt.py`](grad_memgpt.py):
+ladder arm (b), the recall UPPER BOUND that decides H2. READ prepends ALL
+stored per-segment memory tokens as an ordinary causal prefix
+(`[read_st?, bank, read_end?, query]`; stored-out segments masked from
+attention, cumsum position ids compress over masked slots) — no state, no
+hooks, no mem_proj. Shares the linear-state mode's raw-token STORE
+(`_raw_bank_store`); the read is `_bank_prefix_read_logits` /
+`_read_once_bank_prefix`; `forward_per_segment_eval` serves it, so the
+forgetting matrix works in this arm too. Config guards: mutually exclusive
+with `use_linear_state_read` (and gated delta), requires
+`hopfield_value_proj_dim=None`. Config `bank_prefix_read.yaml`; manifest
+entries: `bank_prefix_control` in `kv_linear_read.yaml` + standalone
+`kv_bank_prefix.yaml` (3 seeds, ordered-concat). Tests +4 (17 in
+`test_grad_memgpt_linear_state_read.py`): predictions equal a manual causal
+forward over `[bank, query]`; the outer gradient reaches `self.mem` through
+plain attention (the arm's write-shaping signal; needs `grad_mode='first'` —
+'none' detaches mem from the outer graph by design); `forward_per_segment_eval`
+boundary-k == truncated forward (EM flags identical); config guards. Local
+GPU smoke green (eval_loss 5.70 @ 2 steps, below the linear arms' 5.79 — the
+prefix workspace helps immediately, as an upper bound should); full suite
+78 passed.
+
+**E1 submission postmortem** — the ladder (`run.yaml` →
+`manifests/kv_linear_read.yaml`) took five failed submissions before the
+current clean, queued state; every failure was submission-workflow, not
+model code (the code behaved exactly as in the local smokes): (1) literal
+`"$HF_TOKEN"` in the job env — `.dzhivelikian.bashrc` has an interactivity
+guard (`case $-`), so sourcing it from non-interactive ssh sets nothing →
+401 GatedRepoError on the gated Llama-3.2-1B config in all 15 runs (fix:
+submit from a shell that actually has the env — interactive shell or a
+dumped-env file); (2) a June-era broken `.venv` in the remote project dir
+was partially copied into run copies → `uv sync` aborts with "not a valid
+Python environment" (fix: moved out of the project dir; NOTE
+`exclude_from_copy` matches `.venv` only, so any `.venv.*` sibling is NOT
+excluded); (3) a LOCAL dry-run's `kv_linear_read.yaml.checkpoint.json`
+tar-synced into the project dir → scheduler aborts on manifest-hash mismatch
+after the manifest edit (fix: deleted remotely, `--exclude='*.checkpoint.json'`
+added to the tar recipe in REMOTE.md); (4) duplicate near-simultaneous
+submissions from hung ssh sessions raced one run copy (two jobs on one
+directory: one's `rm -r .venv` cleanup breaking the other's `uv sync`) and
+the shared-UV_CACHE race produced a venv missing safetensors (18/18 runs
+dead in ~50 s each). Cache validated clean afterwards via a throwaway
+`UV_PROJECT_ENVIRONMENT` sync (safetensors 0.5.3 + transformers 4.53.0
+import fine). All gotchas are now in [`docs/REMOTE.md`](docs/REMOTE.md).
+**Current state:** the remote project dir is submission-ready (no `.venv`,
+no stale checkpoints, 18-run manifest incl. `bank_prefix_control`); the
+clean 12:09 submission was cancelled in the queue during the manual cleanup;
+no ladder job is running — resubmit (`bash .cr_env.sh submit run.yaml -y`
+from a shell with the env) when the queue allows, ONE at a time, and verify
+the job record before retrying.
+
 ## 2026-10-18 (c) — implementation review of 8b69397: verdict + one fix
 
 **Reviewed** — the H3 implementation against

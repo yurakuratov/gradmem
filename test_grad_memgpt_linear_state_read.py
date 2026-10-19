@@ -549,6 +549,108 @@ def test_read_state_layers_subset():
 
 
 # --------------------------------------------------------------------- #
+# Bank-prefix control arm (ladder arm (b), use_bank_prefix_read)
+# --------------------------------------------------------------------- #
+
+def _make_bank_prefix_model(seed=0, **kw):
+    kw.setdefault("hopfield_n_segments", 2)
+    torch.manual_seed(seed)
+    cfg = ModelConfig(
+        base_config=_base_config(), n_mem_tokens=2, K=2, lr=0.05,
+        grad_mode="none",
+        use_hopfield_memory=True,
+        use_bank_prefix_read=True,
+        **kw,
+    )
+    model = Model(cfg)
+    model.eval()
+    return model
+
+
+def test_bank_prefix_read_matches_manual_prefix_forward():
+    """The bank-prefix READ is an ordinary causal forward over
+    [bank, query]: predictions equal that manual construction."""
+    model = _make_bank_prefix_model()
+    inputs, _ = _inputs()
+    with torch.no_grad():
+        out = model.forward(inputs)
+
+    # manual reconstruction: run the WRITE exactly as forward does, then a
+    # plain read forward over [bank, query]
+    fwd = {"context_input_ids": inputs["context_input_ids"],
+           "query_input_ids": inputs["context_input_ids"][:, :1]}
+    with torch.no_grad():
+        full = model.forward(fwd, labels=None, collect_segment_mems=True)
+    values = torch.stack(full['stored_values'], dim=1)            # [1, 2, M*d]
+    masks = torch.stack(full['stored_masks'], dim=1).bool()
+    P = model.n_mem_tokens * model.model.config.n_embd
+    bank = values.view(1, 2, model.n_mem_tokens, P // model.n_mem_tokens).reshape(1, -1, P // model.n_mem_tokens)
+    pmask = masks.unsqueeze(-1).expand(1, 2, model.n_mem_tokens).reshape(1, -1).long()
+    qry = inputs["query_input_ids"]
+    qry_emb = model.model.get_input_embeddings()(qry)
+    attn = torch.cat([pmask, (qry != PAD_ID).long()], dim=1)
+    x = torch.cat([bank, qry_emb], dim=1)
+    position_ids = (attn.cumsum(-1) - 1).clamp(min=0)
+    with torch.no_grad():
+        logits = model.model(inputs_embeds=x, attention_mask=attn,
+                             position_ids=position_ids, return_dict=True).logits
+    manual = Model._slice_read_logits(logits, model.n_mem_tokens * 2, qry.size(1))
+    assert torch.allclose(out['predictions'], manual, atol=1e-5), \
+        (out['predictions'] - manual).abs().max()
+    assert all(k is None for k in full['stored_keys'])
+
+
+def test_bank_prefix_outer_grad_reaches_stored_values():
+    """The control arm's point: the outer loss backpropagates through plain
+    attention INTO the stored values (the write-shaping signal the one-shot
+    mode delivers only through its single mixture). grad_mode='first' keeps
+    the inner graph connected to self.mem ('none' detaches it by design)."""
+    torch.manual_seed(0)
+    cfg = ModelConfig(
+        base_config=_base_config(), n_mem_tokens=2, K=1, lr=0.05,
+        grad_mode="first", use_hopfield_memory=True, hopfield_n_segments=2,
+        use_bank_prefix_read=True)
+    model = Model(cfg)
+    model.train()
+    inputs, labels = _inputs()
+    out = model.forward(inputs, labels=labels)
+    out['loss'].backward()
+    assert model.mem.grad is not None and float(model.mem.grad.abs().sum()) > 0, \
+        "no outer gradient reached self.mem through the bank prefix"
+
+
+def test_bank_prefix_per_segment_eval():
+    """forward_per_segment_eval works in the bank-prefix mode: the boundary-k
+    probe equals a forward that wrote only the first k segments (EM flags)."""
+    model = _make_bank_prefix_model(hopfield_segment_size=16, hopfield_n_segments=1)
+    B = 1
+    ctx = (torch.arange(1, 65).view(B, 64) % 67) + 2
+    q0 = torch.tensor([[BOS_ID, 10, 11, 20, 21]])
+    q2 = torch.tensor([[BOS_ID, 30, 31, 40, 41]])
+    qids = torch.stack([q0, q2], dim=1)
+    tmask = torch.zeros(B, 2, 5, dtype=torch.bool)
+    tmask[:, :, 3:5] = True
+    kv_queries = {'query_input_ids': qids, 'target_mask': tmask,
+                  'seg_idx': torch.tensor([[0, 2]]),
+                  'mask': torch.ones(B, 2, dtype=torch.bool),
+                  'ignore_token_ids': []}
+    src_f, probe_f, em_f = model.forward_per_segment_eval({"context_input_ids": ctx}, kv_queries)
+    ctx_trunc = ctx[:, :32]
+    src_t, probe_t, em_t = model.forward_per_segment_eval({"context_input_ids": ctx_trunc}, kv_queries)
+
+    def triples(src, probe, em, boundary):
+        sel = probe == boundary
+        return {int(s): bool(e) for s, e in zip(src[sel].tolist(), em[sel].tolist())}
+
+    assert probe_f.max() == 3 and probe_t.max() == 1
+    for boundary in (0, 1):
+        tf, tt = triples(src_f, probe_f, em_f, boundary), triples(src_t, probe_t, em_t, boundary)
+        assert tf.keys() == tt.keys(), (boundary, tf, tt)
+        for s in tf:
+            assert tf[s] == tt[s], (boundary, s, tf[s], tt[s])
+
+
+# --------------------------------------------------------------------- #
 # Config guards
 # --------------------------------------------------------------------- #
 
@@ -584,6 +686,14 @@ def test_config_guards():
     with _expect_raises(AssertionError):
         ModelConfig(**common, use_hopfield_memory=True, use_linear_state_read=True,
                     use_gradient_checkpointing=True)
+    with _expect_raises(AssertionError):
+        ModelConfig(**common, use_bank_prefix_read=True)       # requires use_hopfield_memory
+    with _expect_raises(AssertionError):
+        ModelConfig(**common, use_hopfield_memory=True, use_linear_state_read=True,
+                    use_bank_prefix_read=True)                 # mutually exclusive read modes
+    with _expect_raises(AssertionError):
+        ModelConfig(**common, use_hopfield_memory=True, use_bank_prefix_read=True,
+                    hopfield_value_proj_dim=64)                # raw prefix tokens only
     # out-of-range layer index fails at model construction (needs the backbone)
     with _expect_raises(ValueError):
         _make_model(read_state_layers=[5])

@@ -13,6 +13,18 @@ max_parallel: 6
 schedule: interleaved
 
 experiments:
+  # (b) bank-prefix control -- the recall UPPER BOUND deciding H2: if it also
+  # fails concat, write quality is implicated. Added as a fast-follow; also
+  # runnable standalone via manifests/kv_bank_prefix.yaml.
+  - name: bank_prefix_control
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/bank_prefix_read.yaml"
+    overrides:
+      model.base_model: llama
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62-S4-ordered_pair_cross_1M"
+    grid:
+      training.seed: [4378, 43894, 2343]
+
   # (a) current one-shot retrieval -- control (known to fail concat)
   - name: hopfield_control
     command: "python run_from_config.py --config"

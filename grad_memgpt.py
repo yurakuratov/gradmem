@@ -239,6 +239,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  read_state_read_sites="all",
                  read_state_segment_emb=False,
                  read_state_exact_softmax=False,
+                 use_bank_prefix_read=False,
                  **kwargs):
         """
         Args:
@@ -406,6 +407,17 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
                  q @ S_r with exact per-token softmax attention over the unfolded bank
                  softmax(q . K_r^T) @ V_r (O(N) per token, stored-out segments/pads masked).
                  Shares all projections/gates/site masks with the state arm.
+             use_bank_prefix_read: bool, the bank-prefix control arm (TOKENWISE_READ.md ladder
+                 arm (b), the recall UPPER BOUND that decides H2): at READ, prepend ALL stored
+                 per-segment memory tokens to the query as an ordinary causal prefix
+                 ([read_st?, bank, read_end?, query]) and let the frozen backbone attend over
+                 them -- no state, no hooks, no retrieval mixture, O(N) context by design (not
+                 scalable; diagnostic only). Decisive in the failure branch: if the bank prefix
+                 ALSO fails ordered-concat, write quality is implicated (H2 rejected). Requires
+                 use_hopfield_memory; mutually exclusive with use_linear_state_read;
+                 hopfield_value_proj_dim must be None (raw stored tokens). STORE appends raw
+                 mem_batch exactly like the linear-state mode; hopfield_bptt_segments detaches
+                 the prefix tokens as today.
          """
         super().__init__(**kwargs)
 
@@ -524,6 +536,8 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.read_state_read_sites = read_state_read_sites
         self.read_state_segment_emb = read_state_segment_emb
         self.read_state_exact_softmax = read_state_exact_softmax
+        # Bank-prefix control arm (ladder arm (b); see docstring above).
+        self.use_bank_prefix_read = use_bank_prefix_read
 
         # Validate mem_proj_mode settings
         assert mem_proj_mode in ["none", "proj", "per_sample", "proj_rw"]
@@ -715,6 +729,16 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
                 "use_linear_state_read is incompatible with use_gradient_checkpointing " \
                 "(the block hooks must fire during the READ forward; checkpoint recompute would re-run the blocks " \
                 "outside the active read pass and drop the injected bias)"
+        if use_bank_prefix_read:
+            assert use_hopfield_memory, \
+                "use_bank_prefix_read requires use_hopfield_memory=True (it reads the Hopfield STORE bank)"
+            assert not use_gated_delta_memory, \
+                "use_bank_prefix_read is mutually exclusive with use_gated_delta_memory"
+            assert not use_linear_state_read, \
+                "use_bank_prefix_read is mutually exclusive with use_linear_state_read " \
+                "(both replace the READ phase; pick one)"
+            assert hopfield_value_proj_dim is None, \
+                "use_bank_prefix_read requires hopfield_value_proj_dim=None (the prefix is the raw stored tokens)"
 
 
 class GradMemGPT(PreTrainedModel):
@@ -1099,6 +1123,12 @@ class GradMemGPT(PreTrainedModel):
         # inner loop, whose autograd.grad calls only ever target mem_batch /
         # per-sample proj tensors.
         self.use_linear_state_read = getattr(config, "use_linear_state_read", False)
+        # Bank-prefix control arm (ladder arm (b)): shares the linear mode's
+        # raw-token STORE (no segment-key pass, no value encoding) but the
+        # READ prepends the whole bank as an ordinary causal prefix.
+        self.use_bank_prefix_read = getattr(config, "use_bank_prefix_read", False)
+        # Both modes store the RAW post-inner-loop memories (no key/encode work).
+        self._raw_bank_store = self.use_linear_state_read or self.use_bank_prefix_read
         self.read_state_heads = getattr(config, "read_state_heads", 4)
         self.read_state_layers_cfg = getattr(config, "read_state_layers", "all")
         self.read_state_beta_init = getattr(config, "read_state_beta_init", 1.0)
@@ -2003,6 +2033,71 @@ class GradMemGPT(PreTrainedModel):
                                                 state_exp)
         return logits.reshape(B, n_q, Q + 1, -1)
 
+    def _bank_prefix_read_logits(self, qry_emb, query_input_ids,
+                                 read_st_batch, read_end_batch,
+                                 values_stack, masks_stack):
+        """Bank-prefix READ (ladder arm (b)) -> [B, Q+1, V].
+
+        Prepends ALL stored per-segment memory tokens as an ordinary causal
+        prefix ([read_st?, bank, read_end?, query]) and lets the backbone
+        attend over them -- the recall upper bound that decides H2. No state,
+        no hooks, no mem_proj: the raw stored tokens ARE the prefix workspace.
+        Stored-out segments are masked from attention (their token slots keep
+        their positions so the layout stays batch-uniform; cumsum position ids
+        compress over the masked slots). No target-span blinding: like the
+        memory-prefix READ, this pass IS the teacher-forced answering pass.
+        """
+        pad_id = self.model.config.pad_token_id
+        device = qry_emb.device
+        C = self.n_ctrl_tokens
+        B, c, P = values_stack.shape
+        M = self.n_mem_tokens
+        bank = values_stack.view(B, c, M, P // M).reshape(B, c * M, -1)
+        prefix_mask = masks_stack.unsqueeze(-1).expand(B, c, M).reshape(B, c * M).long()
+        query_real = (query_input_ids != pad_id).long()
+        if C > 0:
+            ctrl_ones = torch.ones(B, C, dtype=torch.long, device=device)
+            x = torch.cat([read_st_batch, bank, read_end_batch, qry_emb], dim=1)
+            attn = torch.cat([ctrl_ones, prefix_mask, query_real], dim=1)
+        else:
+            x = torch.cat([bank, qry_emb], dim=1)
+            attn = torch.cat([prefix_mask, query_real], dim=1)
+        read_offset = C + c * M
+        # pad to multiple of 32 for compatibility with JVP Flash Attention
+        T = x.size(1)
+        if self.attn_implementation in ('jvp_flash', 'hvp_semi_manual') and T % 32:
+            pad_len = 32 - T % 32
+            x = F.pad(x, [0, 0, 0, pad_len], "constant", 0)
+            attn = F.pad(attn, [0, pad_len], "constant", 0)
+        position_ids = (attn.cumsum(-1) - 1).clamp(min=0)
+        self._set_phase_adapter("read")
+        out = self.model(inputs_embeds=x, attention_mask=attn,
+                         position_ids=position_ids, return_dict=True)
+        return self._slice_read_logits(out.logits, read_offset, query_input_ids.size(1))
+
+    def _read_once_bank_prefix(self, values_stack, masks_stack, query_input_ids,
+                               read_st_batch, read_end_batch):
+        """Batched bank-prefix READ for the forgetting probes (mirrors _read_once_linear).
+
+        values_stack: [B, c, M*d] raw stored memories as of the probed boundary;
+        query_input_ids: [B, n_q, Q]. Returns logits [B, n_q, Q+1, V].
+        """
+        B, n_q, Q = query_input_ids.shape
+        flat_qids = query_input_ids.reshape(B * n_q, -1)
+        qry_emb = self.model.get_input_embeddings()(flat_qids)           # [B*n_q, Q, d]
+        c = values_stack.size(1)
+        bank = values_stack.unsqueeze(1).expand(-1, n_q, -1, -1).reshape(B * n_q, c, -1)
+        masks = masks_stack.unsqueeze(1).expand(-1, n_q, -1).reshape(B * n_q, c)
+        if self.n_ctrl_tokens > 0:
+            rs = read_st_batch.reshape(B, 1, self.n_ctrl_tokens, -1) \
+                .expand(-1, n_q, -1, -1).reshape(B * n_q, self.n_ctrl_tokens, -1)
+            re_ = read_end_batch.reshape(B, 1, self.n_ctrl_tokens, -1) \
+                .expand(-1, n_q, -1, -1).reshape(B * n_q, self.n_ctrl_tokens, -1)
+        else:
+            rs = re_ = None
+        logits = self._bank_prefix_read_logits(qry_emb, flat_qids, rs, re_, bank, masks)
+        return logits.reshape(B, n_q, Q + 1, -1)
+
     @staticmethod
     def _probe_exact_match(logits, query_ids, target_mask, ignore_token_ids):
         """Per-probe exact-match flag, teacher-forced (mirrors compute_metrics_fn).
@@ -2359,11 +2454,12 @@ class GradMemGPT(PreTrainedModel):
                 probe_here = (seg_idx <= seg_idx_loop) & qmask             # [B, n_q]
                 if not probe_here.any():
                     continue
-                if self.use_linear_state_read:
-                    # Linear-state probe: there is no retrieved pattern to
-                    # compress -- the probe read IS the state read (or interface
-                    # two-pass) against the bank as of this boundary
-                    # (stored_*[:n_stored]), batched over the probe axis.
+                if self._raw_bank_store:
+                    # Bank-read probes: there is no retrieved pattern to
+                    # compress -- the probe read runs against the bank as of
+                    # this boundary (stored_*[:n_stored]), batched over the
+                    # probe axis. Linear-state: the state read (or interface
+                    # two-pass). Bank prefix: the whole bank as the prefix.
                     c = snap['n_stored']
                     if c > 0:
                         values_stack = torch.stack(stored_values[:c], dim=1)
@@ -2371,9 +2467,13 @@ class GradMemGPT(PreTrainedModel):
                     else:
                         values_stack = mem_batch_initial.view(B, 1, -1)
                         masks_stack = torch.zeros(B, 1, dtype=torch.bool, device=device)
-                    state = self._build_linear_state(values_stack, masks_stack)
-                    logits_q = self._read_once_linear(state, qids, read_st_batch,
-                                                      read_end_batch, target_mask=tmask)
+                    if self.use_linear_state_read:
+                        state = self._build_linear_state(values_stack, masks_stack)
+                        logits_q = self._read_once_linear(state, qids, read_st_batch,
+                                                          read_end_batch, target_mask=tmask)
+                    else:
+                        logits_q = self._read_once_bank_prefix(
+                            values_stack, masks_stack, qids, read_st_batch, read_end_batch)
                 else:
                     mem_det = self._probe_boundary_memory(
                         snap, stored_keys, stored_values, stored_masks,
@@ -3161,13 +3261,14 @@ class GradMemGPT(PreTrainedModel):
 
                     # Per-segment Hopfield STORE
                     if self.use_hopfield_memory and seg_has_tokens.any():
-                        if self.use_linear_state_read:
-                            # Raw-token STORE for the linear-state read
-                            # (TOKENWISE_READ.md): values are the raw
-                            # post-inner-loop memories, no value encoding
-                            # (hopfield_value_proj_dim is None by assertion)
-                            # and no segment-key forward pass -- the read
-                            # builds token-level keys from the bank itself.
+                        if self._raw_bank_store:
+                            # Raw-token STORE for the bank-read modes (linear
+                            # state / bank prefix; TOKENWISE_READ.md): values
+                            # are the raw post-inner-loop memories, no value
+                            # encoding (hopfield_value_proj_dim is None by
+                            # assertion) and no segment-key forward pass -- the
+                            # linear read builds token-level keys from the bank
+                            # itself, the bank prefix uses the tokens directly.
                             # hopfield_bptt_segments detaches the raw tensors
                             # exactly as it detaches keys/values today.
                             value_code = mem_batch.view(B, -1)            # [B, M*d]
@@ -3382,11 +3483,11 @@ class GradMemGPT(PreTrainedModel):
 
         qry_emb = self.model.get_input_embeddings()(query_input_ids)          # [B,Q,d]
         # ---------------------------------------------------------------- #
-        # Hopfield RETRIEVE phase (if enabled; skipped entirely by the
-        # linear-state read -- its one-shot mixture is what that mode replaces)
+        # Hopfield RETRIEVE phase (if enabled; skipped by the bank-read modes
+        # -- the one-shot mixture is what they replace)
         # ---------------------------------------------------------------- #
         if self.use_hopfield_memory and self.K and hopfield_stored.any() \
-                and not self.use_linear_state_read:
+                and not self._raw_bank_store:
             # Stack stored keys and values for attention-based retrieval
             keys = torch.stack(stored_keys, dim=1)      # [B, n_stored, M*d] (Dv when value-as-key)
             values = torch.stack(stored_values, dim=1)  # [B, n_stored, Dv] (activated codes; M*d unprojected)
@@ -3550,6 +3651,20 @@ class GradMemGPT(PreTrainedModel):
                 linear_state, collect_stats=True,
                 collect_cross_talk=not self.training, stats=stats_acc)
             self._drain_read_state_stats({'stats': stats_acc}, inner_loop_stats, device)
+        elif self.use_bank_prefix_read:
+            # Bank-prefix READ (ladder arm (b)): the recall upper bound -- the
+            # whole bank as an ordinary causal prefix. Nothing stored -> the
+            # prefix slots are masked out (equivalent to no prefix; no
+            # fallback memory in this mode).
+            if self.K and hopfield_stored.any():
+                values_stack = torch.stack(stored_values, dim=1)           # [B, c, M*d] raw
+                masks_stack = torch.stack(stored_masks, dim=1).bool()      # [B, c]
+            else:
+                values_stack = mem_batch_initial.view(B, 1, -1)
+                masks_stack = torch.zeros(B, 1, dtype=torch.bool, device=device)
+            logits_q = self._bank_prefix_read_logits(
+                qry_emb, query_input_ids, read_st_batch, read_end_batch,
+                values_stack, masks_stack)
         else:
             if self.mem_proj_mode == "none":
                 mem_inp = mem_batch
