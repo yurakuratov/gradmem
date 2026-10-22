@@ -7,6 +7,196 @@ rationale), verification status. Current state and hypotheses live in
 **Maintenance rule:** every merged change updates this journal and, when it
 changes the evidence picture, `PROGRESS.md` in the same commit.
 
+## 2026-10-22 — LADDER + CONDITIONING-ABLATION RESULTS: every per-token read solves concat; query-blindness kills the interface read (pre-registered prediction HOLDS)
+
+**Collected** — all 21 experiments (7 arms × 3 seeds) of
+`zhekahauska/gradmem-linear-read` via the new
+[`scripts/collect_comet_results.py`](scripts/collect_comet_results.py)
+(summaries: `docs/results/results.json`, curves: `docs/results/
+em_curves.json`). Stopping protocol (user): runs reaching EM 1.0 ended at
+their threshold (exact-softmax, 47–76k steps); every other run manually
+stopped after >80k steps — the failing arms are flat with no trend at their
+stop points. **Report (with schematic read-method diagrams + EM-curve
+figure):** [`docs/READ_LADDER_RESULTS.md`](docs/READ_LADDER_RESULTS.md);
+figures regenerable via `scripts/make_read_schematics.py` /
+`scripts/make_em_figure.py`.
+
+**Best two-key both-values EM, ordered-concat (mean over seeds 4378/43894/
+2343):** hopfield one-shot 0.248; bank-prefix control 0.024; exact-softmax
+1.000 (all seeds, by 19.5–29k steps); linear-state all-positions 0.997;
+interface conditioned **0.999**; interface query-blind **0.012**.
+Single-key regression arm (linear-state config on single-key data): EM
+0.997–0.9986.
+
+**Pre-registered prediction verdict — HOLDS.** The query-blind arm
+underperforms the conditioned interface on every seed (Δ > 0.98: 0.0026 vs
+0.9988, 0.0202 vs 0.9998, 0.0126 vs 0.9986). Mechanism as predicted: the
+blind arm's reads stay active and calibrated (gate 0.18–0.25, ‖μ‖/‖x‖ and
+β like the conditioned arm) but the fixed M·d channel carries
+query-agnostic content — per-value EM ≈ 0.04–0.14, joint ≈ v1·v2 ≈ 0.01,
+eval loss never fits (0.67–1.18 vs 0.0003–0.0011). The causality trap is
+now empirically demonstrated; **pass 1 conditioning is load-bearing and the
+two-pass machinery is justified.** Honest gap: the prediction's single-key
+clause is untested directly (the ablation manifest has no single-key-data
+arm by design); the nearest proxies (probe-format forgetting matrices,
+`two_key_both_single_exact_match` 0.013–0.279 → 0.0004–0.0012) both collapse
+for the blind arm.
+
+**Ladder decisions (spec § Experimental plan):** (b) fails harder than (a)
+while (c)/(d)/(d′) hit 1.00/0.997/0.999 on the SAME stored tokens ⇒ the
+bank-prefix failure indicts the prefix interface, not write quality
+(confirming the 2026-10-20 interim reading; H2 stands). (d) vs (b): the
+folded O(1) state solves what the O(N) prefix cannot. (c) vs (d): exact
+attention converges ~1.5× faster; superposition costs sample efficiency, not
+accuracy at N = 8 bank items (interference-vs-N curve decides at scale).
+(d′) vs (d): M·L query-conditioned interface reads match all-position reads
+(most seed-consistent solver: 30.5–31.5k steps to 0.99) — per-token reads
+are NOT needed, given pass 1.
+
+**Caveat recorded** — the per-segment forgetting matrices probe with
+single-key `?!K:V!|` queries, which concat-trained arms never see in
+training: for these arms the matrices measure format transfer, not
+forgetting (exact-softmax seed spread 0.34–1.00 diag is variance, not loss;
+no arm degrades within training). A concat-format forgetting probe is the
+honest instrument going forward (added to PROGRESS missing experiments).
+
+## 2026-10-20 (b) — query-blind interface baseline implemented (`read_state_interface_conditioning`)
+
+**Added** — `read_state_interface_conditioning: bool = True` in
+[`grad_memgpt.py`](grad_memgpt.py) per
+[`docs/INTERFACE_CONDITIONING_TASK.md`](docs/INTERFACE_CONDITIONING_TASK.md):
+in the interface read mode, `false` skips the pass-1 conditioning forward
+ENTIRELY and answers pass 2 with the raw learnable `M_0` (the query-blind
+"left-prefix causal" cell of the conditioning ablation — the spec's
+causality-trap configuration, run deliberately). `_linear_state_read_logits`
+hoists `m0`/`mem_ones` and branches: conditioning on = the unchanged two-pass;
+off = `iface = m0`, one read forward instead of two, `return_interface`
+returns the raw `M_0` broadcast, labels/target_mask unused (signature kept),
+stats accumulate from pass 2 only. Validation: `false` requires
+`use_linear_state_read` AND `read_state_read_sites == "interface"`. Plumbing:
+runner argparse field + pass-through (mirrors `read_state_read_sites`);
+`run_from_config.py` flattening needed no change (verified). Manifest
+`manifests/kv_interface_conditioning.yaml`: ONE experiment
+`linear_interface_nocond` (interface config, override
+`read_linear.read_state_interface_conditioning: false`, llama + the ladder's
+ordered-concat dataset path, seeds 4378/43894/2343, `max_parallel: 3`),
+paired at analysis time with the ladder's `linear_interface` runs — the
+conditioned arm is NOT duplicated. Write side untouched; flag-off/default
+behavior unchanged.
+
+**Fix (latent, found by the GPU smoke)** — `run_from_config.py` forwards a
+top-level `run_name_suffix` as a CLI flag (line ~193) but the runner's
+`ExperimentArgs` never declared it, so the FIRST config/manifest to use the
+suffix would have died in HfArgumentParser ("Some specified arguments are not
+used"). No existing config used it — the new manifest is the first. Added the
+optional `run_name_suffix: Optional[str] = None` field (the runner reads the
+suffix from the merged yaml via `generate_run_name`; the field only makes the
+forwarded arg parseable).
+
+**Run-naming deviation** — the brief suggested a `run_naming` `icond` key so
+dirs show `...icondFalse...`; `generate_run_name._format_value` skips
+False-valued keys by pinned design ("negative flags don't add information"),
+so that route would have left the blind arm UNNAMED while renaming any future
+conditioned rerun (`icond` for True). Used a manifest-level
+`run_name_suffix: icondFalse` override instead: exactly the recommended
+`...icondFalse...` dir suffix, zero naming drift for every other arm
+(dry-run-verified: `ns4_m2_K2_hopfield_lsr_sitesinterface_rh4_icondFalse`).
+
+**Tests** — `test_grad_memgpt_linear_state_read.py` +4 (21 total):
+`test_interface_no_conditioning_uses_raw_m0` (exactly ONE read forward via a
+block-0 invocation count — flipping the knob back on gives two; `return_interface`
+IS `M_0`; pass-2 block-0 inputs at the interface positions are `M_0` + wpe),
+`test_interface_no_conditioning_query_blind` (inversion of the query-sensitivity
+test: non-target query perturbation leaves the interface embeddings AND the
+interface-position logit row bitwise unchanged — with teeth: answering rows
+change), `test_interface_conditioning_default_unchanged` (config default True;
+an old config WITHOUT the attribute loads via the getattr default; pass 1
+transforms M_0), `test_interface_conditioning_config_guards` (both asserts
+fire; valid cell constructs). Full suite: 82 passed
+(`uv run --extra dev pytest`). Dry-runs clean: `run_from_config.py` with the
+override (flag flattened, name suffixed), `run_scheduler.py
+manifests/kv_interface_conditioning.yaml --dry-run` = exactly 3 runs. GPU
+smoke (2 steps, batch 8, gpt2 smoke dataset): the nocond arm trains, logs
+`train_/eval_read_state_*`, and writes `forgetting_matrix_step*.json/csv`
+(artifacts under `runs/default/..._icondFalse_smoke`, log
+`/tmp/kv_smoke_logs/interface_nocond.log`).
+
+**Pre-registered prediction (recorded BEFORE submission, no results exist
+yet):** the query-blind arm underperforms the conditioned interface arm on
+BOTH the two-key concat exact-match and single-key exact-match, because
+retrieval degrades to query-agnostic compression through the fixed M·d
+channel. Either outcome is informative — prediction holds ⇒ conditioning is
+load-bearing and the two-pass machinery is justified (an empirical
+demonstration of the causality trap); prediction fails ⇒ pass 1 can be
+dropped, halving the interface arm's read compute.
+
+**Submitted — job `9fa451fc`** (`lm-mpi-job-9fa451fc-f9db-47b5-8852-ee7cb256fcd4`,
+submitted 2026-10-20 17:51 from an interactive shell with the env, clean
+single-job response; run copy `.cryri/run_2026_10_20_1751_e1bc5e`; the ladder
+job `9a6c630c` was left untouched and Running — concurrent submission
+approved by the ladder's owner). Pre-submission remote checks: tar-synced
+with the REMOTE.md recipe (incl. `*.checkpoint.json` exclude; a LOCAL
+dry-run checkpoint the new scheduler had written was deleted, not synced);
+remote `run.yaml` verified (flock guard intact, command →
+`manifests/kv_interface_conditioning.yaml`, description
+"interface-conditioning-ablation nocond", md5 parity on
+grad_memgpt.py / runner / run_from_config.py / manifest, no `.venv`, no
+stale checkpoints). Fan-out audit: exactly one job created at submit time;
+three later jobs (#192–194, 18:00–18:12) could NOT be positively identified
+as ours via the CLI (no description exposed) and were left alone per the
+don't-stop-unidentified rule — if any are our late spawns, the flock guard
+self-exits them before `uv sync`; ours holds the lock and is Running.
+
+**Early gate (step ~1000–1400, all 3 seeds `linear_interface_nocond__{0,1,2}`,
+from the run copy's logs): PASS.** `read_state_gate_abs_mean` ≈ 0.1002 (init
+0.1 — no collapse); eval_loss falling on every seed (≈4.97 → ≈4.39 / 4.41 /
+4.52); zero tracebacks; the nocond flag confirmed live in the run commands
+and the exp dirs carry the `icondFalse` marker.
+`read_state_mu_over_x_norm_ratio` ≈ 0.002 — below the ~0.05–0.5 watchlist
+band as an ABSOLUTE value, but calibrated against the ladder's own
+`linear_interface` arm this is its normal early trajectory (that arm read
+0.00066 at the same age and only ~0.022 after ~24 h, while reportedly solving
+concat; the band evidently describes the mature regime) — the nocond arm sits
+~2–3× HIGHER than its conditioned sibling at the same age and is rising.
+Not a gate failure; collected results remain the decider. Expected finish:
+~3–4 days at ~1 step/s if run to 300k max steps; earlier per-run if
+early_stopping_patience (250 evals) fires. **`run.yaml` currently points at
+`manifests/kv_interface_conditioning.yaml`** — flip it back to
+`manifests/kv_linear_read.yaml` before any ladder resubmission.
+
+## 2026-10-20 — query-blind interface baseline: executor brief (+ interim ladder note)
+
+**Interim observation (single-source, results not yet collected/verified):**
+in the running ladder (job `9a6c630c`), the linear-state arms reportedly do
+very well on ordered-concat while the **bank-prefix control fails
+completely**. Two consequences if it holds across seeds: (1) linear read
+beating the hopfield control with the identical write path is a clean
+causal isolation of the read interface (H2's mechanism); (2) bank-prefix
+failing is *against* its pre-agreed role as the recall upper bound — and
+since (d) succeeds with the SAME stored tokens, its failure indicts the
+prefix interface (frozen reader + raw-token prefix at training scale), not
+write quality. The decision tree's step-1 inference ("(b) fails ⇒ H2
+rejected") is therefore unsound as stated; treat (b) as measuring the
+prefix interface, not write quality. Collect before concluding.
+
+**Added** — [`docs/INTERFACE_CONDITIONING_TASK.md`](
+docs/INTERFACE_CONDITIONING_TASK.md): executor brief for the third cell of
+the interface conditioning ablation — `read_state_interface_conditioning:
+false` skips the pass-1 conditioning and answers with raw `M_0` (the
+query-blind "left-prefix causal" configuration from the spec's
+causality-trap analysis). Contract: config knob + validation, skip-pass-1
+in `_linear_state_read_logits` (`return_interface` returns `M_0`), 4 named
+tests (raw-M₀ use incl. a one-read-forward count, inverted
+query-sensitivity, default-unchanged guard, config guards), new manifest
+`manifests/kv_interface_conditioning.yaml` (3 seeds, paired with the
+ladder's `linear_interface` runs), and a phased remote submission aligned
+with the postmortem discipline (interactive-shell env, `*.checkpoint.json`
+tar-exclude, flock guard preserved, fan-out audit after any submit
+timeout, ladder job untouched). **Pre-registered prediction (to be
+recorded at submission, before results):** the query-blind arm underperforms
+the conditioned interface on both two-key and single-key EM; either outcome
+is informative.
+
 ## 2026-10-19 (b) — submission postmortem #2: API-timeout fan-out; flock guard; ladder RUNNING
 
 **What happened** — resubmitting per the (a) postmortem, every `cr submit`

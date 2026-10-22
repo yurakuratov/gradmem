@@ -23,6 +23,11 @@ Locks in the use_linear_state_read feature (docs/TOKENWISE_READ.md):
       outer-loss gradients while the inner loop succeeds unchanged.
   9.  collect_segment_mems purity in the new mode; None keys.
   10. Config guards: mutual exclusions and required fields.
+  11. The interface conditioning ablation's query-blind cell
+      (read_state_interface_conditioning=False): no pass-1 forward, the raw
+      M_0 is the pass-2 interface embeddings (query-blind by construction),
+      the config default keeps the conditioned two-pass behavior, and the
+      new config guards fire.
 
 Run two ways:
     python test_grad_memgpt_linear_state_read.py   # self-contained
@@ -402,6 +407,121 @@ def test_interface_read_sites():
     t2 = captures_on[-1].size(1)
     assert float(d2[:, :C, :].abs().max()) == 0.0
     assert float(d2[:, C:C + M, :].abs().max()) > 0.0
+
+
+# --------------------------------------------------------------------- #
+# P4b — interface conditioning ablation, query-blind cell
+# (read_state_interface_conditioning=False; docs/INTERFACE_CONDITIONING_TASK.md)
+# --------------------------------------------------------------------- #
+
+def test_interface_no_conditioning_uses_raw_m0():
+    """Knob off: NO pass-1 forward fires, return_interface IS the raw M_0
+    (broadcast), and the pass-2 interface positions' block-0 inputs are M_0
+    (+ position embeddings -- the block input adds wpe)."""
+    model = _make_model(read_sites="interface", read_state_interface_conditioning=False)
+    qry = torch.tensor([[BOS_ID, 66, 40, 68, 69]])
+    labels = torch.full((1, 5), -100, dtype=torch.long)
+    labels[:, 3:5] = qry[:, 3:5]
+
+    block_inputs = []
+    block0 = _gmm.get_backbone(model.model).h[0]
+
+    def spy(store):
+        def _spy(module, args, kwargs, output):
+            x = args[0] if args else kwargs.get('hidden_states')
+            store.append(x.detach().clone())
+            return None
+        return _spy
+
+    h = block0.register_forward_hook(spy(block_inputs), with_kwargs=True)
+    with torch.no_grad():
+        logits, iface = _iface_call(model, qry, labels)
+    h.remove()
+
+    # exactly ONE read forward (with conditioning on it is two: see below)
+    assert len(block_inputs) == 1
+    M = model.n_mem_tokens
+    m0 = model.read_state_interface_mem.unsqueeze(0)                 # [1, M, d]
+    assert torch.equal(iface, m0), "return_interface is not the raw M_0"
+    # pass-2 block-0 input at the interface positions == M_0 + wpe (GPT-2 adds
+    # position embeddings before the blocks; embd_pdrop=0 in the test config)
+    wpe = _gmm.get_backbone(model.model).wpe
+    wpe_rows = wpe(torch.arange(M))                          # positions 0..M-1
+    assert torch.equal(block_inputs[0][:, :M, :], m0 + wpe_rows.unsqueeze(0))
+    assert logits.shape[1] == qry.size(1) + 1
+
+    # the count has teeth: flipping the knob back on re-introduces pass 1
+    model.read_state_interface_conditioning = True
+    h = block0.register_forward_hook(spy(block_inputs), with_kwargs=True)
+    with torch.no_grad():
+        _, iface_cond = _iface_call(model, qry, labels)
+    h.remove()
+    assert len(block_inputs) == 3                                    # +2 (two passes)
+    assert not torch.equal(iface_cond, m0.expand_as(iface_cond))     # conditioned states
+
+
+def test_interface_no_conditioning_query_blind():
+    """The inversion of test_interface_query_sensitivity: with the knob off,
+    perturbing NON-target query tokens leaves the interface embeddings (the
+    raw M_0) and the interface-position logit rows bitwise unchanged -- the
+    left-prefix causal configuration the spec's causality trap describes."""
+    model = _make_model(read_sites="interface", read_state_interface_conditioning=False)
+    qry = torch.tensor([[BOS_ID, 66, 40, 68, 69]])
+    labels = torch.full((1, 5), -100, dtype=torch.long)
+    labels[:, 3:5] = qry[:, 3:5]
+    with torch.no_grad():
+        logits_a, iface_a = _iface_call(model, qry, labels)
+        qry_pert = qry.clone()
+        qry_pert[0, 1] = 55                                          # OUTSIDE the span
+        logits_b, iface_b = _iface_call(model, qry_pert, labels)
+    assert torch.equal(iface_a, iface_b), "raw M_0 interface embeddings saw the query"
+    m0 = model.read_state_interface_mem.unsqueeze(0)
+    assert torch.equal(iface_a, m0.expand_as(iface_a))
+    # sliced row 0 = the read sequence's LAST interface position (read_offset
+    # C+M=2, so the slice starts at row C+M-1=1): its causal past is
+    # interface-only, hence query-independent in this mode
+    assert torch.equal(logits_a[:, :1, :], logits_b[:, :1, :])
+    # the perturbation is not a no-op overall (the answering rows see it)
+    assert not torch.equal(logits_a, logits_b)
+
+
+def test_interface_conditioning_default_unchanged():
+    """Default True keeps the conditioned two-pass behavior: the config
+    defaults the knob to True, an old config WITHOUT the attribute still
+    loads (getattr default True), and pass 1 transforms M_0."""
+    torch.manual_seed(0)
+    cfg = ModelConfig(
+        base_config=_base_config(), n_mem_tokens=2, K=2, lr=0.05,
+        grad_mode="none", use_hopfield_memory=True, hopfield_n_segments=2,
+        use_linear_state_read=True, read_state_read_sites="interface")
+    assert cfg.read_state_interface_conditioning is True
+    # simulate a config from before the knob existed
+    delattr(cfg, "read_state_interface_conditioning")
+    model = Model(cfg)
+    assert model.read_state_interface_conditioning is True
+    model.eval()
+    qry = torch.tensor([[BOS_ID, 66, 40, 68, 69]])
+    labels = torch.full((1, 5), -100, dtype=torch.long)
+    labels[:, 3:5] = qry[:, 3:5]
+    with torch.no_grad():
+        _, iface = _iface_call(model, qry, labels)
+    m0 = model.read_state_interface_mem.unsqueeze(0)
+    assert not torch.equal(iface, m0.expand_as(iface)), \
+        "default (conditioning on) returned the raw M_0 -- pass 1 did not run"
+
+
+def test_interface_conditioning_config_guards():
+    """read_state_interface_conditioning=False requires the linear-state read
+    AND read_sites='interface' (there is no pass 1 to skip otherwise)."""
+    base = _base_config()
+    common = dict(base_config=base, n_mem_tokens=2, K=1, grad_mode="none")
+    with _expect_raises(AssertionError):
+        ModelConfig(**common, read_state_interface_conditioning=False)  # no linear read
+    with _expect_raises(AssertionError):
+        ModelConfig(**common, use_hopfield_memory=True, use_linear_state_read=True,
+                    read_state_interface_conditioning=False)            # sites="all"
+    # the valid cell constructs
+    _make_model(read_sites="interface", read_state_interface_conditioning=False)
 
 
 # --------------------------------------------------------------------- #

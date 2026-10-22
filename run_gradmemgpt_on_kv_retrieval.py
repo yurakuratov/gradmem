@@ -1138,6 +1138,10 @@ class ExperimentArgs:
     exp_path: Optional[str] = field(default=None)
     runs_dir: Optional[str] = field(default=None)
     run_name: Optional[str] = field(default=None)
+    # Forwarded by run_from_config.py when set (it appends to the auto run
+    # name via generate_run_name, which reads it from the merged yaml here);
+    # declared only so the forwarded arg parses.
+    run_name_suffix: Optional[str] = field(default=None)
     per_device_batch_size: int = field(default=64)
     data_path: str = field(default='./data/N2-K4V4-S4(32-64)_1M')
     tokenizer_path: str = field(default='./tokenizers/kv_alphabet_62/')
@@ -1270,6 +1274,10 @@ class ExperimentArgs:
     read_state_beta_init: Optional[float] = field(default=1.0)
     read_state_gate_init: Optional[float] = field(default=0.1)
     read_state_read_sites: Optional[str] = field(default="all")
+    # Query-blind cell of the interface conditioning ablation: skip the
+    # interface pass-1 and answer with the raw learnable M_0 (requires
+    # use_linear_state_read + read_state_read_sites="interface").
+    read_state_interface_conditioning: Optional[bool] = field(default=True)
     read_state_exact_softmax: Optional[bool] = field(default=False)
     # bank-prefix control arm (ladder (b)): the whole stored bank as an
     # ordinary causal prefix at READ -- the recall upper bound deciding H2.
@@ -1609,6 +1617,7 @@ def main(config_path: Optional[str] = None):
         read_state_beta_init=args.read_state_beta_init,
         read_state_gate_init=args.read_state_gate_init,
         read_state_read_sites=args.read_state_read_sites,
+        read_state_interface_conditioning=args.read_state_interface_conditioning,
         read_state_exact_softmax=args.read_state_exact_softmax,
         use_bank_prefix_read=args.use_bank_prefix_read,
     )

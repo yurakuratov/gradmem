@@ -6,7 +6,7 @@ container:
   # attempt, ALL pinned to this same run copy, and the racing `uv sync`s
   # corrupt the shared .venv. First job to start holds .job_lock; duplicates
   # exit 0 immediately (see DUPLICATE_SPAWN in the job log).
-  command: 'exec 9>.job_lock && { flock -n 9 || { echo DUPLICATE_SPAWN_LOCK_HELD_EXITING; exit 0; }; } && python -m pip install --user uv && $HOME/.local/bin/uv cache dir && $HOME/.local/bin/uv sync && $HOME/.local/bin/uv run python run_scheduler.py manifests/kv_linear_read.yaml && rm -r .venv'
+  command: 'exec 9>.job_lock && { flock -n 9 || { echo DUPLICATE_SPAWN_LOCK_HELD_EXITING; exit 0; }; } && python -m pip install --user uv && $HOME/.local/bin/uv cache dir && $HOME/.local/bin/uv sync && $HOME/.local/bin/uv run python run_scheduler.py manifests/kv_interface_conditioning.yaml && rm -r .venv'
 
   # ENV vars
   environment:
@@ -46,4 +46,4 @@ cloud:
   n_workers: 1
   
   # Job description
-  description: "kv-linear-read ladder"
+  description: "interface-conditioning-ablation nocond"

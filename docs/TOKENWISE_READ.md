@@ -209,6 +209,16 @@ changes the output interface, rejected.
   retrieved mixture. `mem_proj`, ctrl tokens, and reader training all carry
   over — the "closer architecturally" rationale in its strongest form.
 
+**Conditioning ablation — the query-blind cell is implemented**
+(`read_state_interface_conditioning: false`; no pass-1 forward at all, pass 2
+answers with the raw learnable $M_0$): this is exactly the *left-prefix
+causal* configuration above, run deliberately as the third cell of the
+conditioning ablation. Manifest:
+[manifests/kv_interface_conditioning.yaml](../manifests/kv_interface_conditioning.yaml)
+(3 seeds, paired with the ladder's `linear_interface` runs); executor brief:
+[INTERFACE_CONDITIONING_TASK.md](INTERFACE_CONDITIONING_TASK.md); the
+pre-registered prediction is journaled in STATUS.md at submission time.
+
 ### Gains / risks vs the read-everywhere design
 
 **Gains.** Read sites $M{\cdot}L$ instead of $T{\cdot}L{\cdot}H_r$ — compute
@@ -286,6 +296,7 @@ requires the Hopfield STORE):
 | `read_state_heads` | 4 | $H_r$ (wider heads than the backbone's are fine and reduce cross-talk) |
 | `read_state_layers` | `"all"` | which blocks instrument; list of indices to restrict |
 | `read_state_read_sites` | `"all"` | `all` = bias at every position; `interface` = only on the $M$ learnable interface tokens (Variant above; count = `n_mem_tokens`, two-pass layout) |
+| `read_state_interface_conditioning` | `true` | interface mode only; `false` = the conditioning ablation's **query-blind cell** — skip pass 1 entirely, answer pass 2 with the raw learnable $M_0$ (requires `read_state_read_sites: "interface"`) |
 | `read_state_beta_init` | 1.0 | initial retrieval sharpness per layer |
 | `read_state_gate_init` | 0.1 | initial $\gamma^\ell$ |
 | `read_state_segment_emb` | `false` | optional learnable per-segment embedding added before $\kappa/\nu$ |

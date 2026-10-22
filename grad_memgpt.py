@@ -237,6 +237,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  read_state_beta_init=1.0,
                  read_state_gate_init=0.1,
                  read_state_read_sites="all",
+                 read_state_interface_conditioning=True,
                  read_state_segment_emb=False,
                  read_state_exact_softmax=False,
                  use_bank_prefix_read=False,
@@ -400,6 +401,15 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
                  tokens (count = n_mem_tokens, two-pass layout: pass 1 conditions [query
                  (target-span blinded), M_0] with the reads on; pass 2 answers
                  [read_st?, interface, read_end?, query] with the pass-1 interface states).
+             read_state_interface_conditioning: bool, only read_sites="interface" (default True).
+                 False = the query-blind cell of the interface conditioning ablation: pass 1 is
+                 skipped entirely and the raw learnable M_0 is the pass-2 interface embeddings.
+                 Sitting at the left of the answering pass and causal, the interface tokens can
+                 then never see the query -- their per-level state reads are query-agnostic (the
+                 "left-prefix causal" configuration from the spec's placement/causality trap).
+                 Requires use_linear_state_read with read_state_read_sites="interface"; with it
+                 off, return_interface returns the raw M_0 (broadcast), labels/target_mask are
+                 unused, and stats accumulate from pass 2 only.
              read_state_segment_emb: stub (must stay False in v1): optional learnable per-segment
                  embedding before kappa/nu. Not implemented -- the per-segment count is dynamic
                  (pair-aware / segment_size modes), so the parameter would need lazy sizing.
@@ -534,6 +544,7 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         self.read_state_beta_init = read_state_beta_init
         self.read_state_gate_init = read_state_gate_init
         self.read_state_read_sites = read_state_read_sites
+        self.read_state_interface_conditioning = read_state_interface_conditioning
         self.read_state_segment_emb = read_state_segment_emb
         self.read_state_exact_softmax = read_state_exact_softmax
         # Bank-prefix control arm (ladder arm (b); see docstring above).
@@ -695,6 +706,15 @@ hopfield_value_proj_dim: int|None, dimension for value projection in Hopfield ST
         # Validate linear-state read settings (TOKENWISE_READ.md).
         assert read_state_read_sites in ("all", "interface"), \
             f"read_state_read_sites must be 'all' or 'interface', got '{read_state_read_sites}'"
+        if not read_state_interface_conditioning:
+            # Query-blind ablation cell: it skips the interface pass 1, so it
+            # only means something inside the interface two-pass mode.
+            assert use_linear_state_read, \
+                "read_state_interface_conditioning=False is the query-blind cell of the " \
+                "interface conditioning ablation and requires use_linear_state_read=True"
+            assert read_state_read_sites == "interface", \
+                "read_state_interface_conditioning=False requires read_state_read_sites='interface' " \
+                f"(there is no pass 1 to skip otherwise), got '{read_state_read_sites}'"
         assert isinstance(read_state_heads, int) and read_state_heads >= 1, \
             f"read_state_heads must be an int >= 1, got {read_state_heads}"
         assert read_state_gate_init > 0, \
@@ -1134,6 +1154,8 @@ class GradMemGPT(PreTrainedModel):
         self.read_state_beta_init = getattr(config, "read_state_beta_init", 1.0)
         self.read_state_gate_init = getattr(config, "read_state_gate_init", 0.1)
         self.read_state_read_sites = getattr(config, "read_state_read_sites", "all")
+        self.read_state_interface_conditioning = getattr(
+            config, "read_state_interface_conditioning", True)
         self.read_state_exact_softmax = getattr(config, "read_state_exact_softmax", False)
         # Escape hatch for tests/debugging: when True the registered hooks are
         # a no-op (same read layout, no injected bias).
@@ -1939,9 +1961,14 @@ class GradMemGPT(PreTrainedModel):
         positions); pass 2 answers [read_st?, interface, read_end?, query]
         with the pass-1 interface states (reads active on the interface
         positions only). The blinding reuses _compress_query's labels >= 0
-        pattern so pass 1 cannot peek at the answer. return_interface=True
-        additionally returns the pass-1 interface embeddings [B, M, d]
-        (diagnostics/tests: the query-sensitivity and blinding checks).
+        pattern so pass 1 cannot peek at the answer. With
+        read_state_interface_conditioning=False there is NO pass 1: the raw
+        learnable M_0 is the pass-2 interface embeddings, so the interface
+        tokens sit at the left of the answering pass and never see the query
+        (query-blind ablation cell; labels/target_mask unused, stats from
+        pass 2 only). return_interface=True additionally returns the pass-2
+        interface embeddings [B, M, d] (the conditioned states, or the raw
+        M_0 broadcast in the query-blind mode -- diagnostics/tests).
         """
         pad_id = self.model.config.pad_token_id
         device = qry_emb.device
@@ -1965,25 +1992,33 @@ class GradMemGPT(PreTrainedModel):
             logits = self._slice_read_logits(out.logits, C, query_input_ids.size(1))
             return (logits, None) if return_interface else logits
 
-        # ---- interface mode, pass 1: condition M_0 on the blinded query ----
-        qry_mask = query_real.clone()
-        if labels is not None:
-            qry_mask[labels >= 0] = 0
         m0 = self.read_state_interface_mem.unsqueeze(0).expand(query_real.size(0), -1, -1)
         mem_ones = torch.ones(query_real.size(0), M, dtype=torch.long, device=device)
-        if C > 0:
-            x1 = torch.cat([read_st_batch, qry_emb, read_end_batch, m0], dim=1)
-            a1 = torch.cat([ctrl_ones, qry_mask, ctrl_ones, mem_ones], dim=1)
+        if self.read_state_interface_conditioning:
+            # ---- interface mode, pass 1: condition M_0 on the blinded query ----
+            qry_mask = query_real.clone()
+            if labels is not None:
+                qry_mask[labels >= 0] = 0
+            if C > 0:
+                x1 = torch.cat([read_st_batch, qry_emb, read_end_batch, m0], dim=1)
+                a1 = torch.cat([ctrl_ones, qry_mask, ctrl_ones, mem_ones], dim=1)
+            else:
+                x1 = torch.cat([qry_emb, m0], dim=1)
+                a1 = torch.cat([qry_mask, mem_ones], dim=1)
+            T1 = x1.size(1)
+            site1 = torch.zeros(query_real.size(0), T1, 1, device=device)
+            site1[:, -M:] = 1.0
+            out1 = self._linear_read_forward_pass(x1, a1, site1, state,
+                                                  collect_stats=collect_stats, stats=stats,
+                                                  need_logits=False)
+            iface = out1.last_hidden_state[:, T1 - M:T1, :]              # [B, M, d]
         else:
-            x1 = torch.cat([qry_emb, m0], dim=1)
-            a1 = torch.cat([qry_mask, mem_ones], dim=1)
-        T1 = x1.size(1)
-        site1 = torch.zeros(query_real.size(0), T1, 1, device=device)
-        site1[:, -M:] = 1.0
-        out1 = self._linear_read_forward_pass(x1, a1, site1, state,
-                                              collect_stats=collect_stats, stats=stats,
-                                              need_logits=False)
-        iface = out1.last_hidden_state[:, T1 - M:T1, :]                  # [B, M, d]
+            # ---- query-blind cell: no pass-1 forward at all ----
+            # M_0 sits at the left of pass 2 and (causally) can never see the
+            # query, so conditioning it would be a no-op; its per-level state
+            # reads are query-agnostic by construction (the spec's
+            # "left-prefix causal" configuration).
+            iface = m0
 
         # ---- pass 2: answer with the conditioned interface embeddings ----
         if C > 0:
@@ -2010,7 +2045,9 @@ class GradMemGPT(PreTrainedModel):
         query_input_ids: [B, n_q, Q]. Flattens the probe axis, drops the memory
         prefix, and serves the state read (all mode) or the interface two-pass
         (interface mode). target_mask blinds the teacher-forced target span in
-        the interface pass-1 conditioning (the _compress_query pattern).
+        the interface pass-1 conditioning (the _compress_query pattern); with
+        read_state_interface_conditioning=False pass 1 does not run and the
+        blinding is simply unused.
         Returns logits [B, n_q, Q+1, V].
         """
         B, n_q, Q = query_input_ids.shape

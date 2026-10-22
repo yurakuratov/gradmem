@@ -1,0 +1,39 @@
+# Interface conditioning ablation -- the query-blind cell
+# (docs/INTERFACE_CONDITIONING_TASK.md; TOKENWISE_READ.md "placement /
+# causality trap"): read_state_interface_conditioning=false skips the
+# interface pass-1 entirely and answers with the raw learnable M_0, so the
+# interface tokens sit at the left of the answering pass and can never see
+# the query -- their per-level state reads fetch query-agnostic content.
+#
+# ONE experiment: the analysis pairs these runs against the running ladder's
+# `linear_interface` arm (manifests/kv_linear_read.yaml -- same base config,
+# same seeds, same ordered-concat data; the conditioned arm is NOT duplicated
+# here). Pre-registered prediction (STATUS.md, recorded at submission time,
+# before results): the query-blind arm underperforms the conditioned
+# interface arm on both the two-key concat EM and single-key EM; either
+# outcome is informative.
+#
+# run_name_suffix marks the exp dirs (`..._icondFalse`) -- run_naming's
+# _format_value skips False-valued keys, so the knob itself cannot mark the
+# blind arm in the run name.
+#
+# Dry run (print commands, execute nothing):
+#   python run_scheduler.py manifests/kv_interface_conditioning.yaml --dry-run
+#
+# Run for real:
+#   python run_scheduler.py manifests/kv_interface_conditioning.yaml
+
+max_parallel: 3
+schedule: interleaved
+
+experiments:
+  - name: linear_interface_nocond
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/linear_state_read_interface.yaml"
+    overrides:
+      read_linear.read_state_interface_conditioning: false
+      run_name_suffix: icondFalse
+      model.base_model: llama
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62-S4-ordered_pair_cross_1M"
+    grid:
+      training.seed: [4378, 43894, 2343]
