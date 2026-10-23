@@ -24,7 +24,7 @@ Run:  uv run python scripts/make_read_schematics.py
 
 import os
 
-OUT = os.path.join(os.path.dirname(__file__), "..", "docs", "figures")
+OUT = os.path.join(os.path.dirname(__file__), "..", "reports", "figures")
 
 # palette
 CTX, CTX_S = "#e8eaf0", "#9aa1b0"      # context / neutral boxes

@@ -7,17 +7,65 @@ rationale), verification status. Current state and hypotheses live in
 **Maintenance rule:** every merged change updates this journal and, when it
 changes the evidence picture, `PROGRESS.md` in the same commit.
 
+## 2026-10-22 (c) — documentation reorganization: docs / tasks / reports
+
+**Changed** — markdown layout per the three-folder convention:
+`docs/` = guides, derivations, designs (TOKENWISE_READ, ADAPTIVE_MEMORY,
+STAR — moved from root, CURRICULUM, REMOTE); `tasks/` = executor briefs
+(TOKENWISE_READ_TASK, INTERFACE_CONDITIONING_TASK, SEGMENT_KEY_TASK — moved
+from docs/); `reports/` = results & evidence (READ_LADDER_RESULTS + its
+`figures/` and `results/` asset dirs — moved from docs/). All moves via
+`git mv` (rename-tracked; `docs/results/` was untracked, plain mv).
+Cross-references updated everywhere: root working files, docs/tasks/reports
+cross-links, manifest-header path mentions (incl.
+`manifests/kv_interface_conditioning.yaml`), AGENTS.md's STAR link, and the
+asset default paths in `scripts/collect_comet_results.py` /
+`make_em_figure.py` / `make_read_schematics.py` (`docs/results|figures` →
+`reports/...`). Historical STATUS path mentions updated to the new
+locations (text unchanged). Link check green across all md files.
+
+**Decision** — root keeps only the working files (README, PROGRESS, STATUS,
+IDEAS, AGENTS); new results land in `reports/`, new executor briefs in
+`tasks/`, designs and guides continue in `docs/`. Matches the gradmem_rl
+two-folder convention plus the explicit tasks/ split.
+
+## 2026-10-22 (b) — interface read: kernel × key-geometry cells (manifest + chunk-key task)
+
+**Architecture fact (from the design discussion, worth recording):** the
+linear-state read stores per-**token** items (N = segments × M) with per-head
+slices of one shared κ, shared across layers — NOT one key per memory chunk
+(the original Hopfield model). The linear mode also already skips
+`_compress_segment`: keys already derive from `M_grad`. The remaining
+untested geometry axis is chunk-vs-token granularity.
+
+**Added** — [`manifests/kv_interface_softmax.yaml`](manifests/kv_interface_softmax.yaml)
+(6 runs, config-only): arm1 `interface_softmax` (exact-softmax kernel at
+interface sites — completes the kernel × site matrix) and arm2
+`interface_softmax_h64` (`read_state_heads: 2` ⇒ key dim 64 = the old
+hopfield key dim). Pre-registered predictions in the manifest header: arm1 ≥
+(d′) at (c)-like convergence (convexity should not bite at M specialized
+interface sites); arm2 within noise of arm1. And
+[`tasks/SEGMENT_KEY_TASK.md`](tasks/SEGMENT_KEY_TASK.md) — the small task for
+arm3 `interface_softmax_segkey64`: chunk-granularity items (N = segments),
+keys `normalize(W_seg·M_grad)` per head (d_h 64 via heads=2), values
+per-head `ν_seg: M·d → d` (pinned rationale: the additive bias μ must be
+d-dimensional — a retrieved `M·d` chunk cannot be reshaped into prefix
+tokens in the bias read); knob `read_state_segment_items`, 5 named tests,
+manifest entry reserved in the manifest header, submission rides arms 1–2.
+Arm3's reading is open: chunk addressing ⇒ simpler storage (one address per
+chunk); if it loses to arm2, token-level addressing is load-bearing.
+
 ## 2026-10-22 — LADDER + CONDITIONING-ABLATION RESULTS: every per-token read solves concat; query-blindness kills the interface read (pre-registered prediction HOLDS)
 
 **Collected** — all 21 experiments (7 arms × 3 seeds) of
 `zhekahauska/gradmem-linear-read` via the new
 [`scripts/collect_comet_results.py`](scripts/collect_comet_results.py)
-(summaries: `docs/results/results.json`, curves: `docs/results/
+(summaries: `reports/results/results.json`, curves: `reports/results/
 em_curves.json`). Stopping protocol (user): runs reaching EM 1.0 ended at
 their threshold (exact-softmax, 47–76k steps); every other run manually
 stopped after >80k steps — the failing arms are flat with no trend at their
 stop points. **Report (with schematic read-method diagrams + EM-curve
-figure):** [`docs/READ_LADDER_RESULTS.md`](docs/READ_LADDER_RESULTS.md);
+figure):** [`reports/READ_LADDER_RESULTS.md`](reports/READ_LADDER_RESULTS.md);
 figures regenerable via `scripts/make_read_schematics.py` /
 `scripts/make_em_figure.py`.
 
@@ -64,7 +112,7 @@ honest instrument going forward (added to PROGRESS missing experiments).
 
 **Added** — `read_state_interface_conditioning: bool = True` in
 [`grad_memgpt.py`](grad_memgpt.py) per
-[`docs/INTERFACE_CONDITIONING_TASK.md`](docs/INTERFACE_CONDITIONING_TASK.md):
+[`tasks/INTERFACE_CONDITIONING_TASK.md`](tasks/INTERFACE_CONDITIONING_TASK.md):
 in the interface read mode, `false` skips the pass-1 conditioning forward
 ENTIRELY and answers pass 2 with the raw learnable `M_0` (the query-blind
 "left-prefix causal" cell of the conditioning ablation — the spec's
@@ -179,8 +227,8 @@ write quality. The decision tree's step-1 inference ("(b) fails ⇒ H2
 rejected") is therefore unsound as stated; treat (b) as measuring the
 prefix interface, not write quality. Collect before concluding.
 
-**Added** — [`docs/INTERFACE_CONDITIONING_TASK.md`](
-docs/INTERFACE_CONDITIONING_TASK.md): executor brief for the third cell of
+**Added** — [`tasks/INTERFACE_CONDITIONING_TASK.md`](
+tasks/INTERFACE_CONDITIONING_TASK.md): executor brief for the third cell of
 the interface conditioning ablation — `read_state_interface_conditioning:
 false` skips the pass-1 conditioning and answers with raw `M_0` (the
 query-blind "left-prefix causal" configuration from the spec's
@@ -295,7 +343,7 @@ the job record before retrying.
 
 **Reviewed** — the H3 implementation against
 [`docs/TOKENWISE_READ.md`](docs/TOKENWISE_READ.md) /
-[TOKENWISE_READ_TASK.md](docs/TOKENWISE_READ_TASK.md). Verified in code:
+[TOKENWISE_READ_TASK.md](tasks/TOKENWISE_READ_TASK.md). Verified in code:
 config validation (all pinned asserts, plus a sensible extra — incompatible
 with `use_gradient_checkpointing`, with rationale), module construction
 (shared bias-free κ/ν, per-layer Q/β/γ/LN, bias-free `W_o` with the S=0
@@ -412,7 +460,7 @@ on the cluster.
 
 ## 2026-10-18 — executor brief for the H3 implementation
 
-**Added** — [`docs/TOKENWISE_READ_TASK.md`](docs/TOKENWISE_READ_TASK.md):
+**Added** — [`tasks/TOKENWISE_READ_TASK.md`](tasks/TOKENWISE_READ_TASK.md):
 the implementation task for the linear-state read spec, written for an
 executor agent with no conversation context. Grounds the spec in the
 codebase (config flow yaml → `run_from_config.py` section flattening →

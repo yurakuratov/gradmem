@@ -1,7 +1,7 @@
-# TASK — implement the linear-state per-level read ([TOKENWISE_READ.md](TOKENWISE_READ.md))
+# TASK — implement the linear-state per-level read ([TOKENWISE_READ.md](../docs/TOKENWISE_READ.md))
 
 Executor brief. You are implementing the read architecture specified in
-[TOKENWISE_READ.md](TOKENWISE_READ.md) — **that document is authoritative for
+[TOKENWISE_READ.md](../docs/TOKENWISE_READ.md) — **that document is authoritative for
 all design decisions** (kernel choice, normalization, gating, two-pass
 layout, naming). This file adds the codebase grounding, the phase plan, and
 the acceptance criteria. Work through the phases in order; each has a
@@ -9,7 +9,7 @@ checkable exit condition.
 
 ## Context (read first, in this order)
 
-1. [TOKENWISE_READ.md](TOKENWISE_READ.md) — the spec. § The mechanism, §
+1. [TOKENWISE_READ.md](../docs/TOKENWISE_READ.md) — the spec. § The mechanism, §
    Design decisions, and the Variant section are binding.
 2. [PROGRESS.md](../PROGRESS.md) — why: facts 5–7 (the one-shot read fails
    cross-segment integration), hypothesis H3. The regression guards

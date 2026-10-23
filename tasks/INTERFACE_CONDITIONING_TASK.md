@@ -7,7 +7,7 @@ running. No conversation context is assumed.
 
 ## Context (read first, in this order)
 
-1. [TOKENWISE_READ.md](TOKENWISE_READ.md) — the read architecture spec,
+1. [TOKENWISE_READ.md](../docs/TOKENWISE_READ.md) — the read architecture spec,
    especially the **Variant** section (the interface-token two-pass design)
    and its "placement / causality trap" discussion.
 2. [STATUS.md](../STATUS.md) entries 2026-10-18 (b) implementation and (c)
@@ -15,7 +15,7 @@ running. No conversation context is assumed.
 3. [PROGRESS.md](../PROGRESS.md) — the running read ladder (missing
    experiment #1) and where this ablation fits (the missing-experiments
    item on the interface conditioning ablation).
-4. [REMOTE.md](REMOTE.md) — the cluster workflow you will use in Phase 4.
+4. [REMOTE.md](../docs/REMOTE.md) — the cluster workflow you will use in Phase 4.
    Read it INCLUDING the submission gotchas: they were earned through two
    postmortems (STATUS.md 2026-10-19, 2026-10-19 (b)) — interactive-shell
    env, `*.checkpoint.json` tar-exclude, API-timeout fan-out, flock guard.
@@ -148,7 +148,7 @@ experiment #2 (conditioning ablation) with the task link. STATUS: entry
 covering the implementation + the pre-registered prediction (exact wording
 from the Context section above) — written BEFORE submission.
 
-### P4 — Submit the remote job (follow [REMOTE.md](REMOTE.md), incl. its gotchas)
+### P4 — Submit the remote job (follow [REMOTE.md](../docs/REMOTE.md), incl. its gotchas)
 1. Check the ladder job's state (`bash .cr_env.sh status 9a6c630c` or the
    current job id from STATUS.md). **Safe default: wait until it finishes**
    (the ablation is 3 runs and the ladder has priority); submitting

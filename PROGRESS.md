@@ -8,7 +8,7 @@ linear-attention retrieval (the Hopfield mode) solve catastrophic forgetting on
 single-key KV retrieval, but the one-shot read interface fails any task that
 must **integrate content from two segments** (ordered pair concatenation).
 **The ladder has now RUN** (results:
-[`docs/READ_LADDER_RESULTS.md`](docs/READ_LADDER_RESULTS.md)): every
+[`reports/READ_LADDER_RESULTS.md`](reports/READ_LADDER_RESULTS.md)): every
 per-token/per-level linear-state read fixes concat (exact-softmax 1.00,
 all-positions 0.997, interface two-pass 0.999) while the one-shot control
 (0.25), the bank-prefix control (0.02) and the query-blind interface (0.01)
@@ -29,7 +29,7 @@ the current Hopfield read fails (b).
 1. **Carried-memory multi-segment gradmem forgets.** The inner loop over
    segments is a running sum of gradient steps with no protection of stored
    directions; forgetting matrices show old pairs degrading as later segments
-   are written (2026-09-10; see also [`STAR.md`](STAR.md) and
+   are written (2026-09-10; see also [`STAR.md`](docs/STAR.md) and
    [`docs/ADAPTIVE_MEMORY.md`](docs/ADAPTIVE_MEMORY.md) for the analysis).
 2. **Independent per-segment writes + attention retrieval mitigate
    forgetting.** Hopfield mode (per-segment K-step gradient write into M
@@ -75,7 +75,7 @@ the current Hopfield read fails (b).
    0.5·0.5 = 0.25. The bank-prefix failure (with the SAME stored tokens that
    give (c)/(d)/(d′) 1.00) indicts the prefix interface, not write quality.
    Single-key regression: 0.997+ EM. Report:
-   [`docs/READ_LADDER_RESULTS.md`](docs/READ_LADDER_RESULTS.md).
+   [`reports/READ_LADDER_RESULTS.md`](reports/READ_LADDER_RESULTS.md).
 9. **Interface conditioning is load-bearing (ablation, 2026-10-22).** Removing
    the interface pass-1 (`read_state_interface_conditioning=false`, the
    query-blind "left-prefix causal" cell) collapses the interface arm from
@@ -101,23 +101,36 @@ the current Hopfield read fails (b).
    (`read_state_cross_talk` is already logged). If it binds: coarse top-k
    segment routing (reuse the compressed-query scores) before building the
    state.
-2. **Pointer chasing / associative join** (`!K1:K2! … !K2:V!`) — the
+2. **Interface read: kernel × key-geometry cells** —
+   [`manifests/kv_interface_softmax.yaml`](manifests/kv_interface_softmax.yaml):
+   arm1 softmax kernel (config-only), arm2 key width 64 = the old hopfield
+   dim (`read_state_heads: 2`, config-only), arm3 **chunk-granularity keys**
+   (one key per stored memory chunk, `W_seg·M_grad`, no per-token addressing
+   — the "chunk as whole with a key" storage model; needs the small task in
+   [`tasks/SEGMENT_KEY_TASK.md`](tasks/SEGMENT_KEY_TASK.md)). Chain of
+   single-factor deltas vs (d′): arm1 isolates the kernel, arm2−arm1 the key
+   width, arm3−arm2 the chunk-vs-token granularity. Note: the linear mode
+   already skips `_compress_segment` — keys already derive from `M_grad`;
+   arm3 changes only granularity. Pre-registered predictions in the manifest
+   header; arm3's outcome is open (chunk addressing ⇒ simpler storage;
+   token-level routing might be load-bearing).
+3. **Pointer chasing / associative join** (`!K1:K2! … !K2:V!`) — the
    depth-bounded-iteration claim is H3's remaining untested leg (fact 7,
    failure 3); dataset noted 2026-09-10 (`irodkin/ar_multihop`). Compare
    (d)/(d′) vs (a).
-3. **Writer×read factorial** — forward writer (RMT-style, `memory_update=
+4. **Writer×read factorial** — forward writer (RMT-style, `memory_update=
    "forward"`, the IDEAS.md baseline) behind the winning read (d′): does a
    decoder-informed forward writer + linear-state read beat the gradient
    writer? After the read settles.
-4. **babilong sanity** of (d′) (reference point: ARMT worked on babilong).
-5. **Concat-format forgetting probe** — the existing per-segment probes use
+5. **babilong sanity** of (d′) (reference point: ARMT worked on babilong).
+6. **Concat-format forgetting probe** — the existing per-segment probes use
    single-key `?!K:V!|` queries, which concat-trained arms never see (so the
    current matrices measure format transfer, not forgetting — report caveat);
    add two-key probes restricted to earlier segments.
-6. **Retrieval-mode ladder on concat** (`mean`/`softmax`/`beta_softmax`/`raw`):
+7. **Retrieval-mode ladder on concat** (`mean`/`softmax`/`beta_softmax`/`raw`):
    config-only documentation that no one-shot mixture setting solves it
    (low priority now that fact 8 establishes the mechanism directly).
-7. **Scale calibration at larger models/data** — everything above ran on
+8. **Scale calibration at larger models/data** — everything above ran on
    4L/128d from scratch; before any deployment claim, replicate (d′) at a
    larger width/depth and on curriculum N.
 
@@ -125,13 +138,21 @@ the current Hopfield read fails (b).
 
 - Working files (repo root): `README.md` (repo & harness overview) · this file
   · `STATUS.md` · `IDEAS.md` · `AGENTS.md` (agent conventions).
-- Topic docs: [`docs/ADAPTIVE_MEMORY.md`](docs/ADAPTIVE_MEMORY.md) (gated
-  carried-memory updates) · [`docs/CURRICULUM.md`](docs/CURRICULUM.md)
-  (stage-wise N curriculum) · [`STAR.md`](STAR.md) (worst-case stability
-  regularizer, still at root).
-- Design specs & workflow (docs/): [`docs/TOKENWISE_READ.md`](docs/TOKENWISE_READ.md)
-  (the H3 read-interface spec) · [`docs/REMOTE.md`](docs/REMOTE.md)
-  (cluster workflow).
+- `docs/` — guides, derivations, designs only:
+  [`docs/TOKENWISE_READ.md`](docs/TOKENWISE_READ.md) (the H3 read-interface
+  spec) · [`docs/ADAPTIVE_MEMORY.md`](docs/ADAPTIVE_MEMORY.md) (gated
+  carried-memory updates) · [`docs/STAR.md`](docs/STAR.md) (worst-case
+  stability regularizer) · [`docs/CURRICULUM.md`](docs/CURRICULUM.md)
+  (stage-wise N curriculum) · [`docs/REMOTE.md`](docs/REMOTE.md) (cluster
+  workflow).
+- `tasks/` — executor briefs: [`tasks/TOKENWISE_READ_TASK.md`](
+  tasks/TOKENWISE_READ_TASK.md) (H3 implementation) ·
+  [`tasks/INTERFACE_CONDITIONING_TASK.md`](tasks/INTERFACE_CONDITIONING_TASK.md)
+  (query-blind baseline + submission) · [`tasks/SEGMENT_KEY_TASK.md`](
+  tasks/SEGMENT_KEY_TASK.md) (chunk-granularity keys, pending).
+- `reports/` — results & evidence: [`reports/READ_LADDER_RESULTS.md`](
+  reports/READ_LADDER_RESULTS.md) (+ `reports/figures/`,
+  `reports/results/`).
 - Models: [`grad_memgpt.py`](grad_memgpt.py) (base gradmem + Hopfield +
   Gated-Delta externals; pair-aware segmentation helpers) ·
   [`grad_memgpt_adaptive.py`](grad_memgpt_adaptive.py) (carried memory, gated

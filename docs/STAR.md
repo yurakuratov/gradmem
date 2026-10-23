@@ -1,9 +1,9 @@
 # STAR — worst-case stability regularisation for multi-segment memory writes
 
-> Implementation: [`grad_memgpt_adaptive.py`](./grad_memgpt_adaptive.py) (adaptive fork only)
-> Config: [`configs/gradmemgpt/kv_retrieval/adaptive_star.yaml`](./configs/gradmemgpt/kv_retrieval/adaptive_star.yaml)
-> Tests: [`test_grad_memgpt_adaptive_star.py`](./test_grad_memgpt_adaptive_star.py)
-> Stage-0 manifest: [`manifests/stage0_capacity_vs_interference.yaml`](./manifests/stage0_capacity_vs_interference.yaml)
+> Implementation: [`grad_memgpt_adaptive.py`](../grad_memgpt_adaptive.py) (adaptive fork only)
+> Config: [`configs/gradmemgpt/kv_retrieval/adaptive_star.yaml`](../configs/gradmemgpt/kv_retrieval/adaptive_star.yaml)
+> Tests: [`test_grad_memgpt_adaptive_star.py`](../test_grad_memgpt_adaptive_star.py)
+> Stage-0 manifest: [`manifests/stage0_capacity_vs_interference.yaml`](../manifests/stage0_capacity_vs_interference.yaml)
 > Source paper: *STAR: Stability-Inducing Weight Perturbation for Continual Learning*, ICLR 2025, arXiv:2503.01595
 
 ## The problem

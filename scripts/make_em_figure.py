@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""EM-vs-step figure for the results report (docs/figures/em_curves.svg).
+"""EM-vs-step figure for the results report (reports/figures/em_curves.svg).
 
 Left: every ladder arm, mean over the 3 seeds (thin lines = seeds).
 Right: the conditioning ablation pair — same seeds, same data, the knob is
@@ -16,8 +16,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CURVES = os.path.join(HERE, "..", "docs", "results", "em_curves.json")
-OUT = os.path.join(HERE, "..", "docs", "figures", "em_curves.svg")
+CURVES = os.path.join(HERE, "..", "reports", "results", "em_curves.json")
+OUT = os.path.join(HERE, "..", "reports", "figures", "em_curves.svg")
 
 STYLE = {
     "hopfield_control":         ("(a) Hopfield one-shot (control)", "#8a93a5", "-"),

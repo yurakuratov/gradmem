@@ -1,5 +1,5 @@
 # Interface conditioning ablation -- the query-blind cell
-# (docs/INTERFACE_CONDITIONING_TASK.md; TOKENWISE_READ.md "placement /
+# (tasks/INTERFACE_CONDITIONING_TASK.md; TOKENWISE_READ.md "placement /
 # causality trap"): read_state_interface_conditioning=false skips the
 # interface pass-1 entirely and answers with the raw learnable M_0, so the
 # interface tokens sit at the left of the answering pass and can never see

@@ -12,7 +12,7 @@
 > >80k steps**. The failing arms are flat curves with no upward trend at
 > their stop points, so "best EM" is a safe ceiling for them.
 > Implementation & pre-registration: [STATUS.md](../STATUS.md) 2026-10-20 (b);
-> spec: [TOKENWISE_READ.md](TOKENWISE_READ.md).
+> spec: [TOKENWISE_READ.md](../docs/TOKENWISE_READ.md).
 
 ## The six read methods in comparison
 

@@ -5,7 +5,7 @@
 > [STATUS.md](../STATUS.md) 2026-10-18 (b) for decisions/deviations and
 > `manifests/kv_linear_read.yaml` for the evidence ladder). Originally
 > specified 2026-10-15. Executor brief (phases, contract, acceptance
-> criteria): [TOKENWISE_READ_TASK.md](TOKENWISE_READ_TASK.md). Evidence
+> criteria): [TOKENWISE_READ_TASK.md(../tasks/TOKENWISE_READ_TASK.md). Evidence
 > context: [PROGRESS.md](../PROGRESS.md) facts 5–7, hypothesis H3.
 
 ## The problem
@@ -216,7 +216,7 @@ causal* configuration above, run deliberately as the third cell of the
 conditioning ablation. Manifest:
 [manifests/kv_interface_conditioning.yaml](../manifests/kv_interface_conditioning.yaml)
 (3 seeds, paired with the ladder's `linear_interface` runs); executor brief:
-[INTERFACE_CONDITIONING_TASK.md](INTERFACE_CONDITIONING_TASK.md); the
+[INTERFACE_CONDITIONING_TASK.md(../tasks/INTERFACE_CONDITIONING_TASK.md); the
 pre-registered prediction is journaled in STATUS.md at submission time.
 
 ### Gains / risks vs the read-everywhere design

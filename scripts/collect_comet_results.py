@@ -4,7 +4,7 @@
 Usage (needs HTTPS_PROXY if comet is not directly reachable):
 
     HTTPS_PROXY=http://127.0.0.1:10809 COMET_API_KEY=... \
-        uv run python scripts/collect_comet_results.py [--out docs/results/results.json]
+        uv run python scripts/collect_comet_results.py [--out reports/results/results.json]
 
 Groups the 21 experiments (7 arms x 3 seeds) of project `gradmem-linear-read`
 by arm (parsed from the run name) and seed (from the logged `seed` param),
@@ -79,7 +79,7 @@ def curve_stats(points):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="docs/results/results.json")
+    ap.add_argument("--out", default="reports/results/results.json")
     ap.add_argument("--workspace", default="zhekahauska")
     ap.add_argument("--project", default="gradmem-linear-read")
     args = ap.parse_args()

@@ -1,0 +1,53 @@
+# Interface read: softmax kernel × key-width cells (chunk-granularity arm pending)
+#
+# Companion to manifests/kv_linear_read.yaml (the main ladder) and
+# reports/READ_LADDER_RESULTS.md. Completes the kernel × key-geometry matrix
+# around the winning interface arm (d′):
+#
+#   (d′)  linear kernel, per-token keys, d_h=32   (ladder, EM 0.999)
+#   arm1  softmax kernel, per-token keys, d_h=32  <- config-only, runnable now
+#   arm2  softmax kernel, per-token keys, d_h=64  <- config-only, runnable now
+#   arm3  softmax kernel, CHUNK keys (W_seg·M_grad, d_h=64)  <- PENDING code
+#         (tasks/SEGMENT_KEY_TASK.md; add the manifest entry when landed)
+#
+# Readings: arm1 vs (d′) isolates the kernel; arm2 vs arm1 isolates key
+# width; arm3 vs arm2 isolates chunk-vs-token granularity (the user's
+# "store each memory chunk as whole with one key" model, keys from M_grad,
+# no segment-compression forward -- which the linear mode already skips).
+#
+# Pre-registered predictions (STATUS): arm1 >= (d′) at (c)-like convergence
+# (convexity should not bite at M specialized interface sites, N=8 items,
+# cross-talk negligible); arm2 within noise of arm1; arm3 open -- chunk
+# addressing removes per-token routing, the interface reads must then
+# select whole segments (enough for this task: both keys live in segments).
+#
+# Dry run: python run_scheduler.py manifests/kv_interface_softmax.yaml --dry-run
+
+max_parallel: 3
+schedule: interleaved
+
+experiments:
+  # arm1: interface + exact-softmax kernel (per-token keys, d_h = 128/4 = 32)
+  - name: interface_softmax
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/linear_state_read_interface.yaml"
+    overrides:
+      read_linear.read_state_exact_softmax: true
+      model.base_model: llama
+      dataset.data_name: N8-K2V2-V62-S4-ordered_pair_cross_1M
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62-S4-ordered_pair_cross_1M"
+    grid:
+      training.seed: [4378, 43894, 2343]
+
+  # arm2: same, key width 64 = the old hopfield key dim (heads 4 -> 2)
+  - name: interface_softmax_h64
+    command: "python run_from_config.py --config"
+    base_config: "configs/gradmemgpt/kv_retrieval/linear_state_read_interface.yaml"
+    overrides:
+      read_linear.read_state_exact_softmax: true
+      read_linear.read_state_heads: 2
+      model.base_model: llama
+      dataset.data_name: N8-K2V2-V62-S4-ordered_pair_cross_1M
+      dataset.data_path: "/home/jovyan/dzhivelikian/test_time_gd/data/N8-K2V2-V62-S4-ordered_pair_cross_1M"
+    grid:
+      training.seed: [4378, 43894, 2343]
