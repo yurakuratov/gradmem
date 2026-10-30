@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+import math
 
 import pytest
 import torch
@@ -98,6 +99,211 @@ def _memory_init_params(model: GradMemGPT, memory_backend: str):
             params.append(model.kv_mem_V0[key])
         return params
     raise ValueError(f"Unknown backend={memory_backend}")
+
+
+def test_shared_writer_uses_read_model_instance():
+    model = GradMemGPT(GradMemGPTConfig(base_config=_build_base_config("gpt2"), K=0))
+    assert model.write_model is model.read_model
+
+
+def test_write_sampling_config_defaults_and_serialization(tmp_path):
+    config = GradMemGPTConfig(K=3, lr=0.4)
+    assert config.K_sampling is False
+    assert (config.K_min, config.K_max) == (3, 3)
+    assert (config.ilr_min, config.ilr_max) == (0.4, 0.4)
+    assert config.ilr_sample_unique is False
+    config = GradMemGPTConfig(
+        K=2, lr=0.4, K_sampling=True, K_min=1, K_max=5,
+        ilr_min=0.01, ilr_max=1.0, ilr_sample_unique=True,
+    )
+    config.save_pretrained(tmp_path)
+    restored = GradMemGPTConfig.from_pretrained(tmp_path)
+    for name in ("K", "lr", "K_sampling", "K_min", "K_max", "ilr_min", "ilr_max", "ilr_sample_unique"):
+        assert getattr(restored, name) == getattr(config, name)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"K_min": 0}, {"K_min": 3, "K_max": 2}, {"K_min": 1.5},
+    {"ilr_min": 0.0}, {"ilr_min": -1.0}, {"ilr_max": float("inf")},
+    {"ilr_min": 1.0, "ilr_max": 0.1}, {"ilr_min": float("nan")},
+])
+def test_write_sampling_rejects_invalid_ranges(kwargs):
+    with pytest.raises(ValueError, match="K_sampling requires"):
+        GradMemGPTConfig(K_sampling=True, **kwargs)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+@pytest.mark.parametrize("unique", [False, True])
+@pytest.mark.parametrize("use_adam", [False, True])
+def test_write_sampling_is_training_only_and_rates_are_log_uniform(monkeypatch, unique, use_adam):
+    base_config = GPT2Config(
+        vocab_size=31, n_embd=16, n_layer=1, n_head=2, n_positions=32,
+        resid_pdrop=0.0, embd_pdrop=0.0, attn_pdrop=0.0,
+    )
+    model = GradMemGPT(GradMemGPTConfig(
+        base_config=base_config, n_mem_tokens=2, K=1, lr=0.4,
+        K_sampling=True, K_min=2, K_max=3, ilr_min=0.01, ilr_max=1.0,
+        ilr_sample_unique=unique, write_objective="energy", use_adam=use_adam,
+    ))
+    inputs = {
+        "context_input_ids": torch.tensor([[1, 2, 3], [1, 2, 3]]),
+        "query_input_ids": torch.tensor([[4, 5], [4, 5]]),
+    }
+    randint = torch.randint
+    sampled_depths = []
+
+    def record_randint(low, high, size, **kwargs):
+        assert (low, high, size) == (2, 4, ())
+        value = randint(low, high, size, **kwargs)
+        sampled_depths.append(value.item())
+        return value
+
+    monkeypatch.setattr(torch, "randint", record_randint)
+    rates = []
+    if use_adam:
+        original_step = model._adam_step
+
+        def record_step(p, g, state, step_idx, lr):
+            rates.append(lr.detach().clone())
+            return original_step(p, g, state, step_idx, lr)
+
+        monkeypatch.setattr(model, "_adam_step", record_step)
+    else:
+        original_step = model._sgd_step
+
+        def record_step(p, g, **kwargs):
+            rates.append(kwargs["lr"].detach().clone())
+            return original_step(p, g, **kwargs)
+
+        monkeypatch.setattr(model, "_sgd_step", record_step)
+
+    torch.manual_seed(42)
+    expected_depth = randint(2, 4, ()).item()
+    expected_lr = torch.empty((2,) if unique else ()).uniform_(
+        math.log(0.01), math.log(1.0),
+    ).exp_()
+    torch.manual_seed(42)
+    output = model(inputs, return_mem=True)
+    assert sampled_depths == [expected_depth]
+    assert len(rates) == expected_depth
+    for lr in rates:
+        torch.testing.assert_close(lr.flatten(), expected_lr.flatten())
+        assert lr.shape == ((2, 1, 1) if unique else ())
+    assert output["inner_loop_stats"]["write_steps"].item() == expected_depth
+    if unique:
+        assert not torch.allclose(output["mem"][0], output["mem"][1])
+    else:
+        torch.testing.assert_close(output["mem"][0], output["mem"][1])
+    assert (model.K, model.lr) == (1, 0.4)
+
+    rates.clear()
+    model.eval()
+    output = model(inputs, return_mem=True)
+    assert sampled_depths == [expected_depth]
+    assert len(rates) == 1
+    assert rates[0].item() == pytest.approx(0.4)
+    assert output["inner_loop_stats"]["write_steps"].item() == 1
+    torch.testing.assert_close(output["mem"][0], output["mem"][1])
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_write_sampling_preserves_second_order_shaping_and_gain_buffers():
+    model = GradMemGPT(GradMemGPTConfig(
+        base_config=GPT2Config(vocab_size=31, n_embd=16, n_layer=1, n_head=2, n_positions=32),
+        n_mem_tokens=2, K=1, lr=0.4, K_sampling=True, K_min=3, K_max=3,
+        ilr_min=0.1, ilr_max=0.1, ilr_sample_unique=True,
+        write_objective="energy", energy_rank_weight=0.1, energy_traj_weight=0.1,
+        energy_anchor_weight=0.1, intermediate_read_weight=0.1,
+        energy_memory_search_weight=0.1, energy_memory_search_num_samples=1,
+        energy_memory_search_use_gain_weighting=True,
+    ))
+    inputs = {
+        "context_input_ids": torch.tensor([[1, 2, 3], [5, 6, 7]]),
+        "query_input_ids": torch.tensor([[4, 8], [4, 9]]),
+    }
+    labels = torch.tensor([[-100, 8], [-100, 9]])
+    output = model(inputs, labels=labels)
+    assert output["inner_loop_stats"]["write_steps"].item() == 3
+    assert model.energy_memory_search_gain_ema.shape == (3,)
+    assert torch.isfinite(output["loss"])
+    output["loss"].backward()
+    assert model.mem.grad is not None and torch.isfinite(model.mem.grad).all()
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.energy_head.parameters())
+    model._compute_energy_memory_search_gain_weights(torch.ones(1, 2))
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_separate_writer_supports_different_hidden_size_and_energy_backward():
+    writer_config = GPT2Config(
+        vocab_size=101, n_embd=32, n_layer=1, n_head=4, n_positions=32, n_ctx=32,
+    )
+    model = GradMemGPT(GradMemGPTConfig(
+        base_config=_build_base_config("gpt2"),
+        separate_writer=True,
+        writer_base_config=writer_config,
+        memory_backend="prefix",
+        n_mem_tokens=2,
+        K=1,
+        lr=0.01,
+        grad_mode="second",
+        write_objective="energy",
+    ))
+    assert model.write_model is not model.read_model
+    assert model.write_memory_proj.in_features == 64
+    assert model.write_memory_proj.out_features == 32
+
+    input_ids = {
+        "context_input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+        "query_input_ids": torch.tensor([[9, 10, 11], [12, 13, 14]]),
+    }
+    labels = torch.tensor([[-100, 15, -100], [-100, 16, -100]])
+    output = model(input_ids, labels=labels, return_mem=True)
+    output["loss"].backward()
+    assert output["predictions"].shape == (2, 4, 101)
+    assert output["mem"].shape == (2, 2, 64)
+    assert next(model.read_model.parameters()).grad is not None
+    assert next(model.write_model.parameters()).grad is not None
+
+
+def test_separate_writer_rejects_non_prefix_memory():
+    with pytest.raises(ValueError, match="supported only for memory_backend='prefix'"):
+        GradMemGPTConfig(
+            base_config=_build_base_config("gpt2"),
+            separate_writer=True,
+            writer_base_config=_build_base_config("gpt2"),
+            memory_backend="lora",
+        )
+
+
+@pytest.mark.parametrize("option", ["use_write_lora", "use_write_head"])
+def test_separate_writer_rejects_write_only_modules(option):
+    with pytest.raises(ValueError, match=f"does not support {option}=True"):
+        GradMemGPTConfig(
+            base_config=_build_base_config("gpt2"),
+            separate_writer=True,
+            writer_base_config=_build_base_config("gpt2"),
+            **{option: True},
+        )
+
+
+def test_separate_writer_checkpoint_round_trip(tmp_path):
+    writer_config = GPT2Config(
+        vocab_size=101, n_embd=32, n_layer=1, n_head=4, n_positions=32, n_ctx=32,
+    )
+    model = GradMemGPT(GradMemGPTConfig(
+        base_config=_build_base_config("gpt2"),
+        separate_writer=True,
+        writer_base_config=writer_config,
+        K=0,
+    ))
+    model.save_pretrained(tmp_path)
+    restored = GradMemGPT.from_pretrained(tmp_path)
+    assert restored.write_model is not restored.read_model
+    assert restored.write_model.config.n_embd == 32
+    assert restored.write_memory_proj.weight.shape == (32, 64)
 
 
 @pytest.mark.forward
@@ -2026,6 +2232,25 @@ def test_energy_memory_search_defaults_validation_and_serialization(tmp_path):
     )
     assert restored_model.energy_memory_search_gain_ema_initialized.all().item()
 
+    larger_config = GradMemGPTConfig(
+        base_config=base_config,
+        memory_backend="prefix",
+        K=5,
+        grad_mode="second",
+        use_adam=False,
+        write_objective="reconstruction",
+    )
+    larger_model = GradMemGPT(larger_config)
+    larger_model.load_state_dict(state_dict)
+    assert torch.allclose(
+        larger_model.energy_memory_search_gain_ema,
+        torch.tensor([0.3, 0.3, 0.0, 0.0, 0.0]),
+    )
+    assert torch.equal(
+        larger_model.energy_memory_search_gain_ema_initialized,
+        torch.tensor([True, True, False, False, False]),
+    )
+
 
 def _build_memory_alignment_model(**config_overrides):
     base_config = _build_base_config("gpt2")
@@ -2145,6 +2370,7 @@ def test_step_alignment_uses_each_inner_update_and_resulting_memory_gradient(
     model, inputs, labels = _build_memory_alignment_model(
         memory_alignment_weight=0.0,
         step_alignment_weight=0.4,
+        alignment_sampling=True,
         align_last_step=align_last_step,
         grad_align_norm=grad_align_norm,
         intermediate_read_weight=0.0,
@@ -2152,7 +2378,9 @@ def test_step_alignment_uses_each_inner_update_and_resulting_memory_gradient(
     model.train()
     recorded_losses = []
     recorded_cosines = []
+    sampled_negative_memories = []
     original_step_alignment = model._compute_step_alignment
+    original_build_negatives = model._build_energy_negative_memories
 
     def _record_step_alignment(target_loss, memory_state, inner_update):
         loss, cosine = original_step_alignment(target_loss, memory_state, inner_update)
@@ -2175,15 +2403,37 @@ def test_step_alignment_uses_each_inner_update_and_resulting_memory_gradient(
         recorded_cosines.append(cosine)
         return loss, cosine
 
+    def _record_negative_memories(*args, **kwargs):
+        negatives, permutation = original_build_negatives(*args, **kwargs)
+        sampled_negative_memories.extend(
+            memory for memory in negatives.values() if memory is not None
+        )
+        return negatives, permutation
+
     model._compute_step_alignment = _record_step_alignment
+    model._build_energy_negative_memories = _record_negative_memories
     output = model(inputs, labels=labels)
     stats = output["inner_loop_stats"]
 
-    assert len(recorded_losses) == model.K + int(align_last_step)
+    assert len(sampled_negative_memories) == 3
+    assert all(not memory.requires_grad for memory in sampled_negative_memories)
+    assert all(memory.grad_fn is None for memory in sampled_negative_memories)
+    assert len(recorded_losses) == model.K + int(align_last_step) + len(sampled_negative_memories)
     expected_loss = torch.stack(recorded_losses).mean()
     expected_cosine = torch.stack(recorded_cosines).mean()
     assert torch.allclose(stats["step_alignment_loss"], expected_loss.detach())
     assert torch.allclose(stats["step_alignment_cosine"], expected_cosine.detach())
+    assert torch.allclose(
+        stats["negative_step_alignment_loss"],
+        torch.stack(recorded_losses[-3:]).mean().detach(),
+    )
+    assert torch.allclose(
+        stats["negative_step_alignment_cosine"],
+        torch.stack(recorded_cosines[-3:]).mean().detach(),
+    )
+    for name in ("deranged", "interpolated", "random"):
+        assert f"negative_step_alignment_{name}_loss" in stats
+        assert f"negative_step_alignment_{name}_cosine" in stats
     assert torch.allclose(
         output["loss"].detach(),
         stats["target_loss"] + model.step_alignment_weight * stats["step_alignment_loss"],
@@ -2199,11 +2449,102 @@ def test_step_alignment_uses_each_inner_update_and_resulting_memory_gradient(
     assert any(gradient.norm().item() > 0.0 for gradient in energy_gradients)
 
 
+@pytest.mark.one_batch_train
+@pytest.mark.all
+def test_step_alignment_sampling_is_disabled_by_default():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_memory_alignment_model(
+        memory_alignment_weight=0.0,
+        step_alignment_weight=0.4,
+        intermediate_read_weight=0.0,
+    )
+
+    def _unexpected_negative_sampling(*_args, **_kwargs):
+        raise AssertionError("regular step alignment must not sample negative memories")
+
+    model._build_energy_negative_memories = _unexpected_negative_sampling
+    model.train()
+    stats = model(inputs, labels=labels)["inner_loop_stats"]
+
+    assert "negative_step_alignment_loss" not in stats
+    assert "negative_step_alignment_cosine" not in stats
+
+
+@pytest.mark.one_batch_train
+@pytest.mark.all
+@pytest.mark.parametrize("write_objective", ["reconstruction", "energy_with_reconstruction"])
+def test_step_alignment_sampling_supports_all_write_objectives(write_objective):
+    torch.manual_seed(0)
+    model, inputs, labels = _build_memory_alignment_model(
+        write_objective=write_objective,
+        memory_alignment_weight=0.0,
+        step_alignment_weight=0.4,
+        alignment_sampling=True,
+        intermediate_read_weight=0.0,
+    )
+    model.train()
+
+    output = model(inputs, labels=labels)
+    stats = output["inner_loop_stats"]
+
+    assert torch.isfinite(stats["negative_step_alignment_loss"]).item()
+    assert torch.isfinite(stats["negative_step_alignment_cosine"]).item()
+    output["loss"].backward()
+    gradients = [
+        parameter.grad for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    assert gradients
+    assert all(torch.isfinite(gradient).all().item() for gradient in gradients)
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_step_alignment_sampling_is_training_only():
+    torch.manual_seed(0)
+    model, inputs, labels = _build_memory_alignment_model(
+        memory_alignment_weight=0.0,
+        step_alignment_weight=0.4,
+        alignment_sampling=True,
+        intermediate_read_weight=0.0,
+    )
+    model.eval()
+
+    def _unexpected_negative_sampling(*_args, **_kwargs):
+        raise AssertionError("evaluation must not sample alignment memories")
+
+    model._build_energy_negative_memories = _unexpected_negative_sampling
+    with torch.no_grad():
+        output = model(inputs, labels=labels)
+
+    stats = output["inner_loop_stats"]
+    assert "negative_step_alignment_loss" not in stats
+    assert "negative_step_alignment_cosine" not in stats
+
+
+@pytest.mark.forward
+@pytest.mark.all
+def test_training_runners_log_average_alignment_cosines():
+    from run_gradmemgpt_on_kv_retrieval import LOSS_COMPONENT_KEYS as kv_keys
+    from run_gradmemgpt_on_mqar import LOSS_COMPONENT_KEYS as mqar_keys
+
+    expected_keys = {
+        "step_alignment_cosine",
+        "negative_step_alignment_cosine",
+        "negative_step_alignment_deranged_cosine",
+        "negative_step_alignment_interpolated_cosine",
+        "negative_step_alignment_random_cosine",
+    }
+    assert expected_keys <= set(kv_keys)
+    assert expected_keys <= set(mqar_keys)
+
+
 @pytest.mark.forward
 @pytest.mark.all
 def test_step_alignment_defaults_validation_and_serialization(tmp_path):
     base_config = _build_base_config("gpt2")
     assert GradMemGPTConfig(base_config=base_config).step_alignment_weight == 0.0
+    assert GradMemGPTConfig(base_config=base_config).alignment_sampling is False
     assert GradMemGPTConfig(base_config=base_config).align_last_step is False
     assert GradMemGPTConfig(base_config=base_config).grad_align_norm == "none"
     invalid_overrides = [
@@ -2224,13 +2565,16 @@ def test_step_alignment_defaults_validation_and_serialization(tmp_path):
         memory_backend="prefix",
         K=2,
         grad_mode="second",
+        write_objective="energy",
         step_alignment_weight=0.25,
+        alignment_sampling=True,
         align_last_step=True,
         grad_align_norm="norm",
     )
     config.save_pretrained(tmp_path)
     restored = GradMemGPTConfig.from_pretrained(tmp_path)
     assert restored.step_alignment_weight == pytest.approx(0.25)
+    assert restored.alignment_sampling is True
     assert restored.align_last_step is True
     assert restored.grad_align_norm == "norm"
 

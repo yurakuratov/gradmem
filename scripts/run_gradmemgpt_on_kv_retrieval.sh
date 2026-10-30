@@ -63,6 +63,12 @@ N_CTRL_TOKENS=0
 K=2
 LAST_K_SECOND_ORDER=${K}
 INNER_LR=0.4
+K_SAMPLING=${K_SAMPLING:-false}
+K_MIN=${K_MIN:-$K}
+K_MAX=${K_MAX:-$K}
+ILR_MIN=${ILR_MIN:-$INNER_LR}
+ILR_MAX=${ILR_MAX:-$INNER_LR}
+ILR_SAMPLE_UNIQUE=${ILR_SAMPLE_UNIQUE:-false}
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 USE_ADAM=false
@@ -98,6 +104,7 @@ INNER_LOSS_WEIGHT=0.5
 READ_FOCAL_GAMMA=${READ_FOCAL_GAMMA:-0.0}
 MEMORY_ALIGNMENT_WEIGHT=${MEMORY_ALIGNMENT_WEIGHT:-0.0}
 STEP_ALIGNMENT_WEIGHT=${STEP_ALIGNMENT_WEIGHT:-0.0}
+ALIGNMENT_SAMPLING=${ALIGNMENT_SAMPLING:-false}
 ALIGN_LAST_STEP=${ALIGN_LAST_STEP:-false}
 GRAD_ALIGN_NORM=${GRAD_ALIGN_NORM:-none}
 INTERMEDIATE_READ_WEIGHT=${INTERMEDIATE_READ_WEIGHT:-0.0}
@@ -139,6 +146,9 @@ if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
 fi
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
+if [ "$K_SAMPLING" = true ]; then
+  RUN_NAME=${RUN_NAME}_Ksample${K_MIN}-${K_MAX}_ilr${ILR_MIN}-${ILR_MAX}_unique${ILR_SAMPLE_UNIQUE}
+fi
 if [ "$LAST_K_SECOND_ORDER" != "$K" ] && [ "$GRAD_MODE" == "second" ]; then
   RUN_NAME=${RUN_NAME}_last_K${LAST_K_SECOND_ORDER}
 fi
@@ -181,6 +191,9 @@ if [ "$MEMORY_ALIGNMENT_WEIGHT" != "0.0" ]; then
 fi
 if [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}
+  if [ "$ALIGNMENT_SAMPLING" = true ]; then
+    RUN_NAME=${RUN_NAME}_sampled
+  fi
   if [ "$ALIGN_LAST_STEP" = true ]; then
     RUN_NAME=${RUN_NAME}_last
   fi
@@ -280,6 +293,12 @@ for N in "${N_VALUES[@]}"; do
     --n_mem_tokens "$N_MEM_TOKENS"
     --memory_backend "$MEMORY_BACKEND"
     --K "$K"
+    --K_sampling "$K_SAMPLING"
+    --K_min "$K_MIN"
+    --K_max "$K_MAX"
+    --ilr_min "$ILR_MIN"
+    --ilr_max "$ILR_MAX"
+    --ilr_sample_unique "$ILR_SAMPLE_UNIQUE"
     --last_K_second_order "$LAST_K_SECOND_ORDER"
     --inner_lr "$INNER_LR"
     --use_adam "$USE_ADAM"
@@ -358,6 +377,9 @@ for N in "${N_VALUES[@]}"; do
   fi
   if [ "$ALIGN_LAST_STEP" = true ]; then
     CMD+=( --align_last_step )
+  fi
+  if [ "$ALIGNMENT_SAMPLING" = true ] && [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
+    CMD+=( --alignment_sampling )
   fi
   if [ "$ORTHOGONAL_LOSS_WEIGHT" != "0.0" ] && [ "$ORTHOGONAL_LOSS_WEIGHT" != "None" ]; then
     CMD+=( --orthogonal_loss_weight "$ORTHOGONAL_LOSS_WEIGHT" )

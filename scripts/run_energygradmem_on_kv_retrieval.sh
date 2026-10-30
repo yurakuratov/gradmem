@@ -6,7 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/collect_env_state.sh"
 
 # Define arguments for the script
-NP=1
+NP=${NP:-1}
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -41,8 +41,8 @@ D=256
 BASE_MODEL=llama
 
 V=62
-# DATA_NAME="N8-K2V1-V${V}_1M"
-DATA_NAME="N16-K2V2-V${V}_noise_0.5_1M"
+DATA_NAME="N8-K2V2-V${V}_1M"
+# DATA_NAME="N16-K2V2-V${V}_noise_0.5_1M"
 DATA_PATH="./data/${DATA_NAME}"
 TOKENIZER_PATH="./tokenizers/kv_alphabet_${V}/"
 
@@ -56,6 +56,12 @@ N_CTRL_TOKENS=0
 K=2
 LAST_K_SECOND_ORDER=${K}
 INNER_LR=0.4
+K_SAMPLING=${K_SAMPLING:-false}
+K_MIN=${K_MIN:-$K}
+K_MAX=${K_MAX:-$K}
+ILR_MIN=${ILR_MIN:-$INNER_LR}
+ILR_MAX=${ILR_MAX:-$INNER_LR}
+ILR_SAMPLE_UNIQUE=${ILR_SAMPLE_UNIQUE:-false}
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 USE_ADAM=false
@@ -64,7 +70,8 @@ USE_MEM_PROJ=false
 MEM_PROJ_MODE="none"
 FREEZE_BACKBONE=false
 MEMORY_ALIGNMENT_WEIGHT=0.0
-STEP_ALIGNMENT_WEIGHT=0.1
+STEP_ALIGNMENT_WEIGHT=${STEP_ALIGNMENT_WEIGHT:-0.1}
+ALIGNMENT_SAMPLING=${ALIGNMENT_SAMPLING:-false}
 ALIGN_LAST_STEP=false
 GRAD_ALIGN_NORM="none"
 INTERMEDIATE_READ_WEIGHT=0.1
@@ -127,6 +134,9 @@ else
   RUN_NAME=energygradmem_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
 fi
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
+if [ "$K_SAMPLING" = true ]; then
+  RUN_NAME=${RUN_NAME}_Ksample${K_MIN}-${K_MAX}_ilr${ILR_MIN}-${ILR_MAX}_unique${ILR_SAMPLE_UNIQUE}
+fi
 if [ "$LAST_K_SECOND_ORDER" != "$K" ] && [ "$GRAD_MODE" == "second" ]; then
   RUN_NAME=${RUN_NAME}_last_K${LAST_K_SECOND_ORDER}
 fi
@@ -207,6 +217,9 @@ if [ "$MEMORY_ALIGNMENT_WEIGHT" != "0.0" ]; then
 fi
 if [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}
+  if [ "$ALIGNMENT_SAMPLING" = true ]; then
+    RUN_NAME=${RUN_NAME}_sampled
+  fi
   if [ "$ALIGN_LAST_STEP" = true ]; then
     RUN_NAME=${RUN_NAME}_last
   fi
@@ -301,6 +314,12 @@ for N in "${N_VALUES[@]}"; do
     --memory_backend "$MEMORY_BACKEND"
     --write_objective "$WRITE_OBJECTIVE"
     --K "$K"
+    --K_sampling "$K_SAMPLING"
+    --K_min "$K_MIN"
+    --K_max "$K_MAX"
+    --ilr_min "$ILR_MIN"
+    --ilr_max "$ILR_MAX"
+    --ilr_sample_unique "$ILR_SAMPLE_UNIQUE"
     --last_K_second_order "$LAST_K_SECOND_ORDER"
     --inner_lr "$INNER_LR"
     --use_adam "$USE_ADAM"
@@ -384,6 +403,9 @@ for N in "${N_VALUES[@]}"; do
   fi
   if [ "$ALIGN_LAST_STEP" = true ]; then
     CMD+=( --align_last_step )
+  fi
+  if [ "$ALIGNMENT_SAMPLING" = true ] && [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
+    CMD+=( --alignment_sampling )
   fi
   if [ "$USE_LAYERWISE_ENERGY" = true ]; then
     CMD+=( --use_layerwise_energy )

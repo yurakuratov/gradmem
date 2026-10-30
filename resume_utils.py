@@ -5,12 +5,13 @@ from pathlib import Path
 from typing import Any
 
 
-def restore_resume_args(args: Any, logger: Any = None) -> Any:
+def restore_resume_args(args: Any, logger: Any = None, *, preserve_args: tuple[str, ...] = ()) -> Any:
     """Restore runner arguments saved in the experiment directory.
 
     A model checkpoint contains model, optimizer, scheduler, RNG, and trainer
     state, but it does not contain the task and GradMem runner arguments.  The
     latter must be restored before constructing the dataset and model.
+    Names in preserve_args retain their current CLI values instead.
     """
     resume_value = getattr(args, "resume_from_checkpoint", None)
     if resume_value is None:
@@ -24,6 +25,21 @@ def restore_resume_args(args: Any, logger: Any = None) -> Any:
         raise ValueError(
             "--resume_from_checkpoint must be a checkpoint directly inside --exp_path so logs continue "
             f"in the same run: checkpoint={resume_path}, exp_path={output_path}"
+        )
+
+    import sys
+
+    import torch
+    from packaging.version import Version
+
+    if Version(torch.__version__).release < (2, 6):
+        raise ValueError(
+            f"Resuming training requires PyTorch >= 2.6; found {torch.__version__} "
+            f"in {sys.executable}. Trainer restores optimizer and scheduler .pt files "
+            "even when model weights use safetensors. Use the rmt environment "
+            "(conda run --no-capture-output -n rmt bash scripts/run_energygradmem_on_mqar.sh "
+            "--resume_from_checkpoint <checkpoint-directory>), or upgrade PyTorch "
+            "in your project environment. Do not bypass the torch.load security check."
         )
 
     config_path = output_path / "config.json"
@@ -40,7 +56,11 @@ def restore_resume_args(args: Any, logger: Any = None) -> Any:
     current_args = vars(args).copy()
     restored_keys = []
     for name, value in saved_args.items():
-        if name not in current_args or name in {"exp_path", "resume_from_checkpoint", "init_checkpoint"}:
+        if (
+            name not in current_args
+            or name in {"exp_path", "resume_from_checkpoint", "init_checkpoint"}
+            or name in preserve_args
+        ):
             continue
         if current_args[name] != value:
             restored_keys.append(name)

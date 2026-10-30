@@ -23,6 +23,12 @@ N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
 K=1
 INNER_LR=0.04
+K_SAMPLING=${K_SAMPLING:-false}
+K_MIN=${K_MIN:-$K}
+K_MAX=${K_MAX:-$K}
+ILR_MIN=${ILR_MIN:-$INNER_LR}
+ILR_MAX=${ILR_MAX:-$INNER_LR}
+ILR_SAMPLE_UNIQUE=${ILR_SAMPLE_UNIQUE:-false}
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 USE_ADAM=false
@@ -42,6 +48,9 @@ if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
 fi
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
+if [ "$K_SAMPLING" = true ]; then
+  RUN_NAME=${RUN_NAME}_Ksample${K_MIN}-${K_MAX}_ilr${ILR_MIN}-${ILR_MAX}_unique${ILR_SAMPLE_UNIQUE}
+fi
 if [ "$INNER_CLIP_VALUE" != "None" ]; then
   RUN_NAME=${RUN_NAME}_icv${INNER_CLIP_VALUE}
 fi
@@ -107,6 +116,12 @@ for task_name in "qa2"; do
         --pretrained_model "$PRETRAINED_MODEL"
         --n_mem_tokens "$N_MEM_TOKENS"
         --K "$K"
+        --K_sampling "$K_SAMPLING"
+        --K_min "$K_MIN"
+        --K_max "$K_MAX"
+        --ilr_min "$ILR_MIN"
+        --ilr_max "$ILR_MAX"
+        --ilr_sample_unique "$ILR_SAMPLE_UNIQUE"
         --inner_lr "$INNER_LR"
         --use_adam "$USE_ADAM"
         --memory_noise_sigma "$MEMORY_NOISE_SIGMA"

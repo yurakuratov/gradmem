@@ -147,7 +147,8 @@ for N in "${N_VALUES[@]}"; do
       --warmup_steps 10000
       --early_stopping_patience 500
       --stop_on_metric_value "$STOP_ON_METRIC_VALUE"
-      --seed "$((142+N))"
+       --seed "$((142+N))"
+       --save_last_checkpoint "$SAVE_LAST_CHECKPOINT"
   )
 
   if [ -n "${INIT_CHECKPOINT:-}" ]; then

@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/collect_env_state.sh"
 
 # Define arguments for the script
+# RESUME_FROM_CHECKPOINT=./snapshot_runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_rank0.01_m0.1_t1.0_mix0.75_anchor0.001_grad_second_bs_64_lr_1e-04_fp32_init_N32_K2_ilr0.4/run_2/checkpoint-319000
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,14 +37,21 @@ TBS=64
 PER_DEVICE_BATCH_SIZE=64
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 
+# READ model architecture. These always configure the main model.
 L=${L:-4}
 H=${H:-4}
 D=${D:-256}
-BASE_MODEL=llama
+BASE_MODEL=${BASE_MODEL:-llama}
+SEPARATE_WRITER=${SEPARATE_WRITER:-false}
+WRITER_BASE_MODEL=${WRITER_BASE_MODEL:-$BASE_MODEL}
+WRITER_PRETRAINED_MODEL=${WRITER_PRETRAINED_MODEL:-}
+WRITER_L=${WRITER_L:-$L}
+WRITER_H=${WRITER_H:-$H}
+WRITER_D=${WRITER_D:-$D}
 
 # Dense MQAR task: 4K framed context tokens + K contiguous queries.
 VOCAB_SIZE=8192
-NUM_KV_PAIRS=${NUM_KV_PAIRS:-16}
+NUM_KV_PAIRS=8
 INPUT_SEQ_LEN=$((3 * NUM_KV_PAIRS))
 DENSE_QUERIES=true
 MQAR_NOISE_LVL=${MQAR_NOISE_LVL:-0.0}
@@ -76,27 +84,38 @@ MQAR_DATA_PATH=${MQAR_DATA_PATH:-./data/${DATA_NAME}}
 
 # Energy-GradMem currently supports prefix memory only.
 MEMORY_BACKEND="prefix"
-WRITE_OBJECTIVE="energy"
+WRITE_OBJECTIVE="reconstruction"
 
 # Memory/write params. Start from known-good GradMem N8 setup.
 N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
-K=1
+K=2
 LAST_K_SECOND_ORDER=${K}
-INNER_LR=5.0
+INNER_LR=0.4
+K_SAMPLING=false
+K_MIN=1
+K_MAX=4
+ILR_MIN=0.1
+ILR_MAX=2.5
+ILR_SAMPLE_UNIQUE=true
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=10.0
 USE_ADAM=false
 GRAD_MODE="second"
 USE_MEM_PROJ=false
 MEM_PROJ_MODE="none"
-USE_WRITE_HEAD=true
-USE_WRITE_LORA=false
+USE_WRITE_HEAD=false
+USE_WRITE_LORA=${USE_WRITE_LORA:-false}
 WRITE_LORA_R=${WRITE_LORA_R:-8}
 WRITE_LORA_ALPHA=${WRITE_LORA_ALPHA:-16}
 WRITE_LORA_DROPOUT=${WRITE_LORA_DROPOUT:-0.0}
 WRITE_LORA_TARGETS=${WRITE_LORA_TARGETS:-}
 FREEZE_BACKBONE=false
+
+if [ "$SEPARATE_WRITER" = true ] && { [ "$USE_WRITE_LORA" = true ] || [ "$USE_WRITE_HEAD" = true ]; }; then
+  printf 'SEPARATE_WRITER cannot be combined with USE_WRITE_LORA or USE_WRITE_HEAD.\n' >&2
+  exit 2
+fi
 
 LORA_MEM_PLACEMENT=${LORA_MEM_PLACEMENT:-between_layers}
 LORA_MEM_TARGET_MODULES=${LORA_MEM_TARGET_MODULES:-}
@@ -111,13 +130,13 @@ KV_MEM_LAYERS=${KV_MEM_LAYERS:-all}
 ENERGY_HEAD_HIDDEN_DIM=None
 WRITE_RECONSTRUCTION_WEIGHT=1.0
 WRITE_ENERGY_WEIGHT=1.0
-ENERGY_RANK_WEIGHT=${ENERGY_RANK_WEIGHT:-0.0}
+ENERGY_RANK_WEIGHT=0.0
 ENERGY_TRAJ_WEIGHT=${ENERGY_TRAJ_WEIGHT:-0.0}
 ENERGY_MARGIN=${ENERGY_MARGIN:-0.1}
 ENERGY_TRAJ_MARGIN=${ENERGY_TRAJ_MARGIN:-0.0}
 ENERGY_RANK_TEMPERATURE=${ENERGY_RANK_TEMPERATURE:-1.0}
 ENERGY_MIX_ALPHA=${ENERGY_MIX_ALPHA:-0.75}
-ENERGY_ANCHOR_WEIGHT=${ENERGY_ANCHOR_WEIGHT:-0.0}
+ENERGY_ANCHOR_WEIGHT=0.0
 USE_LAYERWISE_ENERGY=${USE_LAYERWISE_ENERGY:-false}
 LIPSCHITZ_WEIGHT=${LIPSCHITZ_WEIGHT:-0.0}
 LIPSCHITZ_CONSTRAINT=${LIPSCHITZ_CONSTRAINT:-1.0}
@@ -131,6 +150,7 @@ ENERGY_MEMORY_SEARCH_USE_BEST_FOR_NEXT_STEP=${ENERGY_MEMORY_SEARCH_USE_BEST_FOR_
 READ_FOCAL_GAMMA=${READ_FOCAL_GAMMA:-0.0}
 MEMORY_ALIGNMENT_WEIGHT=${MEMORY_ALIGNMENT_WEIGHT:-0.0}
 STEP_ALIGNMENT_WEIGHT=0.0
+ALIGNMENT_SAMPLING=false
 ALIGN_LAST_STEP=${ALIGN_LAST_STEP:-false}
 GRAD_ALIGN_NORM=${GRAD_ALIGN_NORM:-none}
 INTERMEDIATE_READ_WEIGHT=0.0
@@ -138,9 +158,11 @@ MEMORY_NOISE_SIGMA=${MEMORY_NOISE_SIGMA:-0.0}
 ORTHOGONAL_LOSS_WEIGHT=${ORTHOGONAL_LOSS_WEIGHT:-0.0}
 IVAN_LOSS_WEIGHT=${IVAN_LOSS_WEIGHT:-0.0}
 
-STOP_ON_METRIC_VALUE=0.99
+STOP_ON_METRIC_VALUE=2.0
 SAVE_STEPS=${SAVE_STEPS:-}
-MAX_STEPS=500000
+SAVE_LAST_CHECKPOINT=true
+# Resume preserves this total step limit and SAVE_LAST_CHECKPOINT.
+MAX_STEPS=20000
 
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
@@ -148,25 +170,61 @@ INNER_LOSS_WEIGHT=0.5
 ATTN_IMPL="eager"
 MIXED_PRECISION='no'
 
-# INIT_CHECKPOINT=./runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D128_mem8_K2_ilr0.4_energy_recon1.0_energy1.0_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-15000/model.safetensors
-# RUN_NAME_SUFFIX=init_N8_K2_ilr0.4_recon1.0_energy1.0
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-8000/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-8000/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_grad_second_bs_64_lr_1e-04_fp32/run_3/checkpoint-8000/model.safetensors
 
-# INIT_CHECKPOINT=runs/N8-K2V2-V62_1M/energygradmem_llama_L4H4D128_mem8_K2_ilr0.4_energy_recon1.0_energy1.0_rank0.01_m0.1_t1.0_mix0.75_anchor0.001_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-15500/model.safetensors
-# RUN_NAME_SUFFIX=init_N8_K2_ilr0.4_recon1.0_energy1.0_shaping
-# INIT_CHECKPOINT=./runs/N8-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.4_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-12500/model.safetensors
-# INIT_CHECKPOINT=./runs/N8-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.4_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-14500/model.safetensors
-# RUN_NAME_SUFFIX=init_gradmem_N8_K2_ilr0.4
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-33500/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-42500/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_3/checkpoint-31000/model.safetensors
+# RUN_NAME_SUFFIX=shaping_posttrain
 
-# INIT_CHECKPOINT=/cephfs/home/mkairov/gradim/energy_shaping/runs/mqar_N16_V8192_L48/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_stepalign0.1_fp32/run_1/checkpoint-131000/model.safetensors
-# INIT_CHECKPOINT=/cephfs/home/mkairov/gradim/energy_shaping/runs/mqar_N16_V8192_L48/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_stepalign0.1_fp32/run_2/checkpoint-53000/model.safetensors
-# RUN_NAME_SUFFIX=init_N16
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr10.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-39000/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr10.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-32500/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr10.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_3/checkpoint-56000/model.safetensors
+
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-33500/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-42500/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_3/checkpoint-31000/model.safetensors
+# RUN_NAME_SUFFIX=sampling_posttrain
+
+# INIT_CHECKPOINT=./runs/mqar_N16_V8192_L48/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-381000/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N16_V8192_L48/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-429500/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N16_V8192_L48/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_3/checkpoint-436500/model.safetensors
+# RUN_NAME_SUFFIX=init_N16_K2_ilr0.4
+
+
+# INIT_CHECKPOINT=./runs/mqar_N32_V8192_L96/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N16_K2_ilr0.4/run_1/checkpoint-469000/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N32_V8192_L96/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N16_K2_ilr0.4/run_2/checkpoint-469500/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N32_V8192_L96/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N16_K2_ilr0.4/run_3/checkpoint-498500/model.safetensors
+# RUN_NAME_SUFFIX=init_N32_K2_ilr0.4
+
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-33500/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-42500/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_3/checkpoint-31000/model.safetensors
+
+# INIT_CHECKPOINT="./runs/mqar_N8_V8192_L24/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-8000/model.safetensors"
+# INIT_CHECKPOINT="./runs/mqar_N8_V8192_L24/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-8000/model.safetensors"
+INIT_CHECKPOINT="./runs/mqar_N8_V8192_L24/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_grad_second_bs_64_lr_1e-04_fp32/run_3/checkpoint-8000/model.safetensors"
+
+RUN_NAME_SUFFIX=compute_match
+
+INIT_CHECKPOINT=${INIT_CHECKPOINT:-}
+
+N_VALUES=(1 2 3)
 
 if [ "$WRITE_OBJECTIVE" = "reconstruction" ]; then
   RUN_NAME=gradmem_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
 else
   RUN_NAME=energygradmem_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
 fi
+if [ "$SEPARATE_WRITER" = true ]; then
+  RUN_NAME=${RUN_NAME}_writer_${WRITER_BASE_MODEL}_L${WRITER_L}H${WRITER_H}D${WRITER_D}
+fi
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
+if [ "$K_SAMPLING" = true ]; then
+  RUN_NAME=${RUN_NAME}_Ksample${K_MIN}-${K_MAX}_ilr${ILR_MIN}-${ILR_MAX}_unique${ILR_SAMPLE_UNIQUE}
+fi
 if [ "$LAST_K_SECOND_ORDER" != "$K" ] && [ "$GRAD_MODE" == "second" ]; then
   RUN_NAME=${RUN_NAME}_last_K${LAST_K_SECOND_ORDER}
 fi
@@ -181,6 +239,9 @@ if [ "$USE_MEM_PROJ" = true ]; then
   if [ "$MEM_PROJ_MODE" == "per_sample" ]; then
     RUN_NAME=${RUN_NAME}_ps
   fi
+fi
+if [ "$USE_WRITE_HEAD" = true ]; then
+  RUN_NAME=${RUN_NAME}_whead
 fi
 if [ "$WRITE_OBJECTIVE" != "reconstruction" ]; then
   RUN_NAME=${RUN_NAME}_energy
@@ -229,6 +290,12 @@ if [ "$READ_FOCAL_GAMMA" != "0.0" ]; then
 fi
 if [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}
+  if [ "$ALIGNMENT_SAMPLING" = true ]; then
+    RUN_NAME=${RUN_NAME}_sampled
+  fi
+fi
+if [ "$INTERMEDIATE_READ_WEIGHT" != "0.0" ]; then
+  RUN_NAME=${RUN_NAME}_iread${INTERMEDIATE_READ_WEIGHT}
 fi
 if [ "$MEMORY_NOISE_SIGMA" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_mnoise${MEMORY_NOISE_SIGMA}
@@ -242,7 +309,6 @@ if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
   RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
 fi
 
-N_VALUES=(1)
 if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
   if [ ! -d "$RESUME_FROM_CHECKPOINT" ]; then
     echo "[ERROR] resume checkpoint directory does not exist: $RESUME_FROM_CHECKPOINT" >&2
@@ -305,11 +371,18 @@ for N in "${N_VALUES[@]}"; do
     --n_head "$H"
     --n_embd "$D"
     --base_model "$BASE_MODEL"
+    --separate_writer "$SEPARATE_WRITER"
     --n_mem_tokens "$N_MEM_TOKENS"
     --n_ctrl_tokens "$N_CTRL_TOKENS"
     --memory_backend "$MEMORY_BACKEND"
     --write_objective "$WRITE_OBJECTIVE"
     --K "$K"
+    --K_sampling "$K_SAMPLING"
+    --K_min "$K_MIN"
+    --K_max "$K_MAX"
+    --ilr_min "$ILR_MIN"
+    --ilr_max "$ILR_MAX"
+    --ilr_sample_unique "$ILR_SAMPLE_UNIQUE"
     --last_K_second_order "$LAST_K_SECOND_ORDER"
     --inner_lr "$INNER_LR"
     --use_adam "$USE_ADAM"
@@ -346,7 +419,15 @@ for N in "${N_VALUES[@]}"; do
     --early_stopping_patience 2000
     --stop_on_metric_value "$STOP_ON_METRIC_VALUE"
     --seed "$((142+$N))"
+    --save_last_checkpoint "$SAVE_LAST_CHECKPOINT"
   )
+  if [ "$SEPARATE_WRITER" = true ]; then
+    CMD+=( --writer_base_model "$WRITER_BASE_MODEL" )
+    CMD+=( --writer_n_layer "$WRITER_L" --writer_n_head "$WRITER_H" --writer_n_embd "$WRITER_D" )
+    if [ -n "$WRITER_PRETRAINED_MODEL" ]; then
+      CMD+=( --writer_pretrained_model "$WRITER_PRETRAINED_MODEL" )
+    fi
+  fi
 
   if [ -n "${INIT_CHECKPOINT:-}" ] && [ -z "$RESUME_FROM_CHECKPOINT" ]; then
     CMD+=( --init_checkpoint "$INIT_CHECKPOINT" )
@@ -407,6 +488,9 @@ for N in "${N_VALUES[@]}"; do
   fi
   if [ "$ALIGN_LAST_STEP" = true ]; then
     CMD+=( --align_last_step )
+  fi
+  if [ "$ALIGNMENT_SAMPLING" = true ] && [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
+    CMD+=( --alignment_sampling )
   fi
   if [ "$ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING" = true ]; then
     CMD+=( --energy_memory_search_use_gain_weighting )

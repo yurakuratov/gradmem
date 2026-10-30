@@ -24,6 +24,7 @@ from transformers import (
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
 from kv_dataset_utils import query_target_spans
+from resume_utils import restore_resume_args
 
 
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -56,6 +57,14 @@ LOSS_COMPONENT_KEYS = [
     "memory_alignment_cosine",
     "step_alignment_loss",
     "step_alignment_cosine",
+    "negative_step_alignment_loss",
+    "negative_step_alignment_cosine",
+    "negative_step_alignment_deranged_loss",
+    "negative_step_alignment_deranged_cosine",
+    "negative_step_alignment_interpolated_loss",
+    "negative_step_alignment_interpolated_cosine",
+    "negative_step_alignment_random_loss",
+    "negative_step_alignment_random_cosine",
     "orthogonal_loss",
     "orthogonal_residual_dot",
     "orthogonal_alpha",
@@ -371,6 +380,12 @@ class ExperimentArgs:
     memory_backend: Optional[str] = field(default="prefix")
     n_mem_tokens: Optional[int] = field(default=8)
     K: Optional[int] = field(default=3)
+    K_sampling: Optional[bool] = field(default=False)
+    K_min: Optional[int] = field(default=None)
+    K_max: Optional[int] = field(default=None)
+    ilr_min: Optional[float] = field(default=None)
+    ilr_max: Optional[float] = field(default=None)
+    ilr_sample_unique: Optional[bool] = field(default=False)
     last_K_second_order: Optional[int] = field(default=None)
     inner_lr: Optional[float] = field(default=0.01)
     use_adam: Optional[bool] = field(default=True)
@@ -422,6 +437,7 @@ class ExperimentArgs:
     inner_loss_weight: Optional[float] = field(default=None)
     memory_alignment_weight: Optional[float] = field(default=0.0)
     step_alignment_weight: Optional[float] = field(default=0.0)
+    alignment_sampling: Optional[bool] = field(default=False)
     align_last_step: Optional[bool] = field(default=False)
     grad_align_norm: Optional[str] = field(default="none")
     intermediate_read_weight: Optional[float] = field(default=0.0)
@@ -434,19 +450,9 @@ if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
     args = parser.parse_args_into_dataclasses()[0]
 
+    restore_resume_args(args, logger)
     if args.init_checkpoint is not None and args.resume_from_checkpoint is not None:
         raise ValueError('--init_checkpoint and --resume_from_checkpoint are mutually exclusive')
-    if args.resume_from_checkpoint is not None:
-        resume_path = Path(args.resume_from_checkpoint).resolve()
-        output_path = Path(args.exp_path).resolve()
-        if not resume_path.is_dir():
-            raise ValueError(f'Resume checkpoint directory does not exist: {resume_path}')
-        if resume_path.parent != output_path:
-            raise ValueError(
-                '--resume_from_checkpoint must be a checkpoint directly inside --exp_path so logs continue '
-                f'in the same run: checkpoint={resume_path}, exp_path={output_path}'
-            )
-        args.resume_from_checkpoint = str(resume_path)
 
     accel = accelerate.Accelerator()
     from accelerate.logging import get_logger
@@ -460,7 +466,7 @@ if __name__ == '__main__':
 
     assert not (args.pretrained_model is not None and args.base_model is not None), "only one of these args must be set"
 
-    if accel.is_main_process:
+    if accel.is_main_process and args.resume_from_checkpoint is None:
         config = {
             'cli_args': dict(vars(args)),
         }
@@ -511,6 +517,9 @@ if __name__ == '__main__':
     gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
                                       memory_backend=args.memory_backend,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
+                                      K_sampling=args.K_sampling, K_min=args.K_min, K_max=args.K_max,
+                                      ilr_min=args.ilr_min, ilr_max=args.ilr_max,
+                                      ilr_sample_unique=args.ilr_sample_unique,
                                       last_K_second_order=args.last_K_second_order,
                                       lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
                                       n_ctrl_tokens=args.n_ctrl_tokens,
@@ -566,6 +575,7 @@ if __name__ == '__main__':
                                        inner_loss_weight=args.inner_loss_weight,
                                          memory_alignment_weight=args.memory_alignment_weight,
                                          step_alignment_weight=args.step_alignment_weight,
+                                         alignment_sampling=args.alignment_sampling,
                                         align_last_step=args.align_last_step,
                                         grad_align_norm=args.grad_align_norm,
                                         intermediate_read_weight=args.intermediate_read_weight,

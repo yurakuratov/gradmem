@@ -18,6 +18,7 @@ from transformers import (
     EarlyStoppingCallback, TrainerCallback,
     HfArgumentParser
 )
+from transformers.trainer_utils import get_last_checkpoint
 
 from grad_memgpt import GradMemGPT, GradMemGPTConfig
 from resume_utils import restore_resume_args
@@ -52,6 +53,17 @@ LOSS_COMPONENT_KEYS = [
     "energy_traj_loss",
     "energy_anchor_loss",
     "energy_aux_loss",
+    "step_alignment_loss",
+    "step_alignment_cosine",
+    "intermediate_read_loss",
+    "negative_step_alignment_loss",
+    "negative_step_alignment_cosine",
+    "negative_step_alignment_deranged_loss",
+    "negative_step_alignment_deranged_cosine",
+    "negative_step_alignment_interpolated_loss",
+    "negative_step_alignment_interpolated_cosine",
+    "negative_step_alignment_random_loss",
+    "negative_step_alignment_random_cosine",
 ]
 
 ENERGY_LANDSCAPE_STAT_KEYS = [
@@ -137,7 +149,7 @@ class MQARGradMemGPT(GradMemGPT):
     def __init__(self, config):
         super().__init__(config)
         expected_vocab_size = config.mqar_vocab_size
-        actual_vocab_size = self.model.config.vocab_size
+        actual_vocab_size = self.read_model.config.vocab_size
         if actual_vocab_size != expected_vocab_size:
             raise ValueError(
                 f'Base model vocabulary size {actual_vocab_size} does not match '
@@ -145,16 +157,17 @@ class MQARGradMemGPT(GradMemGPT):
             )
 
         # Noisy MQAR uses token 0 as the visible left frame for each KV pair.
-        embeddings = self.model.get_input_embeddings()
-        if embeddings.padding_idx == 0:
-            embeddings.padding_idx = None
-            if not config.mqar_dense_queries:
-                initializer_range = getattr(self.model.config, 'initializer_range', 0.02)
-                with torch.no_grad():
-                    embeddings.weight[0].normal_(mean=0.0, std=initializer_range)
-        self.model.config.pad_token_id = 0
-        self.model.config.bos_token_id = None
-        self.model.config.eos_token_id = None
+        for model in {self.read_model, self.write_model}:
+            embeddings = model.get_input_embeddings()
+            if embeddings.padding_idx == 0:
+                embeddings.padding_idx = None
+                if not config.mqar_dense_queries:
+                    initializer_range = getattr(model.config, 'initializer_range', 0.02)
+                    with torch.no_grad():
+                        embeddings.weight[0].normal_(mean=0.0, std=initializer_range)
+            model.config.pad_token_id = 0
+            model.config.bos_token_id = None
+            model.config.eos_token_id = None
 
 
 def preprocess_logits_for_metrics(eval_pred, labels):
@@ -274,11 +287,73 @@ class StopOnMetricValue(TrainerCallback):
             logger.info(f'metric {self.metric_name}={metric_value:.4f} >= {self.value:.4f}, stopping training..')
 
 
+class SaveLastCheckpointCallback(TrainerCallback):
+    def on_step_end(self, args, state, control, **kwargs):
+        if control.should_training_stop:
+            control.should_save = True
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        if control.should_training_stop:
+            control.should_save = True
+
+
 class CustomTrainer(Trainer):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, save_last_checkpoint=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.save_last_checkpoint = save_last_checkpoint
+        self._resume_checkpoint = None
+        if save_last_checkpoint:
+            # Run after stopping callbacks so off-cadence stops save resumable state.
+            self.add_callback(SaveLastCheckpointCallback())
         self._train_component_sums = {}
         self._train_component_count = None
+
+    def train(self, resume_from_checkpoint=None, *args, **kwargs):
+        if resume_from_checkpoint is True:
+            resume_from_checkpoint = get_last_checkpoint(self.args.output_dir)
+            if resume_from_checkpoint is None:
+                raise ValueError(f'No checkpoint found in {self.args.output_dir}')
+        self._resume_checkpoint = (
+            Path(resume_from_checkpoint).resolve() if resume_from_checkpoint else None
+        )
+        return super().train(resume_from_checkpoint, *args, **kwargs)
+
+    def _sorted_checkpoints(self, *args, **kwargs):
+        checkpoints = super()._sorted_checkpoints(*args, **kwargs)
+        if self.save_last_checkpoint and self._resume_checkpoint is not None:
+            # The source is an immutable recovery point, outside the rotating
+            # set of checkpoints produced by this resumed training session.
+            checkpoints = [
+                path for path in checkpoints
+                if Path(path).resolve() != self._resume_checkpoint
+            ]
+        return checkpoints
+
+    def _load_rng_state(self, checkpoint):
+        from numpy.core.multiarray import _reconstruct
+        # NumPy 2 renamed numpy.core to numpy._core. Allow only the objects
+        # needed for the saved uint32 RNG array, scoped to safe RNG loading.
+        with torch.serialization.safe_globals([
+            (_reconstruct, 'numpy.core.multiarray._reconstruct'),
+            (_reconstruct, 'numpy._core.multiarray._reconstruct'),
+            np.ndarray,
+            np.dtype,
+            type(np.dtype(np.uint32)),
+        ]):
+            return super()._load_rng_state(checkpoint)
+
+    def _save_checkpoint(self, *args, **kwargs):
+        if not self.save_last_checkpoint:
+            return super()._save_checkpoint(*args, **kwargs)
+        # Keep best_metric for early stopping, but prevent Trainer from
+        # protecting (or reconstructing the path to) an older best checkpoint.
+        self.state.best_model_checkpoint = None
+        best_global_step = getattr(self.state, 'best_global_step', None)
+        self.state.best_global_step = None
+        try:
+            return super()._save_checkpoint(*args, **kwargs)
+        finally:
+            self.state.best_global_step = best_global_step
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         labels = inputs.get("labels")
@@ -358,6 +433,10 @@ class ExperimentArgs:
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
+    save_last_checkpoint: Optional[bool] = field(
+        default=False,
+        metadata={'help': 'Retain the latest checkpoint and save the final state, including on early stopping. Preserve the source checkpoint when resuming.'},
+    )
     warmup_steps: Optional[int] = field(default=1000)
     max_steps: Optional[int] = field(default=50000)
     logging_steps: Optional[int] = field(default=100)
@@ -383,10 +462,22 @@ class ExperimentArgs:
     n_head: Optional[int] = field(default=4)
     n_embd: Optional[int] = field(default=128)
     max_position_embeddings: Optional[int] = field(default=1024)
+    separate_writer: Optional[bool] = field(default=False)
+    writer_base_model: Optional[str] = field(default=None)
+    writer_pretrained_model: Optional[str] = field(default=None)
+    writer_n_layer: Optional[int] = field(default=None)
+    writer_n_head: Optional[int] = field(default=None)
+    writer_n_embd: Optional[int] = field(default=None)
     # GradMemGPT parameters
     memory_backend: Optional[str] = field(default="prefix")
     n_mem_tokens: Optional[int] = field(default=8)
     K: Optional[int] = field(default=3)
+    K_sampling: Optional[bool] = field(default=False)
+    K_min: Optional[int] = field(default=None)
+    K_max: Optional[int] = field(default=None)
+    ilr_min: Optional[float] = field(default=None)
+    ilr_max: Optional[float] = field(default=None)
+    ilr_sample_unique: Optional[bool] = field(default=False)
     last_K_second_order: Optional[int] = field(default=None)
     inner_lr: Optional[float] = field(default=0.01)
     use_adam: Optional[bool] = field(default=True)
@@ -438,6 +529,7 @@ class ExperimentArgs:
     inner_loss_weight: Optional[float] = field(default=None)
     memory_alignment_weight: Optional[float] = field(default=0.0)
     step_alignment_weight: Optional[float] = field(default=0.0)
+    alignment_sampling: Optional[bool] = field(default=False)
     align_last_step: Optional[bool] = field(default=False)
     grad_align_norm: Optional[str] = field(default='none')
     intermediate_read_weight: Optional[float] = field(default=0.0)
@@ -446,11 +538,48 @@ class ExperimentArgs:
     ivan_loss_weight: Optional[float] = field(default=0.0)
 
 
+def build_scratch_mqar_config(base_model, n_layer, n_head, n_embd, max_positions, vocab_size):
+    if base_model == 'gpt2':
+        config = AutoConfig.from_pretrained('gpt2')
+        config.n_layer = n_layer
+        config.n_head = n_head
+        config.n_embd = n_embd
+        config.n_positions = max_positions
+        config.n_ctx = max_positions
+    elif base_model == 'pythia':
+        config = AutoConfig.from_pretrained('EleutherAI/pythia-160m')
+        config.num_hidden_layers = n_layer
+        config.num_attention_heads = n_head
+        config.hidden_size = n_embd
+        config.intermediate_size = n_embd * 4
+        config.max_position_embeddings = max_positions
+    elif base_model == 'llama':
+        config = AutoConfig.from_pretrained('unsloth/Llama-3.2-1B')
+        config.num_hidden_layers = n_layer
+        config.num_attention_heads = n_head
+        config.num_key_value_heads = n_head
+        config.hidden_size = n_embd
+        config.head_dim = n_embd // n_head
+        config.intermediate_size = n_embd * 4
+        config.rope_scaling = None
+        config.rope_theta = 10000.0
+        config.max_position_embeddings = max_positions
+    else:
+        raise ValueError(f'Unsupported base model: {base_model}')
+    config.torch_dtype = "float32"
+    config.vocab_size = vocab_size
+    config.pad_token_id = 0
+    config.bos_token_id = None
+    config.eos_token_id = None
+    config.use_cache = False
+    return config
+
+
 if __name__ == '__main__':
     parser = HfArgumentParser(ExperimentArgs)
     args = parser.parse_args_into_dataclasses()[0]
 
-    restore_resume_args(args, logger)
+    restore_resume_args(args, logger, preserve_args=("max_steps", "save_last_checkpoint"))
     if args.init_checkpoint is not None and args.resume_from_checkpoint is not None:
         raise ValueError('--init_checkpoint and --resume_from_checkpoint are mutually exclusive')
 
@@ -581,40 +710,15 @@ if __name__ == '__main__':
                     f'MQAR vocab_size {args.vocab_size}.'
                 )
             logger.info(f'Building the base model from checkpoint config: {checkpoint_config}')
-        elif args.base_model == 'gpt2':
-            config = AutoConfig.from_pretrained('gpt2')
-            config.n_layer = args.n_layer
-            config.n_head = args.n_head
-            config.n_embd = args.n_embd
-            config.n_positions = args.max_position_embeddings
-            config.n_ctx = args.max_position_embeddings
-        elif args.base_model == 'pythia':
-            config = AutoConfig.from_pretrained('EleutherAI/pythia-160m')
-            config.num_hidden_layers = args.n_layer
-            config.num_attention_heads = args.n_head
-            config.hidden_size = args.n_embd
-            config.intermediate_size = config.hidden_size * 4
-            config.max_position_embeddings = args.max_position_embeddings
-        elif args.base_model == 'llama':
-            config = AutoConfig.from_pretrained('unsloth/Llama-3.2-1B')
-            config.num_hidden_layers = args.n_layer
-            config.num_attention_heads = args.n_head
-            config.num_key_value_heads = args.n_head
-            config.hidden_size = args.n_embd
-            config.head_dim = config.hidden_size // config.num_attention_heads
-            config.intermediate_size = config.hidden_size * 4
-            config.rope_scaling = None
-            config.rope_theta = 10000.0
-            config.max_position_embeddings = args.max_position_embeddings
         else:
-            raise ValueError(f'Unsupported base model: {args.base_model}')
-
-        config.torch_dtype = "float32"  # weights in float32, at training precision is controlled by accelerate
-        config.vocab_size = args.vocab_size
-        config.pad_token_id = 0
-        config.bos_token_id = None
-        config.eos_token_id = None
-        config.use_cache = False
+            config = build_scratch_mqar_config(
+                args.base_model,
+                args.n_layer,
+                args.n_head,
+                args.n_embd,
+                args.max_position_embeddings,
+                args.vocab_size,
+            )
     else:
         config = None
         pretrained_config = AutoConfig.from_pretrained(args.pretrained_model)
@@ -624,10 +728,35 @@ if __name__ == '__main__':
                 f'MQAR vocab_size {args.vocab_size}.'
             )
 
+    writer_config = None
+    if args.separate_writer:
+        if args.writer_pretrained_model is None:
+            writer_config = build_scratch_mqar_config(
+                args.writer_base_model or args.base_model,
+                args.writer_n_layer or args.n_layer,
+                args.writer_n_head or args.n_head,
+                args.writer_n_embd or args.n_embd,
+                args.max_position_embeddings,
+                args.vocab_size,
+            )
+        else:
+            writer_pretrained_config = AutoConfig.from_pretrained(args.writer_pretrained_model)
+            if writer_pretrained_config.vocab_size != args.vocab_size:
+                raise ValueError(
+                    f'Writer vocabulary size {writer_pretrained_config.vocab_size} does not match '
+                    f'MQAR vocab_size {args.vocab_size}.'
+                )
+
     initialize_run_seed(args.seed)
     gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
+                                      separate_writer=args.separate_writer,
+                                      writer_pretrained_model=args.writer_pretrained_model,
+                                      writer_base_config=writer_config,
                                       memory_backend=args.memory_backend,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
+                                      K_sampling=args.K_sampling, K_min=args.K_min, K_max=args.K_max,
+                                      ilr_min=args.ilr_min, ilr_max=args.ilr_max,
+                                      ilr_sample_unique=args.ilr_sample_unique,
                                       last_K_second_order=args.last_K_second_order,
                                       lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
                                       n_ctrl_tokens=args.n_ctrl_tokens,
@@ -683,6 +812,7 @@ if __name__ == '__main__':
                                        inner_loss_weight=args.inner_loss_weight,
                                        memory_alignment_weight=args.memory_alignment_weight,
                                        step_alignment_weight=args.step_alignment_weight,
+                                       alignment_sampling=args.alignment_sampling,
                                        align_last_step=args.align_last_step,
                                        grad_align_norm=args.grad_align_norm,
                                        intermediate_read_weight=args.intermediate_read_weight,
@@ -767,7 +897,7 @@ if __name__ == '__main__':
         logging_steps=args.logging_steps,
         report_to='tensorboard',
         metric_for_best_model=args.metric_for_best_model,
-        load_best_model_at_end=True,
+        load_best_model_at_end=not args.save_last_checkpoint,
         eval_on_start=True,
         greater_is_better=True,
         remove_unused_columns=False,
@@ -783,6 +913,7 @@ if __name__ == '__main__':
     trainer = CustomTrainer(
         model=model,
         args=training_args,
+        save_last_checkpoint=args.save_last_checkpoint,
         train_dataset=train_dataset,
         eval_dataset=valid_dataset,
         data_collator=data_collator,

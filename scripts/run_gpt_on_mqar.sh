@@ -31,6 +31,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 NP=${NP:-1}  # Default to 1 process if not set
+SAVE_LAST_CHECKPOINT=${SAVE_LAST_CHECKPOINT:-false}
 LR=${LR:-1e-04}
 ADAM_BETA2=${ADAM_BETA2:-}
 TBS=${TBS:-64}
@@ -38,18 +39,19 @@ PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-64}
 STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-0.99}
 MIXED_PRECISION=${MIXED_PRECISION:-no}
 RUN_NAME_SUFFIX=${RUN_NAME_SUFFIX:-}
+BIDIRECTIONAL_ATTENTION=true
 
 L=4
 H=4
 D=256
 MAX_POSITION_EMBEDDINGS=1024
-BASE_MODEL=mamba
+BASE_MODEL=llama
 
 # Dense MQAR query-order distribution.
 VOCAB_SIZE=8192
-NUM_KV_PAIRS=32
+NUM_KV_PAIRS=8
 INPUT_SEQ_LEN=$((3 * NUM_KV_PAIRS))
-MQAR_NOISE_LVL=${MQAR_NOISE_LVL:-0.0}
+MQAR_NOISE_LVL=0.0
 TRAIN_NUM_EXAMPLES=1000000
 VALID_NUM_EXAMPLES=5000
 # zoology uses power_law with 0.01
@@ -96,6 +98,9 @@ else
 fi
 
 RUN_NAME=${RUN_NAME}_bs_${TBS}_lr_${LR}
+if [ "$BIDIRECTIONAL_ATTENTION" = true ]; then
+  RUN_NAME=${RUN_NAME}_bidirectional
+fi
 if [ "$MQAR_NOISE_LVL" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_mqarnoise${MQAR_NOISE_LVL}
 fi
@@ -104,13 +109,17 @@ if [ -n "$ADAM_BETA2" ]; then
   RUN_NAME=${RUN_NAME}_b2_${ADAM_BETA2}
 fi
 
+# INIT_CHECKPOINT=./runs/mqar_N32_V8192_L96/llama_L4H4D256_L1024_bs_64_lr_1e-04/run_1/checkpoint-135000/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N32_V8192_L96/llama_L4H4D256_L1024_bs_64_lr_1e-04/run_2/checkpoint-148500/model.safetensors
+# INIT_CHECKPOINT=./runs/mqar_N32_V8192_L96/llama_L4H4D256_L1024_bs_64_lr_1e-04/run_3/checkpoint-76000/model.safetensors
+# RUN_NAME_SUFFIX=init_N32
+
 if [ -n "${RUN_NAME_SUFFIX:-}" ]; then
   RUN_NAME=${RUN_NAME}_${RUN_NAME_SUFFIX}
 fi
 
-
 # Run ID
-N_VALUES=(1 2 3)
+N_VALUES=(1)
 if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
   if [ ! -d "$RESUME_FROM_CHECKPOINT" ]; then
     echo "[ERROR] resume checkpoint directory does not exist: $RESUME_FROM_CHECKPOINT" >&2
@@ -178,11 +187,15 @@ for N in "${N_VALUES[@]}"; do
       --warmup_steps 10000
       --early_stopping_patience 500
       --stop_on_metric_value "$STOP_ON_METRIC_VALUE"
-      --seed "$((142+N))"
+       --seed "$((142+N))"
+       --save_last_checkpoint "$SAVE_LAST_CHECKPOINT"
   )
 
   if [ -n "$ADAM_BETA2" ]; then
     CMD+=(--adam_beta2 "$ADAM_BETA2")
+  fi
+  if [ "$BIDIRECTIONAL_ATTENTION" = true ]; then
+    CMD+=(--bidirectional_attention)
   fi
   if [ -n "${INIT_CHECKPOINT:-}" ] && [ -z "$RESUME_FROM_CHECKPOINT" ]; then
     CMD+=(--init_checkpoint "$INIT_CHECKPOINT")

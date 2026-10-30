@@ -171,6 +171,10 @@ class ExperimentArgs:
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
+    save_last_checkpoint: Optional[bool] = field(
+        default=False,
+        metadata={'help': 'Keep the final checkpoint instead of restoring the best checkpoint.'},
+    )
     warmup_steps: Optional[int] = field(default=1000)
     max_steps: Optional[int] = field(default=50_000)
     logging_steps: Optional[int] = field(default=100)
@@ -382,7 +386,7 @@ if __name__ == '__main__':
         logging_steps=args.logging_steps,
         report_to='tensorboard',
         metric_for_best_model=args.metric_for_best_model,
-        load_best_model_at_end=True,
+        load_best_model_at_end=not args.save_last_checkpoint,
         eval_on_start=True,
         greater_is_better=True,
         remove_unused_columns=False,

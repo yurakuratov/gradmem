@@ -3,6 +3,7 @@ import logging
 import os
 from pathlib import Path
 import math
+from types import MethodType
 
 import torch
 import torch.nn.functional as F
@@ -23,6 +24,7 @@ from transformers import (
 )
 
 from transformers.trainer_utils import get_last_checkpoint
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from zoology_mqar_data import (
     ZOOLOGY_MQAR_SOURCE,
     build_mqar_datasets,
@@ -37,6 +39,79 @@ logging.basicConfig(format=logger_fmt, level=log_lvl)
 logger = logging.getLogger('')
 
 logger.info(f"CUDA DEVICE COUNT: {torch.cuda.device_count()}")
+
+
+def enable_llama_bidirectional_attention(model):
+    """Replace Llama's causal forward mask without changing checkpoint keys."""
+    if model.config.model_type != 'llama' or not hasattr(model, 'model'):
+        raise ValueError('bidirectional_attention currently requires a Llama causal LM')
+
+    def bidirectional_forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        inputs_embeds=None,
+        position_ids=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+        **kwargs,
+    ):
+        if (input_ids is None) == (inputs_embeds is None):
+            raise ValueError('Exactly one of input_ids and inputs_embeds must be provided')
+        if inputs_embeds is None:
+            inputs_embeds = self.get_input_embeddings()(input_ids)
+        batch_size, seq_len = inputs_embeds.shape[:2]
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                batch_size, seq_len, dtype=torch.bool, device=inputs_embeds.device
+            )
+        else:
+            attention_mask = attention_mask.bool()
+        full_attention_mask = torch.zeros(
+            batch_size,
+            1,
+            seq_len,
+            seq_len,
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        ).masked_fill(
+            ~attention_mask[:, None, None, :],
+            torch.finfo(inputs_embeds.dtype).min,
+        )
+        return_dict = self.config.use_return_dict if return_dict is None else return_dict
+        outputs = self.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=full_attention_mask,
+            position_ids=position_ids,
+            use_cache=False,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=True,
+        )
+        logits = self.lm_head(outputs.last_hidden_state)
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
+        if not return_dict:
+            result = (logits, outputs.past_key_values, outputs.hidden_states, outputs.attentions)
+            return ((loss,) + result) if loss is not None else result
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    model.config.bidirectional_attention = True
+    model.forward = MethodType(bidirectional_forward, model)
+    return model
 
 
 def collate_fn(batch):
@@ -177,6 +252,10 @@ class ExperimentArgs:
     gradient_accumulation_steps: Optional[int] = field(default=1)
     total_batch_size: Optional[int] = field(default=None)
     metric_for_best_model: Optional[str] = field(default='token_accuracy')
+    save_last_checkpoint: Optional[bool] = field(
+        default=False,
+        metadata={'help': 'Keep the final checkpoint instead of restoring the best checkpoint.'},
+    )
     warmup_steps: Optional[int] = field(default=1000)
     max_steps: Optional[int] = field(default=50000)
     logging_steps: Optional[int] = field(default=100)
@@ -201,6 +280,7 @@ class ExperimentArgs:
     max_position_embeddings: Optional[int] = field(default=None)
     attn_implementation: Optional[str] = field(default=None)
     attention_dropout: Optional[float] = field(default=0.0)
+    bidirectional_attention: Optional[bool] = field(default=False)
 
     # allow writing to existing folder & resume
     overwrite_output_dir: Optional[bool] = field(default=False)
@@ -401,6 +481,9 @@ if __name__ == '__main__':
         if len(unexpected_k) != 0:
             logger.info(f'{unexpected_k} were found in checkpoint, but model is not expecting them!')
 
+    if args.bidirectional_attention:
+        enable_llama_bidirectional_attention(model)
+
     logger.info(f'model config: {model.config}')
     logger.info(f'model: {model}')
     logger.info(f'model.dtype: {model.dtype}')
@@ -441,7 +524,7 @@ if __name__ == '__main__':
         logging_steps=args.logging_steps,
         report_to='tensorboard',
         metric_for_best_model=args.metric_for_best_model,
-        load_best_model_at_end=True,
+        load_best_model_at_end=not args.save_last_checkpoint,
         eval_on_start=True,
         greater_is_better=True,
         remove_unused_columns=False,
@@ -476,7 +559,8 @@ if __name__ == '__main__':
         try:
             state_path = Path(last_ckpt) / "trainer_state.json"
             trainer.state = TrainerState.load_from_json(state_path)
-            trainer._load_best_model()
+            if not args.save_last_checkpoint:
+                trainer._load_best_model()
             logger.info(f'Successfully loaded best model from {trainer.state.best_model_checkpoint}')
         except Exception as e:
             logger.error(f"Failed to load best model from {output_dir}: {e}")

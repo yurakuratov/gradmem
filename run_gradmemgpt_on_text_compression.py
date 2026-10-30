@@ -225,6 +225,12 @@ class ExperimentArgs:
     memory_backend: Optional[str] = field(default="prefix")
     n_mem_tokens: Optional[int] = field(default=8)
     K: Optional[int] = field(default=2)
+    K_sampling: Optional[bool] = field(default=False)
+    K_min: Optional[int] = field(default=None)
+    K_max: Optional[int] = field(default=None)
+    ilr_min: Optional[float] = field(default=None)
+    ilr_max: Optional[float] = field(default=None)
+    ilr_sample_unique: Optional[bool] = field(default=False)
     last_K_second_order: Optional[int] = field(default=None)
     inner_lr: Optional[float] = field(default=0.08)
     use_adam: Optional[bool] = field(default=False)
@@ -331,6 +337,9 @@ if __name__ == '__main__':
     gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model,
                                       memory_backend=args.memory_backend,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
+                                      K_sampling=args.K_sampling, K_min=args.K_min, K_max=args.K_max,
+                                      ilr_min=args.ilr_min, ilr_max=args.ilr_max,
+                                      ilr_sample_unique=args.ilr_sample_unique,
                                       last_K_second_order=args.last_K_second_order,
                                       lr=args.inner_lr, use_adam=args.use_adam, grad_mode=args.grad_mode,
                                       n_ctrl_tokens=args.n_ctrl_tokens,

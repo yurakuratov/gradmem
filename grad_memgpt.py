@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.nn import functional as F
-from transformers import AutoModelForCausalLM, PreTrainedModel, PretrainedConfig
+from transformers import AutoModelForCausalLM, CONFIG_MAPPING, PreTrainedModel, PretrainedConfig
 from transformers.cache_utils import DynamicCache
 from contextlib import contextmanager, nullcontext
 import math
@@ -58,10 +58,19 @@ class GradMemGPTConfig(PretrainedConfig):
     def __init__(self,
                  pretrained_model=None,
                  base_config=None,
+                 separate_writer=False,
+                 writer_pretrained_model=None,
+                 writer_base_config=None,
                  memory_backend="prefix",
                  n_mem_tokens=8,
                  K=2,
                  lr=0.01,
+                 K_sampling=False,
+                 K_min=None,
+                 K_max=None,
+                 ilr_min=None,
+                 ilr_max=None,
+                 ilr_sample_unique=False,
                  use_adam=False,
                  grad_mode="second",
                  last_K_second_order=None,
@@ -112,6 +121,7 @@ class GradMemGPTConfig(PretrainedConfig):
                  inner_loss_weight=None,
                  memory_alignment_weight=0.0,
                  step_alignment_weight=0.0,
+                 alignment_sampling=False,
                  align_last_step=False,
                  grad_align_norm="none",
                  intermediate_read_weight=0.0,
@@ -123,10 +133,19 @@ class GradMemGPTConfig(PretrainedConfig):
         Args:
             pretrained_model: str, name of pretrained model to load (e.g., 'gpt2')
             base_config: dict or PretrainedConfig, config for base model when creating from scratch
+            separate_writer: bool, use an independent causal LM for WRITE
+            writer_pretrained_model: str|None, pretrained model for the independent writer
+            writer_base_config: dict or PretrainedConfig|None, scratch config for the independent writer
             memory_backend: str, memory implementation ("prefix", "lora", "kv_cache")
             n_mem_tokens: int, number of memory tokens
             K: int, number of inner loop steps
             lr: float, inner loop learning rate, it is a effective learning rate per sample
+            K_sampling: bool, sample WRITE depth and learning rate during training only
+            K_min: int|None, inclusive minimum sampled depth (defaults to K)
+            K_max: int|None, inclusive maximum sampled depth (defaults to K)
+            ilr_min: float|None, minimum log-uniform learning rate (defaults to lr)
+            ilr_max: float|None, maximum log-uniform learning rate (defaults to lr)
+            ilr_sample_unique: bool, sample a learning rate per example instead of per batch
             use_adam: bool, whether to use Adam optimizer in inner loop
             grad_mode: str, gradient mode ("none", "first", "second")
             last_K_second_order: int, use second order update for last K inner gradient steps only
@@ -192,6 +211,8 @@ class GradMemGPTConfig(PretrainedConfig):
                 stopped READ gradient on the final prefix memory
             step_alignment_weight: float, weight for aligning each inner-loop memory update with the
                 stopped READ gradient at the resulting memory state
+            alignment_sampling: bool, also align WRITE-objective gradients at detached deranged,
+                interpolated, and random memories when step alignment is enabled
             align_last_step: bool, also align the post-WRITE gradient at M_K, whose update is not applied
             grad_align_norm: str, step-alignment normalization ("none" or "norm"); "norm" weights
                 each per-sample cosine loss by the stopped task-gradient norm
@@ -211,12 +232,33 @@ class GradMemGPTConfig(PretrainedConfig):
         else:
             self.pretrained_model = None
             self.base_config = base_config
+        self.separate_writer = bool(separate_writer)
+        self.writer_pretrained_model = writer_pretrained_model
+        self.writer_base_config = writer_base_config
 
         # GradMemGPT specific parameters
         self.memory_backend = memory_backend
         self.n_mem_tokens = n_mem_tokens
         self.K = K
         self.lr = lr
+        self.K_sampling = bool(K_sampling)
+        self.K_min = K if K_min is None else K_min
+        self.K_max = K if K_max is None else K_max
+        self.ilr_min = lr if ilr_min is None else ilr_min
+        self.ilr_max = lr if ilr_max is None else ilr_max
+        self.ilr_sample_unique = bool(ilr_sample_unique)
+        if self.K_sampling:
+            if (
+                not isinstance(self.K_min, int) or isinstance(self.K_min, bool)
+                or not isinstance(self.K_max, int) or isinstance(self.K_max, bool)
+                or not 1 <= self.K_min <= self.K_max
+            ):
+                raise ValueError("K_sampling requires integer bounds 1 <= K_min <= K_max")
+            if (
+                not math.isfinite(self.ilr_min) or not math.isfinite(self.ilr_max)
+                or not 0.0 < self.ilr_min <= self.ilr_max
+            ):
+                raise ValueError("K_sampling requires finite bounds 0 < ilr_min <= ilr_max")
         self.use_adam = use_adam
         self.grad_mode = grad_mode
         self.n_ctrl_tokens = n_ctrl_tokens
@@ -272,6 +314,7 @@ class GradMemGPTConfig(PretrainedConfig):
         self.inner_loss_weight = inner_loss_weight
         self.memory_alignment_weight = memory_alignment_weight
         self.step_alignment_weight = step_alignment_weight
+        self.alignment_sampling = bool(alignment_sampling)
         self.align_last_step = align_last_step
         self.grad_align_norm = grad_align_norm
         self.intermediate_read_weight = intermediate_read_weight
@@ -285,6 +328,17 @@ class GradMemGPTConfig(PretrainedConfig):
         assert self.memory_backend in ["prefix", "lora", "kv_cache"], (
             "memory_backend must be one of: prefix, lora, kv_cache"
         )
+        if self.separate_writer and self.memory_backend != "prefix":
+            raise ValueError("separate_writer is currently supported only for memory_backend='prefix'")
+        if self.separate_writer and self.use_write_lora:
+            raise ValueError("separate_writer does not support use_write_lora=True")
+        if self.separate_writer and self.use_write_head:
+            raise ValueError("separate_writer does not support use_write_head=True")
+        writer_sources = int(self.writer_pretrained_model is not None) + int(self.writer_base_config is not None)
+        if self.separate_writer and writer_sources != 1:
+            raise ValueError(
+                "separate_writer requires exactly one of writer_pretrained_model and writer_base_config"
+            )
         assert self.write_objective in ["reconstruction", "energy", "energy_with_reconstruction"], (
             "write_objective must be one of: reconstruction, energy, energy_with_reconstruction"
         )
@@ -451,8 +505,8 @@ class InputPrefixMemoryBackend(MemoryBackend):
         batch_ctx = {
             "context_input_ids": context_input_ids,
             "query_input_ids": query_input_ids,
-            "ctx_emb": o.model.get_input_embeddings()(context_input_ids),
-            "qry_emb": o.model.get_input_embeddings()(query_input_ids),
+            "ctx_emb": o.write_model.get_input_embeddings()(context_input_ids),
+            "qry_emb": o.read_model.get_input_embeddings()(query_input_ids),
             "mem_offset": mem_offset,
         }
 
@@ -486,6 +540,8 @@ class InputPrefixMemoryBackend(MemoryBackend):
             mem_inp = o.mem_proj(mem_batch)
         else:
             mem_inp = o._apply_linear(mem_batch, memory_state["W_batch"], memory_state["b_batch"])
+        if o.write_memory_proj is not None:
+            mem_inp = o.write_memory_proj(mem_inp)
 
         if o.n_ctrl_tokens > 0:
             x_ctx = torch.cat(
@@ -802,6 +858,29 @@ class GradMemGPT(PreTrainedModel):
     """
     config_class = GradMemGPTConfig
 
+    @staticmethod
+    def _build_model(pretrained_model, base_config, attn_implementation):
+        if pretrained_model is not None:
+            return AutoModelForCausalLM.from_pretrained(
+                pretrained_model, attn_implementation=attn_implementation
+            )
+        if isinstance(base_config, dict):
+            model_type = base_config.get("model_type")
+            if model_type not in CONFIG_MAPPING:
+                raise ValueError(f"Unsupported serialized base model type: {model_type!r}")
+            base_config = CONFIG_MAPPING[model_type].from_dict(base_config)
+        return AutoModelForCausalLM.from_config(
+            base_config, attn_implementation=attn_implementation
+        )
+
+    @property
+    def read_model(self):
+        return self.model
+
+    @property
+    def write_model(self):
+        return self._write_model if self.separate_writer else self.read_model
+
     def __init__(self, config):
         """
         grad_mode: "none" | "first" | "second"
@@ -843,13 +922,19 @@ class GradMemGPT(PreTrainedModel):
         if config.pretrained_model is None and config.base_config is None:
             raise ValueError("Either pretrained_model or base_config must be provided to instantiate GradMemGPT")
 
-        # initialize base model, attention is eager to support backward pass over backward pass
-        if config.pretrained_model is not None:
-            self.model = AutoModelForCausalLM.from_pretrained(config.pretrained_model,
-                                                              attn_implementation=config.attn_implementation)
-        else:
-            self.model = AutoModelForCausalLM.from_config(config.base_config,
-                                                          attn_implementation=config.attn_implementation)
+        # Eager attention supports backward-over-backward in the WRITE model.
+        self.model = self._build_model(
+            config.pretrained_model, config.base_config, config.attn_implementation
+        )
+        self.separate_writer = bool(getattr(config, "separate_writer", False))
+        if self.separate_writer:
+            self._write_model = self._build_model(
+                config.writer_pretrained_model,
+                config.writer_base_config,
+                config.attn_implementation,
+            )
+            if self.write_model.config.vocab_size != self.read_model.config.vocab_size:
+                raise ValueError("READ and WRITE models must use the same vocabulary size")
         self.attn_implementation = config.attn_implementation
         if self.attn_implementation in ("jvp_flash", "hvp_semi_manual") and attn_double_bwd is None:
             raise ImportError(
@@ -912,6 +997,12 @@ class GradMemGPT(PreTrainedModel):
         self.K = config.K
         self.last_K_second_order = config.last_K_second_order
         self.lr = config.lr
+        self.K_sampling = config.K_sampling
+        self.K_min = config.K_min
+        self.K_max = config.K_max
+        self.ilr_min = config.ilr_min
+        self.ilr_max = config.ilr_max
+        self.ilr_sample_unique = config.ilr_sample_unique
         self.use_adam = config.use_adam
         self.grad_mode = config.grad_mode
         self.inner_clip_value = config.inner_clip_value
@@ -965,6 +1056,7 @@ class GradMemGPT(PreTrainedModel):
         self.read_loss_alignment = getattr(config, "read_loss_alignment", "causal")
         self.memory_alignment_weight = float(getattr(config, "memory_alignment_weight", 0.0) or 0.0)
         self.step_alignment_weight = float(getattr(config, "step_alignment_weight", 0.0) or 0.0)
+        self.alignment_sampling = bool(getattr(config, "alignment_sampling", False))
         self.align_last_step = bool(getattr(config, "align_last_step", False))
         self.grad_align_norm = getattr(config, "grad_align_norm", "none")
         self.intermediate_read_weight = float(getattr(config, "intermediate_read_weight", 0.0) or 0.0)
@@ -1008,10 +1100,11 @@ class GradMemGPT(PreTrainedModel):
             raise ValueError(
                 "energy_memory_search_use_best_for_next_step requires energy_memory_search_weight > 0"
             )
-        self.register_buffer("energy_memory_search_gain_ema", torch.zeros(self.K, dtype=torch.float32))
+        max_write_steps = max(self.K, self.K_max) if self.K_sampling else self.K
+        self.register_buffer("energy_memory_search_gain_ema", torch.zeros(max_write_steps, dtype=torch.float32))
         self.register_buffer(
             "energy_memory_search_gain_ema_initialized",
-            torch.zeros(self.K, dtype=torch.bool),
+            torch.zeros(max_write_steps, dtype=torch.bool),
         )
         if self.write_objective in ("energy", "energy_with_reconstruction") and self.memory_backend != "prefix":
             raise ValueError(
@@ -1027,7 +1120,10 @@ class GradMemGPT(PreTrainedModel):
             self.inner_loss_weight = 0.0
 
         # memory parameters (shape = n_mem_tokens × d)
-        n_embd = getattr(self.model.config, 'n_embd', self.model.config.hidden_size)
+        n_embd = getattr(self.read_model.config, 'n_embd', self.read_model.config.hidden_size)
+        write_n_embd = getattr(
+            self.write_model.config, 'n_embd', self.write_model.config.hidden_size
+        )
         if self.memory_backend == "prefix":
             # self.mem are inner loop per-sample params, intial states of mem (self.mem) are meta-learned
             self.mem = nn.Parameter(torch.randn(self.n_mem_tokens, n_embd) * 0.02)
@@ -1041,46 +1137,51 @@ class GradMemGPT(PreTrainedModel):
                     self.mem_proj.bias.zero_()
             else:
                 self.mem_proj = None
+            if self.separate_writer and write_n_embd != n_embd:
+                self.write_memory_proj = nn.Linear(n_embd, write_n_embd, bias=False)
+            else:
+                self.write_memory_proj = None
         else:
             self.mem = None
             self.mem_proj = None
+            self.write_memory_proj = None
 
         # optional read/write control parameters (shape = n_ctrl_tokens × d)
         if self.n_ctrl_tokens > 0:
             # write ctrl tokens can be trained only by outer loop and only if grads flow through inner loop ("second")
-            self.write_st = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
-            self.write_end = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
+            self.write_st = nn.Parameter(torch.randn(self.n_ctrl_tokens, write_n_embd) * 0.02)
+            self.write_end = nn.Parameter(torch.randn(self.n_ctrl_tokens, write_n_embd) * 0.02)
             self.read_st = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
             self.read_end = nn.Parameter(torch.randn(self.n_ctrl_tokens, n_embd) * 0.02)
 
         if self.use_write_head:
-            V = self.model.config.vocab_size
-            self.write_head = nn.Linear(n_embd, V, bias=False)
+            V = self.write_model.config.vocab_size
+            self.write_head = nn.Linear(write_n_embd, V, bias=False)
 
-            if hasattr(self.model, 'get_output_embeddings'):
-                head_params = self.model.get_output_embeddings().weight
+            if hasattr(self.write_model, 'get_output_embeddings'):
+                head_params = self.write_model.get_output_embeddings().weight
             else:  # fallback to input embeddings
-                head_params = self.model.get_input_embeddings().weight
+                head_params = self.write_model.get_input_embeddings().weight
             with torch.no_grad():
                 self.write_head.weight.copy_(head_params.detach())
 
         if self.write_objective in ("energy", "energy_with_reconstruction"):
-            energy_hidden = self.energy_head_hidden_dim or n_embd
+            energy_hidden = self.energy_head_hidden_dim or write_n_embd
             if self.use_layerwise_energy:
                 n_layers = len(self._get_transformer_blocks())
-                self.energy_ln = nn.ModuleList(nn.LayerNorm(n_embd) for _ in range(n_layers))
+                self.energy_ln = nn.ModuleList(nn.LayerNorm(write_n_embd) for _ in range(n_layers))
                 self.energy_head = nn.ModuleList(
                     nn.Sequential(
-                        nn.Linear(n_embd, energy_hidden),
+                        nn.Linear(write_n_embd, energy_hidden),
                         nn.SiLU(),
                         nn.Linear(energy_hidden, 1),
                     )
                     for _ in range(n_layers)
                 )
             else:
-                self.energy_ln = nn.LayerNorm(n_embd)
+                self.energy_ln = nn.LayerNorm(write_n_embd)
                 self.energy_head = nn.Sequential(
-                    nn.Linear(n_embd, energy_hidden),
+                    nn.Linear(write_n_embd, energy_hidden),
                     nn.SiLU(),
                     nn.Linear(energy_hidden, 1),
                 )
@@ -1090,9 +1191,10 @@ class GradMemGPT(PreTrainedModel):
 
         self.tie_weights()
         self.main_input_name = "input_ids"
-        self.model.config.use_cache = False
-        if self.model.config.pad_token_id is None:
-            self.model.config.pad_token_id = self.model.config.eos_token_id
+        for model in {self.read_model, self.write_model}:
+            model.config.use_cache = False
+            if model.config.pad_token_id is None:
+                model.config.pad_token_id = model.config.eos_token_id
 
         # turn on gradient checkpointing to save gpu ram
         # currently, gradient checkpointing is not used in inner loop, so it wont save GPU RAM at forward pass.
@@ -1174,16 +1276,20 @@ class GradMemGPT(PreTrainedModel):
         return 0
 
     def tie_weights(self):
-        self.model.tie_weights()
+        self.read_model.tie_weights()
+        if self.separate_writer:
+            self.write_model.tie_weights()
 
     def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
         # force {"use_reentrant": False}
-        if hasattr(self.model, "gradient_checkpointing_enable"):
-            try:
-                self.model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-            except TypeError:
-                # fallback for older HF versions
-                self.model.gradient_checkpointing_enable()
+        for model in {self.read_model, self.write_model}:
+            if hasattr(model, "gradient_checkpointing_enable"):
+                try:
+                    model.gradient_checkpointing_enable(
+                        gradient_checkpointing_kwargs={"use_reentrant": False}
+                    )
+                except TypeError:
+                    model.gradient_checkpointing_enable()
 
     def _count_memory_parameters(self):
         if self.memory_backend == "prefix":
@@ -1224,7 +1330,7 @@ class GradMemGPT(PreTrainedModel):
         if parsed:
             return parsed
 
-        model_type = getattr(self.model.config, "model_type", None)
+        model_type = getattr(self.write_model.config, "model_type", None)
         targets_by_type = {
             "llama": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             "gpt2": ["c_attn", "c_proj", "c_fc"],
@@ -1250,19 +1356,24 @@ class GradMemGPT(PreTrainedModel):
             target_modules=target_modules,
             task_type=TaskType.CAUSAL_LM,
         )
-        self.model = get_peft_model(self.model, lora_config)
-        if not (hasattr(self.model, "disable_adapter_layers") and hasattr(self.model, "enable_adapter_layers")):
+        wrapped_model = get_peft_model(self.write_model, lora_config)
+        if self.separate_writer:
+            self._write_model = wrapped_model
+        else:
+            self.model = wrapped_model
+        if not (hasattr(self.write_model, "disable_adapter_layers") and hasattr(self.write_model, "enable_adapter_layers")):
             raise RuntimeError("PEFT model does not support adapter toggling; cannot enforce write-only LoRA.")
 
         # keep base model trainable to preserve previous behavior
-        for param in self.model.parameters():
+        for param in self.write_model.parameters():
             param.requires_grad = True
 
     def _freeze_backbone_params(self):
-        for _, param in self.model.named_parameters():
-            param.requires_grad = False
+        for model in {self.read_model, self.write_model}:
+            for param in model.parameters():
+                param.requires_grad = False
         if self.use_write_lora:
-            for name, param in self.model.named_parameters():
+            for name, param in self.write_model.named_parameters():
                 if "lora_" in name:
                     param.requires_grad = True
 
@@ -1271,11 +1382,14 @@ class GradMemGPT(PreTrainedModel):
         if not self.use_write_lora:
             yield
             return
-        self.model.disable_adapter_layers()
+        if self.separate_writer:
+            yield
+            return
+        self.write_model.disable_adapter_layers()
         try:
             yield
         finally:
-            self.model.enable_adapter_layers()
+            self.write_model.enable_adapter_layers()
 
     def _adam_step(self, p, g, state, step_idx, lr, beta1=0.9, beta2=0.999, eps=1e-8, clip_value=10.0):
         """
@@ -1400,7 +1514,7 @@ class GradMemGPT(PreTrainedModel):
         if "attention_mask" in write_batch:
             model_kwargs["attention_mask"] = write_batch["attention_mask"]
         model_kwargs["output_hidden_states"] = self.use_layerwise_energy
-        outs = get_backbone(self.model)(
+        outs = get_backbone(self.write_model)(
             inputs_embeds=write_batch["inputs_embeds"],
             return_dict=True,
             **model_kwargs,
@@ -1571,21 +1685,21 @@ class GradMemGPT(PreTrainedModel):
         if 'attention_mask' in write_batch:
             model_kwargs['attention_mask'] = write_batch['attention_mask']
         if self.use_write_head:
-            outs = get_backbone(self.model)(inputs_embeds=write_batch['inputs_embeds'],
+            outs = get_backbone(self.write_model)(inputs_embeds=write_batch['inputs_embeds'],
                                             return_dict=True,
                                             **model_kwargs)
             hidden = outs.last_hidden_state[:, write_batch['logits_start']:, :]
             logits = self.write_head(hidden)
         else:
-            # outs = self.model(inputs_embeds=write_batch['inputs_embeds'],
+            # outs = self.write_model(inputs_embeds=write_batch['inputs_embeds'],
             #                   return_dict=True,
             #                   **model_kwargs)
             # logits = outs.logits[:, write_batch['logits_start']:, :]
-            outs = get_backbone(self.model)(inputs_embeds=write_batch['inputs_embeds'],
+            outs = get_backbone(self.write_model)(inputs_embeds=write_batch['inputs_embeds'],
                                             return_dict=True,
                                             **model_kwargs)
             hidden = outs.last_hidden_state[:, write_batch['logits_start']:, :]
-            logits = self.model.lm_head(hidden)
+            logits = self.write_model.get_output_embeddings()(hidden)
 
         loss = self._compute_write_reconstruction_loss(logits, write_batch)
         return outs, loss
@@ -1595,7 +1709,7 @@ class GradMemGPT(PreTrainedModel):
         if 'attention_mask' in write_batch:
             model_kwargs['attention_mask'] = write_batch['attention_mask']
         model_kwargs['output_hidden_states'] = self.use_layerwise_energy
-        outs = get_backbone(self.model)(
+        outs = get_backbone(self.write_model)(
             inputs_embeds=write_batch['inputs_embeds'],
             return_dict=True,
             **model_kwargs,
@@ -1604,7 +1718,7 @@ class GradMemGPT(PreTrainedModel):
         if self.use_write_head:
             logits = self.write_head(hidden)
         else:
-            output_embeddings = self.model.get_output_embeddings()
+            output_embeddings = self.write_model.get_output_embeddings()
             if output_embeddings is None:
                 raise RuntimeError("Model does not expose output embeddings for reconstruction logits")
             logits = output_embeddings(hidden)
@@ -1613,7 +1727,7 @@ class GradMemGPT(PreTrainedModel):
         return outs, reconstruction_loss, energy_loss
 
     def _get_transformer_blocks(self):
-        backbone = get_backbone(self.model)
+        backbone = get_backbone(self.write_model)
         for attr in ("h", "layers", "block", "blocks"):
             if hasattr(backbone, attr):
                 blocks = getattr(backbone, attr)
@@ -1650,7 +1764,9 @@ class GradMemGPT(PreTrainedModel):
         self.lora_mem_layer_ids = layer_ids
         self.lora_mem_slot_ids = list(layer_ids)
 
-        hidden_size = getattr(self.model.config, "n_embd", getattr(self.model.config, "hidden_size", None))
+        hidden_size = getattr(
+            self.read_model.config, "n_embd", getattr(self.read_model.config, "hidden_size", None)
+        )
         if hidden_size is None:
             raise ValueError("Could not infer hidden size from model config")
         self.lora_mem_scale = float(self.lora_mem_alpha) / float(max(1, self.lora_mem_r))
@@ -1736,7 +1852,7 @@ class GradMemGPT(PreTrainedModel):
         if parsed:
             return parsed
 
-        model_type = getattr(self.model.config, "model_type", None)
+        model_type = getattr(self.read_model.config, "model_type", None)
         targets_by_type = {
             "llama": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
             "gpt2": ["c_attn", "c_proj", "c_fc"],
@@ -1759,7 +1875,7 @@ class GradMemGPT(PreTrainedModel):
                 raise ValueError(f"lora_mem_layers has out-of-range index {idx} for {n_layers} layers")
 
         targets = self._resolve_lora_mem_targets()
-        backbone = get_backbone(self.model)
+        backbone = get_backbone(self.read_model)
         selected = []
         for module_name, module in backbone.named_modules():
             if module_name == "":
@@ -1809,20 +1925,22 @@ class GradMemGPT(PreTrainedModel):
                 raise ValueError(f"kv_mem_layers has out-of-range index {idx} for {n_layers} layers")
         self.kv_mem_layer_ids = layer_ids
 
-        hidden_size = getattr(self.model.config, "n_embd", getattr(self.model.config, "hidden_size", None))
+        hidden_size = getattr(
+            self.read_model.config, "n_embd", getattr(self.read_model.config, "hidden_size", None)
+        )
         if hidden_size is None:
             raise ValueError("Could not infer hidden size from model config")
 
         num_attn_heads = getattr(
-            self.model.config,
+            self.read_model.config,
             "num_attention_heads",
-            getattr(self.model.config, "n_head", None),
+            getattr(self.read_model.config, "n_head", None),
         )
         if num_attn_heads is None:
             raise ValueError("Could not infer number of attention heads from model config")
 
-        num_kv_heads = getattr(self.model.config, "num_key_value_heads", num_attn_heads)
-        head_dim = getattr(self.model.config, "head_dim", hidden_size // num_attn_heads)
+        num_kv_heads = getattr(self.read_model.config, "num_key_value_heads", num_attn_heads)
+        head_dim = getattr(self.read_model.config, "head_dim", hidden_size // num_attn_heads)
 
         self.kv_mem_K0 = nn.ParameterDict()
         self.kv_mem_V0 = nn.ParameterDict()
@@ -2019,20 +2137,21 @@ class GradMemGPT(PreTrainedModel):
 
     @contextmanager
     def _temporary_model_eval(self):
-        was_training = self.model.training
-        self.model.eval()
+        was_training = self.read_model.training
+        self.read_model.eval()
         try:
             yield
         finally:
-            self.model.train(was_training)
+            self.read_model.train(was_training)
 
     def _sample_norm_preserving_memory_candidates(self, memory, previous_memory):
         """Sample on the memory norm sphere at a chord radius tied to the last WRITE step."""
         center = memory.detach()
         previous = previous_memory.detach()
         original_shape = center.shape
-        center_flat = center.float().flatten(1)
-        previous_flat = previous.float().flatten(1)
+        dtype = torch.float64 if center.dtype == torch.float64 else torch.float32
+        center_flat = center.to(dtype=dtype).flatten(1)
+        previous_flat = previous.to(dtype=dtype).flatten(1)
         batch_size, flat_dim = center_flat.shape
         num_samples = self.energy_memory_search_num_samples
         eps = torch.finfo(center_flat.dtype).eps
@@ -2089,7 +2208,7 @@ class GradMemGPT(PreTrainedModel):
                     model_kwargs = read_batch.get('model_kwargs', {})
                     with backend.activation_context(candidate_state):
                         with self._disable_write_lora():
-                            read_out = self.model(
+                            read_out = self.read_model(
                                 inputs_embeds=read_batch['inputs_embeds'],
                                 return_dict=True,
                                 **model_kwargs,
@@ -2132,10 +2251,16 @@ class GradMemGPT(PreTrainedModel):
     @torch.no_grad()
     def _compute_energy_memory_search_gain_weights(self, relative_target_gains):
         gains = relative_target_gains.detach().float().clamp_min(0.0)
-        if gains.ndim != 2 or gains.size(0) != self.K:
+        if (
+            gains.ndim != 2
+            or not 1 <= gains.size(0) <= self.energy_memory_search_gain_ema.numel()
+            or (not self.K_sampling and gains.size(0) != self.K)
+        ):
             raise ValueError(
-                f"relative_target_gains must have shape [K, batch], got {tuple(gains.shape)} for K={self.K}"
+                f"relative_target_gains must have shape [K, batch] within the configured WRITE depth, got {tuple(gains.shape)}"
             )
+        gain_ema = self.energy_memory_search_gain_ema[:gains.size(0)]
+        gain_ema_initialized = self.energy_memory_search_gain_ema_initialized[:gains.size(0)]
         positive = gains.gt(0.0)
         gain_sum = (gains * positive).sum(dim=1)
         positive_count = positive.sum(dim=1).to(dtype=torch.float32)
@@ -2146,22 +2271,22 @@ class GradMemGPT(PreTrainedModel):
         batch_positive_mean = gain_sum / positive_count.clamp_min(1.0)
         decay = self.energy_memory_search_gain_ema_decay
         updated_ema = torch.where(
-            self.energy_memory_search_gain_ema_initialized,
-            decay * self.energy_memory_search_gain_ema + (1.0 - decay) * batch_positive_mean,
+            gain_ema_initialized,
+            decay * gain_ema + (1.0 - decay) * batch_positive_mean,
             batch_positive_mean,
         )
         has_positive = positive_count.gt(0.0)
-        self.energy_memory_search_gain_ema.copy_(torch.where(
+        gain_ema.copy_(torch.where(
             has_positive,
             updated_ema,
-            self.energy_memory_search_gain_ema,
+            gain_ema,
         ))
-        self.energy_memory_search_gain_ema_initialized.logical_or_(has_positive)
+        gain_ema_initialized.logical_or_(has_positive)
 
         # Let the normalizer rise immediately but decay smoothly. Otherwise a
         # stale, near-zero EMA can amplify a sudden positive gain by 1 / (1 - decay).
         normalizer = torch.maximum(
-            self.energy_memory_search_gain_ema,
+            gain_ema,
             batch_positive_mean,
         ).clamp_min(torch.finfo(torch.float32).eps)
         return gains / normalizer.unsqueeze(1)
@@ -2306,26 +2431,118 @@ class GradMemGPT(PreTrainedModel):
             return (1 - task_grad_norm * cosine).mean(), cosine.mean()
         return 1 - cosine.mean(), cosine.mean()
 
+    def _compute_negative_step_alignments(
+        self,
+        backend,
+        memory_state,
+        memory_state_initial,
+        batch_ctx,
+        labels,
+    ):
+        negative_memories, _ = self._build_energy_negative_memories(
+            memory_state["mem_batch"],
+            memory_state_initial["mem_batch"],
+            self.energy_mix_alpha,
+        )
+        alignments = {}
+        for name, negative_memory in negative_memories.items():
+            if negative_memory is None:
+                continue
+
+            candidate_state = {
+                key: value.detach() if isinstance(value, torch.Tensor) else value
+                for key, value in memory_state.items()
+            }
+            candidate_memory = negative_memory.detach().requires_grad_(True)
+            candidate_state["mem_batch"] = candidate_memory
+
+            write_batch = backend.build_write_inputs(candidate_state, batch_ctx)
+            with backend.activation_context(candidate_state):
+                if self.write_objective == "reconstruction":
+                    write_out, sampled_inner_loss = self._run_reconstruction_write_forward(write_batch)
+                elif self.write_objective == "energy":
+                    write_out, sampled_inner_loss = self._run_energy_write_forward(write_batch)
+                else:
+                    write_out, reconstruction_loss, energy_loss = (
+                        self._run_energy_reconstruction_write_forward(write_batch)
+                    )
+                    sampled_inner_loss = (
+                        self.write_reconstruction_weight * reconstruction_loss
+                        + self.write_energy_weight * energy_loss
+                    )
+            write_gradient = torch.autograd.grad(
+                sampled_inner_loss.sum(),
+                candidate_memory,
+                create_graph=True,
+                retain_graph=True,
+            )[0]
+            del write_out
+
+            read_batch = backend.build_read_inputs(candidate_state, batch_ctx)
+            read_model_kwargs = read_batch.get("model_kwargs", {})
+            with backend.activation_context(candidate_state):
+                with self._disable_write_lora():
+                    read_out = self.read_model(
+                        inputs_embeds=read_batch["inputs_embeds"],
+                        return_dict=True,
+                        **read_model_kwargs,
+                    )
+            predictions = read_out.logits[
+                :,
+                read_batch["logits_start"]:read_batch["logits_start"] + read_batch["pred_len"],
+                :,
+            ]
+            candidate_target_loss = self._compute_read_target_loss(
+                predictions,
+                read_batch,
+                labels,
+            )
+            loss, cosine = self._compute_step_alignment(
+                candidate_target_loss,
+                candidate_state,
+                write_gradient,
+            )
+            alignments[name] = {"loss": loss, "cosine": cosine}
+            del read_out
+
+        return alignments
+
     def forward(self, input_ids, labels=None, return_mem=False):
         context_input_ids = input_ids['context_input_ids']
         query_input_ids = input_ids['query_input_ids']
 
-        pad_id = self.model.config.pad_token_id
+        pad_id = self.read_model.config.pad_token_id
         device = context_input_ids.device
         B = context_input_ids.size(0)
+        write_steps = self.K
+        lr_dtype = torch.float64 if next(self.parameters()).dtype == torch.float64 else torch.float32
+        inner_lr = torch.tensor(self.lr, device=device, dtype=lr_dtype)
+        if self.training and self.K_sampling:
+            sampled_steps = torch.randint(self.K_min, self.K_max + 1, (), device=device)
+            # Depth-dependent distributed gain statistics require matching depths across ranks.
+            if dist.is_available() and dist.is_initialized():
+                dist.broadcast(sampled_steps, src=0)
+            write_steps = int(sampled_steps.item())
+            lr_shape = (B,) if self.ilr_sample_unique else ()
+            inner_lr = torch.empty(lr_shape, device=device, dtype=lr_dtype).uniform_(
+                math.log(self.ilr_min), math.log(self.ilr_max)
+            ).exp_()
+        second_order_steps = (
+            write_steps if self.last_K_second_order == self.K else min(self.last_K_second_order, write_steps)
+        )
         inner_loss = torch.tensor(0.0, device=device)
 
         backend = self.memory_backend_impl
         memory_state, memory_state_initial = backend.init_memory_state(B)
         # These are diagnostics whenever their prefix-memory gradients exist; their
         # weights control only whether they contribute to the outer objective.
-        memory_alignment_active = labels is not None and self.memory_backend == "prefix" and self.K > 0
+        memory_alignment_active = labels is not None and self.memory_backend == "prefix" and write_steps > 0
         step_alignment_active = memory_alignment_active
         orthogonal_loss_active = memory_alignment_active
-        ivan_loss_active = labels is not None and self.ivan_loss_weight > 0.0 and self.K > 0
+        ivan_loss_active = labels is not None and self.ivan_loss_weight > 0.0 and write_steps > 0
         outer_memory_gradient_active = memory_alignment_active or orthogonal_loss_active or ivan_loss_active
         initial_memory = memory_state["mem_batch"] if memory_alignment_active else None
-        intermediate_read_active = labels is not None and self.K > 1
+        intermediate_read_active = labels is not None and write_steps > 1
         intermediate_read_objective_active = (
             intermediate_read_active and self.intermediate_read_weight > 0.0
         )
@@ -2349,14 +2566,18 @@ class GradMemGPT(PreTrainedModel):
         )
 
         inner_loop_stats = {
+            'write_steps': torch.tensor(write_steps, device=device),
+            'inner_lr_mean': inner_lr.mean().detach(),
+            'inner_lr_min': inner_lr.min().detach(),
+            'inner_lr_max': inner_lr.max().detach(),
             'inner_grad_norm_mean': torch.tensor(0.0, device=device),
             'inner_grad_norm_max': torch.tensor(-1.0, device=device),
             'inner_grad_norm_min': torch.tensor(1e06, device=device),
         }
 
-        if self.K and has_write_context:
+        if write_steps and has_write_context:
             with torch.enable_grad():
-                for k in range(self.K):
+                for k in range(write_steps):
                     gradient_memory_state = memory_state
                     if self.training and self.memory_noise_sigma > 0.0:
                         gradient_memory_state = dict(memory_state)
@@ -2397,10 +2618,10 @@ class GradMemGPT(PreTrainedModel):
                         inner_loop_stats['inner_reconstruction_loss'] = rec_loss.detach().mean()
                     inner_loss = inner_loss_per_sample.sum()
 
-                    is_second_order_step = (self.grad_mode == "second") and (k >= (self.K - self.last_K_second_order))
+                    is_second_order_step = (self.grad_mode == "second") and (k >= (write_steps - second_order_steps))
                     create_graph = is_second_order_step
                     retain_graph = create_graph or (
-                        (self.add_inner_loss_to_outer and k == self.K - 1)
+                        (self.add_inner_loss_to_outer and k == write_steps - 1)
                         or intermediate_read_objective_active
                     )
 
@@ -2424,10 +2645,11 @@ class GradMemGPT(PreTrainedModel):
 
                     new_params = []
                     for p, g, i in zip(clean_inner_params, grads, range(len(clean_inner_params))):
+                        step_lr = inner_lr.reshape(B, *([1] * (p.ndim - 1))) if inner_lr.ndim else inner_lr
                         if self.use_adam:
-                            p_new = self._adam_step(p, g, opt_state.setdefault(str(i), {}), k + 1, self.lr)
+                            p_new = self._adam_step(p, g, opt_state.setdefault(str(i), {}), k + 1, step_lr)
                         else:
-                            p_new = self._sgd_step(p, g,
+                            p_new = self._sgd_step(p, g, lr=step_lr,
                                                    clip_value=self.inner_clip_value,
                                                    clip_norm=self.inner_clip_norm)
                         new_params.append(p_new)
@@ -2449,11 +2671,11 @@ class GradMemGPT(PreTrainedModel):
                         memory_state["mem_batch"] = (
                             student_memory + (teacher_memory - student_memory.detach())
                         )
-                    if intermediate_read_active and k < self.K - 1:
+                    if intermediate_read_active and k < write_steps - 1:
                         intermediate_memory_states.append(backend.snapshot_memory_state(memory_state))
 
-        if self.K:
-            inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / self.K
+        if write_steps:
+            inner_loop_stats['inner_grad_norm_mean'] = inner_loop_stats['inner_grad_norm_mean'] / write_steps
             inner_loop_stats['inner_loss'] = inner_loss.detach() / B
 
         inner_loss_after_write = None
@@ -2519,7 +2741,7 @@ class GradMemGPT(PreTrainedModel):
                 read_model_kwargs["output_attentions"] = True
             with backend.activation_context(memory_state):
                 with self._disable_write_lora():
-                    read_out = self.model(inputs_embeds=read_batch['inputs_embeds'],
+                    read_out = self.read_model(inputs_embeds=read_batch['inputs_embeds'],
                                           return_dict=True,
                                           **read_model_kwargs)
                     logits_q = read_out.logits
@@ -2661,7 +2883,7 @@ class GradMemGPT(PreTrainedModel):
                     intermediate_model_kwargs = intermediate_read_batch.get('model_kwargs', {})
                     with backend.activation_context(intermediate_memory_state):
                         with self._disable_write_lora():
-                            intermediate_read_out = self.model(
+                            intermediate_read_out = self.read_model(
                                 inputs_embeds=intermediate_read_batch['inputs_embeds'],
                                 return_dict=True,
                                 **intermediate_model_kwargs,
@@ -2717,7 +2939,7 @@ class GradMemGPT(PreTrainedModel):
 
             intermediate_depth_losses = torch.stack(intermediate_depth_losses)
             intermediate_weights = self._intermediate_read_weights(
-                self.K,
+                write_steps,
                 device=intermediate_depth_losses.device,
                 dtype=intermediate_depth_losses.dtype,
             )
@@ -2742,7 +2964,7 @@ class GradMemGPT(PreTrainedModel):
             batch_ctx,
             target_loss,
             initial_memory,
-            self.K,
+            write_steps,
             energy_loss_history,
             energy_loss_after_write,
             memory_alignment_active=memory_alignment_active,
@@ -2785,9 +3007,30 @@ class GradMemGPT(PreTrainedModel):
                 )
                 step_alignment_losses.append(reconstruction_alignment_loss_after_write)
                 step_alignment_cosines.append(reconstruction_alignment_cosine_after_write)
+
+            negative_step_alignments = {}
+            if (
+                self.training
+                and self.alignment_sampling
+                and self.step_alignment_weight > 0.0
+            ):
+                negative_step_alignments = self._compute_negative_step_alignments(
+                    backend,
+                    memory_state,
+                    memory_state_initial,
+                    batch_ctx,
+                    labels,
+                )
+                step_alignment_losses.extend(
+                    result["loss"] for result in negative_step_alignments.values()
+                )
+                step_alignment_cosines.extend(
+                    result["cosine"] for result in negative_step_alignments.values()
+                )
             step_alignment_loss = torch.stack(step_alignment_losses).mean()
             step_alignment_cosine = torch.stack(step_alignment_cosines).mean()
         else:
+            negative_step_alignments = {}
             step_alignment_loss = zero
             step_alignment_cosine = zero
         memory_alignment_loss = final_auxiliary_losses["memory_alignment_loss"]
@@ -2900,6 +3143,18 @@ class GradMemGPT(PreTrainedModel):
             "lipschitz_grad_norm_mean": lipschitz_gradient_norm.mean(),
             "lipschitz_grad_norm_max": lipschitz_gradient_norm.max(),
         })
+        if negative_step_alignments:
+            negative_losses = torch.stack([
+                result["loss"] for result in negative_step_alignments.values()
+            ])
+            negative_cosines = torch.stack([
+                result["cosine"] for result in negative_step_alignments.values()
+            ])
+            loss_stats["negative_step_alignment_loss"] = negative_losses.mean()
+            loss_stats["negative_step_alignment_cosine"] = negative_cosines.mean()
+            for name, result in negative_step_alignments.items():
+                loss_stats[f"negative_step_alignment_{name}_loss"] = result["loss"]
+                loss_stats[f"negative_step_alignment_{name}_cosine"] = result["cosine"]
         if lipschitz_active:
             loss_stats["lipschitz_loss"] = lipschitz_loss
         if memory_search_active:

@@ -36,10 +36,17 @@ TBS=64
 PER_DEVICE_BATCH_SIZE=64
 GRAD_ACC_STEPS=$(($TBS/($PER_DEVICE_BATCH_SIZE*$NP)))
 
-L=4
-H=4
-D=256
-BASE_MODEL=llama
+# READ model architecture. These always configure the main model.
+L=${L:-4}
+H=${H:-4}
+D=${D:-256}
+BASE_MODEL=${BASE_MODEL:-llama}
+SEPARATE_WRITER=${SEPARATE_WRITER:-false}
+WRITER_BASE_MODEL=${WRITER_BASE_MODEL:-$BASE_MODEL}
+WRITER_PRETRAINED_MODEL=${WRITER_PRETRAINED_MODEL:-}
+WRITER_L=${WRITER_L:-$L}
+WRITER_H=${WRITER_H:-$H}
+WRITER_D=${WRITER_D:-$D}
 
 # Dense MQAR query-order distribution.
 VOCAB_SIZE=8192
@@ -87,19 +94,30 @@ N_CTRL_TOKENS=0
 K=2
 LAST_K_SECOND_ORDER=${K}
 INNER_LR=0.4
+K_SAMPLING=${K_SAMPLING:-false}
+K_MIN=${K_MIN:-$K}
+K_MAX=${K_MAX:-$K}
+ILR_MIN=${ILR_MIN:-$INNER_LR}
+ILR_MAX=${ILR_MAX:-$INNER_LR}
+ILR_SAMPLE_UNIQUE=${ILR_SAMPLE_UNIQUE:-false}
 INNER_CLIP_VALUE=None
 INNER_CLIP_NORM=None
 USE_ADAM=false
 GRAD_MODE="second"
 USE_MEM_PROJ=false
 MEM_PROJ_MODE="none"
-USE_WRITE_HEAD=false
-USE_WRITE_LORA=false
+USE_WRITE_HEAD=${USE_WRITE_HEAD:-false}
+USE_WRITE_LORA=${USE_WRITE_LORA:-false}
 WRITE_LORA_R=8
 WRITE_LORA_ALPHA=16
 WRITE_LORA_DROPOUT=0.0
 WRITE_LORA_TARGETS=""
 FREEZE_BACKBONE=false
+
+if [ "$SEPARATE_WRITER" = true ] && { [ "$USE_WRITE_LORA" = true ] || [ "$USE_WRITE_HEAD" = true ]; }; then
+  printf 'SEPARATE_WRITER cannot be combined with USE_WRITE_LORA or USE_WRITE_HEAD.\n' >&2
+  exit 2
+fi
 ENERGY_HEAD_HIDDEN_DIM=None
 WRITE_OBJECTIVE="reconstruction"
 WRITE_RECONSTRUCTION_WEIGHT=1.0
@@ -136,6 +154,7 @@ ENERGY_MEMORY_SEARCH_USE_BEST_FOR_NEXT_STEP=${ENERGY_MEMORY_SEARCH_USE_BEST_FOR_
 READ_FOCAL_GAMMA=${READ_FOCAL_GAMMA:-0.0}
 MEMORY_ALIGNMENT_WEIGHT=${MEMORY_ALIGNMENT_WEIGHT:-0.0}
 STEP_ALIGNMENT_WEIGHT=${STEP_ALIGNMENT_WEIGHT:-0.0}
+ALIGNMENT_SAMPLING=${ALIGNMENT_SAMPLING:-false}
 ALIGN_LAST_STEP=${ALIGN_LAST_STEP:-false}
 GRAD_ALIGN_NORM=${GRAD_ALIGN_NORM:-none}
 INTERMEDIATE_READ_WEIGHT=${INTERMEDIATE_READ_WEIGHT:-0.0}
@@ -146,6 +165,7 @@ STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
 STOP_ON_METRIC_VALUE=0.99
 RUN_NAME_SUFFIX=0.99
 SAVE_STEPS=${SAVE_STEPS:-}
+SAVE_LAST_CHECKPOINT=${SAVE_LAST_CHECKPOINT:-false}
 MAX_STEPS=${MAX_STEPS:-200000}
 
 ATTN_IMPL="eager"
@@ -159,6 +179,9 @@ MIXED_PRECISION='no'
 # RUN_NAME_SUFFIX=init_N64_K1_ilr0.08_N16_K2
 
 RUN_NAME=gradmem_${BASE_MODEL}_L${L}H${H}D${D}
+if [ "$SEPARATE_WRITER" = true ]; then
+  RUN_NAME=${RUN_NAME}_writer_${WRITER_BASE_MODEL}_L${WRITER_L}H${WRITER_H}D${WRITER_D}
+fi
 if [ "$MEMORY_BACKEND" = "prefix" ]; then
   RUN_NAME=${RUN_NAME}_mem${N_MEM_TOKENS}
 fi
@@ -179,6 +202,9 @@ if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
 fi
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
+if [ "$K_SAMPLING" = true ]; then
+  RUN_NAME=${RUN_NAME}_Ksample${K_MIN}-${K_MAX}_ilr${ILR_MIN}-${ILR_MAX}_unique${ILR_SAMPLE_UNIQUE}
+fi
 if [ "$LAST_K_SECOND_ORDER" != "$K" ] && [ "$GRAD_MODE" == "second" ]; then
   RUN_NAME=${RUN_NAME}_last_K${LAST_K_SECOND_ORDER}
 fi
@@ -231,6 +257,9 @@ if [ "$READ_FOCAL_GAMMA" != "0.0" ]; then
 fi
 if [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_stepalign${STEP_ALIGNMENT_WEIGHT}
+  if [ "$ALIGNMENT_SAMPLING" = true ]; then
+    RUN_NAME=${RUN_NAME}_sampled
+  fi
 fi
 if [ "$MEMORY_NOISE_SIGMA" != "0.0" ]; then
   RUN_NAME=${RUN_NAME}_mnoise${MEMORY_NOISE_SIGMA}
@@ -313,6 +342,7 @@ for N in "${N_VALUES[@]}"; do
     --n_head "$H"
     --n_embd "$D"
     --base_model "$BASE_MODEL"
+    --separate_writer "$SEPARATE_WRITER"
     --n_mem_tokens "$N_MEM_TOKENS"
     --n_ctrl_tokens "$N_CTRL_TOKENS"
     --memory_backend "$MEMORY_BACKEND"
@@ -320,6 +350,12 @@ for N in "${N_VALUES[@]}"; do
     --write_reconstruction_weight "$WRITE_RECONSTRUCTION_WEIGHT"
     --write_energy_weight "$WRITE_ENERGY_WEIGHT"
     --K "$K"
+    --K_sampling "$K_SAMPLING"
+    --K_min "$K_MIN"
+    --K_max "$K_MAX"
+    --ilr_min "$ILR_MIN"
+    --ilr_max "$ILR_MAX"
+    --ilr_sample_unique "$ILR_SAMPLE_UNIQUE"
     --last_K_second_order "$LAST_K_SECOND_ORDER"
     --inner_lr "$INNER_LR"
     --use_adam "$USE_ADAM"
@@ -347,7 +383,15 @@ for N in "${N_VALUES[@]}"; do
     --early_stopping_patience 500
     --stop_on_metric_value "$STOP_ON_METRIC_VALUE"
     --seed "$((142+$N))"
+    --save_last_checkpoint "$SAVE_LAST_CHECKPOINT"
   )
+  if [ "$SEPARATE_WRITER" = true ]; then
+    CMD+=( --writer_base_model "$WRITER_BASE_MODEL" )
+    CMD+=( --writer_n_layer "$WRITER_L" --writer_n_head "$WRITER_H" --writer_n_embd "$WRITER_D" )
+    if [ -n "$WRITER_PRETRAINED_MODEL" ]; then
+      CMD+=( --writer_pretrained_model "$WRITER_PRETRAINED_MODEL" )
+    fi
+  fi
   # Optional args
   if [ -n "${INIT_CHECKPOINT:-}" ] && [ -z "$RESUME_FROM_CHECKPOINT" ]; then
     CMD+=( --init_checkpoint "$INIT_CHECKPOINT" )
@@ -414,6 +458,9 @@ for N in "${N_VALUES[@]}"; do
   fi
   if [ "$ALIGN_LAST_STEP" = true ]; then
     CMD+=( --align_last_step )
+  fi
+  if [ "$ALIGNMENT_SAMPLING" = true ] && [ "$STEP_ALIGNMENT_WEIGHT" != "0.0" ]; then
+    CMD+=( --alignment_sampling )
   fi
   if [ "$ENERGY_MEMORY_SEARCH_USE_GAIN_WEIGHTING" = true ]; then
     CMD+=( --energy_memory_search_use_gain_weighting )

@@ -17,6 +17,9 @@ export ENERGY_TRAJ_MARGIN=${ENERGY_TRAJ_MARGIN:-0.0}
 export ENERGY_RANK_TEMPERATURE=${ENERGY_RANK_TEMPERATURE:-1.0}
 export ENERGY_MIX_ALPHA=${ENERGY_MIX_ALPHA:-0.75}
 export WRITE_OBJECTIVE="energy"
+export K_SAMPLING=${K_SAMPLING:-false}
+export ILR_SAMPLE_UNIQUE=${ILR_SAMPLE_UNIQUE:-false}
+# Sampling bounds fall back to K/INNER_LR in the base launcher.
 
 # shellcheck source=run_energygradmem_on_kv_retrieval.sh
 source "$SCRIPT_DIR/run_energygradmem_on_kv_retrieval.sh"
