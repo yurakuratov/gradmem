@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import torch
 
-from evaluate_energy_shaping import (
+from analysis_tools.legacy.evaluate_energy_shaping import (
     METRIC_FAMILY_VERSIONS,
     METRIC_CACHE_DIRNAME,
     ResolvedRun,
@@ -147,7 +147,7 @@ def test_complete_caches_materialize_without_model_or_dataset_loading(tmp_path):
         }))
 
     loaded_datasets = {}
-    with patch("evaluate_energy_shaping.load_frozen_model", side_effect=AssertionError("model loaded")):
+    with patch("analysis_tools.legacy.evaluate_energy_shaping.load_frozen_model", side_effect=AssertionError("model loaded")):
         output, tokenizer_digest = evaluate_resolved_run(
             spec, args, loaded_datasets, device=torch.device("cpu")
         )

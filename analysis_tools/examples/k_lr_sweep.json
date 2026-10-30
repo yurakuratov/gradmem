@@ -1,0 +1,31 @@
+{
+  "kind": "k_lr_sweep",
+  "precision": "fp32",
+  "output_dir": "reports/k_lr_sweep_example_n32",
+  "device": "cpu",
+  "dataset": {"label": "N32", "path": "data/mqar_N32_V8192_L96"},
+  "examples": 256,
+  "batch_size": 64,
+  "dpi": 220,
+  "k_lr_sweep": {
+    "steps": [0, 1, 2, 4, 8, 16],
+    "inner_lrs": [0.1, 0.2, 0.4, 0.8, 1.6]
+  },
+  "setups": [
+    {
+      "label": "Reconstruction (replace checkpoint paths)",
+      "runs": [
+        "/REPLACE_WITH_RECONSTRUCTION_CHECKPOINT_1",
+        "/REPLACE_WITH_RECONSTRUCTION_CHECKPOINT_2"
+      ]
+    },
+    {
+      "label": "Energy shaping (replace checkpoint paths)",
+      "k_lr_sweep": {"inner_lrs": [0.1, 0.2, 0.4, 0.8]},
+      "runs": [
+        "/REPLACE_WITH_ENERGY_SHAPING_CHECKPOINT_1",
+        "/REPLACE_WITH_ENERGY_SHAPING_CHECKPOINT_2"
+      ]
+    }
+  ]
+}

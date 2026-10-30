@@ -1,0 +1,42 @@
+{
+  "kind": "update_svd",
+  "precision": "fp32",
+  "output_dir": "reports/update_svd_orig_vs_sampling_n32",
+  "device": "cuda",
+  "dataset": {"label": "N32", "path": "data/mqar_N32_V8192_L96"},
+  "examples": 256,
+  "batch_size": 256,
+  "dpi": 220,
+  "update_svd": {
+    "steps": 16,
+    "energy_threshold": 0.99,
+    "dash_start": null,
+    "show_n_runs": true
+  },
+  "setups": [
+    {
+      "label": "GradMem",
+      "runs": [
+        "./runs/mqar_N32_V8192_L96/gradmem_llama_L4H4D256_mem8_K1_ilr0.4_icn10.0_whead_grad_second_bs_64_lr_1e-04_fp32_init_N16_K1_ilr0.4/run_1/checkpoint-476000"
+      ]
+    },
+    {
+      "label": "Energy (orig)",
+      "runs": [
+        "./runs/mqar_N32_V8192_L96/energygradmem_llama_L4H4D256_mem8_K1_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N16_K1_ilr0.4/run_1/checkpoint-437000"
+      ]
+    },
+    {
+      "label": "Energy (sampling, k1)",
+      "runs": [
+        "./runs/mqar_N32_V8192_L96/energygradmem_llama_L4H4D256_mem8_K1_ilr0.4_Ksample1-1_ilr0.1-2.5_uniquetrue_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N16_K2_ilr0.4/run_1/checkpoint-485500"
+      ]
+    },
+    {
+      "label": "Energy (sampling, k1-4)",
+      "runs": [
+        "./runs/mqar_N32_V8192_L96/energygradmem_llama_L4H4D256_mem8_K1_ilr0.4_Ksample1-4_ilr0.1-2.5_uniquetrue_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N16_K2_ilr0.4/run_1/checkpoint-499000"
+      ]
+    }
+  ]
+}

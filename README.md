@@ -150,9 +150,26 @@ the search loss still attracts the SGD-derived state toward that detached target
 The full training rollout is target-guided, while inference follows the ordinary
 query-independent SGD trajectory.
 
+### Analysis And Reports
+
+Use the unified JSON CLI for MQAR landscapes, K extrapolation, and beneficial
+memory-search reports:
+
+```bash
+conda run -n rmt python -m analysis_tools experiment.json
+```
+
+See [`analysis_tools/README.md`](analysis_tools/README.md) and
+[`analysis_tools/examples/`](analysis_tools/examples/) for configuration examples.
+All analysis sources are under `analysis_tools/`; generated artifacts are under
+`reports/`. Historical `analysis/` results were moved intact; the mapping is in
+`reports/migration.md`. Diffusion sweeps and error-placement tools are retained
+under `analysis_tools/diffusion/`, and specialist KV/mixed-objective tools under
+`analysis_tools/legacy/`.
+
 ### Cached checkpoint evaluation
 
-`evaluate_energy_shaping.py` stores expensive task and landscape measurements in
+`analysis_tools/legacy/evaluate_energy_shaping.py` stores expensive task and landscape measurements in
 `checkpoint-*/energy_shaping_metrics/`. Run it once with `--cache-only` to
 precompute checkpoint data, then run later comparisons with the same evaluation
 settings and a new `--output-dir`; model and dataset loading are skipped when all
@@ -170,7 +187,7 @@ conda run -n rmt python scripts/cache_all_energy_shaping_checkpoints.py \
   --runs-dir runs -- --device cpu
 ```
 
-Arguments after `--` are forwarded to `evaluate_energy_shaping.py`. Use
+Arguments after `--` are forwarded to `analysis_tools.legacy.evaluate_energy_shaping`. Use
 `--dry-run` before a large sweep, and pass the same evaluation settings that
 will be used for later comparisons.
 - `scripts/run_gradmemgpt_on_babi.sh`

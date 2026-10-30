@@ -1,0 +1,80 @@
+{
+  "kind": "extrapolation",
+  "precision": "fp32",
+  "output_dir": "reports/n64_extrapolation_final_v2",
+  "device": "cuda",
+  "dataset": {
+    "label": "N64",
+    "path": "data/mqar_N64_V8192_L192"
+  },
+  "examples": 256,
+  "batch_size": 256,
+  "extrapolation": {
+    "steps": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16
+    ],
+    "dash_start": null,
+    "show_n_runs": false,
+    "uncertainty_style": "band",
+    "show_runs": true
+
+  },
+  "setups": [
+    {
+      "label": "GradMem",
+      "runs": [
+        "./runs/mqar_N64_V8192_L192/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_whead_grad_second_bs_64_lr_1e-04_fp32_init_N32_K2_ilr0.4/run_1/checkpoint-468000",
+        "./runs/mqar_N64_V8192_L192/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_whead_grad_second_bs_64_lr_1e-04_fp32_init_N32_K2_ilr0.4/run_2/checkpoint-447000",
+        "./runs/mqar_N64_V8192_L192/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_whead_grad_second_bs_64_lr_1e-04_fp32_init_N32_K2_ilr0.4/run_3/checkpoint-497500"
+      ]
+    },
+    {
+      "label": "EnergyGradMem",
+      "runs": [
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N32_K2_ilr0.4/run_1/checkpoint-499000",
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N32_K2_ilr0.4/run_2/checkpoint-500000",
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N32_K2_ilr0.4/run_3/checkpoint-494000"
+      ]
+    },
+    {
+      "label": "EnergyGradMem (sampling)",
+      "runs": [
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_Ksample1-4_ilr0.1-2.5_uniquetrue_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N16_K2_ilr0.4/run_1/checkpoint-500000",
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_Ksample1-4_ilr0.1-2.5_uniquetrue_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N16_K2_ilr0.4/run_2/checkpoint-494500",
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_Ksample1-4_ilr0.1-2.5_uniquetrue_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_init_N16_K2_ilr0.4/run_3/checkpoint-495500"
+      ]
+    },
+    {
+      "label": "EnergyGradMem (iREAD)",
+      "runs": [
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_iread0.1_fp32_init_N32_K2_ilr0.4/run_1/checkpoint-283000",
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_iread0.1_fp32_init_N32_K2_ilr0.4/run_2/checkpoint-315000",
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_grad_second_bs_64_lr_1e-04_iread0.1_fp32_init_N32_K2_ilr0.4/run_3/checkpoint-303000"
+      ]
+    },
+    {
+      "label": "EnergyGradMem (shaping)",
+      "runs": [
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_rank0.01_m0.1_t1.0_mix0.75_anchor0.001_grad_second_bs_64_lr_1e-04_fp32_init_N32_K2_ilr0.4/run_1/checkpoint-307500",
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_rank0.01_m0.1_t1.0_mix0.75_anchor0.001_grad_second_bs_64_lr_1e-04_fp32_init_N32_K2_ilr0.4/run_2/checkpoint-319000",
+        "./runs/mqar_N64_V8192_L192/energygradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_energy_rank0.01_m0.1_t1.0_mix0.75_anchor0.001_grad_second_bs_64_lr_1e-04_fp32_init_N32_K2_ilr0.4/run_3/checkpoint-233500"
+      ]
+    }
+  ]
+}

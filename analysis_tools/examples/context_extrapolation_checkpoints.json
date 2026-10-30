@@ -1,0 +1,27 @@
+{
+    "GradMem": [
+        "./runs/mqar_N8_V8192_L24/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-8000",
+        "./runs/mqar_N8_V8192_L24/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_grad_second_bs_64_lr_1e-04_fp32/run_2/checkpoint-8000",
+        "./runs/mqar_N8_V8192_L24/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_grad_second_bs_64_lr_1e-04_fp32/run_3/checkpoint-8000"
+    ],
+    "EnergyGradMem": [
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_compute_match/run_1/checkpoint-20000",
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_compute_match/run_2/checkpoint-20000",
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_compute_match/run_3/checkpoint-20000"
+    ],
+    "EnergyGradMem (shaping)": [
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_rank0.01_m0.1_t1.0_mix0.75_anchor0.001_grad_second_bs_64_lr_1e-04_fp32_shaping_posttrain/run_1/checkpoint-20000",
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_rank0.01_m0.1_t1.0_mix0.75_anchor0.001_grad_second_bs_64_lr_1e-04_fp32_shaping_posttrain/run_2/checkpoint-20000",
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_rank0.01_m0.1_t1.0_mix0.75_anchor0.001_grad_second_bs_64_lr_1e-04_fp32_shaping_posttrain/run_3/checkpoint-20000"
+    ],
+    "EnergyGradMem (sampling)": [
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_Ksample1-4_ilr1.0-10.0_uniquetrue_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_sampling_posttrain/run_1/checkpoint-20000",
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_Ksample1-4_ilr1.0-10.0_uniquetrue_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_sampling_posttrain/run_2/checkpoint-20000",
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_Ksample1-4_ilr1.0-10.0_uniquetrue_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32_sampling_posttrain/run_3/checkpoint-20000"
+    ],
+    "EnergyGradMem (iREAD)": [
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_iread0.1_fp32_iread_posttrain/run_1/checkpoint-20000",
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_iread0.1_fp32_iread_posttrain/run_2/checkpoint-20000",
+        "./runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_iread0.1_fp32_iread_posttrain/run_3/checkpoint-20000"
+    ]
+}

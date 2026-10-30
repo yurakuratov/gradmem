@@ -1,4 +1,4 @@
-from analyze_gradmem_mix_failures import error_category, make_shared_first_value_row, parse_pairs
+from analysis_tools.legacy.analyze_gradmem_mix_failures import error_category, make_shared_first_value_row, parse_pairs
 
 
 def test_error_category_is_exhaustive():

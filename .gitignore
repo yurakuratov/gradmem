@@ -184,3 +184,17 @@ snapshots
 AGENTS.md
 opencode.json
 gradmem.pdf
+plot_*
+analyze_*
+evaluate_*
+make_*
+average_*
+rebuild_*
+reports/
+analysis/
+
+# Maintained analysis sources must not match the root one-off script ignores.
+!analysis_tools/
+!analysis_tools/**
+analysis_tools/**/__pycache__/
+analysis_tools/**/*.pyc

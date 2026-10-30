@@ -1,6 +1,6 @@
 # Frozen-checkpoint evaluator
 
-[`evaluate_energy_shaping.py`](evaluate_energy_shaping.py) compares frozen GradMem and EnergyGradMem checkpoints. It evaluates task generalization, the memory-writing landscape, and—when requested—whether the inner write objective is aligned with downstream read quality.
+[`analysis_tools/legacy/evaluate_energy_shaping.py`](analysis_tools/legacy/evaluate_energy_shaping.py) compares frozen GradMem and EnergyGradMem checkpoints. It evaluates task generalization, the memory-writing landscape, and—when requested—whether the inner write objective is aligned with downstream read quality.
 
 The evaluator does not train the model. It reconstructs each model from its run configuration, loads a checkpoint strictly, evaluates in FP32 on the selected device, and checks that the parameter hash is unchanged afterward.
 
@@ -9,7 +9,7 @@ The evaluator does not train the model. It reconstructs each model from its run 
 Evaluate every completed `run_*` in one experiment folder at its recorded best checkpoint:
 
 ```bash
-python evaluate_energy_shaping.py \
+conda run -n rmt python -m analysis_tools.legacy.evaluate_energy_shaping \
   --experiment-paths runs/N8-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.4_grad_second_bs_64_lr_1e-04_fp32 \
   --aliases baseline \
   --checkpoint-selector best \
@@ -23,7 +23,7 @@ python evaluate_energy_shaping.py \
 Compare several experiment folders:
 
 ```bash
-python evaluate_energy_shaping.py \
+conda run -n rmt python -m analysis_tools.legacy.evaluate_energy_shaping \
   --experiment-paths <gradmem-folder> <energy-folder> <shaped-folder> \
   --aliases baseline energy energy_shaped \
   --checkpoint-selector best \
@@ -38,7 +38,7 @@ python evaluate_energy_shaping.py \
 Select individual runs or use different checkpoint selectors:
 
 ```bash
-python evaluate_energy_shaping.py \
+conda run -n rmt python -m analysis_tools.legacy.evaluate_energy_shaping \
   --model baseline <baseline-run> checkpoint-14500 \
   --model energy <energy-run> best \
   --model energy_shaped <shaped-run> latest \
@@ -72,7 +72,7 @@ Landscape and quality diagnostics have separate limits:
 Quality diagnostics are additive and can be computed for an existing completed output:
 
 ```bash
-python evaluate_energy_shaping.py \
+conda run -n rmt python -m analysis_tools.legacy.evaluate_energy_shaping \
   --output-dir runs/shaping_eval/three_way \
   --resume \
   --quality-diagnostics

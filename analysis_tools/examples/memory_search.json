@@ -1,0 +1,24 @@
+{
+  "kind": "memory_search",
+  "precision": "fp32",
+  "output_dir": "reports/memory_search_example",
+  "device": "cpu",
+  "dataset": {"label": "N8", "path": "data/mqar_N8_V8192_L24"},
+  "examples": 256,
+  "batch_size": 64,
+  "seed": 143,
+  "memory_search": {
+    "steps": 2,
+    "num_samples": 4,
+    "radius_scale": 0.25,
+    "quantiles": [0.5, 0.75, 1.0]
+  },
+  "setups": [
+    {
+      "label": "Original initialization",
+      "runs": [
+        "runs/mqar_N8_V8192_L24/energygradmem_llama_L4H4D256_mem8_K2_ilr5.0_icn10.0_energy_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-33500"
+      ]
+    }
+  ]
+}

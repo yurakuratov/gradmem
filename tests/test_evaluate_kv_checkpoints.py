@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from transformers import GPT2Config
 
-from evaluate_kv_checkpoints import (
+from analysis_tools.legacy.evaluate_kv_checkpoints import (
     best_checkpoint_for_run,
     discover_run_directories,
     local_lipschitz_trajectory_batch,

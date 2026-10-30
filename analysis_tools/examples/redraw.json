@@ -1,0 +1,22 @@
+{
+  "output_dir": "reports/n64_step_projection_v5",
+  "dpi": 220,
+  "figsize": [12, 5],
+  "subtitle_font_size": 18,
+  "tick_font_size": 12,
+  "axis_label_font_size": 15,
+  "legend_font_size": 15,
+  "step_orth_proj": {
+    "dash_start": null,
+    "show_n_runs": false,
+    "uncertainty_style": "band",
+    "show_runs": true,
+    "dash_start_by_setup": {
+      "GradMem": 7,
+      "EnergyGradMem": 2,
+      "EnergyGradMem (sampling)": 12,
+      "EnergyGradMem (iREAD)": 2,
+      "EnergyGradMem (shaping)": 2
+    }
+  }
+}
