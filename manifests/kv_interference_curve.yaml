@@ -1,0 +1,116 @@
+# Interference curve vs N on single-key KV — checkpoint-chained curriculum
+# (tasks/INTERFERENCE_CURVE_TASK.md, Revision 2; implements PROGRESS.md
+# missing-experiment #1)
+#
+# REVISION 2 (2026-10-26, user-directed): arms re-selected after the cycle-1
+# submission was cancelled before it started training. The SUBMITTED arms are
+# the two interface reads below; `linear_all`, all-positions `exact_softmax`,
+# and `hopfield` are DEFERRED to a later cycle (not cancelled) — their
+# definitions stay in scripts/run_interference_chain.py's ARMS table so a
+# follow-up manifest can run them without code changes.
+#
+# QUESTION (pre-registered): does the superposed linear-attention state
+# (S = Σ k vᵀ) lose accuracy as the memory bank grows, relative to exact
+# softmax over the unfolded bank? At N=8 the two are equal at convergence
+# (ladder, EM 0.995–1.00; reports/READ_LADDER_RESULTS.md); superposition costs
+# sample efficiency only. This curve finds where (if anywhere) that changes.
+# Revision 2 instantiates both sides at the M=2 learnable interface sites
+# (two-pass conditioning; the deployable read).
+#
+# DESIGN INVARIANT: per-segment load is constant — 2 pairs per segment into
+# M=2 memory tokens, pair-aware segmentation, so segments = N/2 and the bank =
+# N stored tokens. Only cross-talk between stored items grows.
+#
+# MECHANICS: run_scheduler.py has NO dependency support, so each of the 6
+# chains (2 arms x 3 seeds) is ONE scheduler run of the wrapper
+# scripts/run_interference_chain.py, which executes the 5 phases itself
+# (train N=8, warm-start N=16 from the N=8 checkpoint, ... N=96), calling
+# run_from_config.py per phase, resolving the previous phase's
+# runs/<data>/interf_<arm>_N<N>/run_<seed>_<uid8>/ (newest mtime, per-seed
+# glob so sibling seeds are never picked up), and recording
+# runs/interference_curve/<arm>_<seed>.chain.json (idempotent resume:
+# completed phases are skipped on rerun). Weights-only warm start (no
+# optimizer state); M=2 constant so no mem slicing. A phase ending below EM
+# 0.99 still chains (the curve records the shortfall); a crashed phase stops
+# only its own chain.
+#
+# NOTE on base_config: run_scheduler.load_manifest REQUIRES a base_config
+# field on every experiment; this manifest has none semantically (the wrapper
+# owns the per-arm base configs), so base_config below points at this manifest
+# itself — a placeholder token the wrapper receives and ignores (it consumes
+# only key=val tokens).
+#
+# MEMORY PROBE (local RTX 3050 4GB, gpt2 backbone = tiny L4H4D128 from
+# scratch; peak bytes are hardware-independent): measured peak train-step
+# memory (WRITE inner loop K=2 second-order + two-pass READ + outer backward)
+# on real N96-K2V2 batches, ctx_len ~680, pair-aware 48-segment geometry
+# (torch.cuda.max_memory_allocated, GiB; 2 steps + step-0 eval; probe re-run
+# 2026-10-26 for the interface arms — the interface read is two-pass, so the
+# cycle-1 linear_all/exact_softmax numbers do NOT carry over):
+#   interface         B=16 3.61, B=8 1.89   (B=32/64 OOM on the 4GB card)
+#   interface_softmax B=16 3.63, B=8 1.90   (B=32/64 OOM on the 4GB card)
+# N=8/B=64 anchors: 1.47 / 1.47 GiB (4 pair-aware segments; the ladder's
+# proven config). Peak is linear in B (fits: ~0.235 GB/sample at N=96), so
+# A100 projections at N=96/B=64 are ~15 GB per chain; N=96 at B=64/32 did
+# not fit the probe card, so per the task brief's fallback the per-device
+# batch steps down at large N with total_batch_size 64 kept via gradient
+# accumulation (run_from_config derives grad_acc = total // per_device; the
+# runner asserts the product):
+#   N =  8   16   32   64   96
+#   B = 64   64   64   32   16
+# (worst phase per chain ~3.6 GB at B=16 measured; 3 concurrent chains use
+# <20 GB of the A100's 80 GB — large margin for eval passes, fragmentation,
+# and the 48x48 forgetting-matrix eval at N=96).
+#
+# PRE-REGISTERED PREDICTIONS (pasted VERBATIM from the task brief Revision 2,
+# before submission):
+#
+# - **P1 (control):** `interface_softmax` (exact softmax over the unfolded
+#   bank at the interface sites) reaches EM ≥ 0.99 at every phase through
+#   N=96 under the 50k budget. If it fails at some N, that phase's reading is
+#   protocol/write-bound, not superposition — recorded as such.
+# - **P2 (the question):** with Δ(N) = (interface_softmax EM − interface EM),
+#   mean over seeds at each phase's best EM: superposition **binds** at the
+#   first N with Δ(N) > 0.05; if Δ(N) ≤ 0.02 through N=96, superposition
+#   **holds** at this scale (follow-up: extend to N=128, dataset exists).
+#   `read_state_cross_talk` should rise with N in `interface`; its trajectory
+#   is part of the readout.
+# - **P3 (kernel, soft expectation — no strong bet):** at N=8 the kernel
+#   difference should be small (convexity does not bite at M specialized
+#   interface sites — the `kv_interface_softmax.yaml` arm1 pre-registration);
+#   any divergence between the kernels is expected to appear only where
+#   superposition begins to bind.
+# - **Fairness note:** unchanged from revision 1 (identical curriculum per
+#   arm; warm starts by design).
+# - **Cost estimate:** 30 runs (2 arms × 5 phases × 3 seeds), 6 chains;
+#   expected ~3–5 days wall on the A100 once started.
+#
+# Dry run:
+#   uv run python run_scheduler.py manifests/kv_interference_curve.yaml --dry-run
+
+max_parallel: 3        # three seeds of ONE arm in parallel (6 chains total;
+                       # phases spend most time at small N; ladder ran 6 concurrent)
+schedule: sequential   # arms run one after another; the wrapper sequences phases
+
+experiments:
+  # (d') interface read, linear kernel — per-token keys, d_h=32, two-pass
+  # conditioning; the deployable read (ladder's fastest, most seed-consistent
+  # solver)
+  - name: interf_interface
+    command: "python scripts/run_interference_chain.py"
+    base_config: "manifests/kv_interference_curve.yaml"   # scheduler-required placeholder; ignored by the wrapper
+    overrides:
+      chain.arm: interface
+    grid:
+      chain.seed: [4378, 43894, 2343]
+
+  # exact softmax over the unfolded bank at the SAME interface sites and
+  # two-pass conditioning — the no-superposition control (O(N) read; arm1 of
+  # manifests/kv_interface_softmax.yaml riding the curriculum)
+  - name: interf_interface_softmax
+    command: "python scripts/run_interference_chain.py"
+    base_config: "manifests/kv_interference_curve.yaml"   # scheduler-required placeholder; ignored by the wrapper
+    overrides:
+      chain.arm: interface_softmax
+    grid:
+      chain.seed: [4378, 43894, 2343]

@@ -1,0 +1,111 @@
+# Interference curve vs N — carried-memory baseline arm (adaptive sgd)
+# (tasks/INTERFERENCE_CURVE_TASK.md, Revision 3, 2026-11-02 user-directed)
+#
+# REVISION 3: the main question the curve must answer is whether SEPARATE
+# memory tokens per segment mitigate catastrophic forgetting — so the
+# carried-memory baseline (every segment's inner loop continues in the SAME
+# M tokens; the running sum m_t = m_{t-1} - lr*g overwrites earlier
+# segments) runs on the IDENTICAL curriculum/protocol/seeds, as its OWN
+# cluster job (run_adaptive.yaml) ALONGSIDE the running interference job
+# (ccde14ed, manifests/kv_interference_curve.yaml — untouched). One arm, one
+# experiment, 3 seeds = 3 chains via the same wrapper
+# scripts/run_interference_chain.py (ARMS['adaptive']).
+#
+# ARM CONFIG SUMMARY (ARMS['adaptive'] in the wrapper): base
+# configs/gradmemgpt/kv_retrieval/adaptive_mamba.yaml (the segmented-carry
+# adaptive fork) with the gated bits stripped: adaptive.memory_update_rule
+# sgd (plain gradient inner loop; builds NO gate heads), NO mamba/convex
+# recurrence, NO STAR keys, NO replay, no curriculum: block (checkpoint
+# chaining instead, like the interface arms), memory-prefix READ as-is.
+# Write hyperparameters matched to the curve's arms: gradmem.n_mem_tokens 2
+# (base had 8), K 2, inner_lr 0.04, grad_mode second, use_write_head true.
+# Segmentation identical to the interface arms: pair-aware, 2 pairs per
+# segment, per-phase segmentation.n_segments = N/2 (base's segment_size
+# nulled — mutually exclusive with pair-aware). training.per_segment_eval
+# is on (from the base config) with per_segment_eval_steps 2500: the
+# [n_seg,n_seg] FORGETTING MATRIX is a PRIMARY readout for this arm (it
+# directly visualizes carry-overwriting as N grows; 48x48 at N=96).
+# Budget asymmetry is the design: 2 carried tokens vs N stored tokens for
+# the interface arms — the comparison measures the architecture axis
+# (same-token carry vs per-segment slots), not matched capacity.
+#
+# MECHANICS: identical to the curve manifest — each chain is ONE scheduler
+# run of the wrapper, which executes the 5 phases itself (N=8 scratch ->
+# warm-start 16/32/64/96), calling run_from_config.py per phase, resolving
+# the previous phase's runs/<data>/interf_adaptive_N<N>/run_<seed>_<uid8>/
+# (newest mtime, per-seed glob), recording
+# runs/interference_curve/adaptive_<seed>.chain.json (idempotent resume;
+# completed phases skipped on rerun). Weights-only warm start; M=2 constant
+# so no mem slicing. Protocol identical to the interface arms: 50k
+# steps/phase, stop_on_em_threshold 0.99, early_stopping_patience 50,
+# warmup 10k (phase 1) -> 1k (phases >=2), eval_steps 500, comet project
+# gradmem-linear-read-interference.
+#
+# NOTE on base_config: run_scheduler.load_manifest REQUIRES a base_config
+# field on every experiment; this manifest has none semantically (the wrapper
+# owns the arm's base config), so base_config below points at this manifest
+# itself — a placeholder token the wrapper receives and ignores (it consumes
+# only key=val tokens).
+#
+# MEMORY PROBE (local RTX 3050 4GB, gpt2 backbone = tiny L4H4D128 from
+# scratch; peak bytes are hardware-independent): measured peak
+# torch.cuda.max_memory_allocated (GiB) over the FULL production phase-5
+# geometry — real N96-K2V2 batches, ctx_len ~680, pair-aware 48-segment
+# carry, ONE retained autograd graph over all 48 segments x K=2
+# second-order steps, 2 train steps + step-0 eval + the 48x48
+# forgetting-matrix pass (probe re-run 2026-11-02 for this arm; the carry's
+# single-graph profile does NOT carry over from the interface arms):
+#   adaptive  B=64 OOM, B=32 OOM (both hit the 4GB card ceiling), B=16 2.99, B=8 1.51
+# Linear fit alloc(B) ~= 0.03 + 0.185*B GiB -> ~0.185 GiB/sample at N=96,
+# ~14% LIGHTER per sample than the interface arms (0.215; the M=2 one-graph
+# sgd carry beats the two-pass interface read). Per-sample cost scales
+# ~linearly with n_segments, so the per-phase batch ladder below is
+# IDENTICAL to the interface arms' (uniform per-phase batch protocol across
+# the arm family; every entry's A100 projection for 3 concurrent chains is
+# <= ~12 GB of 80 GB):
+#   N =  8   16   32   64   96
+#   B = 64   64   64   32   16      (total_batch_size 64 everywhere via
+#                                    gradient accumulation, as the interface
+#                                    arms run it)
+#
+# PRE-REGISTERED PREDICTIONS (pasted VERBATIM from the task brief Revision 3,
+# before submission):
+#
+# - **P-A1 (the expected failure):** the carried arm does NOT reach EM ≥ 0.99
+#   even at small N under the 50k budget (fact 1: the running-sum inner loop
+#   overwrites earlier segments; at 4 segments the 2026-09-10 forgetting
+#   matrices already showed degradation, while the per-segment-write arms sit
+#   at 0.99+). Forgetting matrices should show diagonal ≫ last-column gaps
+#   that widen with each phase.
+# - **P-A2 (the readout):** the per-phase gap to the `interface` arms is the
+#   effect size of "separate memory tokens mitigate forgetting". If the
+#   carried arm unexpectedly HOLDS (EM ≥ 0.99 through N=96), fact 1 is
+#   contradicted at matched protocol — a major surprise requiring
+#   investigation before any H1 claim (protocol differences vs 2026-09-10
+#   would be the first suspect, not H1's failure).
+# - **Fairness note:** 2 carried tokens vs N stored tokens is by design
+#   (architecture axis, not matched capacity); identical curriculum, protocol,
+#   and seeds as the interface arms.
+# - **Cost estimate:** 15 runs (3 seeds × 5 phases), 3 chains; if P-A1 holds,
+#   phases end by patience (~25–30k steps) rather than the cap — expect
+#   ~1–2 days wall on its own GPU.
+#
+# Dry run:
+#   uv run python run_scheduler.py manifests/kv_interference_adaptive.yaml --dry-run
+
+max_parallel: 3        # the 3 seeds of the ONE arm run in parallel (3 chains;
+                       # the wrapper sequences phases within each chain)
+schedule: sequential   # one experiment only; the wrapper sequences phases
+
+experiments:
+  # Revision-3 carried-memory baseline: adaptive fork, memory_update_rule
+  # sgd, every segment writes into the SAME 2 memory tokens across the
+  # N/2 pair-aware segments of each phase. Forgetting matrix = primary
+  # readout.
+  - name: interf_adaptive
+    command: "python scripts/run_interference_chain.py"
+    base_config: "manifests/kv_interference_adaptive.yaml"   # scheduler-required placeholder; ignored by the wrapper
+    overrides:
+      chain.arm: adaptive
+    grid:
+      chain.seed: [4378, 43894, 2343]

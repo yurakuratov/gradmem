@@ -14,7 +14,14 @@ all-positions 0.997, interface two-pass 0.999) while the one-shot control
 (0.25), the bank-prefix control (0.02) and the query-blind interface (0.01)
 fail — and the conditioning ablation shows **pass-1 query conditioning is
 load-bearing** (prediction held, Δ > 0.98 per seed). The deployable read is
-(d′): interface-only reads + two-pass conditioning.
+(d′): interface-only reads + two-pass conditioning. **The interference curve
+vs N is RUNNING** (resubmitted 2026-10-29, job `ccde14ed`, early gate
+passed) with user-selected arms: `interface` (linear kernel, the deployable
+d′) + `interface_softmax` (exact softmax at the same interface sites — the
+no-superposition control); hopfield dropped, linear-all variants deferred.
+Single-key checkpoint curriculum N ∈ {8,16,32,64,96}, 3 seeds,
+50k-steps/0.99-EM protocol — revision-2 predictions in
+[`manifests/kv_interference_curve.yaml`](manifests/kv_interference_curve.yaml).
 
 ## The challenge
 
@@ -85,22 +92,44 @@ the current Hopfield read fails (b).
    prediction. The causality trap is demonstrated empirically: per-level
    state reads fix concat ONLY when their queries can see the task query.
 
+## Theoretical scope clarification (2026-11-02; no new experiments)
+
+Independent segment writes protect earlier segment encodings from subsequent
+inner-loop gradient rewriting, conditional on fixed outer parameters. This
+is narrower than a guarantee against retrieval forgetting. Folding those
+encodings into `S = sum k v^T` can still produce key-collision cross-talk;
+the query-conditioned interface adds a separate extraction constraint.
+Carried SGD has local transition Jacobian `I - eta H` (unclipped plain SGD),
+whereas independent additive state writes have identity transition Jacobian.
+Both mechanisms still require a successful decoder. The current linear mode
+retains a bank and builds S at READ, rather than incrementally maintaining
+only S. At d=128/H=4 its 4096-coordinate matrix state is also larger than
+M=2 carried tokens (256 coordinates), so equal token count is not a matched
+state-budget comparison. Existing facts support mitigation in the measured
+regime; they do not establish unlimited retention or isolate write-rule
+effects from state size and reader changes. See the 2026-11-02 STATUS entry.
+
 ## Hypotheses ledger
 
 | hypothesis | status | strongest support | strongest doubt / missing |
 |---|---|---|---|
 | **H1** independently written per-segment memories + attention retrieval beat carried memory on forgetting | **supported** (KV single-key) | fact 2: all pairs stored with 2 tokens / 8 pairs / 4 segments; clean forgetting matrices | not yet shown at large segment counts; carried-memory controls with matched budget not tabulated here |
 | **H2** the concat failure is a **read-interface** bottleneck, not a write-quality one | **supported** (ladder, 2026-10-22) | facts 5–7; the ran control: bank-prefix fails at 0.024 WHILE (c)/(d)/(d′) reach 1.00/0.997/0.999 on the SAME stored tokens — the prefix interface, not write quality, is indicted (fact 8) | prefix-interface failure is established only at this training scale (4L/128d from scratch); a pretrained/larger frozen reader might yet make the prefix work |
-| **H3** per-token, per-level linear-attention reads from a shared state (`S = Σkᵢvᵢᵀ`), added as a bias to softmax attention over the query context, fix routing + payload + iteration at O(1) read cost | **supported for routing+payload** (ladder 2026-10-22: 0.995–1.00 vs 0.25/0.02 controls; single-key 0.997+); implementation STATUS.md 2026-10-18 (b)/(c) | facts 8–9; interface variant (d′) matches all-position reads at M·L sites — cheaper architecture suffices given pass-1 conditioning | the **iteration** claim (pointer chasing, depth-bounded multi-hop) is untested; interference-vs-N untested (state superposition may bind at larger banks — (c) vs (d) gap) |
+| **H3** per-token, per-level linear-attention reads from a shared state (`S = Σkᵢvᵢᵀ`), added as a bias to softmax attention over the query context, fix routing + payload + iteration at O(1) read cost | **supported for routing+payload** (ladder 2026-10-22: 0.995–1.00 vs 0.25/0.02 controls; single-key 0.997+); implementation STATUS.md 2026-10-18 (b)/(c) | facts 8–9; interface variant (d′) matches all-position reads at M·L sites — cheaper architecture suffices given pass-1 conditioning | the **iteration** claim (pointer chasing, depth-bounded multi-hop) is untested; interference-vs-N RUNNING (curve submitted 2026-10-26) |
 
 ## Missing experiments (decision-critical, in priority order)
 
-1. **Interference curve vs N** — (d)/(d′) vs (c) as the bank grows
-   (n_pairs ↑): the superposed state is exact-softmax's equal at N = 8 bank
-   items; find where (if anywhere) cross-talk bends the curve
-   (`read_state_cross_talk` is already logged). If it binds: coarse top-k
-   segment routing (reuse the compressed-query scores) before building the
-   state.
+1. **Interference curve vs N** — **RUNNING (resubmitted 2026-10-29, job
+   `ccde14ed`, early gate passed; manifest
+   [`kv_interference_curve.yaml`](manifests/kv_interference_curve.yaml))**.
+   Protocol per user: single-key KV, checkpoint-chained curriculum
+   N ∈ {8,16,32,64,96}, 50k steps/phase, 0.99-EM early stop; arms
+   `interface` + `interface_softmax` (user-selected: hopfield dropped,
+   linear-all deferred — definitions kept in the chain script for a later
+   manifest). Revision-2 predictions P1–P3 in the manifest header;
+   `read_state_cross_talk` trajectory is part of the readout (already
+   rising in the live run). If superposition binds: coarse top-k segment
+   routing (reuse the compressed-query scores) before building the state.
 2. **Interface read: kernel × key-geometry cells** —
    [`manifests/kv_interface_softmax.yaml`](manifests/kv_interface_softmax.yaml):
    arm1 softmax kernel (config-only), arm2 key width 64 = the old hopfield

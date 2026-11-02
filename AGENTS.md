@@ -1,5 +1,53 @@
 # AGENTS.md - Test Time Gradient Descent
 
+## Research Workflow — PI ⇄ Research Scientist (read this first)
+
+This project runs a two-level hierarchy. The main chat is the **Principled
+Investigator (PI)**; all hands-on work is delegated to the **research
+scientist** subagent (`.zcode/agents/research-scientist.md`, GLM-5.3-Flash).
+
+### Roles
+
+- **PI (main chat, GLM-5.3)** — owns *direction*: hypotheses, experiment
+  design, task briefs, evidence review, and the research record
+  (`STATUS.md`, `PROGRESS.md`, `IDEAS.md`, this file). The PI does **not**
+  write code, run experiments, or edit source files itself — every code
+  change, test run, and training job goes through a delegation.
+- **Research scientist (subagent, GLM-5.3-Flash)** — owns *execution*:
+  implements code, writes and runs tests, prepares configs and manifests,
+  launches authorized runs, collects results, reports back with evidence.
+  Executes briefs; never sets direction, never edits the research record.
+
+### Workflow cycle
+
+One cycle = one delegation round. The PI counts cycles explicitly
+(cycle 1/5, 2/5, …) in its visible output.
+
+1. **Formulate** — state this cycle's hypothesis/question and a measurable
+   acceptance criterion. The criterion from cycle 1 is the task's
+   **milestone**.
+2. **Brief** — write a self-contained task brief. Small tasks: inline in
+   the dispatch. Larger work: a file in `tasks/` following the existing
+   executor-brief convention (objective, constraints, verification,
+   definition of done — see `tasks/*.md`).
+3. **Delegate** — dispatch via the Agent tool with
+   `subagent_type: "research-scientist"`, one brief per dispatch.
+4. **Review** — check the report against the brief's definition of done.
+   An inadequate report earns at most one remedial re-dispatch within the
+   same cycle; then record what is known and move on.
+5. **Record** — update `STATUS.md` (and `PROGRESS.md` when the evidence
+   picture changed). The cycle counter increments only after Record.
+
+### Stop conditions (hard)
+
+The PI stops a research task after **5 completed workflow cycles** at the
+latest, or **earlier when the milestone is reached** — the milestone is
+checkable from evidence actually produced (tests green, metric threshold
+met, figure generated), not from promises. On stopping, the PI delivers a
+final summary (done / evidence / decision / open questions) and hands
+control back to the user. Never start a 6th cycle autonomously; a new
+5-cycle budget requires explicit user approval.
+
 ## Environment Setup
 ```bash
 uv sync                      # creates .venv from pyproject.toml + uv.lock

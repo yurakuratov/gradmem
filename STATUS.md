@@ -7,6 +7,172 @@ rationale), verification status. Current state and hypotheses live in
 **Maintenance rule:** every merged change updates this journal and, when it
 changes the evidence picture, `PROGRESS.md` in the same commit.
 
+## 2026-11-02 — cycle 1: theoretical comparison of carried writes and linear-state interface reads
+
+**Milestone reached (analysis only).** Research-scientist code inspection
+confirmed that the linear interface baseline still uses gradient writes:
+each segment starts from the same learned initial tokens, writes independently,
+and appends its result to a bank. READ constructs `S_h = sum k_i v_i^T` once
+from that bank; incremental additive state writes are an algebraically
+equivalent interpretation, not the current execution strategy.
+
+**Framework:** separate (1) modification of earlier encodings by subsequent
+writes, (2) interference when reading superposed encodings, and (3) the
+query-conditioned interface's ability to extract the required information.
+For fixed model parameters, unclipped carried SGD has local state Jacobian
+`I - eta H`; independent additive writes have identity state Jacobian.
+The latter removes cross-segment gradient rewriting of earlier encodings,
+but does not guarantee old-answer retention: at a fixed head query the new
+read contribution is `sum_new (q dot k_i) v_i`, and later-layer queries can
+also change. The random-isotropic-key noise estimate grows as
+`sqrt((N-1)/d_h)` only under explicit independence/centering assumptions.
+Gradient descent itself is not inherently destructive: a linear regression
+delta update protects old orthogonal key directions exactly.
+
+**Comparison constraints:** at d=128, H=4 the matrix state has 4096 scalar
+coordinates versus 256 for M=2 carried tokens (other adaptive M choices
+change this ratio). Current code also retains the growing bank and projected
+K/V; fixed-size state does not imply constant total forward memory. Both
+interface passes read the state. Match state budgets, segment boundaries,
+write steps, and read interfaces before attributing an accuracy gap to the
+write operator. Proposed diagnostics: old-probe loss changes versus write
+gradient alignment, segment-order sensitivity, key-overlap versus retrieval
+error, and interference scaling with N and d_h. No experiments launched,
+tests run, source/config changes, or new performance claims. Existing run
+status was not checked. Stop after cycle 1; no further cycle needed.
+
+## 2026-10-29 — cycle 2: interference curve re-armed to interface reads; resubmitted, EARLY GATE PASSED
+
+**User-directed re-arm (protocol note: arm selection is the user's call — the
+PI proposes options and asks).** The cycle-1 pending job was stopped by the
+user personally. New submitted arms: `interface` (linear kernel, per-token
+keys, d_h=32 — the deployable (d′) and the ladder's fastest solver) +
+`interface_softmax` (exact softmax over the unfolded bank at the SAME
+interface sites and two-pass conditioning — the no-superposition control;
+arm1 of [`kv_interface_softmax.yaml`](manifests/kv_interface_softmax.yaml)
+riding the curriculum). `hopfield` dropped (fails concat — uninteresting
+baseline); `linear_all`/all-positions `exact_softmax` deferred, definitions
+kept in the wrapper's ARMS table. Revision-2 predictions P1–P3 verbatim in
+the manifest header (Δ(N) = interface_softmax − interface EM; superposition
+binds at first Δ > 0.05, holds if Δ ≤ 0.02 through N=96; cross-talk
+trajectory part of the readout). Everything else unchanged from cycle 1
+(phases, 50k/0.99/patience-50/warmup 10k→1k, chaining, comet project
+`gradmem-linear-read-interference`).
+
+**Verification — first-ever interface runs on single-key.** Chain smoke
+(`interface`, 2 phases N8→N16, gpt2, 2 steps): two-pass conditioning clean
+on single-key labels; phase-2 warm-start PROVEN by checksum (sha256 of
+model-at-init restricted to checkpoint keys == sha256 of phase-1's
+resolved `model.safetensors`; 78/78 shared tensors bitwise-equal; runner
+log shows the load); idempotent resume skips completed phases.
+`interface_softmax` phase-1 smoke clean. Suite **82 passed**. Memory probe
+re-measured for the two-pass arms (N96/B16 ≈ 3.6 GiB, ~0.235 GB/sample;
+batch table 64/64/64/32/16 with total_batch 64 via accumulation; A100
+projection < 20 GB for 3 concurrent chains). Remote data N8–N96 verified
+present. Stale cycle-1 scheduler checkpoint deleted before sync.
+
+**Submitted and RUNNING — job `ccde14ed`
+(`lm-mpi-job-ccde14ed-f57a-409a-8b5c-a90c188e7e02`, copy
+`run_2026_10_29_1748_358129`), early gate PASSED at step ~2.7k/50k of
+phase 1:** eval_loss 2.969 → 2.767 (steps 2k → 2.5k), zero tracebacks,
+`runs/N8-K2V2-V62_1M/interf_interface_N8/run_{4378,43894,2343}_*` with the
+right seeds, `read_state_*` logging live — **`read_state_cross_talk` 0.117
+→ 0.169 and rising (the P2 readout trajectory is already recording)**.
+`interface_softmax` chains start after arm 1 finishes (sequential
+schedule); its single-key kernel path is smoke-covered locally. One job at
+submit time (fan-out audit clean); expected ~3–5 days wall once running.
+
+**Adjacent problems noticed, NOT fixed (house habits cover them):**
+(1) `run_from_config.py --debug` silently drops the `segmentation:` YAML
+section — the runner's programmatic flatten list lacks it; debug-mode-only
+quirk, the production CLI path is unaffected. (2) Local dry-runs silently
+write `manifests/<name>.checkpoint.json` (the known tar-exclude gotcha) —
+delete before any sync, as done here.
+
+## 2026-10-26 — cycle 1: interference curve vs N submitted (single-key, checkpoint curriculum)
+
+**Protocol (user-fixed)** — vanilla single-key KV-retrieval (NOT concat),
+curriculum `N ∈ {8,16,32,64,96}` via **explicit checkpoint chaining** (phase
+k+1 warm-starts from phase k's best checkpoint — the user-preferred variant
+of the embed curriculum mechanics, allowing per-phase batch/OOM control),
+fair stopping = **50k steps/phase max, early stop at eval EM ≥ 0.99**
+(`stop_on_em_threshold` runner arg, config-only), patience 50 as flat
+backstop, warmup 10k (phase 1) → 1k (phases ≥ 2). Arms: (c) exact-softmax,
+(d) linear-state all-positions, (a) hopfield one-shot control; seeds
+4378/43894/2343; 45 runs in 9 chains. Design invariant: 2 pairs/segment into
+M=2 tokens (segments = N/2, bank = N tokens) — only stored-item cross-talk
+grows. Brief: [`tasks/INTERFERENCE_CURVE_TASK.md`](tasks/INTERFERENCE_CURVE_TASK.md);
+pre-registered predictions P1–P3 + fairness note + cost estimate pasted
+VERBATIM into the manifest header BEFORE submission.
+
+**Decision — chain wrapper, not scheduler deps** — `run_scheduler.py` has no
+dependency support (sequential dequeues in order but does not wait), so each
+(arm, seed) chain is ONE scheduler run of the new
+[`scripts/run_interference_chain.py`](scripts/run_interference_chain.py),
+which sequences the 5 phases itself (per-seed run-dir resolution by newest
+mtime, weights-only warm start, idempotent resume via
+`runs/interference_curve/<arm>_<seed>.chain.json`; a sub-0.99 phase still
+chains — the curve records the shortfall). Manifest
+[`manifests/kv_interference_curve.yaml`](manifests/kv_interference_curve.yaml)
+(9 chain commands; `base_config` is a documented placeholder the wrapper
+ignores). Local smoke chain (gpt2, 2 steps × 2 phases) verified warm-start +
+resume (`runs/interference_curve/smoke_linear_all_4378.chain.json`); memory
+probe on real N96 batches → per-phase batch 64/64/64/32/16 with
+total_batch 64 via grad accumulation (A100 projection < 15 GB for 3
+concurrent chains; probe table in the manifest header).
+
+**Decision — (d′) interface arm deferred from the curve** — rationale: (d)
+and (d′) share the superposed state (the mechanism under test) and differ
+only in read sites; (d) is the single-key-proven config (ladder regression
+arm EM 0.997+) while (d′) never ran on single-key, so an untested arm
+warm-chaining through phases risks confounding arm-specific warm-up trouble
+with interference. Counterweight recorded: (d′) is the deployable read and
+concentrates state extraction on M·L taps, so it could bind earlier than
+(d); its chain is one wrapper entry + one manifest experiment (zero new
+machinery) and is the natural follow-up — at the binding N per P2, or as a
+full chain before any deployment claim.
+
+**Comet** — new project `gradmem-linear-read-interference` in
+[`run.yaml`](run.yaml) (user directive; keeps the ladder's
+`gradmem-linear-read` collection clean; later collection passes the project
+explicitly to `scripts/collect_comet_results.py`).
+
+**Submitted — PENDING in queue** (submission confirmed by the user
+2026-10-26; long queue ahead; job id to be recorded at first monitoring
+pass). run.yaml → `manifests/kv_interference_curve.yaml`, description
+"interference-curve single-key curriculum", flock guard intact. The early
+gate (eval_loss falling, zero tracebacks, `interf_<arm>_N8` dirs with the
+right seeds, `read_state_*` logging) is due when the job STARTS — not yet
+checked. **Caveat:** the executor's report was lost when its agent run was
+cancelled after submission; the verification above is from the artifacts
+themselves (manifest header, chain script, dry-run = exactly 9 chains, smoke
+state file, run.yaml retarget) — consistent with the brief's definition of
+done except the pytest-suite run and the remote data presence check, which
+are unconfirmed. Expected ~4–7 days of GPU time once started.
+
+## 2026-10-25 — research workflow: PI ⇄ research-scientist hierarchy
+
+**Changed** — two-level research workflow installed. New subagent
+`.zcode/agents/research-scientist.md` (GLM-5.3-Flash) owns all coding,
+testing, and run execution; `AGENTS.md` gained a leading "Research
+Workflow" section defining the PI (main chat, GLM-5.3) role, the 5-step
+workflow cycle (formulate → brief → delegate → review → record), and hard
+stop conditions (5 completed cycles max, or the cycle-1 milestone reached,
+whichever comes first; no autonomous 6th cycle). A project-agnostic twin
+of the agent definition at `gradmem/.zcode/agents/research-scientist.md`
+(added together with the gradmem_rl copy; the brief names the target repo)
+keeps the subagent dispatchable when ZCode is opened at the gradmem root
+instead of inside `test_time_gd`.
+
+**Decision** — the PI never edits source or runs experiments directly; it
+owns direction, briefs, evidence review, and the research record
+(STATUS/PROGRESS/IDEAS/AGENTS). Delegation goes through the Agent tool
+(`research-scientist`), one self-contained brief per dispatch; long briefs
+follow the `tasks/` convention. Rationale: spend expensive-model reasoning
+on direction and cheap-model tokens on execution, and bound autonomous
+runs by an explicit cycle budget so control returns to the user at a
+milestone or after 5 cycles.
+
 ## 2026-10-22 (c) — documentation reorganization: docs / tasks / reports
 
 **Changed** — markdown layout per the three-folder convention:
