@@ -1,158 +1,103 @@
+"""Explicit attention forward, backward, and backward-over-backward."""
+
 import torch
 
-from transformers.integrations.sdpa_attention import repeat_kv
 
-from typing import Optional
+def _probabilities(q, k, mask, causal, scale):
+    scores = (q @ k.transpose(-2, -1)) * scale
+    if mask is not None:
+        scores = scores.masked_fill(~mask, -float("inf")) if mask.dtype == torch.bool else scores + mask
+    if causal:
+        allowed = torch.ones(scores.shape[-2:], dtype=torch.bool, device=q.device).tril()
+        scores = scores.masked_fill(~allowed, -float("inf"))
+    empty = torch.isneginf(scores).all(-1, keepdim=True)
+    return scores.masked_fill(empty, 0).softmax(-1).masked_fill(empty, 0)
+
+
+def _work(tensor):
+    return tensor.float() if tensor.dtype in (torch.float16, torch.bfloat16) else tensor
 
 
 class SDPA_FullManualBwd(torch.autograd.Function):
     @staticmethod
     def forward(ctx, grad_out, q, k, v, attn_mask, is_causal, dropout_mask, dropout_scale, scale):
         ctx.save_for_backward(grad_out, q, k, v, dropout_mask)
-        ctx.attn_mask = attn_mask
-        ctx.is_causal = is_causal
-        ctx.scale = scale
-        ctx.dropout_scale = dropout_scale
-        d = q.size(-1)
-        scale = scale if (scale is not None) else (1 / d ** 0.5)
+        ctx.settings = attn_mask, is_causal, dropout_scale, scale
+        with torch.autocast(q.device.type, enabled=False):
+            go, qw, kw, vw = map(_work, (grad_out, q, k, v))
+            p = _probabilities(qw, kw, attn_mask, is_causal, scale)
+            r = dropout_mask.to(p.dtype) * dropout_scale if dropout_mask is not None else 1.0
+            dp = (go @ vw.transpose(-2, -1)) * r
+            ds = p * (dp - (dp * p).sum(-1, keepdim=True))
+            return ((ds @ kw * scale).to(q.dtype),
+                    (ds.transpose(-2, -1) @ qw * scale).to(k.dtype),
+                    ((p * r).transpose(-2, -1) @ go).to(v.dtype))
 
-        scores = (q @ k.transpose(-2, -1)) * scale
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                attn_mask = torch.where(attn_mask, 0.0, float('-inf')).to(q.dtype)
-            scores = scores + attn_mask
-        if is_causal:
-            S, L = scores.size(-2), scores.size(-1)
-            causal = torch.triu(scores.new_full((S, L), float("-inf")), diagonal=1).to(q.dtype)
-            scores = scores + causal
-        
-        P = torch.softmax(scores, dim=-1)
-        # use cached dropout mask
-        if dropout_mask is not None:
-            P = P * dropout_mask * dropout_scale
-
-        dV  = P.transpose(-2, -1) @ grad_out
-        dP  = grad_out @ v.transpose(-2, -1)
-        Ssm = (dP * P).sum(dim=-1, keepdim=True)
-        dS  = (dP - Ssm) * P
-        dQ  = dS @ k * scale
-        dK  = dS.transpose(-2, -1) @ q * scale
-        return dQ, dK, dV, None, None, None, None
-    
     @staticmethod
-    def backward(ctx, grad_q, grad_k, grad_v, *_):
+    def backward(ctx, grad_q, grad_k, grad_v):
         grad_out, q, k, v, dropout_mask = ctx.saved_tensors
-        attn_mask, is_causal = ctx.attn_mask, ctx.is_causal
-        dropout_scale, scale = ctx.dropout_scale, ctx.scale
+        mask, causal, dropout_scale, scale = ctx.settings
+        with torch.autocast(q.device.type, enabled=False):
+            go, qw, kw, vw = map(_work, (grad_out, q, k, v))
+            gq, gk, gv = [_work(g) if g is not None else torch.zeros_like(_work(x))
+                          for g, x in zip((grad_q, grad_k, grad_v), (q, k, v))]
+            p = _probabilities(qw, kw, mask, causal, scale)
+            r = dropout_mask.to(p.dtype) * dropout_scale if dropout_mask is not None else 1.0
+            dp = (go @ vw.transpose(-2, -1)) * r
+            center = (dp * p).sum(-1, keepdim=True)
+            ds = p * (dp - center)
+            bar_ds = (gq @ kw.transpose(-2, -1) + qw @ gk.transpose(-2, -1)) * scale
+            beta = (bar_ds * p).sum(-1, keepdim=True)
+            bar_dp = p * (bar_ds - beta)
+            bar_p = (go @ gv.transpose(-2, -1)) * r + bar_ds * (dp - center) - dp * beta
+            bar_scores = p * (bar_p - (bar_p * p).sum(-1, keepdim=True))
+            dgo = (p * r) @ gv + (bar_dp * r) @ vw
+            dq = (ds @ gk + bar_scores @ kw) * scale
+            dk = (ds.transpose(-2, -1) @ gq + bar_scores.transpose(-2, -1) @ qw) * scale
+            dv = (bar_dp * r).transpose(-2, -1) @ go
+        return dgo.to(grad_out.dtype), dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), None, None, None, None, None
 
-        d = q.size(-1)
-        scale = scale if (scale is not None) else (1 / d ** 0.5)
-
-        scores = (q @ k.transpose(-2, -1)) * scale
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                attn_mask = torch.where(attn_mask, 0.0, float('-inf')).to(q.dtype)
-            scores = scores + attn_mask
-        if is_causal:
-            S, L = scores.size(-2), scores.size(-1)
-            causal = torch.triu(scores.new_full((S, L), float("-inf")), diagonal=1).to(q.dtype)
-            scores = scores + causal
-
-        P = torch.softmax(scores, dim=-1)
-        # use cached dropout mask
-        if dropout_mask is not None:
-            P = P * dropout_mask * dropout_scale
-
-        dP  = grad_out @ v.transpose(-2, -1)
-        Ssm = (dP * P).sum(dim=-1, keepdim=True)
-        dS  = (dP - Ssm) * P
-
-        bar_dS = (grad_q @ k.transpose(-2, -1) + q @ grad_k.transpose(-2, -1)) * scale
-        beta = (bar_dS * P).sum(dim=-1, keepdim=True)
-        bar_dP = P * (bar_dS - beta)
-        bar_P  = grad_out @ grad_v.transpose(-2, -1) + bar_dS * (dP - Ssm) - dP * beta
-
-        tmp = (bar_P * P).sum(dim=-1, keepdim=True)
-        bar_scores = (bar_P - tmp) * P
-
-        dgrad_grad_out = P @ grad_v + bar_dP @ v
-        dgrad_q        = (dS @ grad_k + bar_scores @ k) * scale
-        dgrad_k        = (dS.transpose(-2, -1) @ grad_q + bar_scores.transpose(-2, -1) @ q) * scale
-        dgrad_v        = bar_dP.transpose(-2, -1) @ grad_out
-
-        return dgrad_grad_out, dgrad_q, dgrad_k, dgrad_v, None, None, None, None, None
-    
 
 class SDPA_FullManual(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None):
-        ctx.attn_mask = attn_mask
-        ctx.is_causal = bool(is_causal)
-        ctx.scale = scale
-
-        d = q.size(-1)
-        scale = scale if (scale is not None) else (1 / d ** 0.5)
-        scores = (q @ k.transpose(-2, -1)) * scale
-
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                attn_mask = torch.where(attn_mask, 0.0, float('-inf')).to(q.dtype)
-            scores = scores + attn_mask
-
-        if is_causal:
-            S, L = scores.size(-2), scores.size(-1)
-            scores = scores + torch.triu(scores.new_full((S, L), float("-inf")), diagonal=1)
-
-        P = torch.softmax(scores, dim=-1)
-        if dropout_p and dropout_p > 0.0:
-            dropout_mask = (torch.rand_like(P) > dropout_p).to(P.dtype)
-            dropout_scale = 1.0 / (1.0 - dropout_p)
-        else:
-            dropout_mask = None
-            dropout_scale = None
-        if dropout_mask is not None:
-            P = P * dropout_mask * dropout_scale
-
-        ctx.dropout_scale = dropout_scale
+        if not 0 <= dropout_p <= 1:
+            raise ValueError("dropout_p must be between 0 and 1")
+        scale = scale if scale is not None else q.shape[-1] ** -0.5
+        with torch.autocast(q.device.type, enabled=False):
+            qw, kw, vw = map(_work, (q, k, v))
+            p = _probabilities(qw, kw, attn_mask, is_causal, scale)
+            dropout_mask = torch.rand_like(p) >= dropout_p if dropout_p else None
+            dropout_scale = 1 / (1 - dropout_p) if dropout_p < 1 else 0.0
+            if dropout_mask is not None:
+                p = p * dropout_mask * dropout_scale
+            out = (p @ vw).to(q.dtype)
         ctx.save_for_backward(q, k, v, dropout_mask)
-        
-        out = P @ v
+        ctx.settings = attn_mask, is_causal, dropout_scale, scale
         return out
 
     @staticmethod
     def backward(ctx, grad_out):
         q, k, v, dropout_mask = ctx.saved_tensors
-        attn_mask, is_causal = ctx.attn_mask, ctx.is_causal
-        scale, dropout_scale = ctx.scale, ctx.dropout_scale
-        return SDPA_FullManualBwd.apply(grad_out, q, k, v, attn_mask, is_causal, dropout_mask, dropout_scale, scale)
+        mask, causal, dropout_scale, scale = ctx.settings
+        grads = SDPA_FullManualBwd.apply(grad_out, q, k, v, mask, causal, dropout_mask, dropout_scale, scale)
+        return *grads, None, None, None, None
 
 
-def hvp_manual(
-    module: torch.nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
-    dropout: float = 0.0,
-    scaling: Optional[float] = None,
-    is_causal: Optional[bool] = None,
-    **kwargs,
-) -> tuple[torch.Tensor, None]:
-    if hasattr(module, "num_key_value_groups"):
-        key = repeat_kv(key, module.num_key_value_groups)
-        value = repeat_kv(value, module.num_key_value_groups)
-
+def hvp_manual(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None, **kwargs):
+    if torch.is_autocast_enabled(query.device.type) and query.dtype != torch.float64:
+        dtype = torch.get_autocast_dtype(query.device.type)
+        query, key, value = (x.to(dtype) for x in (query, key, value))
+    if query.shape[1] != key.shape[1]:
+        groups = query.shape[1] // key.shape[1]
+        key, value = (x.repeat_interleave(groups, dim=1) for x in (key, value))
     if attention_mask is not None and attention_mask.ndim == 4:
-        attention_mask = attention_mask[:, :, :, : key.shape[-2]]
-        if attention_mask.size(1) < query.size(1):
-            attention_mask = attention_mask.expand(-1, query.size(1), -1, -1)
-    
+        attention_mask = attention_mask[..., :key.shape[-2]]
     if is_causal is None:
-        is_causal = query.shape[2] > 1 and attention_mask is None and getattr(module, "is_causal", True)
-
-    attn_output = SDPA_FullManual.apply(
-        query, key, value, attention_mask, dropout, is_causal, scaling,
-    )
-
-    attn_output = attn_output.transpose(1, 2).contiguous()
-    return attn_output, None
+        is_causal = query.shape[-2] > 1 and attention_mask is None and getattr(module, "is_causal", True)
+    if scaling is None and hasattr(module, "scale_attn_weights"):
+        scaling = query.shape[-1] ** -0.5 if module.scale_attn_weights else 1.0
+        if getattr(module, "scale_attn_by_inverse_layer_idx", False):
+            scaling /= module.layer_idx + 1
+    out = SDPA_FullManual.apply(query, key, value, attention_mask, dropout, is_causal, scaling)
+    return out.transpose(1, 2).contiguous(), None

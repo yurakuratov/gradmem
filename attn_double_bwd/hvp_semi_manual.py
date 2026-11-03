@@ -232,7 +232,7 @@ def _attn_fwd_inner(
 
         # -- Compute qk --
         k = tl.load(K_block_ptr)
-        qk = tl.dot(q, k)
+        qk = tl.dot(q, k, input_precision="ieee")
         if ENABLE_JVP:
             t_k = tl.load(T_K_block_ptr)
             t_qk = tl.dot(t_q, k) + tl.dot(q, t_k)
@@ -321,7 +321,7 @@ def _attn_fwd_inner(
             T_V_block_ptr = tl.advance(T_V_block_ptr, (BLOCK_N, 0))
             T_K_block_ptr = tl.advance(T_K_block_ptr, (0, BLOCK_N))
 
-        acc = tl.dot(p, v.to(dtype), acc).to(acc.dtype)
+        acc = tl.dot(p, v.to(dtype), acc, input_precision="ieee").to(acc.dtype)
 
         # -- Update m_i --
         m_i = m_ij
@@ -445,7 +445,7 @@ def _attn_fwd_inner_tma(
 
         # -- Compute qk ----
         k = desc_k.load([offsetk_y, 0]).T
-        qk = tl.dot(q, k)
+        qk = tl.dot(q, k, input_precision="ieee")
         if ENABLE_JVP:
             t_k = desc_k_t.load([offsetk_y, 0]).T
             t_qk = tl.dot(t_q, k) + tl.dot(q, t_k)
@@ -535,7 +535,7 @@ def _attn_fwd_inner_tma(
             p_tv_acc = p_tv_acc * alpha[:, None] + tl.dot(p, t_v.to(dtype)).to(t_v.dtype)
 
         # NOTE: This non transposed v for FP8 is only supported on Blackwell
-        acc = tl.dot(p, v.to(dtype), acc).to(acc.dtype)
+        acc = tl.dot(p, v.to(dtype), acc, input_precision="ieee").to(acc.dtype)
 
         # Update m_i and l_i
         # Place this at the end of the loop to reduce register pressure
@@ -1508,7 +1508,7 @@ def _attn_bwd_dkdv(
         # Load m before computing qk to reduce pipeline stall
         offs_m = curr_m + tl.arange(0, BLOCK_M1)
         m = tl.load(M + offs_m)
-        qkT = tl.dot(k, qT)
+        qkT = tl.dot(k, qT, input_precision="ieee")
 
         # Exponentiation
         pT = tl.math.exp2(qkT - m[None, :])
@@ -1540,19 +1540,19 @@ def _attn_bwd_dkdv(
         ppT = pT
         ppT = ppT.to(dtype)
         do = tl.load(do_ptrs)
-        dv += tl.dot(ppT, do.to(dtype)).to(do.dtype)
+        dv += tl.dot(ppT, do.to(dtype), input_precision="ieee").to(do.dtype)
         # NOTE: D (= delta) is pre-divided by ds_scale.
         Di = tl.load(D + offs_m)
 
         # Compute dP and dS to derive dK
-        dpT = tl.dot(v, tl.trans(do)).to(tl.float32)
+        dpT = tl.dot(v, tl.trans(do), input_precision="ieee").to(tl.float32)
 
         if ENABLE_DROPOUT:  # This derivative should be masked with the same dropout mask
             dpT = dpT * dropout_mask.to(dpT.dtype) * dropout_scale
 
         dsT = pT * (dpT - Di[None, :])
         dsT = dsT.to(dtype)
-        dk += tl.dot(dsT, tl.trans(qT).to(dtype)).to(qT.dtype)
+        dk += tl.dot(dsT, tl.trans(qT).to(dtype), input_precision="ieee").to(qT.dtype)
 
         # Increment pointers
         curr_m += step_m
@@ -1658,7 +1658,7 @@ def _attn_bwd_dq(
         offs_n = curr_n + tl.arange(0, BLOCK_N2)
         kT = tl.load(kT_ptrs)
         vT = tl.load(vT_ptrs)
-        qk = tl.dot(q, kT)
+        qk = tl.dot(q, kT, input_precision="ieee")
 
         # Exponentiation
         p = tl.math.exp2(qk - m)
@@ -1686,7 +1686,7 @@ def _attn_bwd_dq(
             p = p * dropout_mask.to(p.dtype) * dropout_scale
 
         # Compute dP and dS
-        dp = tl.dot(do, vT).to(tl.float32)
+        dp = tl.dot(do, vT, input_precision="ieee").to(tl.float32)
 
         if ENABLE_DROPOUT:  # NOTE: This derivative should be masked with the same dropout mask.
             dp = dp * dropout_mask.to(dp.dtype) * dropout_scale
@@ -1696,7 +1696,7 @@ def _attn_bwd_dq(
         # Compute dQ
         # NOTE: We need to de-scale dq in the end, because kT was pre-scaled.
         ds = ds.to(dtype)
-        dq += tl.dot(ds, tl.trans(kT).to(dtype)).to(kT.dtype)
+        dq += tl.dot(ds, tl.trans(kT).to(dtype), input_precision="ieee").to(kT.dtype)
 
         # Increment pointers
         curr_n += step_n
@@ -3040,6 +3040,16 @@ def hvp_semi_manual(
     is_causal: Optional[bool] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
+    if is_causal is None:
+        is_causal = query.shape[-2] > 1 and attention_mask is None and getattr(module, "is_causal", True)
+    # The original Triton kernels only support square CUDA calls without
+    # dropout or additive biases. Preserve other calls instead of silently
+    # disabling dropout or rejecting ordinary additive padding masks.
+    if (query.device.type != "cuda" or not is_causal or dropout or attention_mask is not None
+            or query.shape[-2] != key.shape[-2] or query.shape[-2] % 32
+            or query.shape[-1] not in (32, 64, 128)):
+        from .hvp_manual import hvp_manual
+        return hvp_manual(module, query, key, value, attention_mask, dropout, scaling, is_causal, **kwargs)
     if hasattr(module, "num_key_value_groups"):
         key = repeat_kv(key, module.num_key_value_groups)
         value = repeat_kv(value, module.num_key_value_groups)
@@ -3052,8 +3062,6 @@ def hvp_semi_manual(
     if is_causal is None:
         is_causal = query.shape[2] > 1 and attention_mask is None and getattr(module, "is_causal", True)
 
-    # set dropout to 0 (not supported by JVP)
-    dropout = 0.0
     attn_output = JVPAttn.fwd(
         query, key, value, attention_mask, dropout, is_causal, scaling,
     )

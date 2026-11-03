@@ -514,7 +514,7 @@ class InputPrefixMemoryBackend(MemoryBackend):
         lm_labels[lm_labels == pad_id] = -100
         mask = (lm_labels != -100)
 
-        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+        if o.attn_implementation == 'hvp_semi_manual':
             pad_list = [0, -(batch_ctx["ctx_emb"].size(1) + mem_offset) % 32, 0, 0]
             mask = F.pad(mask, pad_list, "constant", 0)
             lm_labels = F.pad(lm_labels, pad_list, "constant", -100)
@@ -578,7 +578,7 @@ class InputPrefixMemoryBackend(MemoryBackend):
         else:
             x_qry = torch.cat([mem_inp, batch_ctx["qry_emb"]], dim=1)
 
-        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+        if o.attn_implementation == 'hvp_semi_manual':
             x_qry = F.pad(x_qry, [0, 0, 0, -x_qry.size(1) % 32], "constant", 0)
 
         return {
@@ -660,7 +660,7 @@ class LoraMemoryBackend(MemoryBackend):
         mask = (lm_labels != -100)
 
         x_ctx = ctx_emb
-        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+        if o.attn_implementation == 'hvp_semi_manual':
             pad_n = (-x_ctx.size(1)) % 32
             if pad_n:
                 x_ctx = F.pad(x_ctx, [0, 0, 0, pad_n], "constant", 0)
@@ -688,7 +688,7 @@ class LoraMemoryBackend(MemoryBackend):
         _ = memory_state
         o = self.owner
         x_qry = batch_ctx["qry_emb"]
-        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+        if o.attn_implementation == 'hvp_semi_manual':
             x_qry = F.pad(x_qry, [0, 0, 0, (-x_qry.size(1)) % 32], "constant", 0)
         return {
             "inputs_embeds": x_qry,
@@ -769,7 +769,7 @@ class KVCacheMemoryBackend(MemoryBackend):
         mask = (lm_labels != -100)
 
         x_ctx = ctx_emb
-        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+        if o.attn_implementation == 'hvp_semi_manual':
             pad_n = (-x_ctx.size(1)) % 32
             if pad_n:
                 x_ctx = F.pad(x_ctx, [0, 0, 0, pad_n], "constant", 0)
@@ -799,7 +799,7 @@ class KVCacheMemoryBackend(MemoryBackend):
     def build_read_inputs(self, memory_state, batch_ctx):
         o = self.owner
         x_qry = batch_ctx["qry_emb"]
-        if o.attn_implementation in ('jvp_flash', 'hvp_semi_manual'):
+        if o.attn_implementation == 'hvp_semi_manual':
             x_qry = F.pad(x_qry, [0, 0, 0, (-x_qry.size(1)) % 32], "constant", 0)
         return {
             "inputs_embeds": x_qry,
@@ -936,7 +936,7 @@ class GradMemGPT(PreTrainedModel):
             if self.write_model.config.vocab_size != self.read_model.config.vocab_size:
                 raise ValueError("READ and WRITE models must use the same vocabulary size")
         self.attn_implementation = config.attn_implementation
-        if self.attn_implementation in ("jvp_flash", "hvp_semi_manual") and attn_double_bwd is None:
+        if self.attn_implementation in ("hvp_manual", "hvp_semi_manual") and attn_double_bwd is None:
             raise ImportError(
                 f"attn_implementation={self.attn_implementation} requires triton/attn_double_bwd. "
                 "Install triton or use a standard attention implementation (e.g. eager)."
