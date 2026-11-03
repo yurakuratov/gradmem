@@ -87,3 +87,30 @@ def test_attention_variant_gradmem_meta_training(backend, objective, dtype):
     output["loss"].backward()
     assert torch.isfinite(output["loss"])
     assert model.mem.grad is not None and torch.isfinite(model.mem.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [True, False])
+def test_semi_manual_uses_aten_forward_and_backward(dtype, causal, monkeypatch):
+    calls = []
+    for name in ("_scaled_dot_product_flash_attention", "_scaled_dot_product_flash_attention_backward"):
+        operator = getattr(torch.ops.aten, name)
+        original = operator.default
+        def counted(*args, _name=name, _original=original, **kwargs):
+            calls.append(_name)
+            return _original(*args, **kwargs)
+        monkeypatch.setattr(operator, "default", counted)
+    torch.manual_seed(42)
+    inputs = [torch.randn(1, 2, 7, 32, device="cuda", dtype=dtype, requires_grad=True) for _ in range(3)]
+    reference = [x.detach().float().requires_grad_() for x in inputs]
+    out, _ = hvp_semi_manual(SimpleNamespace(is_causal=causal), *inputs, None, is_causal=causal)
+    actual = _derivatives(out.transpose(1, 2), inputs)
+    with sdpa_kernel(SDPBackend.MATH):
+        out = torch.nn.functional.scaled_dot_product_attention(*reference, is_causal=causal)
+    expected = _derivatives(out, reference)
+    assert "_scaled_dot_product_flash_attention" in calls
+    assert "_scaled_dot_product_flash_attention_backward" in calls
+    for candidate, target in zip(torch.utils._pytree.tree_leaves(actual), torch.utils._pytree.tree_leaves(expected)):
+        error = (candidate.float() - target).norm() / target.norm().clamp_min(1e-8)
+        assert error < (0.025 if dtype == torch.bfloat16 else 0.005), error.item()

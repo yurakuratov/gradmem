@@ -84,7 +84,7 @@ class SDPA_FullManual(torch.autograd.Function):
         return *grads, None, None, None, None
 
 
-def hvp_manual(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None, **kwargs):
+def _prepare_attention(module, query, key, value, attention_mask, scaling, is_causal):
     if torch.is_autocast_enabled(query.device.type) and query.dtype != torch.float64:
         dtype = torch.get_autocast_dtype(query.device.type)
         query, key, value = (x.to(dtype) for x in (query, key, value))
@@ -99,5 +99,12 @@ def hvp_manual(module, query, key, value, attention_mask, dropout=0.0, scaling=N
         scaling = query.shape[-1] ** -0.5 if module.scale_attn_weights else 1.0
         if getattr(module, "scale_attn_by_inverse_layer_idx", False):
             scaling /= module.layer_idx + 1
+    return query, key, value, attention_mask, scaling, is_causal
+
+
+def hvp_manual(module, query, key, value, attention_mask, dropout=0.0, scaling=None, is_causal=None, **kwargs):
+    query, key, value, attention_mask, scaling, is_causal = _prepare_attention(
+        module, query, key, value, attention_mask, scaling, is_causal,
+    )
     out = SDPA_FullManual.apply(query, key, value, attention_mask, dropout, is_causal, scaling)
     return out.transpose(1, 2).contiguous(), None

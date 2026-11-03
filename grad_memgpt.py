@@ -514,12 +514,6 @@ class InputPrefixMemoryBackend(MemoryBackend):
         lm_labels[lm_labels == pad_id] = -100
         mask = (lm_labels != -100)
 
-        if o.attn_implementation == 'hvp_semi_manual':
-            pad_list = [0, -(batch_ctx["ctx_emb"].size(1) + mem_offset) % 32, 0, 0]
-            mask = F.pad(mask, pad_list, "constant", 0)
-            lm_labels = F.pad(lm_labels, pad_list, "constant", -100)
-            batch_ctx["ctx_emb"] = F.pad(batch_ctx["ctx_emb"], [0, 0] + pad_list, "constant", 0)
-
         batch_ctx["lm_labels"] = lm_labels
         batch_ctx["mask"] = mask
 
@@ -577,9 +571,6 @@ class InputPrefixMemoryBackend(MemoryBackend):
             )
         else:
             x_qry = torch.cat([mem_inp, batch_ctx["qry_emb"]], dim=1)
-
-        if o.attn_implementation == 'hvp_semi_manual':
-            x_qry = F.pad(x_qry, [0, 0, 0, -x_qry.size(1) % 32], "constant", 0)
 
         return {
             "inputs_embeds": x_qry,
@@ -660,13 +651,6 @@ class LoraMemoryBackend(MemoryBackend):
         mask = (lm_labels != -100)
 
         x_ctx = ctx_emb
-        if o.attn_implementation == 'hvp_semi_manual':
-            pad_n = (-x_ctx.size(1)) % 32
-            if pad_n:
-                x_ctx = F.pad(x_ctx, [0, 0, 0, pad_n], "constant", 0)
-                lm_labels = F.pad(lm_labels, [0, pad_n], "constant", -100)
-                mask = F.pad(mask, [0, pad_n], "constant", 0)
-
         return {
             "x_ctx": x_ctx,
             "lm_labels": lm_labels,
@@ -688,8 +672,6 @@ class LoraMemoryBackend(MemoryBackend):
         _ = memory_state
         o = self.owner
         x_qry = batch_ctx["qry_emb"]
-        if o.attn_implementation == 'hvp_semi_manual':
-            x_qry = F.pad(x_qry, [0, 0, 0, (-x_qry.size(1)) % 32], "constant", 0)
         return {
             "inputs_embeds": x_qry,
             "logits_start": 0,
@@ -769,13 +751,6 @@ class KVCacheMemoryBackend(MemoryBackend):
         mask = (lm_labels != -100)
 
         x_ctx = ctx_emb
-        if o.attn_implementation == 'hvp_semi_manual':
-            pad_n = (-x_ctx.size(1)) % 32
-            if pad_n:
-                x_ctx = F.pad(x_ctx, [0, 0, 0, pad_n], "constant", 0)
-                lm_labels = F.pad(lm_labels, [0, pad_n], "constant", -100)
-                mask = F.pad(mask, [0, pad_n], "constant", 0)
-
         return {
             "x_ctx": x_ctx,
             "lm_labels": lm_labels,
@@ -799,8 +774,6 @@ class KVCacheMemoryBackend(MemoryBackend):
     def build_read_inputs(self, memory_state, batch_ctx):
         o = self.owner
         x_qry = batch_ctx["qry_emb"]
-        if o.attn_implementation == 'hvp_semi_manual':
-            x_qry = F.pad(x_qry, [0, 0, 0, (-x_qry.size(1)) % 32], "constant", 0)
         return {
             "inputs_embeds": x_qry,
             "logits_start": 0,
@@ -861,17 +834,22 @@ class GradMemGPT(PreTrainedModel):
     @staticmethod
     def _build_model(pretrained_model, base_config, attn_implementation):
         if pretrained_model is not None:
-            return AutoModelForCausalLM.from_pretrained(
+            model = AutoModelForCausalLM.from_pretrained(
                 pretrained_model, attn_implementation=attn_implementation
             )
-        if isinstance(base_config, dict):
-            model_type = base_config.get("model_type")
-            if model_type not in CONFIG_MAPPING:
-                raise ValueError(f"Unsupported serialized base model type: {model_type!r}")
-            base_config = CONFIG_MAPPING[model_type].from_dict(base_config)
-        return AutoModelForCausalLM.from_config(
-            base_config, attn_implementation=attn_implementation
-        )
+        else:
+            if isinstance(base_config, dict):
+                model_type = base_config.get("model_type")
+                if model_type not in CONFIG_MAPPING:
+                    raise ValueError(f"Unsupported serialized base model type: {model_type!r}")
+                base_config = CONFIG_MAPPING[model_type].from_dict(base_config)
+            model = AutoModelForCausalLM.from_config(
+                base_config, attn_implementation=attn_implementation
+            )
+        if attn_implementation == "hvp_semi_manual":
+            from attn_double_bwd.common import prepare_attention_model
+            prepare_attention_model(model)
+        return model
 
     @property
     def read_model(self):
