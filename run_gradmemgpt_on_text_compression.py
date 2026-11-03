@@ -256,7 +256,9 @@ class ExperimentArgs:
     kv_mem_layers: Optional[str] = field(default="all")
     freeze_backbone: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
-    attn_implementation: Optional[str] = field(default="eager")
+    attn_implementation: Optional[str] = field(default="eager", metadata={
+        "help": "Attention backend: eager, hvp_manual, hvp_semi_manual, flashbob (alias bob), or another registered backend."
+    })
     read_focal_gamma: Optional[float] = field(default=0.0)
     add_inner_loss_to_outer: Optional[bool] = field(default=False)
     inner_loss_weight: Optional[float] = field(default=None)

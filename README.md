@@ -58,6 +58,68 @@ conda activate /home/jovyan/kuratov/envs/py311_pt2.6_cu12.4
 
 `accelerate.yaml` contains a default single-process setup.
 
+### FlashBoB (second-order attention)
+
+GradMem and EnergyGradMem share a **workspace-local** FlashBoB implementation in
+`attn_double_bwd/flashbob/` and its Transformers adapter in
+`attn_double_bwd/flashbob_attention.py`. No sibling checkout, editable package,
+or separately installed `bob` module is required. Use a compatible environment
+(PyTorch 2.8/Triton 3.4 or PyTorch 2.9/Triton 3.5):
+
+```bash
+conda env create -f environment-flashbob.yaml
+```
+
+Use `attn_implementation="flashbob"` in `GradMemGPTConfig`, or pass
+`--attn_implementation flashbob` to any `run_gradmemgpt_on_*.py` entry point
+(KV retrieval/bAbI, MQAR, SQuAD variants, and text compression). `bob` is an alias.
+Both separate READ/WRITE models use the selected backend, which is checkpointed.
+Existing energy objectives and shaping use this same shared model path.
+
+All GradMem/EnergyGradMem bash presets accept an environment override and encode
+non-eager attention in the run name, including the shaping wrapper:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NP=1 ATTN_IMPL=flashbob conda run -n gradmem-flashbob \
+  bash scripts/run_energygradmem_shaping_on_kv_retrieval.sh
+```
+
+CUDA acceleration supports MHA FP16/BF16 head dimensions 32, 48, 64, 128;
+square GQA/MQA supports BF16 dimensions 32, 64, 128 (group size <=32).
+CPU MHA uses FlashBoB's reference implementation. Explicit masks (including
+padding and cached causal masks), attention dropout, unsupported dtypes/shapes,
+and requested attention weights use a **warned differentiable math fallback**.
+FP32 runs remain valid but are not accelerated on CUDA. No mask or dropout is
+silently discarded. Q/K/V follow the explicitly selected autocast dtype, just
+as with PyTorch SDPA; outside autocast, model dtypes are unchanged. For acceleration,
+use BF16/FP16 and zero attention dropout; pretrained GPT-2 commonly has nonzero
+attention dropout during training. FlashBoB supports reverse-mode derivatives
+through second order, not arbitrary higher-order/forward-mode derivatives.
+
+On hosts exposing only `libcuda.so.1`, Triton may also need a `libcuda.so` linker
+symlink and `TRITON_LIBCUDA_PATH` pointing to its directory. Keep that setup local
+to the Conda environment rather than modifying system libraries.
+
+Integration checks (CUDA tests run on the explicitly selected GPU):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 conda run -n gradmem-flashbob \
+  python -m pytest -q tests/test_flashbob_attention.py
+```
+
+Other attention variants live alongside it in `attn_double_bwd/`:
+
+- `hvp_manual`: explicit forward, first backward, and second backward, including
+  consistent dropout-mask reuse.
+- `hvp_semi_manual`: PyTorch ATen FlashAttention forward/first backward for
+  eligible CUDA FP16/BF16 calls, with explicit second backward. Other inputs
+  use a warned manual fallback. Sequence lengths need not be multiples of 32.
+- `flashbob` (alias `bob`): fused forward/first backward and Triton second
+  backward, subject to the support limits above.
+
+The obsolete `jvp_flash` implementation has been removed. Use one of the
+reverse-mode implementations above for second-order GradMem training.
+
 ## Data
 
 ### KV retrieval

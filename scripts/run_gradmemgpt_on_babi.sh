@@ -37,13 +37,16 @@ GRAD_MODE="second"
 USE_MEM_PROJ=true
 MEM_PROJ_MODE="proj"
 USE_WRITE_HEAD=true
-ATTN_IMPL="eager"
+ATTN_IMPL=${ATTN_IMPL:-eager}
 MIXED_PRECISION='bf16'
 
 # INIT_CHECKPOINT=./runs/babilong_qa3_0k/gradmem_gpt2_mem8_K1_ilr0.4_mem_proj_whead_grad_second_bs_64_lr_1e-04/run_2_bf16/checkpoint-127500/model.safetensors
 # RUN_NAME_SUFFIX=init_qa3_K1_ilr0.4_run_2_bf16
 
 RUN_NAME=gradmem_${MODEL_NAME}_mem${N_MEM_TOKENS}
+if [ "$ATTN_IMPL" != "eager" ]; then
+  RUN_NAME=${RUN_NAME}_attn_${ATTN_IMPL}
+fi
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
 fi
@@ -102,7 +105,6 @@ for task_name in "qa2"; do
         --main_process_port "$PORT"
         --num_processes "$NP"
         --mixed_precision "$MIXED_PRECISION"
-        --multi_gpu
         --config_file accelerate.yaml
       run_gradmemgpt_on_kv_retrieval.py
         --exp_path "$EXP_PATH"

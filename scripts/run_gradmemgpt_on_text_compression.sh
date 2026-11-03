@@ -75,10 +75,13 @@ INNER_LOSS_WEIGHT=None
 READ_FOCAL_GAMMA=${READ_FOCAL_GAMMA:-0.0}
 
 
-ATTN_IMPL="eager"
+ATTN_IMPL=${ATTN_IMPL:-eager}
 MIXED_PRECISION='bf16'
 
 RUN_NAME=gradmem_${MODEL_NAME}_N${MAX_CONTEXT_LENGTH}
+if [ "$ATTN_IMPL" != "eager" ]; then
+  RUN_NAME=${RUN_NAME}_attn_${ATTN_IMPL}
+fi
 
 if [ "$MEMORY_BACKEND" = "prefix" ]; then
   RUN_NAME=${RUN_NAME}_mem${N_MEM_TOKENS}

@@ -35,8 +35,12 @@ USE_MEM_PROJ=true
 MEM_PROJ_MODE="proj"
 USE_WRITE_HEAD=true
 READ_FOCAL_GAMMA=${READ_FOCAL_GAMMA:-0.0}
+ATTN_IMPL=${ATTN_IMPL:-eager}
 
 RUN_NAME=gradmem_${MODEL_NAME}_mem${N_MEM_TOKENS}
+if [ "$ATTN_IMPL" != "eager" ]; then
+  RUN_NAME=${RUN_NAME}_attn_${ATTN_IMPL}
+fi
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
 fi
@@ -113,6 +117,7 @@ for N in "${N_VALUES[@]}"; do
     --use_adam $USE_ADAM \
     --memory_noise_sigma $MEMORY_NOISE_SIGMA \
     --grad_mode $GRAD_MODE \
+    --attn_implementation "$ATTN_IMPL" \
     --read_focal_gamma $READ_FOCAL_GAMMA \
     $( [ "$INNER_CLIP_VALUE" != "None" ] && echo "--inner_clip_value $INNER_CLIP_VALUE" ) \
     $( [ "$INNER_CLIP_NORM" != "None" ] && echo "--inner_clip_norm $INNER_CLIP_NORM" ) \

@@ -1,0 +1,22 @@
+name: gradmem-flashbob
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - torch==2.9.1
+      - triton>=3.5,<3.6
+      - transformers==4.57.1
+      - accelerate>=1.5,<2
+      - datasets>=3.4,<4
+      - peft>=0.17,<0.19
+      - wandb
+      - tensorboard
+      - pytest>=8,<10
+      - scikit-learn
+      - scipy
+      - matplotlib
+      - sentencepiece
+      - tiktoken
+# FlashBoB is bundled under attn_double_bwd/flashbob; no external install needed.

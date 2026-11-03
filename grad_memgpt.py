@@ -285,7 +285,10 @@ class GradMemGPTConfig(PretrainedConfig):
             self.last_K_second_order = 0
         self.last_K_second_order = max(0, min(self.last_K_second_order, K))
         self.use_gradient_checkpointing = use_gradient_checkpointing
-        self.attn_implementation = attn_implementation
+        # HF from_dict consumes/overwrites `attn_implementation`; retain a
+        # separately serialized copy for reliable checkpoint restoration.
+        self.attn_implementation = attn_implementation or kwargs.pop("gradmem_attn_implementation", "eager")
+        self.gradmem_attn_implementation = self.attn_implementation
         self.write_objective = write_objective
         self.energy_head_hidden_dim = energy_head_hidden_dim
         self.use_layerwise_energy = use_layerwise_energy
@@ -833,6 +836,9 @@ class GradMemGPT(PreTrainedModel):
 
     @staticmethod
     def _build_model(pretrained_model, base_config, attn_implementation):
+        if attn_implementation in ("flashbob", "bob"):
+            from attn_double_bwd.flashbob_attention import register_flashbob
+            register_flashbob()
         if pretrained_model is not None:
             model = AutoModelForCausalLM.from_pretrained(
                 pretrained_model, attn_implementation=attn_implementation
@@ -846,7 +852,7 @@ class GradMemGPT(PreTrainedModel):
             model = AutoModelForCausalLM.from_config(
                 base_config, attn_implementation=attn_implementation
             )
-        if attn_implementation == "hvp_semi_manual":
+        if attn_implementation in ("flashbob", "bob", "hvp_semi_manual"):
             from attn_double_bwd.common import prepare_attention_model
             prepare_attention_model(model)
         return model
@@ -916,8 +922,9 @@ class GradMemGPT(PreTrainedModel):
         self.attn_implementation = config.attn_implementation
         if self.attn_implementation in ("hvp_manual", "hvp_semi_manual") and attn_double_bwd is None:
             raise ImportError(
-                f"attn_implementation={self.attn_implementation} requires triton/attn_double_bwd. "
-                "Install triton or use a standard attention implementation (e.g. eager)."
+                f"attn_implementation={self.attn_implementation} requires attn_double_bwd "
+                "and compatible Transformers attention registration support. "
+                "Use environment-flashbob.yaml or a standard implementation (e.g. eager)."
             )
         if attn_double_bwd is None and _is_main_process():
             logger.info("triton/attn_double_bwd is not available; using standard attention kernels")

@@ -115,7 +115,7 @@ LIPSCHITZ_WEIGHT=${LIPSCHITZ_WEIGHT:-0.0}
 LIPSCHITZ_CONSTRAINT=${LIPSCHITZ_CONSTRAINT:-1.0}
 STOP_ON_METRIC_VALUE=${STOP_ON_METRIC_VALUE:-1.00}
 
-ATTN_IMPL="eager"
+ATTN_IMPL=${ATTN_IMPL:-eager}
 MIXED_PRECISION='no'
 
 # INIT_CHECKPOINT=./runs/N16-K2V2-V62_1M/gradmem_llama_L4H4D128_mem8_K2_ilr0.04_whead_grad_second_bs_64_lr_1e-04/run_1/checkpoint-198000/model.safetensors
@@ -126,6 +126,9 @@ MIXED_PRECISION='no'
 # RUN_NAME_SUFFIX=init_N64_K1_ilr0.08_N16_K2
 
 RUN_NAME=gradmem_${BASE_MODEL}_L${L}H${H}D${D}
+if [ "$ATTN_IMPL" != "eager" ]; then
+  RUN_NAME=${RUN_NAME}_attn_${ATTN_IMPL}
+fi
 if [ "$MEMORY_BACKEND" = "prefix" ]; then
   RUN_NAME=${RUN_NAME}_mem${N_MEM_TOKENS}
 fi

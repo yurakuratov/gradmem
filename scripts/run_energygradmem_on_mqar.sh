@@ -167,7 +167,7 @@ MAX_STEPS=20000
 ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
 
-ATTN_IMPL="eager"
+ATTN_IMPL=${ATTN_IMPL:-eager}
 MIXED_PRECISION='no'
 
 # INIT_CHECKPOINT=./runs/mqar_N8_V8192_L24/gradmem_llama_L4H4D256_mem8_K2_ilr0.4_icn10.0_grad_second_bs_64_lr_1e-04_fp32/run_1/checkpoint-8000/model.safetensors
@@ -222,6 +222,9 @@ if [ "$SEPARATE_WRITER" = true ]; then
   RUN_NAME=${RUN_NAME}_writer_${WRITER_BASE_MODEL}_L${WRITER_L}H${WRITER_H}D${WRITER_D}
 fi
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
+if [ "$ATTN_IMPL" != "eager" ]; then
+  RUN_NAME=${RUN_NAME}_attn_${ATTN_IMPL}
+fi
 if [ "$K_SAMPLING" = true ]; then
   RUN_NAME=${RUN_NAME}_Ksample${K_MIN}-${K_MAX}_ilr${ILR_MIN}-${ILR_MAX}_unique${ILR_SAMPLE_UNIQUE}
 fi

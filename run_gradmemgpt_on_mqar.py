@@ -502,7 +502,9 @@ class ExperimentArgs:
     kv_mem_layers: Optional[str] = field(default="all")
     freeze_backbone: Optional[bool] = field(default=False)
     use_gradient_checkpointing: Optional[bool] = field(default=False)
-    attn_implementation: Optional[str] = field(default="eager")
+    attn_implementation: Optional[str] = field(default="eager", metadata={
+        "help": "Attention backend: eager, hvp_manual, hvp_semi_manual, flashbob (alias bob), or another registered backend."
+    })
     write_objective: Optional[str] = field(default="reconstruction")
     energy_head_hidden_dim: Optional[int] = field(default=None)
     use_layerwise_energy: Optional[bool] = field(default=False)

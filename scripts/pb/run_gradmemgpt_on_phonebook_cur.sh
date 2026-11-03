@@ -33,6 +33,7 @@ GRAD_MODE="second"
 USE_MEM_PROJ=false
 MEM_PROJ_MODE="none"
 USE_WRITE_HEAD=true
+ATTN_IMPL=${ATTN_IMPL:-eager}
 
 N_PAIRSS=(0 2 4 8 16 32 64)
 
@@ -42,6 +43,9 @@ N_PAIRS=${N_PAIRSS[j]}
 PREV_N_PAIRS=${N_PAIRSS[j-1]}
 
 RUN_NAME=gradmem_${MODEL_NAME}_mem${N_MEM_TOKENS}
+if [ "$ATTN_IMPL" != "eager" ]; then
+  RUN_NAME=${RUN_NAME}_attn_${ATTN_IMPL}
+fi
 if [ "$N_CTRL_TOKENS" -gt 0 ]; then
   RUN_NAME=${RUN_NAME}_c${N_CTRL_TOKENS}
 fi
@@ -111,7 +115,7 @@ for N in "${N_VALUES[@]}"; do
     --adam_beta1 $ADAM_BETA1 \
     --adam_beta2 $ADAM_BETA2 \
     --pretrained_model $PRETRAINED_MODEL \
-    --attn_implementation "eager" \
+    --attn_implementation "$ATTN_IMPL" \
     --n_mem_tokens $N_MEM_TOKENS \
     --K $K \
     --K_sampling "$K_SAMPLING" \

@@ -114,7 +114,7 @@ ADD_INNER_LOSS_TO_OUTER=false
 INNER_LOSS_WEIGHT=0.5
 READ_FOCAL_GAMMA=0.0
 
-ATTN_IMPL="eager"
+ATTN_IMPL=${ATTN_IMPL:-eager}
 MIXED_PRECISION='no'
 
 # INIT_CHECKPOINT=/cephfs/home/mkairov/gradim/energy_shaping/runs/mix-N8-K2V2-V62_1M/llama_L4H4D128_bs_64_lr_1e-04/run_2/checkpoint-186500/model.safetensors
@@ -134,6 +134,9 @@ else
   RUN_NAME=energygradmem_${BASE_MODEL}_L${L}H${H}D${D}_mem${N_MEM_TOKENS}
 fi
 RUN_NAME=${RUN_NAME}_K${K}_ilr${INNER_LR}
+if [ "$ATTN_IMPL" != "eager" ]; then
+  RUN_NAME=${RUN_NAME}_attn_${ATTN_IMPL}
+fi
 if [ "$K_SAMPLING" = true ]; then
   RUN_NAME=${RUN_NAME}_Ksample${K_MIN}-${K_MAX}_ilr${ILR_MIN}-${ILR_MAX}_unique${ILR_SAMPLE_UNIQUE}
 fi
