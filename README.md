@@ -30,6 +30,58 @@ GradMem runs in two phases:
 
 In short: GradMem learns to use gradient descent itself as a writing operation.
 
+## Experimental self-distillation
+
+`run_self_distillation_on_kv_retrieval.py` inherits the complete KV GradMem CLI
+(memory backends, WRITE objectives, energy parameters, and auxiliary losses).
+`self_distillation.py` adds a teacher forward on `[context; query; target]`
+before ordinary query-independent WRITE and context-free READ. The teacher is
+the current READ backbone without fast memory or WRITE-only adapters; its outputs
+are detached, and its forward runs under `no_grad`. It follows the model's current
+train/eval mode, including dropout. There is no separate or EMA teacher.
+
+The final outer loss is weighted READ CE + weighted distillation + all existing
+auxiliary losses. These nonnegative CLI weights can be combined:
+
+| Flag | Python default | Loss |
+| --- | --- | --- |
+| `--read_ce_weight` | 1 | Final READ target CE |
+| `--distill_logits_query_weight` | 0 | Query-token KL(teacher ‖ student) |
+| `--distill_logits_target_weight` | 0 | Target-token KL(teacher ‖ student) |
+| `--distill_hidden_query_weight` | 0 | Query-token hidden MSE |
+| `--distill_hidden_target_weight` | 0 | Target-token hidden MSE |
+
+KL uses temperature 1 and the logits **preceding** each selected token. Hidden
+MSE uses states **at** each token, averaging over hidden dimensions, non-padding
+selected tokens, and equally over all transformer layers (no embedding layer).
+These are Hugging Face hidden-state outputs, including final normalization on
+the last layer. Target tokens have labels other than `-100`; other non-padding
+tokens are query tokens. Empty selections contribute zero. LoRA/KV memory omit
+the first token from KL because they have no preceding input position. Only
+causal READ alignment is supported. Existing intermediate-READ and auxiliary
+loss definitions/weights are unchanged; `read_ce_weight` weights final CE only.
+
+The shell preset reuses the energy launcher and enables target KL with weight 1
+alongside CE with weight 1. Its other weights default to zero. Uppercase weight
+environment variables or CLI flags override these settings; **all** inherited
+runner flags can also be passed, with CLI overrides taking precedence:
+
+```bash
+# Example configuration; select an available GPU before launching.
+NP=1 bash scripts/run_self_distillation_on_kv_retrieval.sh \
+  --write_objective reconstruction \
+  --distill_hidden_query_weight 0.1 \
+  --distill_hidden_target_weight 0.1
+```
+
+Existing backend restrictions still apply (energy WRITE requires prefix memory).
+Run names include the distillation weights and a CLI digest to distinguish
+overridden inherited settings. Configuration/checkpoint serialization and resume
+use the shared runner. With all distillation weights zero, the teacher is skipped;
+without labels, inference always skips it. Full-context teacher evaluation with
+labels is more expensive than deployment READ and requires room for the full
+context + query + target sequence.
+
 ## Repository layout
 
 - `grad_memgpt.py` - GradMem model and inner-loop memory optimization logic.

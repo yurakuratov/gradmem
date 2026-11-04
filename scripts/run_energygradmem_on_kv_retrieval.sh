@@ -8,6 +8,7 @@ source "$SCRIPT_DIR/collect_env_state.sh"
 # Define arguments for the script
 NP=${NP:-1}
 RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-}
+EXTRA_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --resume_from_checkpoint|--resume-from-checkpoint)
@@ -23,8 +24,13 @@ while [[ $# -gt 0 ]]; do
       shift
       ;;
     *)
-      echo "[ERROR] unknown argument: $1" >&2
-      exit 2
+      if [ "${TRAIN_SCRIPT:-}" = "run_self_distillation_on_kv_retrieval.py" ]; then
+        EXTRA_ARGS+=( "$1" )
+        shift
+      else
+        echo "[ERROR] unknown argument: $1" >&2
+        exit 2
+      fi
       ;;
   esac
 done
@@ -298,7 +304,7 @@ for N in "${N_VALUES[@]}"; do
       --num_processes "$NP"
       --mixed_precision "$MIXED_PRECISION"
       --config_file accelerate.yaml
-    run_gradmemgpt_on_kv_retrieval.py
+    "${TRAIN_SCRIPT:-run_gradmemgpt_on_kv_retrieval.py}"
     --exp_path "$EXP_PATH"
     --per_device_batch_size "$PER_DEVICE_BATCH_SIZE"
     --gradient_accumulation_steps "$GRAD_ACC_STEPS"
@@ -426,6 +432,7 @@ for N in "${N_VALUES[@]}"; do
     CMD+=( --ivan_loss_weight "$IVAN_LOSS_WEIGHT" )
   fi
 
+  CMD+=( "${EXTRA_ARGS[@]}" )
   print_run_header "$EXP_PATH" "$PORT" "$NP" "$MIXED_PRECISION" "${CMD[@]}"
 
   start_run_timer

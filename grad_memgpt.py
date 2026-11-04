@@ -2492,7 +2492,15 @@ class GradMemGPT(PreTrainedModel):
 
         return alignments
 
+    def _prepare_outer_supervision(self, input_ids, labels):
+        """Optional full-context supervision, prepared before query-independent WRITE."""
+        return None
+
+    def _outer_supervision_loss(self, supervision, read_out, read_batch, input_ids, labels, target_loss):
+        return target_loss.new_zeros(()), {}
+
     def forward(self, input_ids, labels=None, return_mem=False):
+        supervision = self._prepare_outer_supervision(input_ids, labels)
         context_input_ids = input_ids['context_input_ids']
         query_input_ids = input_ids['query_input_ids']
 
@@ -2717,7 +2725,9 @@ class GradMemGPT(PreTrainedModel):
         read_grad_context = torch.enable_grad() if outer_memory_gradient_active else nullcontext()
         with read_grad_context:
             read_batch = backend.build_read_inputs(memory_state, batch_ctx)
-            read_model_kwargs = read_batch.get('model_kwargs', {})
+            read_model_kwargs = dict(read_batch.get('model_kwargs', {}))
+            if supervision is not None and supervision.get('hidden_states') is not None:
+                read_model_kwargs['output_hidden_states'] = True
             log_mem_attn_read = (
                 self.attn_implementation == "eager" and self.memory_backend in ("prefix", "kv_cache")
             )
@@ -2769,6 +2779,9 @@ class GradMemGPT(PreTrainedModel):
         target_grad_context = torch.enable_grad() if outer_memory_gradient_active else nullcontext()
         with target_grad_context:
             target_loss = self._compute_read_target_loss(output['predictions'], read_batch, labels)
+            supervision_loss, supervision_stats = self._outer_supervision_loss(
+                supervision, read_out, read_batch, input_ids, labels, target_loss
+            )
 
         zero = target_loss.new_tensor(0.0)
         memory_search_loss = zero
@@ -3105,6 +3118,7 @@ class GradMemGPT(PreTrainedModel):
         )
         outer_loss = (
             target_loss
+            + supervision_loss
             + auxiliary_loss
             + weighted_memory_search_loss
             + weighted_lipschitz_loss
@@ -3155,7 +3169,7 @@ class GradMemGPT(PreTrainedModel):
             })
         if rank_active or trajectory_active or anchor_active or memory_search_active:
             loss_stats["energy_aux_loss"] = energy_aux_loss
-        for name, value in {**loss_stats, **landscape_stats}.items():
+        for name, value in {**loss_stats, **landscape_stats, **supervision_stats}.items():
             output["inner_loop_stats"][name] = value.detach()
         output['loss'] = outer_loss
         return output

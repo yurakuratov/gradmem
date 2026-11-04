@@ -448,8 +448,10 @@ class ExperimentArgs:
     ivan_loss_weight: Optional[float] = field(default=0.0)
 
 
-if __name__ == '__main__':
-    parser = HfArgumentParser(ExperimentArgs)
+def main(args_class=ExperimentArgs, config_class=GradMemGPTConfig, model_class=GradMemGPT,
+         extra_config_fields=()):
+    global logger
+    parser = HfArgumentParser(args_class)
     args = parser.parse_args_into_dataclasses()[0]
 
     restore_resume_args(args, logger)
@@ -516,7 +518,8 @@ if __name__ == '__main__':
 
     # Trainer seeds runtime RNG later, after the model has already been built.
     initialize_run_seed(args.seed)
-    gradmem_config = GradMemGPTConfig(pretrained_model=args.pretrained_model, base_config=config,
+    gradmem_config = config_class(pretrained_model=args.pretrained_model, base_config=config,
+                                      **{name: getattr(args, name) for name in extra_config_fields},
                                       memory_backend=args.memory_backend,
                                       n_mem_tokens=args.n_mem_tokens, K=args.K,
                                       K_sampling=args.K_sampling, K_min=args.K_min, K_max=args.K_max,
@@ -586,7 +589,7 @@ if __name__ == '__main__':
                                        ivan_loss_weight=args.ivan_loss_weight)
 
     # Create gradmemgpt model
-    model = GradMemGPT(gradmem_config)
+    model = model_class(gradmem_config)
 
     if args.init_checkpoint is not None:
         state_dict = load_file(args.init_checkpoint)
@@ -696,3 +699,7 @@ if __name__ == '__main__':
     logger.info(f'{metrics}')
     trainer.save_metrics(split='all', metrics=metrics)
     trainer.state.save_to_json(output_dir / 'trainer_state.json')
+
+
+if __name__ == '__main__':
+    main()
