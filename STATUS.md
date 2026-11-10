@@ -7,6 +7,331 @@ rationale), verification status. Current state and hypotheses live in
 **Maintenance rule:** every merged change updates this journal and, when it
 changes the evidence picture, `PROGRESS.md` in the same commit.
 
+## 2026-11-09 (f) — contribution roadmap formulated
+
+Added the requested staged roadmap to PROGRESS: freeze the cost/comparison
+model; derive linear acquisition, correlated-snapshot retrieval, and gradient
+paths; test the matched-forward gradient intervention; validate allocation
+predictions out of sample; and establish transformer resource frontiers
+against strong local-only and hierarchical baselines. Commit interval tau
+and reset horizon h remain separate throughout.
+
+Primary proposed contribution is predictive fixed-error resource allocation;
+outer-optimization improvements are a conditional supporting claim. Gates
+explicitly allow a null gradient result, an exact-reader-only benefit, or a
+failure to predict held-out allocations. Required controls include deep
+local memory, fast LoRA, local segmentation, joint local writing, endpoint
+commits, branch-detached snapshots, and exact reads. Training versus
+deployment cost and whole-payload theory versus token-wise implementation
+are accounted separately. Next milestone is a specification and linear
+model/experiment brief, not a broad run grid. Research records only changed;
+no source/config modifications, experiments, or new empirical claims.
+
+## 2026-11-09 (e) — intermediate commits as gradient access points
+
+Recorded the user's proposed intermediate shared-memory commits in IDEAS.
+Separate commit interval tau from reset/carry horizon h; endpoint-only
+storage remains a baseline. Derived the final-loss gradient as a sum of
+paths through each later commit, including a direct term at a committed
+state. For linear delta-rule writes, that term bypasses subsequent
+I-eta*x*x^T factors. This establishes shorter available routes, not a
+convergence guarantee or a modification of the inner optimization objective.
+
+Proposed control: identical snapshots with versus without stop-gradient on
+the intermediate snapshot branches, retaining the differentiable live
+recurrence and final commit. Forward values match at identical parameters;
+the comparison tests additional writer-gradient routes. Separate historical
+availability, gradient routing, and LA superposition using endpoint-only
+and exact-reader controls. Account for correlated snapshots, extra commits,
+and training graph memory; fixed-size folded state does not imply fixed
+retrieval error. Prior recurrent attention shortcuts limit novelty claims.
+Research notes only; no source/config edits, experiments, or new evidence.
+
+## 2026-11-09 (d) — include segmented shared writes inside the local writer
+
+User-requested baseline/theory addition recorded in IDEAS: carry the same
+local memory through h elementary segments, run K inner steps on each,
+commit only the final group state to global LA, and reset locally between
+groups. This applies to tokens, deep prefixes, and adapter codes. Endpoints
+h=1 and h=J interpolate independent segment writing and fully carried WRITE
+dynamics; intermediate h retains the hierarchy while bounding local carry.
+
+Theory now includes h in local distortion, noise sensitivity, retained local
+capacity, and compute. For whole-memory commits and T=ceil(J/h), the working
+error model is delta_local(p,K,h)+Gamma(p,K,h)*(T-1)/D. Within-group forgetting
+belongs in delta_local. Local dependency depth is up to h*K, but total inner
+step count remains J*K when K is held per elementary segment. Graph detach
+and optimizer-buffer policy must be distinguished from forward carry.
+
+Add both the h sweep and joint-versus-sequential writing of identical group
+content to baseline design. Match/report actual compute, since K steps per
+subsegment and K steps on a concatenated group are different budgets. The
+reset/commit interval becomes an explicit theoretical optimization variable
+alongside p,D,K. Only research notes changed; no source/config edits or runs.
+
+## 2026-11-09 (c) — cycle 1: scientific contribution assessment and evidence audit
+
+**Scope:** evaluate proposed contributions (optimization/convergence from
+global LA; capacity/complexity theory for local-gradient/global-associative
+memory). Recommendation, not an experiment authorization: use fixed-error
+local/global resource allocation as the main contribution, with a controlled
+write-isolation mechanism study as supporting evidence.
+
+**Evidence boundary:** the report establishes that the complete independent
+write + global interface architecture beats the two-token carried-prefix
+baseline at N8/N16 under the stated training budget. It does not isolate LA:
+state capacity, WRITE allocation, READ interface, and gradient-path depth
+change together. In the matched interface architecture, exact softmax trains
+faster than LA: N16 reaches 0.99 in 5.5-9.5k outer steps, versus 47.5k for
+one LA seed and two non-reaches by 50k. These are OUTER training steps,
+not inner WRITE convergence. N32's completed LA mean best 0.926 versus
+truncated exact mean best 0.978 supports the finite-budget kernel gap; the
+short adaptive N32 run and LA N64 plateau do not establish asymptotic ceilings.
+Curriculum arms inherit different checkpoints; step-0 comparisons are not
+a common-frozen-writer intervention.
+
+**Diagnostic correction identified, report left unchanged:** the code's
+cross-talk metric excludes the largest absolute-score item, not the known
+target (`grad_memgpt.py:1732`). It is computed before interface site masking
+and measures unweighted absolute similarity, not actual signed/value-weighted
+retrieval noise. Agreement with the random-key estimate is suggestive rather
+than a verified causal capacity law.
+
+**Proposed decisive experiment:** a capacity/read-matched three-arm study
+with shared sequential writes + exact read, disjoint local writes + exact
+read, and disjoint local writes + LA. A fourth shared+LA arm tests interaction.
+Use identical total fast-state budgets and common reader geometry; add a
+competitive deep-prefix/fast-LoRA one-level baseline for the resource frontier.
+Primary causal runs at fixed N, with training FLOPs/time to a fixed error and
+right-censoring for non-reaches. Probe old facts during frozen-weight inner
+writes and measure real value-weighted interference at active read sites.
+Start near N16/N32; this does not require finishing the expensive N96 grid.
+
+**Theory target:** independent writers remove products of later segment
+Jacobians from an early segment's path into the stored state; this does NOT
+by itself prove improved outer optimization. Combine that mechanism with
+local payload size P, capacity b, finite-step distortion delta, MSE-noise
+amplification coefficient Gamma, and local write cost. Under explicit random
+outer-key/decoder assumptions, epsilon approximately delta+Gamma*(T-1)/D,
+T=N/b; hence D_required approximately Gamma*(T-1)/(epsilon-delta).
+Budget DP state, T*W_local+T*DP writes, query reads, routing, and actual
+runtime storage. Seek a predicted optimal p,D,K allocation and specified
+dominance/no-benefit regimes, not a universal dominance theorem: unrestricted
+one-level memory can encode and emulate the hierarchical state.
+
+**Novelty check:** ARMT already combines memory tokens and associative
+storage (arXiv:2407.04841); GradMem already studies compute and input/per-layer
+memory (arXiv:2603.13875, appendices D/J); ATLAS studies local-context memory
+optimization and capacity (arXiv:2505.23735). Tensor capacity Dp and the mere
+combination are insufficient novelty. The proposed distinctive claim is a
+predictive, validated fixed-error allocation rule for gradient-written codes
+and global storage. This is a targeted literature check, not a priority proof.
+
+Research-scientist evidence audit completed; milestone reached. No source,
+report, config, or manifest changes; no tests/jobs/remote requests. Only PI
+research records updated. Stop after cycle 1; all proposed runs remain drafts.
+
+## 2026-11-09 (b) — interference curve collected and analysed (partial; P2 decided)
+
+**What changed:** collected all 30 experiments of Comet project
+`gradmem-linear-read-interference` (curve job `ccde14ed`: `interface`,
+`interface_softmax`; adaptive job `7c2ed873`: `adaptive`). Report
+[`reports/INTERFERENCE_CURVE_RESULTS.md`](reports/INTERFERENCE_CURVE_RESULTS.md),
+data `reports/results/interference_curve.json`, figure
+`reports/figures/interference_em_vs_n.svg`. New read-only analysis scripts
+`scripts/collect_interference_results.py` and
+`scripts/make_interference_figure.py` were written in the main chat. That
+deviates from the AGENTS.md role split (PI does not write code); flagged to
+the user. No source, config or manifest changes.
+
+**Coverage:** both jobs died on 2026-11-03. Interface N64 ×3 and adaptive
+N32 ×3 were interrupted together at about 11:00–11:30
+(`InterruptedExperiment`). The softmax chains then ran N8→N16→N32 and died at
+18:15 with `OSError(28, 'No space left on device')`. 15 of 45 planned runs
+never started (interface N96; softmax N64/N96; adaptive N64/N96) and 9 were
+truncated (softmax N32 at ≤2.5k steps, interface N64 at 22.5–23k, adaptive
+N32 at 2.5–3k).
+
+**Verdicts:** **P2 — superposition binds at N=32.** Δ(N) = +0.0005 / +0.0025
+/ **+0.052** at N=8/16/32 (best EM, mean over seeds). Δ(32) is a lower bound:
+the control was truncated while the interface arm used its full 50k. Seed
+ranges do not overlap (control worst 0.975 > interface best 0.948).
+Interface N64 plateaus at EM 0.41 (EM and loss flat from ~10k to 23k steps);
+there is no N64 control. **P1** held at N=8/16 (threshold stops at 17–19k
+and 5.5–9.5k steps) and is untested at N ≥ 32. **P3** held (kernels
+indistinguishable until the binding N). **P-A1** held for EM: the carried arm
+never reaches 0.99 (best 0.82 / 0.48 / 0.15 at N=8/16/32). Its forgetting
+matrices are not on Comet, so that part is still open. **P-A2** effect size
+(interface − adaptive): 0.17 / 0.51 / 0.78.
+
+**Interpretation (hypothesis, consistent with all points; not yet
+tested):** the binding N matches the 2026-11-03 random-key estimate
+noise/signal ≈ √((N−1)/d_h), with d_h = 128/4 = 32. That gives 0.47 / 0.68 /
+0.98 / 1.40 at N=8/16/32/64. The measured interference floor at N ≥ 32
+(0.143) equals the random-unit-vector |cos| in 32 dims (0.142). Warm-transfer
+step-0 EM (not pre-registered) separates the reads cleanly: exact softmax
+0.93 at N16 and N32; superposed 0.865 / 0.688 / 0.254 at N16/32/64.
+
+**Decisions:** none taken; options are listed in the report's "Next" for the
+user. The cheapest decision-relevant follow-up is resuming only the softmax
+chains (N32→N64) after fixing the remote disk. The direct capacity test is
+the planned `kv_interface_softmax.yaml` arm2 (d_h = 64) on the curriculum.
+Cost note: N64 runs at 9.3 s/step, so a full 50k phase is about 5.4 days;
+the pre-registered 3–5-day estimate for the whole job was far too low.
+
+**Verification:** numbers re-derived end-to-end by the collector from
+Comet (matching an independent ad-hoc pull); figure passed the visual gate.
+
+## 2026-11-09 — cycle 1: complementary local/global memory and payload accounting
+
+**User reframing adopted:** compare spending capacity on local gradient
+memory versus outer associative addressing within the SAME hierarchical
+family. LA can store gradient-written prefixes, tokens, or adapter codes;
+it need not compete with those writer parameterizations. The local payload
+size and number of global entries are essential additional variables.
+
+**Milestone reached (analytic audit only):** a local linear memory A_s of
+shape p-by-v stored under one segment key k_s in R^D gives the tensor
+S=sum_s k_s tensor A_s, shape D-by-p-by-v. A query (q,x) reads
+sum_s(q dot k_s)*A_s^T*x. Orthogonal segment keys and p independent local
+addresses permit T<=D segments and N=T*p<=D*p arbitrary associations,
+paid through D*p*v state scalars. Earlier N<=D bounds used D for the TOTAL
+address width; here D is only the outer segment address and total feature
+width is D*p. These are different architectures, not contradictory bounds.
+
+For random independent unit segment keys, full local load, and independent
+isotropic payload values, relative retrieval MSE is (T-1)/D. Slot-wise LA
+with a separate random key per local row instead has (T*p-1)/D_slot and
+state D_slot*v. At matched small error epsilon and many segments,
+D_chunk approximately T/epsilon and D_slot approximately T*p/epsilon:
+both states require order T*p*v/epsilon scalars. Dense chunk commits cost
+order T^2*p*v/epsilon versus T^2*p^2*v/epsilon for slot commits. At fixed
+N=T*p, chunk storage is order N*v/epsilon and commits N^2*v/(p*epsilon).
+These are standard dense-algorithm counts, not lower bounds; sparse
+coordinate-addressed writes can remove the commit difference.
+
+**General payload law:** if local size p stores b(p) facts into P(p) payload
+coordinates, T=N/b(p), ideal random-key outer storage is order
+N*P(p)/(b(p)*epsilon), and dense commits order
+N^2*P(p)/(b(p)^2*epsilon). Thus payload per retained fact P/b controls
+storage, while P/b^2 controls commits. These conclusions require larger p
+to support larger groups; at fixed segmentation, chunk storage grows with P.
+Nonlinear local decoding adds noise sensitivity and local fitting error:
+under small unbiased read perturbations, an approximate error model is
+delta_local + gamma(p)*(T-1)/D. Budget D using the remaining error margin;
+parameter count alone does not determine gamma or b.
+
+**Qualifications:** full-payload reads cost D*P, but one-hot local queries
+can select a tensor slice before reading (D*v); multiple local queries can
+amortize one payload retrieval. Chunk routing must be supplied or learned
+and charged. Raw LoRA factor averaging does not equal operator averaging;
+use shared-basis coefficients, a shared factor, effective operators, or
+explicitly analyze bilinear decoding errors. Actual model currently uses
+token-wise keys, not this whole-payload tensor construction. Local writer,
+projection, optimizer, and retained-bank costs remain additional.
+
+Research-scientist audit confirmed capacity, interference, storage, compute,
+and the factor-mixing qualification. Tensor-product binding is established
+background (Smolensky, 1990); above cost/error derivations are this analysis.
+No code/config edits, tests, training, or remote checks. Stop after cycle 1.
+
+## 2026-11-03 — cycle 1: fixed-error complexity frontier, deep memory and fast LoRA
+
+**User correction incorporated:** increasing writable state does not require
+proportionally increasing sequence length. Independent per-layer token
+parameters expose approximately L*m*d coordinates at the same m-token prefix
+length as shallow memory; KV-only prefixes expose about 2*L*m*d coordinates
+without memory-token queries/FFNs; fast LoRA exposes about 2*L_a*r*d factor
+coordinates without extra sequence positions. Extra attention/adapter work
+and backward passes still count. This invalidates a general computational
+advantage inferred only from linear-state size versus shallow-token count.
+
+**Milestone reached (theoretical framework, no experiments):** compare each
+architecture's minimum total write + Q-query read cost subject to the SAME
+retrieval-error requirement and a stated peak-memory budget. Optimize memory
+size, write steps, retention method/replay, and compression within each
+family. Count projection, backbone, commit, and runtime-memory costs; do not
+equate parameter count with usable capacity or gradient-update FLOPs.
+
+**Linear fixed-error result:** for target memory map F and query covariance
+C, let sigma_j be singular values of F*C^(1/2). Best rank-r approximation
+has relative expected squared error sum_{j>r}(sigma_j^2)/sum_j(sigma_j^2).
+Thus r_epsilon defines the oracle factorized-memory requirement. Dense
+linear-state reads cost D*d_v, while factorized reads cost r*(D+d_v), before
+shared projections; dense is arithmetically preferable only above the
+corresponding rank crossover. A factored linear-attention state is itself a
+LoRA-like map. This is a representation/read-cost result, not proof that an
+online optimizer can attain the target cheaply. Flat spectra and steeply
+decaying spectra imply different winners.
+
+**Write geometry:** linearize old/new retrieval outputs with Jacobians J_o
+and J_n with respect to writable coordinates z. With Pi projecting onto
+ker(J_o), new residual e is writable without first-order old-output change
+iff e lies in range(J_n Pi). Minimum-norm update is
+Pi*J_n^T*(J_n*Pi*J_n^T)^dagger*e, squared norm
+e^T*(J_n*Pi*J_n^T)^dagger*e. Useful additional memory enlarges or improves
+the conditioning of these directions. Constructing this projector is not
+assumed cheap; it is a geometric diagnostic. A fixed-J oracle batch-GD
+analysis is distinct from actual segment-only sequential optimization.
+
+**No universal winner:** gradient updates to disjoint one-hot-addressed
+columns preserve all previous facts exactly, while random-key additive
+memory needs D about N/epsilon for normalized MSE epsilon. Orthogonal
+addressing can help either writer. LA's potential advantage is cheap
+independent commits when alternative writes require expensive optimization
+or replay, provided the required global width/read cost remains competitive.
+The existing gradient encoder is still charged to LA; analytic commits do
+not remove its inner backpropagation.
+
+Research-scientist audit confirmed the nullspace formula, counterexample,
+deep-prefix/LoRA cost accounting, and fixed-error comparison. Primary papers
+consulted: Prefix-Tuning (ACL 2021), LoRA (arXiv:2106.09685), TTT
+(arXiv:2407.04620). No source/config edits, tests, training, or remote status
+checks. Stop after cycle 1; current experiment results unchanged.
+
+## 2026-11-02 — follow-up cycle 1: two-stage linear memory capacity and compute
+
+**Milestone reached (analytic audit; no experiments).** Model local gradient
+encoding as a p-by-v associative matrix per segment, committed additively to
+a D-by-v global state through a D-by-p embedding. For T segments with b
+arbitrary vector targets each, fixed linear encoding/query features imply
+`N = T*b <= min(T*p, D)` as a necessary exact-recall condition, with b<=p
+locally. Orthogonal segment subspaces achieve full-load capacity T*p when
+T*p<=D; they require the query to identify the appropriate segment subspace.
+Full-rank keys alone do not make same-key additive reads exact: their Gram
+matrix must be identity for arbitrary values, or the reader must use dual
+queries. These are linear arbitrary-target bounds, not measured capacity
+limits for the nonlinear neural reader.
+
+For orthonormal local keys and independent random orthonormal segment frames,
+iid centered target values give relative cross-talk MSE `(T-1)*b/D`. With
+zero-start K-step local GD and constant step eta, local scaling is
+`a = 1-(1-eta)^K`, yielding total relative MSE
+`(1-a)^2 + a^2*(T-1)*b/D`. Increasing local optimization accuracy does not
+remove global superposition interference.
+
+**Compute qualification (new code observation):** the hook computes
+`_linear_state_read_bias` on ALL sequence positions before multiplying by
+`site_mask` (`grad_memgpt.py:1679-1680`). Thus 2*M*L counts active interface
+injection sites, not actual computed reads; current read arithmetic spans
+L*(T1+T2) positions. No optimization was made. The implementation also
+retains the growing bank and projected K/V.
+
+Ignoring projection/backbone/diagnostic costs, an unfolded N-item bank costs
+O(R*N*(D+v)) for R reads; folding costs O(N*D*v+R*D*v). With D=v=h, the
+simple operation-count crossover is R*(2*N-h)>N*h. For H=4,h=32,N=8 the
+state uses 4096 coordinates versus 2048 for projected K/V, and a state read
+uses twice their leading multiply-accumulate count before folding cost.
+This is an analytic cost comparison, not a runtime benchmark.
+
+Local iterative optimization can save work relative to K repeated global
+gradient passes, but a direct rank-one global delta update already costs
+O(D*v) per fact. Savings require specifying that comparator and accounting
+for the commit/projections. The hierarchy relocates iterative work to small
+scratch memory and amortizes retrieval; it does not multiply capacity beyond
+the global state budget. Research scientist independently checked the
+equations; source/configs unchanged. Stop after this follow-up cycle 1.
+
 ## 2026-11-02 — cycle 1: theoretical comparison of carried writes and linear-state interface reads
 
 **Milestone reached (analysis only).** Research-scientist code inspection
@@ -40,6 +365,61 @@ gradient alignment, segment-order sensitivity, key-overlap versus retrieval
 error, and interference scaling with N and d_h. No experiments launched,
 tests run, source/config changes, or new performance claims. Existing run
 status was not checked. Stop after cycle 1; no further cycle needed.
+
+## 2026-11-02 (b) — cycle 3: carried-memory baseline arm submitted as a separate job (the write-side leg of the curve)
+
+**User-directed arm.** The curve's organizing question per the user: whether
+**separate memory tokens per segment mitigate catastrophic forgetting** — so
+the carried-memory baseline ([`grad_memgpt_adaptive.py`](grad_memgpt_adaptive.py),
+every segment writes into the SAME M=2 tokens) runs the IDENTICAL curriculum
+as a separate cluster job alongside the running interference job. Config
+pinned: the adaptive fork's native cross-segment carry, baseline update
+`memory_update_rule: sgd` (plain gradient inner loop; NO mamba/convex
+gating, NO STAR, NO replay, NO `curriculum:` block — checkpoint chaining
+like every other arm), memory-prefix read as-is; write hyperparameters
+matched to the interface arms (M=2, K=2, inner_lr 0.04, grad_mode second,
+use_write_head), pair-aware `n_segments = N/2` per phase. Budget asymmetry
+by design: 2 carried tokens vs N stored tokens — the architecture axis, not
+matched capacity (cf. the 2026-11-02 theory entry's budget-matching
+constraint; also note the read state sizes there: the interface arms' bank
+is N tokens but the read taps a d²/H state). `per_segment_eval` on — **the
+forgetting matrix is a primary readout for this arm**. Revision-3
+predictions P-A1/P-A2 verbatim in the new manifest header: P-A1 — the
+carried arm fails to reach EM 0.99 even at small N (fact-1 mechanism:
+running-sum overwrites), forgetting-matrix diagonal ≫ last-column gaps
+widening per phase; P-A2 — the per-phase gap to the interface arms is the
+"separate tokens mitigate forgetting" effect size; if the carried arm
+unexpectedly HOLDS, fact 1 is contradicted at matched protocol —
+investigate before any H1 claim.
+
+**Delivery: separate manifest + run spec.**
+[`manifests/kv_interference_adaptive.yaml`](manifests/kv_interference_adaptive.yaml)
+(one experiment, seeds 4378/43894/2343 = 3 chains through the same wrapper —
+`adaptive` arm added to its ARMS table) +
+[`run_adaptive.yaml`](run_adaptive.yaml) (same env, same comet project
+`gradmem-linear-read-interference`; the flock guard is per-run-copy so the
+two jobs cannot collide). `run.yaml` and the RUNNING interference job
+`ccde14ed` untouched.
+
+**Verification.** 2-phase smoke: warm-start PROVEN by checksum (54/54
+tensors bitwise-equal to phase-1's resolved `model.safetensors`), rerun
+skips both phases, forgetting matrices written (4×4 and 8×8). N=96 probe
+(included the 48-segment forgetting pass — this arm's peak must be
+measured, not extrapolated): B=16 fits at 2.99 GiB, ~0.185 GiB/sample —
+**~14% LIGHTER per sample than the interface arms** (the "carry retains one
+big autograd graph ⇒ heavier" prior was wrong; wrapper comment corrected);
+batch ladder unified with the interface arms 64/64/64/32/16. Suite
+**82 passed**; dry-run = exactly 3 chains. User committed the work
+mid-cycle as `083d5a5`.
+
+**Submitted — job `7c2ed873` (`lm-mpi-job-7c2ed873-521c-4de3-8bc4-b6d54cd7ad11`),
+PENDING** (queue busy at submit: 3 running / 4 pending ahead). Early gate
+due at start: eval_loss trajectory, zero tracebacks,
+`runs/N8-K2V2-V62_1M/interf_adaptive_N8/run_{4378,43894,2343}_*`.
+Expected ~1–2 days on its own GPU once started (15 runs; plateaued phases
+end by patience per P-A1). Executor-note for the record: the interface
+job's N=96 phases could likely have used B>16 per the per-sample probe
+numbers — left as-is (uniform protocol; already running).
 
 ## 2026-10-29 — cycle 2: interference curve re-armed to interface reads; resubmitted, EARLY GATE PASSED
 

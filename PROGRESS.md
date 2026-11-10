@@ -15,13 +15,20 @@ all-positions 0.997, interface two-pass 0.999) while the one-shot control
 fail — and the conditioning ablation shows **pass-1 query conditioning is
 load-bearing** (prediction held, Δ > 0.98 per seed). The deployable read is
 (d′): interface-only reads + two-pass conditioning. **The interference curve
-vs N is RUNNING** (resubmitted 2026-10-29, job `ccde14ed`, early gate
-passed) with user-selected arms: `interface` (linear kernel, the deployable
-d′) + `interface_softmax` (exact softmax at the same interface sites — the
-no-superposition control); hopfield dropped, linear-all variants deferred.
-Single-key checkpoint curriculum N ∈ {8,16,32,64,96}, 3 seeds,
-50k-steps/0.99-EM protocol — revision-2 predictions in
-[`manifests/kv_interference_curve.yaml`](manifests/kv_interference_curve.yaml).
+vs N has partial results** (2026-11-09,
+[`reports/INTERFERENCE_CURVE_RESULTS.md`](reports/INTERFERENCE_CURVE_RESULTS.md)).
+Both jobs died on 2026-11-03 (an interrupt, then a full disk), so no arm
+reached N=96 and the control is truncated from N=32 on. On single-key with
+the deployable read, **superposition binds at N=32**: Δ against exact
+softmax at the same interface sites is 0.0005 / 0.0025 / 0.052 at
+N=8/16/32, and the interface read plateaus at EM 0.41 at N=64. This matches
+the random-key estimate √((N−1)/d_h) with key width d_h = 32 (a hypothesis;
+d_h sweep pending). The carried-memory baseline (same curriculum, every
+segment writing the SAME M=2 tokens;
+[`manifests/kv_interference_adaptive.yaml`](manifests/kv_interference_adaptive.yaml))
+fails at every N (0.82 / 0.48 / 0.15 at N=8/16/32). Per-segment slots are
+the first-order effect; read superposition is second-order and appears only
+once N ≈ d_h.
 
 ## The challenge
 
@@ -109,27 +116,256 @@ state-budget comparison. Existing facts support mitigation in the measured
 regime; they do not establish unlimited retention or isolate write-rule
 effects from state size and reader changes. See the 2026-11-02 STATUS entry.
 
+**Capacity/compute follow-up (2026-11-02; analytic, not benchmarked):** a
+linear two-stage model with local address width p, global width D, T segments
+and b arbitrary vector targets per segment requires b<=p and T*b<=D for
+exact recall with fixed linear query features. Orthogonal segment addressing
+can attain that bound; random segment frames instead incur relative
+cross-talk MSE `(T-1)*b/D` under orthonormal local keys and iid centered
+values. This does not set the nonlinear reader's empirical KV capacity.
+Actual interface arithmetic currently computes all-position reads and then
+masks their outputs (`grad_memgpt.py:1679-1680`); 2*M*L is an active-injection
+count, not the number of computed reads. At N=8,H=4,d_h=32 the 4096-scalar
+state is larger than the 2048-scalar projected K/V bank. Folded reads gain
+asymptotically with growing N and reuse, but no small-N runtime advantage
+has been established here. See the follow-up STATUS entry for assumptions
+and operation-count crossover.
+
+**Fixed-error comparison (2026-11-03; theoretical):** shallow-token count is
+an insufficient comparator for linear-state complexity. Independent deep
+tokens, per-layer KV prefixes, and fast LoRA can expand writable state with
+no proportional increase in sequence length. Compare minimum total write
+plus query-read cost at matched retrieval error and memory budget. For a
+linear target map, the query-weighted singular-value tail determines the
+minimum factor rank at a given error; a factored LA state and a LoRA-style
+map can implement the same read. Online acquisition remains a separate
+constraint: useful new writable directions are measured by J_new projected
+onto the old-query Jacobian's nullspace, not parameter count alone. No
+universal LA advantage follows; cheap commits must offset encoding,
+interference-driven state size, and read cost against the best competing
+write schedule. No new empirical result; see the 2026-11-03 STATUS entry.
+
+**Complementary hierarchy (2026-11-09; analytic):** LA can index whole
+gradient-written local memories rather than individual tokens. A local
+p-by-v matrix stored as one payload needs a D-by-(p*v) outer state, with
+tensor-product query (global q, local x). Exact orthogonal capacity is D*p,
+paid by D*p*v scalars; previous D-only bounds refer to flat total address
+width. At fixed N, local b-fact payload size P, and random-key error epsilon,
+outer storage scales as N*P/(b*epsilon), dense commits as
+N^2*P/(b^2*epsilon). Lossless grouping P=b*v preserves leading storage but
+reduces dense commits; true compression can also reduce storage, while
+overparameterized payloads may increase it. Evaluate local fitting error,
+decoder sensitivity, routing, and payload format before applying these
+ideal laws to prefixes/LoRA. This whole-payload design differs from the
+implemented token-wise linear state. See 2026-11-09 STATUS; no new runs.
+
+**Contribution/evidence audit (2026-11-09):** the current adaptive gap is a
+whole-architecture comparison, not an isolated LA/optimization effect.
+Exact-softmax independent writes converge faster than LA in the matched
+interface arms; outer training steps do not measure inner WRITE convergence.
+Short interrupted phases are censored, and width-dependent capacity remains
+a hypothesis. The cross-talk diagnostic is non-top-1 absolute similarity
+before site masking, not target-aware/value-weighted noise. Proposed paper
+direction (draft only): predict and validate local/global capacity allocation
+at fixed error, supported by a capacity/read-matched write-isolation study.
+See STATUS 2026-11-09(c) and IDEAS; no new experiments or report edits.
+
+**Required baseline extension (2026-11-09):** include sequential shared
+gradient writes INSIDE each local group, followed by one outer commit and
+a local reset. Local carry horizon h interpolates independent elementary
+writes (h=1) and fully carried WRITE dynamics (h=J). Treat h as an allocation
+variable with p,D,K: larger groups reduce outer entry count but may worsen
+local retention and credit assignment. Total inner steps stay J*K at fixed
+per-segment K; maximum local write dependency is h*K before graph truncation.
+Compare against joint writing of the same group and report real compute.
+Specified in IDEAS; no implementation or experiment performed.
+
+## Contribution roadmap (2026-11-09; research plan, execution not started)
+
+**Working thesis:** local gradient writing, global associative storage, and
+intermediate commits offer distinct ways to spend memory and compute.
+Predict when each is worthwhile at a fixed retrieval error, including
+regimes where a strong one-level memory wins. Intermediate commits may
+improve outer credit assignment while retaining a persistent local writer;
+this is a falsifiable supporting mechanism, not an established speedup.
+
+**Target deliverables:** an explicit linear associative-memory theory;
+a controlled gradient-routing study; and a validated allocation rule for
+local size p, global address D, reset horizon h, commit interval tau, and
+inner-step count K. No universal dominance or novel-attention-shortcut claim.
+This roadmap does not launch jobs or supersede the historical results above.
+
+### Stage 0 — freeze the comparison and cost model
+
+- Define N facts, J elementary segments, Q queries per written context,
+  a retrieval-error target epsilon, an outer-training budget, and an inference
+  memory budget. Keep local address size p separate from actual payload
+  size P(p), retained-fact count b, and architectural parameter count.
+- Specify local reset h and commits tau independently, including final
+  partial groups; record optimizer-buffer resets and derivative truncation.
+  Distinguish whole-payload theory from implemented token-wise K/V storage.
+- Primary deployment objective: minimize C_local + C_commit + Q*C_read
+  subject to held-out error <= epsilon and the memory/training budgets.
+  Also report training FLOPs/time to target error as a separate frontier.
+  Count temporary banks, K/V tensors, autograd activations, projection costs,
+  and actual read sites; DP is only the ideal folded whole-payload state.
+- Separate frozen-outer-weight memory acquisition/retention from end-to-end
+  outer optimization. Use normalized MSE in the linear model and explicit
+  KV error/EM targets in the transformer; no assumed universal conversion.
+- Audit prior work on gradient-written memory, recurrent attention shortcuts,
+  and associative memory to identify the precise gap before claiming novelty.
+
+**Exit artifact:** one comparison specification, baseline table, cost ledger,
+and falsifiable claims, with error targets and evaluation protocol fixed
+before the corresponding experiments.
+
+### Stage 1 — derive a minimal linear theory
+
+Use W_j=W_(j-1)+eta*(v_j-W_(j-1)x_j)*x_j^T and explicitly specified local
+key/value distributions. Encode whole W snapshots with global keys in D
+dimensions; begin with fixed/oracle keys, then test learned routing.
+
+1. Derive acquisition and forgetting versus p,K,h and local-key geometry;
+   include orthogonal-key cases with no overwrite interference.
+2. Derive retrieval error with multiple correlated snapshots. Retain payload
+   and address covariance, duplicated facts, bias, and cross terms rather
+   than automatically substituting (number_of_commits-1)/D. Separate an
+   exact oracle snapshot read from implementable query-dependent routing.
+3. Prove the gradient-path decomposition in IDEAS. Under restricted fixed
+   routing/linear-quadratic assumptions, analyze conditioning or convergence
+   if tractable. Otherwise state only a path-length theorem; stronger or
+   shorter gradients alone do not prove faster convergence.
+4. Combine the error calculation with measured/derived operation counts to
+   obtain crossover conditions against specified one-level algorithms.
+   Include finite-rank/information constraints and cases where hierarchy
+   loses; factorized or sparsely addressed one-level solutions can be cheap.
+
+**Exit artifact:** propositions with explicit assumptions and a predicted
+phase diagram over local capacity, address size, and commit frequency. A
+bound that only says 'larger memory helps' is insufficient: it must select
+an allocation or predict a crossover that can be tested out of sample.
+
+### Stage 2 — test the mechanism in a controlled linear system
+
+First verify numerical predictions for the fixed writer. To test OUTER
+optimization, define shared trainable writer/encoder parameters and train
+them across associative-recall episodes; a parameter-free delta rule alone
+cannot establish an outer-training speedup.
+
+Compare endpoint-only commits, intermediate commits with snapshot-branch
+stop-gradient, and fully differentiable intermediate commits. Keep final
+commits and the live recurrence differentiable in all applicable arms.
+The latter two must have equal forward values at identical parameters and
+different intended writer gradients. Run an exact-reader control on the
+same snapshots to isolate superposition. Keep gates, normalization, keys,
+loss scale, and training protocol matched; permit equally budgeted tuning.
+
+Sweep h and tau at fixed p,D,K first; then vary p,D and key correlations
+around predicted crossovers. Measure error by fact age, target-aware
+value-weighted read contamination, gradient contributions/alignment, and
+training FLOPs/time to target. Report memory and non-reaching/censored runs.
+
+**Gate:** does differentiable snapshot access improve training compute
+beyond identical forward snapshot storage, reproducibly across seeds?
+If only snapshot availability helps, retain a retention/capacity claim and
+drop the gradient-speedup claim. If exact attention benefits but LA does
+not, diagnose routing/interference before escalating model or context size.
+
+### Stage 3 — falsify the allocation rule on held-out linear problems
+
+Estimate local distortion, payload cost, and noise sensitivity on a limited
+calibration set. Choose p,D,h,tau,K using the theory before evaluating new
+N, query counts Q, and key-correlation regimes. Compare with an exhaustive
+small-grid oracle and simple fixed-allocation heuristics. Report feasibility
+(meeting epsilon), deployment/training cost, and cost regret relative to
+the best feasible grid configuration. State the grid's limits; it is not a
+global optimum. Preregister acceptable regret and uncertainty using pilot
+precision, without tuning them on the held-out results.
+
+**Gate:** predicts useful choices beyond the calibration grid and identifies
+both favorable and unfavorable regimes. If coefficients require retuning
+at every N, narrow the theory's claim to descriptive scaling.
+
+### Stage 4 — validate in GradMem against strong baselines
+
+Begin with controlled N16/N32 KV tasks, identical initialization/data order
+where architectures permit, and matched tuning budgets. Existing curriculum
+curves motivate this experiment but are not a causal convergence comparison.
+Use repeated seeds, common checkpoints for frozen-writer interventions, and
+confidence intervals; do not equate fewer outer steps with lower compute.
+
+Required baseline families:
+- One-level shared memory with increased local capacity, including deep
+  prefixes/tokens and a competitive fast-LoRA configuration, so sequence
+  length is not artificially tied to memory capacity.
+- Independent writes plus global storage (h=tau=1).
+- Shared segmented local writes with endpoint-only commits (tau=h).
+- Shared local writes with intermediate commits (tau<h), both branch-
+  detached and differentiable.
+- Exact attention over the same snapshots as a routing/reader control.
+- Sequential subsegment versus joint encoding of the SAME local group,
+  with actual compute matched/reported rather than equal nominal K.
+
+Stage these comparisons; do not run the full Cartesian product. First use
+one local parameterization to isolate h/tau and the gradient intervention.
+Then compare the best configurations on resource frontiers against stronger
+one-level and alternative local parameterizations. Expand context lengths
+only after the mechanism and cost accounting are credible.
+
+**Gate:** a reproducible improvement on a specified error/compute/memory
+frontier against competitive baselines, with the mechanism's scope stated.
+For broader claims, test a second local parameterization. Avoid averaging
+LoRA factors as if they were a linear operator; define payload encoding and
+include its cost and distortion. Defer that hierarchical variant if needed,
+but retain a strong one-level LoRA competitor.
+
+### Stage 5 — determine the paper's scope
+
+Minimum coherent result: linear propositions and failure regimes, held-out
+allocation predictions, a causal snapshot-gradient ablation (including a
+null result if found), and transformer resource frontiers with strong local
+baselines. Add ordered-pair/multi-fact retrieval before claiming integration
+benefits; add a longer realistic task only after the controlled results.
+
+Planned main figures: (1) local/global/cadence phase diagram with predictions
+and measurements, (2) matched-forward snapshot gradient intervention,
+(3) fixed-error compute/state frontiers, (4) held-out allocation regret.
+The evidence chooses whether the paper leads with resource allocation,
+optimization, or retention. Faster inner fitting, universal superiority,
+and constant-memory unlimited capacity remain outside the claims.
+
+**Immediate next milestone:** Stage 0's specification plus Stage 1's linear
+error/gradient model and a bounded Stage 2 experiment brief. No large sweep
+is needed to decide whether to proceed. Implementation and runs follow the
+PI/research-scientist workflow in AGENTS.md when execution is undertaken.
+
 ## Hypotheses ledger
 
 | hypothesis | status | strongest support | strongest doubt / missing |
 |---|---|---|---|
-| **H1** independently written per-segment memories + attention retrieval beat carried memory on forgetting | **supported** (KV single-key) | fact 2: all pairs stored with 2 tokens / 8 pairs / 4 segments; clean forgetting matrices | not yet shown at large segment counts; carried-memory controls with matched budget not tabulated here |
+| **H1** independently written per-segment memories + attention retrieval beat carried memory on forgetting | **supported** (KV single-key) | fact 2: all pairs stored with 2 tokens / 8 pairs / 4 segments; clean forgetting matrices | not yet shown at large segment counts (N ≥ 64 is confounded by read superposition); carried-memory control now tabulated on the identical curriculum (2026-11-09): 0.82/0.48/0.15 vs interface 0.99/0.99/0.93 at N=8/16/32 (budget unmatched by design: 2 carried tokens vs N stored); its forgetting matrices are still on the remote only |
 | **H2** the concat failure is a **read-interface** bottleneck, not a write-quality one | **supported** (ladder, 2026-10-22) | facts 5–7; the ran control: bank-prefix fails at 0.024 WHILE (c)/(d)/(d′) reach 1.00/0.997/0.999 on the SAME stored tokens — the prefix interface, not write quality, is indicted (fact 8) | prefix-interface failure is established only at this training scale (4L/128d from scratch); a pretrained/larger frozen reader might yet make the prefix work |
-| **H3** per-token, per-level linear-attention reads from a shared state (`S = Σkᵢvᵢᵀ`), added as a bias to softmax attention over the query context, fix routing + payload + iteration at O(1) read cost | **supported for routing+payload** (ladder 2026-10-22: 0.995–1.00 vs 0.25/0.02 controls; single-key 0.997+); implementation STATUS.md 2026-10-18 (b)/(c) | facts 8–9; interface variant (d′) matches all-position reads at M·L sites — cheaper architecture suffices given pass-1 conditioning | the **iteration** claim (pointer chasing, depth-bounded multi-hop) is untested; interference-vs-N RUNNING (curve submitted 2026-10-26) |
+| **H3** per-token, per-level linear-attention reads from a shared state (`S = Σkᵢvᵢᵀ`), added as a bias to softmax attention over the query context, fix routing + payload + iteration at O(1) read cost | **supported for routing+payload** (ladder 2026-10-22: 0.995–1.00 vs 0.25/0.02 controls; single-key 0.997+); implementation STATUS.md 2026-10-18 (b)/(c) | facts 8–9; interface variant (d′) matches all-position reads at M·L sites — cheaper architecture suffices given pass-1 conditioning | the **iteration** claim (pointer chasing, depth-bounded multi-hop) is untested; **O(1)-read capacity is bounded**: at d_h=32, superposition binds at N=32 on single-key (Δ(32)=0.052; EM 0.41 at N=64; [report](reports/INTERFERENCE_CURVE_RESULTS.md)). O(1) reads hold only while N ≲ d_h per head (capacity hypothesis, d_h sweep pending) |
 
 ## Missing experiments (decision-critical, in priority order)
 
-1. **Interference curve vs N** — **RUNNING (resubmitted 2026-10-29, job
-   `ccde14ed`, early gate passed; manifest
-   [`kv_interference_curve.yaml`](manifests/kv_interference_curve.yaml))**.
+1. **Interference curve vs N** — **PARTIAL RESULTS (2026-11-09,
+   [`reports/INTERFERENCE_CURVE_RESULTS.md`](reports/INTERFERENCE_CURVE_RESULTS.md)):
+   superposition binds at N=32.** Both jobs (`ccde14ed`, `7c2ed873`) died on
+   2026-11-03 (an interrupt, then a full disk). Still missing: the softmax
+   control at N ≥ 32 (P1, Δ(64)), N96 for all arms, and the adaptive arm's
+   forgetting matrices (remote only). Manifest:
+   [`kv_interference_curve.yaml`](manifests/kv_interference_curve.yaml).
    Protocol per user: single-key KV, checkpoint-chained curriculum
    N ∈ {8,16,32,64,96}, 50k steps/phase, 0.99-EM early stop; arms
    `interface` + `interface_softmax` (user-selected: hopfield dropped,
    linear-all deferred — definitions kept in the chain script for a later
-   manifest). Revision-2 predictions P1–P3 in the manifest header;
-   `read_state_cross_talk` trajectory is part of the readout (already
-   rising in the live run). If superposition binds: coarse top-k segment
-   routing (reuse the compressed-query scores) before building the state.
+   manifest). Revision-2 predictions P1–P3 in the manifest header.
+   `read_state_cross_talk` rose 0.127 → 0.143 and saturated at the
+   random-key |cos| for d_h=32. Superposition binds, so the planned
+   mitigation applies: coarse top-k segment routing (reuse the
+   compressed-query scores) before building the state. The direct capacity
+   test is d_h = 64 (#2 arm2) on this curriculum.
 2. **Interface read: kernel × key-geometry cells** —
    [`manifests/kv_interface_softmax.yaml`](manifests/kv_interface_softmax.yaml):
    arm1 softmax kernel (config-only), arm2 key width 64 = the old hopfield
@@ -180,7 +416,8 @@ effects from state size and reader changes. See the 2026-11-02 STATUS entry.
   (query-blind baseline + submission) · [`tasks/SEGMENT_KEY_TASK.md`](
   tasks/SEGMENT_KEY_TASK.md) (chunk-granularity keys, pending).
 - `reports/` — results & evidence: [`reports/READ_LADDER_RESULTS.md`](
-  reports/READ_LADDER_RESULTS.md) (+ `reports/figures/`,
+  reports/READ_LADDER_RESULTS.md) · [`reports/INTERFERENCE_CURVE_RESULTS.md`](
+  reports/INTERFERENCE_CURVE_RESULTS.md) (+ `reports/figures/`,
   `reports/results/`).
 - Models: [`grad_memgpt.py`](grad_memgpt.py) (base gradmem + Hopfield +
   Gated-Delta externals; pair-aware segmentation helpers) ·

@@ -1,7 +1,7 @@
 ---
 name: research-scientist
 description: Research scientist executor for the test_time_gd project — implements code, writes and runs tests, prepares configs/manifests, launches authorized runs, collects results. The PI (main chat) delegates ALL coding and execution work here. Use for any task that writes or runs code; do not use for research-direction decisions.
-model: GLM-5.3-Flash
+model: account:zai-individual-coding-plan/GLM-5.3-Flash$max
 tools: Read, Write, Edit, Bash, TodoWrite, TaskOutput, WebFetch, WebSearch
 ---
 
