@@ -3,27 +3,49 @@
 Standalone entry points (neither invokes another experiment script):
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 NP=1 conda run -n rmt \
-  bash scripts/run_support_distillation_on_squad.sh \
-  --n_support_questions 2 --K 3 --inner_lr 0.01
+N_SUPPORT_QUESTIONS=2 INNER_RECONSTRUCTION_WEIGHT=1.0 conda run -n rmt \
+  bash scripts/run_support_distillation_on_squad.sh
 ```
 
-Check GPU availability before launching. Batch size counts **contexts**;
-each inner forward has `batch_size * n_support_questions` rows. The default
-launcher uses one GPU, batch size one, eager attention and bf16. Override
-launcher settings with environment variables, or pass **any Python runner
-argument** after the shell command. All existing self-distillation runner
-arguments are declared locally in the new runner, not imported from it:
+Check GPU availability before launching. The launcher is based directly on
+`scripts/run_energygradmem_on_squad.sh`: it retains every Bash variable, CLI
+argument, conditional branch, run-name construction, run loop, locking, logging,
+timing, and finalization. Configure the Bash variables in the script, or use
+environment overrides where the assignment supports them. It does not use a
+generic CLI passthrough as a substitute for explicit Bash parameters.
+
+Inherited settings include `NP=2`, `TBS=64`, `PER_DEVICE_BATCH_SIZE=16`, `K=1`,
+`INNER_LR=0.4`, WRITE LoRA, frozen backbone, `flashbob`, and bf16. These settings
+are retained, **not** a newly validated hardware configuration. For a single-GPU
+run, edit `NP=1`, check batch size/accumulation, select an available GPU using
+`CUDA_VISIBLE_DEVICES`, and verify Accelerate configuration before launching.
+The necessary algorithm-specific default change is
+`WRITE_OBJECTIVE=reconstruction`: support KL replaces the original WRITE loss.
+Energy-related variables and forwarding are retained; unsupported enabled
+objectives still fail explicitly in model configuration validation.
+
+Batch size counts **contexts**; each inner forward has
+`batch_size * n_support_questions` support rows, plus one reconstruction row per
+context if CE is enabled. The standalone Python runner also exposes its full CLI:
 
 ```bash
 conda run -n rmt python run_support_distillation_on_squad.py --help
 ```
 
-The launcher does not source another shell script or the repository's Accelerate
-configuration. For a small randomly initialized model, set `PRETRAINED_MODEL=''`,
-`BASE_MODEL=llama`, `TOKENIZER_PATH=<tokenizer>`, and optionally `L`, `H`, `D`.
-Output defaults to a unique directory under `runs/squad/`; CLI arguments are saved
-in `config.json`, and full model configuration is saved with checkpoints.
+Like the source launcher, it sources `collect_env_state.sh` for shared run
+utilities and passes `accelerate.yaml` to Accelerate. It does not invoke or source
+another experiment launcher. For a small randomly initialized model, edit
+`PRETRAINED_MODEL=''`, `BASE_MODEL=llama`, `TOKENIZER_PATH=<tokenizer>`, and
+optionally `L`, `H`, `D`. Ensure the tokenizer matches the selected backbone.
+Outputs use `runs/squad/<descriptive-run-name>/run_<N>` and the inherited run-lock
+lifecycle. CLI arguments are saved in `config.json`, and full model configuration
+is saved with checkpoints.
+
+New Bash controls include `N_SUPPORT_QUESTIONS`, `INNER_DISTILL_QUERY_WEIGHT`,
+`INNER_DISTILL_TARGET_WEIGHT`, `INNER_RECONSTRUCTION_WEIGHT`, `READ_CE_WEIGHT`,
+all four `DISTILL_*_WEIGHT` controls, and explicit training/evaluation settings.
+The support count and all inner/outer distillation weights appear in the run
+name. Non-default added training controls get suffixes as well.
 
 ## Protocol
 
@@ -53,8 +75,9 @@ in `config.json`, and full model configuration is saved with checkpoints.
 
 This WRITE is support-question-conditioned, not standard query-independent
 GradMem. It uses reference support answers as teacher-forcing inputs; it does
-not generate pseudo-answers. `max_context_length` truncates teacher contexts
-only and is unset by default.
+not generate pseudo-answers. `max_context_length` truncates contexts used by the
+teacher and optional reconstruction CE. The launcher inherits a 256-token cap;
+the Python entry point defaults to no cap.
 
 ## Arguments and restrictions
 
@@ -81,11 +104,15 @@ is the safe default for higher-order gradients; alternative attention backends
 must support backward-over-backward. The existing Adam inner optimizer detaches
 its updates, so it is deliberately disallowed.
 
-To resume, invoke the Python entry point directly with the original arguments,
-`--exp_path <existing-run>` and `--resume_from_checkpoint <checkpoint-directory>`.
-The shell launcher deliberately refuses existing output paths.
+To resume through the launcher, set `RESUME_FROM_CHECKPOINT` to a checkpoint
+directory; the run name includes a resume suffix. Alternatively invoke the Python
+entry point with the original arguments, `--exp_path <run>` and
+`--resume_from_checkpoint <checkpoint-directory>`. The shell uses the inherited
+run-lock/existing-run policy from `collect_env_state.sh`.
 
 Tests: `conda run -n rmt python -m pytest -q tests/test_support_distillation.py`.
+Launcher coverage checks (no training dependencies or GPU run):
+`conda run -n rmt python tests/test_support_distillation_launcher.py`.
 
 ## Optional inner reconstruction CE
 
