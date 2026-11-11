@@ -55,6 +55,11 @@ class SelfDistillationGradMemGPT(GradMemGPT):
         if labels is None or not any(getattr(self, name) for name in DISTILLATION_DEFAULTS
                                      if name != 'read_ce_weight'):
             return None
+        return self._full_context_teacher(input_ids, need_hidden=bool(
+            self.distill_hidden_query_weight or self.distill_hidden_target_weight))
+
+    def _full_context_teacher(self, input_ids, *, need_hidden=False):
+        """Current, detached, memory-free teacher shared by READ and WRITE KL."""
         context = input_ids['context_input_ids']
         query = input_ids['query_input_ids']
         pad_id = self.read_model.config.pad_token_id
@@ -67,7 +72,6 @@ class SelfDistillationGradMemGPT(GradMemGPT):
             full[i, :row.numel()] = row
             full[i, row.numel():row.numel() + query.size(1)] = query[i]
         mask = full.ne(pad_id)
-        need_hidden = bool(self.distill_hidden_query_weight or self.distill_hidden_target_weight)
         # Explicitly disable WRITE-only adapters and any fast LoRA memory.
         with torch.no_grad(), self._disable_write_lora(), self._enable_lora_memory(None):
             teacher = self.read_model(

@@ -19,10 +19,11 @@ Inherited settings include `NP=2`, `TBS=64`, `PER_DEVICE_BATCH_SIZE=16`, `K=1`,
 are retained, **not** a newly validated hardware configuration. For a single-GPU
 run, edit `NP=1`, check batch size/accumulation, select an available GPU using
 `CUDA_VISIBLE_DEVICES`, and verify Accelerate configuration before launching.
-The necessary algorithm-specific default change is
-`WRITE_OBJECTIVE=reconstruction`: support KL replaces the original WRITE loss.
-Energy-related variables and forwarding are retained; unsupported enabled
-objectives still fail explicitly in model configuration validation.
+`WRITE_OBJECTIVE` now defaults to `energy`, matching the source launcher.
+Support KL augments the selected WRITE signal; use `WRITE_OBJECTIVE=reconstruction`
+for KL with optional context CE and no learned energy. All inherited model
+compatibility checks still apply. Reconstruction, energy, and mixed objectives
+are available for **all three memory formats**, including LoRA and KV cache.
 
 Batch size counts **contexts**; each inner forward has
 `batch_size * n_support_questions` support rows, plus one reconstruction row per
@@ -64,8 +65,9 @@ name. Non-default added training controls get suffixes as well.
   selected tokens, then average over support questions. Sum over independent
   context memories when differentiating, so inner LR is batch-size independent.
 - `inner_distill_target_weight=1` and `inner_distill_query_weight=0` by default.
-  K differentiable SGD steps update memory only; model parameters are updated
-  by the outer optimizer, not by the inner loop.
+  Inner steps update memory only; model parameters are updated by the outer
+  optimizer, not by the inner loop. SGD with `grad_mode=second` preserves the
+  differentiable WRITE trajectory.
 - Held-out READ sees only memory and the held-out question/teacher-forced answer.
   Its answer CE backpropagates through all K updates. Held-out inputs and labels
   never influence WRITE. Optional **outer** distillation weights retain their
@@ -95,14 +97,31 @@ arguments. New arguments:
 - `--dataloader_num_workers` (0)
 - `--resume_from_checkpoint` (unset)
 
-Requires prefix memory, `grad_mode=second`, SGD (`use_adam=false`), and all K
-steps second order. Leave `write_objective=reconstruction`: this runner replaces
-that inner objective with support KL. Energy/shaping losses, K sampling,
-separate writers, WRITE heads, memory noise and other auxiliary trajectory
-losses are rejected explicitly rather than silently ignored. Eager attention
-is the safe default for higher-order gradients; alternative attention backends
-must support backward-over-backward. The existing Adam inner optimizer detaches
-its updates, so it is deliberately disallowed.
+Support distillation now uses the original GradMem meta-loop rather than a
+replacement loop. It supports all three memory formats: `prefix`, `lora`, and
+`kv_cache`. Support questions share one per-context state, expanded recursively
+over prefix tensors, LoRA factors, or KV tensors. Backends retain their native
+activation contexts, cache construction, and causal logit alignment.
+
+The inherited mechanisms remain operational: K/LR sampling, gradient modes and
+partial second-order depth, clipping, memory projection, WRITE heads, separate
+writers, backbone freezing / WRITE LoRA, memory noise, inner-loss-to-outer,
+intermediate READ, alignment/orthogonal/Ivan losses, energy ranking/trajectory/
+anchor/Lipschitz shaping, and memory search. Original validation constraints are
+preserved, not bypassed: energy-memory search requires prefix memory, SGD, and
+all WRITE steps second order. Energy itself, layer-wise energy,
+ranking/trajectory/anchor shaping, and the Lipschitz penalty work with prefix,
+LoRA, and KV-cache memory. Non-prefix ranking negatives and gradient norms use
+the concatenated fast-factor/cache parameter space. See
+`AGENTS.md` for the target-guided training/inference mismatch when
+`energy_memory_search_use_best_for_next_step` is enabled.
+
+`grad_mode=second` with SGD is recommended for the requested meta-gradients.
+First-order and detached modes remain selectable with their original meanings.
+The inherited Adam inner optimizer remains selectable, but it detaches its
+updates and does **not** provide full second-order meta-gradients. Eager attention
+is a safe choice for CPU tests; other attention implementations must support
+backward-over-backward for second-order training.
 
 To resume through the launcher, set `RESUME_FROM_CHECKPOINT` to a checkpoint
 directory; the run name includes a resume suffix. Alternatively invoke the Python
@@ -113,21 +132,40 @@ run-lock/existing-run policy from `collect_env_state.sh`.
 Tests: `conda run -n rmt python -m pytest -q tests/test_support_distillation.py`.
 Launcher coverage checks (no training dependencies or GPU run):
 `conda run -n rmt python tests/test_support_distillation_launcher.py`.
+Energy/backend matrix (native and support-distillation, GPT-2/NeoX/Llama):
+`conda run -n rmt python -m unittest discover -s tests -p test_energy_memory_backends.py -v`.
 
 ## Optional inner reconstruction CE
 
-The inner objective is support KL plus `inner_reconstruction_weight * context CE`.
+For `write_objective=reconstruction`, the inner objective is support KL plus
+`inner_reconstruction_weight * context CE`. This preserves the existing
+support-runner default of KL-only WRITE; `write_reconstruction_weight` retains
+its original role in the **energy_with_reconstruction** objective.
+For `write_objective=energy`, add the original learned energy (coefficient one).
+For `write_objective=energy_with_reconstruction`, add the original weighted sum
+`write_energy_weight * energy + write_reconstruction_weight * context CE`.
+Thus `inner_reconstruction_weight` always adds optional extra CE, and should
+normally remain zero when the weighted mixed objective already supplies CE.
+Both support KL weights may be zero for native CE/energy baselines, provided
+another inner signal remains enabled.
 CE is averaged over non-padding context tokens independently per context, then
 added to that context's support-averaged KL. It does not directly enter the outer
 loss. Its default weight of zero preserves KL-only WRITE.
 
-When enabled, reconstruction rows and **all** support-question rows (including
-the first) share one backbone forward call per inner step. They share the same
+For shared-writer prefix memory, context CE/energy and **all** support-question
+rows (including the first) share one backbone forward call per inner step.
+Layer-wise energy and custom WRITE heads are supported in this fused path.
+They share the same
 per-context memory through differentiable copies, but remain separate batch
 rows: support KL never sees the context tokens. This avoids a separate CE
 forward invocation, not the necessary context-token computation; padding to the
 longest row may increase memory/compute. Concatenating context before support
 QA would be cheaper in some cases but would leak context into the student.
-The teacher is still computed once before the inner loop. Logs distinguish
+Separate writers and non-prefix memory use their native context WRITE forward
+plus one parallel support-question forward per step, rather than combining
+different hidden spaces or cache/adapter activation into an invalid batch.
+The teacher is still computed once before the inner loop. As in native GradMem,
+there is also a final WRITE-objective evaluation for diagnostics and shaping.
+Logs distinguish
 `inner_support_kl_loss`, `inner_reconstruction_loss`, and their weighted total
 `inner_loss`.

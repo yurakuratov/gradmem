@@ -1223,14 +1223,14 @@ def test_prefix_energy_write_handles_padded_contexts():
 
 @pytest.mark.forward
 @pytest.mark.all
-def test_energy_objective_rejects_unsupported_backend():
+def test_energy_objective_accepts_all_backends():
     base_config = _build_base_config("gpt2")
 
     for write_objective in ["energy", "energy_with_reconstruction"]:
-        with pytest.raises(ValueError, match="supported only for memory_backend='prefix'"):
-            _ = GradMemGPTConfig(
+        for backend in ('prefix', 'lora', 'kv_cache'):
+            cfg = GradMemGPTConfig(
                 base_config=base_config,
-                memory_backend="lora",
+                memory_backend=backend,
                 n_mem_tokens=4,
                 K=1,
                 lr=0.01,
@@ -1241,8 +1241,9 @@ def test_energy_objective_rejects_unsupported_backend():
                 use_write_head=False,
                 attn_implementation="eager",
                 write_objective=write_objective,
-                **_backend_extra_kwargs("lora"),
+                **_backend_extra_kwargs(backend),
             )
+            assert cfg.memory_backend == backend
 
 
 @pytest.mark.forward

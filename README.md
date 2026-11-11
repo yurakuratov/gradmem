@@ -74,7 +74,10 @@ NP=1 bash scripts/run_self_distillation_on_kv_retrieval.sh \
   --distill_hidden_target_weight 0.1
 ```
 
-Existing backend restrictions still apply (energy WRITE requires prefix memory).
+Energy and reconstruction WRITE both support prefix, LoRA, and KV-cache memory,
+including layer-wise energy and ranking/trajectory/anchor shaping. Memory search
+and other explicitly prefix-specific auxiliary mechanisms retain their own
+backend restrictions.
 Run names include the distillation weights and a CLI digest to distinguish
 overridden inherited settings. Configuration/checkpoint serialization and resume
 use the shared runner. With all distillation weights zero, the teacher is skipped;

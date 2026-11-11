@@ -145,7 +145,8 @@ def compute_metrics_fn(eval_pred, ignore_token_ids, tokenizer):
     if 'mem_attn_read' in inner_loop_stats:
         metrics['mem_attn_read'] = float(inner_loop_stats['mem_attn_read'].mean())
     for key in (
-        'inner_support_kl_loss', 'inner_reconstruction_loss', 'inner_energy_loss', 'inner_loss_after_write',
+        'inner_support_kl_loss', 'inner_support_kl_loss_after_write',
+        'inner_reconstruction_loss', 'inner_energy_loss', 'inner_loss_after_write',
         'inner_reconstruction_loss_after_write', 'inner_energy_loss_after_write',
         'outer_loss', 'target_loss', 'energy_rank_loss', 'energy_traj_loss',
         'energy_anchor_loss', 'energy_aux_loss', 'step_alignment_loss',

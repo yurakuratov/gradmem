@@ -39,8 +39,6 @@ def test_config_validation_and_serialization(tmp_path):
 @pytest.mark.parametrize('backend', ['prefix', 'lora', 'kv_cache'])
 @pytest.mark.parametrize('objective', ['reconstruction', 'energy', 'energy_with_reconstruction'])
 def test_teacher_detached_and_second_order_gradients(backend, objective):
-    if backend != 'prefix' and objective != 'reconstruction':
-        pytest.skip('Existing energy objectives require prefix memory')
     torch.manual_seed(7)
     model = SelfDistillationGradMemGPT(config(
         memory_backend=backend, write_objective=objective,

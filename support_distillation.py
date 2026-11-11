@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from datasets import Dataset
 
 from self_distillation import SelfDistillationConfig, SelfDistillationGradMemGPT
+from grad_memgpt import get_backbone
 
 
 def build_episodes(records, n_support, seed):
@@ -74,26 +75,11 @@ class SupportDistillationConfig(SelfDistillationConfig):
         for value in (inner_distill_query_weight, inner_distill_target_weight):
             if not math.isfinite(value) or value < 0:
                 raise ValueError('Inner KL weights must be finite and nonnegative')
-        if not (inner_distill_query_weight or inner_distill_target_weight):
-            raise ValueError('At least one inner KL weight must be positive')
         if not math.isfinite(inner_reconstruction_weight) or inner_reconstruction_weight < 0:
             raise ValueError('inner_reconstruction_weight must be finite and nonnegative')
-        if self.memory_backend != 'prefix' or self.grad_mode != 'second' or self.use_adam:
-            raise ValueError('Support distillation requires prefix memory, grad_mode=second, use_adam=false')
-        if self.K < 1 or self.last_K_second_order not in (None, self.K):
-            raise ValueError('All K>=1 WRITE steps must be second order')
-        # Keep the entire existing CLI, but never silently ignore incompatible objectives.
-        unsupported = ('K_sampling', 'use_write_head', 'separate_writer',
-                       'add_inner_loss_to_outer', 'energy_rank_weight', 'energy_traj_weight',
-                       'energy_anchor_weight', 'lipschitz_weight', 'energy_memory_search_weight',
-                       'memory_alignment_weight', 'step_alignment_weight',
-                       'intermediate_read_weight', 'orthogonal_loss_weight', 'ivan_loss_weight',
-                       'memory_noise_sigma')
-        for name in unsupported:
-            if getattr(self, name, False):
-                raise ValueError(f'{name} is not supported by support-question KL WRITE')
-        if self.write_objective != 'reconstruction':
-            raise ValueError('Leave write_objective=reconstruction; this runner replaces WRITE with support KL')
+        if not (inner_distill_query_weight or inner_distill_target_weight or inner_reconstruction_weight
+                or self.write_objective in ('energy', 'energy_with_reconstruction')):
+            raise ValueError('At least one inner KL, reconstruction, or energy signal must be enabled')
         self.n_support_questions = n_support_questions
         self.inner_distill_query_weight = inner_distill_query_weight
         self.inner_distill_target_weight = inner_distill_target_weight
@@ -104,115 +90,127 @@ class SupportDistillationGradMemGPT(SelfDistillationGradMemGPT):
     config_class = SupportDistillationConfig
 
     def forward(self, input_ids, labels=None, return_mem=False):
-        if labels is None:
-            raise ValueError('Held-out labels are required for episodic training/evaluation')
-        # HF evaluation uses no_grad; WRITE still needs gradients w.r.t. memory.
+        # Retain the existing meta-loop, backend activation, sampling, optimizers,
+        # intermediate READs, shaping/search, and auxiliary losses unchanged.
         with torch.enable_grad():
-            return self._episode_forward(input_ids, labels, return_mem)
+            return super().forward(input_ids, labels=labels, return_mem=return_mem)
 
-    def _episode_forward(self, inputs, labels, return_mem):
-        backend = self.memory_backend_impl
+    def _prepare_write_supervision(self, inputs, labels):
         b = inputs['context_input_ids'].size(0)
         n = self.config.n_support_questions
         support = inputs['support_input_ids']
         support_labels = inputs['support_labels']
-        if support.size(0) != b * n:
+        if support.size(0) != b * n or support_labels.shape != support.shape:
             raise ValueError('Support batch must have B * n_support_questions rows')
         pad = self.read_model.config.pad_token_id
+        if not inputs['context_input_ids'].ne(pad).any():
+            raise ValueError('Support distillation requires a nonempty context')
         teacher_inputs = dict(context_input_ids=inputs['context_input_ids'].repeat_interleave(n, 0),
                               query_input_ids=support)
-        # Force logit teacher construction even when outer distillation is disabled.
-        # Call the same teacher helper using a local flag, restored immediately.
-        old = self.distill_logits_target_weight
-        try:
-            self.distill_logits_target_weight = 1.0
-            teacher = self._prepare_outer_supervision(teacher_inputs, support_labels)
-        finally:
-            self.distill_logits_target_weight = old
-        state, initial = backend.init_memory_state(b)
-        # Context is never passed into the student's READ path.
         empty = inputs['context_input_ids'][:, :0]
-        support_ctx = backend.prepare_batch(empty.repeat_interleave(n, 0), support, pad)
-        reconstruction_ctx = (backend.prepare_batch(inputs['context_input_ids'],
-                              inputs['query_input_ids'][:, :0], pad)
-                              if self.config.inner_reconstruction_weight else None)
-        losses, norms, reconstruction_losses, kl_losses = [], [], [], []
-        for _ in range(self.K):
-            repeated = {k: v.repeat_interleave(n, 0) for k, v in state.items()}
-            read_batch = backend.build_read_inputs(repeated, support_ctx)
-            x = read_batch['inputs_embeds']
-            offset = read_batch['logits_start'] + 1
-            attention = torch.cat([support.new_ones((b * n, offset)), support.ne(pad)], 1)
-            if reconstruction_ctx is not None:
-                # Independent rows share a forward call, not context information.
-                write_batch = backend.build_write_inputs(state, reconstruction_ctx)
-                write_x = write_batch['inputs_embeds']
-                write_attention = torch.cat([
-                    support.new_ones((b, write_batch['context_start'])),
-                    inputs['context_input_ids'].ne(pad)], 1)
-                length = max(x.size(1), write_x.size(1))
-                x = torch.cat([F.pad(x, (0, 0, 0, length - x.size(1))),
-                               F.pad(write_x, (0, 0, 0, length - write_x.size(1)))], 0)
-                attention = torch.cat([F.pad(attention, (0, length - attention.size(1))),
-                                       F.pad(write_attention, (0, length - write_attention.size(1)))], 0)
-            out = self.read_model(inputs_embeds=x, attention_mask=attention,
-                                  use_cache=False, return_dict=True)
-            student = out.logits[:b * n, offset - 1:offset + support.size(1) - 1].float()
-            kl = F.kl_div(F.log_softmax(student, -1),
-                          F.log_softmax(teacher['logits'].float(), -1),
-                          log_target=True, reduction='none').sum(-1)
-            valid = support.ne(pad) & teacher['logits_valid']
-            per_question = kl.new_zeros(b * n)
-            for mask, weight in ((support_labels.ne(-100), self.config.inner_distill_target_weight),
-                                 (support_labels.eq(-100), self.config.inner_distill_query_weight)):
-                mask = mask & valid
-                per_question = per_question + weight * (kl * mask).sum(-1) / mask.sum(-1).clamp_min(1)
-            per_context = per_question.reshape(b, n).mean(-1)
-            kl_losses.append(per_context.detach())
-            if reconstruction_ctx is not None:
-                context = inputs['context_input_ids']
-                start = write_batch['logits_start']
-                logits = out.logits[b * n:, start:start + context.size(1)].float()
-                valid_context = context.ne(pad)
-                ce = F.cross_entropy(logits.transpose(1, 2),
-                                     context.masked_fill(~valid_context, -100),
-                                     reduction='none', ignore_index=-100)
-                per_context_ce = ce.sum(-1) / valid_context.sum(-1).clamp_min(1)
-                reconstruction_losses.append(per_context_ce.detach())
-                per_context = per_context + self.config.inner_reconstruction_weight * per_context_ce
-            # Sum across independent memories: inner_lr must not depend on outer batch size.
-            params = backend.inner_params(state)
-            grads = torch.autograd.grad(per_context.sum(), params, create_graph=self.training)
-            norms.append(grads[0].detach().flatten(1).norm(dim=1))
-            losses.append(per_context.detach())
-            backend.assign_inner_params(state, [
-                self._sgd_step(p, g, clip_value=self.inner_clip_value, clip_norm=self.inner_clip_norm)
-                for p, g in zip(params, grads)])
-        heldout_ctx = backend.prepare_batch(empty, inputs['query_input_ids'], pad)
-        read_batch = backend.build_read_inputs(state, heldout_ctx)
-        offset = read_batch['logits_start'] + 1
-        attention = torch.cat([labels.new_ones((b, offset)), inputs['query_input_ids'].ne(pad)], 1)
-        with self._disable_write_lora():
-            out = self.read_model(inputs_embeds=read_batch['inputs_embeds'], attention_mask=attention,
-                                  output_hidden_states=bool(self.distill_hidden_query_weight or
-                                                            self.distill_hidden_target_weight),
-                                  use_cache=False, return_dict=True)
-        predictions = out.logits[:, read_batch['logits_start']:]
-        target_loss = self._compute_read_target_loss(predictions, read_batch, labels)
-        supervision = self._prepare_outer_supervision(inputs, labels)
-        extra, stats = self._outer_supervision_loss(supervision, out, read_batch, inputs, labels, target_loss)
-        mem_norm, delta = backend.compute_memory_stats(state, initial)
-        stats.update(inner_loss=torch.stack(losses).mean(), target_loss=target_loss.detach())
-        stats['inner_support_kl_loss'] = torch.stack(kl_losses).mean()
-        stats['inner_reconstruction_loss'] = (torch.stack(reconstruction_losses).mean()
-                                              if reconstruction_losses else target_loss.new_zeros(()))
-        for name, values in [('inner_grad_norm', torch.stack(norms)),
-                             ('mem_norm', mem_norm), ('delta_mem_norm', delta)]:
-            stats[name + '_mean'] = values.mean()
-            stats[name + '_max'] = values.max()
-            stats[name + '_min'] = values.min()
-        stats = {k: v.detach().reshape(1) for k, v in stats.items()}
-        result = dict(loss=target_loss + extra, predictions=predictions, inner_loop_stats=stats)
-        if return_mem:
-            backend.attach_return_memory(result, state)
-        return result
+        return dict(
+            b=b, n=n, tokens=support, labels=support_labels,
+            context=inputs['context_input_ids'],
+            teacher=self._full_context_teacher(teacher_inputs),
+            batch_ctx=self.memory_backend_impl.prepare_batch(empty.repeat_interleave(n, 0), support, pad),
+            kl_history=[],
+        )
+
+    @staticmethod
+    def _map_state(state, fn):
+        if isinstance(state, dict):
+            return {key: SupportDistillationGradMemGPT._map_state(value, fn) for key, value in state.items()}
+        if isinstance(state, tuple):
+            return tuple(SupportDistillationGradMemGPT._map_state(value, fn) for value in state)
+        return fn(state)
+
+    def _support_kl(self, logits, read_batch, supervision):
+        tokens, labels = supervision['tokens'], supervision['labels']
+        # Prefix memory predicts token zero; LoRA/KV need a preceding seed token.
+        start = read_batch['logits_start'] + (self.memory_backend == 'prefix')
+        first = 0 if start else 1
+        student = logits[:, start + first - 1:start + tokens.size(1) - 1].float()
+        teacher = supervision['teacher']
+        kl = F.kl_div(F.log_softmax(student, -1),
+                      F.log_softmax(teacher['logits'][:, first:].float(), -1),
+                      log_target=True, reduction='none').sum(-1)
+        valid = tokens[:, first:].ne(self.read_model.config.pad_token_id) & teacher['logits_valid'][:, first:]
+        per_question = kl.new_zeros(tokens.size(0))
+        for mask, weight in ((labels.ne(-100), self.config.inner_distill_target_weight),
+                             (labels.eq(-100), self.config.inner_distill_query_weight)):
+            mask = mask[:, first:] & valid
+            per_question = per_question + weight * (kl * mask).sum(-1) / mask.sum(-1).clamp_min(1)
+        return per_question.reshape(supervision['b'], supervision['n']).mean(-1)
+
+    def _support_forward(self, backend, state, supervision):
+        repeated = self._map_state(state, lambda tensor: tensor.repeat_interleave(supervision['n'], 0))
+        read_batch = backend.build_read_inputs(repeated, supervision['batch_ctx'])
+        kwargs = dict(read_batch.get('model_kwargs', {}))
+        prefix = read_batch['inputs_embeds'].size(1) - supervision['tokens'].size(1)
+        mask = torch.cat([supervision['tokens'].new_ones((supervision['tokens'].size(0), prefix)),
+                          supervision['tokens'].ne(self.read_model.config.pad_token_id)], 1)
+        if self.memory_backend == 'kv_cache':
+            mask = torch.cat([mask.new_ones((mask.size(0), self.n_mem_tokens)), mask], 1)
+        kwargs['attention_mask'] = mask
+        # Support KL is a WRITE signal, so WRITE-only LoRA stays enabled here.
+        with backend.activation_context(repeated):
+            out = self.read_model(inputs_embeds=read_batch['inputs_embeds'], return_dict=True, **kwargs)
+        return self._support_kl(out.logits, read_batch, supervision)
+
+    def _fused_prefix_forward(self, backend, state, batch_ctx, supervision):
+        """Context CE/energy and every support KL share a backbone invocation."""
+        b, n = supervision['b'], supervision['n']
+        repeated = self._map_state(state, lambda tensor: tensor.repeat_interleave(n, 0))
+        read_batch = backend.build_read_inputs(repeated, supervision['batch_ctx'])
+        write_batch = backend.build_write_inputs(state, batch_ctx)
+        read_x, write_x = read_batch['inputs_embeds'], write_batch['inputs_embeds']
+        width = max(read_x.size(1), write_x.size(1))
+        x = torch.cat([F.pad(read_x, (0, 0, 0, width - read_x.size(1))),
+                       F.pad(write_x, (0, 0, 0, width - write_x.size(1)))], 0)
+        pad = self.read_model.config.pad_token_id
+        read_mask = torch.cat([supervision['tokens'].new_ones((b * n, read_batch['logits_start'] + 1)),
+                               supervision['tokens'].ne(pad)], 1)
+        write_mask = torch.cat([supervision['context'].new_ones((b, write_batch['context_start'])),
+                                supervision['context'].ne(pad)], 1)
+        mask = torch.cat([F.pad(read_mask, (0, width - read_mask.size(1))),
+                          F.pad(write_mask, (0, width - write_mask.size(1)))], 0)
+        out = get_backbone(self.write_model)(inputs_embeds=x, attention_mask=mask,
+                  output_hidden_states=self.use_layerwise_energy, return_dict=True)
+        hidden = out.last_hidden_state
+        support_logits = self.read_model.get_output_embeddings()(hidden[:b * n, :read_x.size(1)])
+        kl = self._support_kl(support_logits, read_batch, supervision)
+        context_hidden = hidden[b * n:, :write_x.size(1)]
+        head = self.write_head if self.use_write_head else self.write_model.get_output_embeddings()
+        reconstruction = self._compute_write_reconstruction_loss(
+            head(context_hidden[:, write_batch['logits_start']:]), write_batch)
+        energy = None
+        if self.write_objective in ('energy', 'energy_with_reconstruction'):
+            states = (tuple(h[b * n:, :write_x.size(1)] for h in out.hidden_states[1:])
+                      if self.use_layerwise_energy else context_hidden)
+            energy = self._compute_write_energy(states, write_batch)
+        return out, reconstruction, energy, kl
+
+    def _run_write_objective(self, backend, state, batch_ctx, supervision, *, final=False):
+        # Separate writers have different hidden spaces; other memory formats
+        # require their own adapter/cache activation. Retain their native paths.
+        if self.memory_backend == 'prefix' and not self.separate_writer:
+            out, reconstruction, energy, kl = self._fused_prefix_forward(backend, state, batch_ctx, supervision)
+        else:
+            out, reconstruction, energy, _ = super()._run_write_objective(
+                backend, state, batch_ctx, supervision, final=final)
+            kl = self._support_forward(backend, state, supervision)
+        loss = kl + self.config.inner_reconstruction_weight * reconstruction
+        if self.write_objective == 'energy':
+            loss = loss + energy  # Preserve original energy-only coefficient.
+        elif self.write_objective == 'energy_with_reconstruction':
+            loss = loss + self.write_energy_weight * energy + self.write_reconstruction_weight * reconstruction
+        if final:
+            supervision['final_kl'] = kl.detach().mean()
+        else:
+            supervision['kl_history'].append(kl.detach().mean())
+        return out, reconstruction, energy, loss
+
+    def _write_supervision_stats(self, supervision):
+        history = supervision['kl_history']
+        return dict(inner_support_kl_loss=history[-1] if history else supervision['final_kl'],
+                    inner_support_kl_loss_after_write=supervision['final_kl'])

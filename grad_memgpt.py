@@ -345,11 +345,6 @@ class GradMemGPTConfig(PretrainedConfig):
         assert self.write_objective in ["reconstruction", "energy", "energy_with_reconstruction"], (
             "write_objective must be one of: reconstruction, energy, energy_with_reconstruction"
         )
-        if self.write_objective in ("energy", "energy_with_reconstruction") and self.memory_backend != "prefix":
-            raise ValueError(
-                "write_objective='energy' and 'energy_with_reconstruction' are currently supported only "
-                "for memory_backend='prefix'"
-            )
         if self.energy_rank_temperature <= 0.0:
             raise ValueError("energy_rank_temperature must be > 0")
         if not 0.0 <= self.energy_mix_alpha <= 1.0:
@@ -360,8 +355,6 @@ class GradMemGPTConfig(PretrainedConfig):
             raise ValueError("lipschitz_constraint must be finite and >= 0")
         if not math.isfinite(self.read_focal_gamma) or self.read_focal_gamma < 0.0:
             raise ValueError("read_focal_gamma must be finite and >= 0")
-        if self.lipschitz_weight > 0.0 and self.memory_backend != "prefix":
-            raise ValueError("lipschitz_weight > 0 requires memory_backend='prefix'")
         if not math.isfinite(self.energy_memory_search_weight) or self.energy_memory_search_weight < 0.0:
             raise ValueError("energy_memory_search_weight must be finite and >= 0")
         if self.energy_memory_search_num_samples < 1:
@@ -669,6 +662,7 @@ class LoraMemoryBackend(MemoryBackend):
             "mask": batch_ctx["mask"],
             "logits_start": 0,
             "label_shift": 1,
+            "context_start": 0,
         }
 
     def build_read_inputs(self, memory_state, batch_ctx):
@@ -768,6 +762,7 @@ class KVCacheMemoryBackend(MemoryBackend):
             "mask": batch_ctx["mask"],
             "logits_start": 0,
             "label_shift": 1,
+            "context_start": 0,
             "model_kwargs": {
                 "past_key_values": self.owner._build_dynamic_cache(memory_state["kv_mem"]),
                 "use_cache": True,
@@ -1091,11 +1086,6 @@ class GradMemGPT(PreTrainedModel):
             "energy_memory_search_gain_ema_initialized",
             torch.zeros(max_write_steps, dtype=torch.bool),
         )
-        if self.write_objective in ("energy", "energy_with_reconstruction") and self.memory_backend != "prefix":
-            raise ValueError(
-                "write_objective='energy' and 'energy_with_reconstruction' are currently supported only "
-                "for memory_backend='prefix'"
-            )
         self.add_inner_loss_to_outer = config.add_inner_loss_to_outer
         self.inner_loss_weight = config.inner_loss_weight
         if self.add_inner_loss_to_outer:
@@ -1542,12 +1532,29 @@ class GradMemGPT(PreTrainedModel):
             "random": random_mem,
         }, permutation
 
+    def _energy_memory_tensor(self, backend, memory_state):
+        """Per-example geometry: prefix embeddings or all fast adapter/cache factors."""
+        if self.memory_backend == 'prefix':
+            return memory_state['mem_batch']
+        params = backend.inner_params(memory_state)
+        return torch.cat([param.flatten(1) for param in params], dim=1)
+
+    def _energy_candidate_state(self, backend, memory_template, memory):
+        candidate_state = backend.snapshot_memory_state(memory_template)
+        if self.memory_backend == 'prefix':
+            candidate_state = {key: value.detach() for key, value in candidate_state.items()}
+            candidate_state['mem_batch'] = memory
+        else:
+            params, offset = [], 0
+            for param in backend.inner_params(memory_template):
+                size = param[0].numel()
+                params.append(memory[:, offset:offset + size].reshape_as(param))
+                offset += size
+            backend.assign_inner_params(candidate_state, params)
+        return candidate_state
+
     def _run_energy_memory_candidate(self, backend, memory_template, batch_ctx, mem_batch):
-        candidate_state = {
-            key: value.detach() if isinstance(value, torch.Tensor) else value
-            for key, value in memory_template.items()
-        }
-        candidate_state["mem_batch"] = mem_batch.detach()
+        candidate_state = self._energy_candidate_state(backend, memory_template, mem_batch.detach())
         write_batch = backend.build_write_inputs(candidate_state, batch_ctx)
         with backend.activation_context(candidate_state):
             outs, energy = self._run_energy_write_forward(write_batch)
@@ -1559,7 +1566,7 @@ class GradMemGPT(PreTrainedModel):
         if not compute_rank and not compute_anchor:
             raise ValueError("At least one energy landscape objective must be active")
 
-        positive_mem = memory_state["mem_batch"].detach()
+        positive_mem = self._energy_memory_tensor(backend, memory_state).detach()
         energy_positive = self._run_energy_memory_candidate(backend, memory_state, batch_ctx, positive_mem)
 
         negative_energies = {}
@@ -1567,7 +1574,7 @@ class GradMemGPT(PreTrainedModel):
         if compute_rank:
             negative_memories, _ = self._build_energy_negative_memories(
                 positive_mem,
-                memory_state_initial["mem_batch"],
+                self._energy_memory_tensor(backend, memory_state_initial),
                 self.energy_mix_alpha,
             )
             for name, negative_mem in negative_memories.items():
@@ -1604,12 +1611,8 @@ class GradMemGPT(PreTrainedModel):
 
     def _compute_lipschitz_constraint_loss(self, backend, memory_state, batch_ctx, *, create_graph):
         """Measure and optionally constrain the WRITE gradient at detached M_K locations."""
-        candidate_state = {
-            key: value.detach() if isinstance(value, torch.Tensor) else value
-            for key, value in memory_state.items()
-        }
-        candidate_memory = memory_state["mem_batch"].detach().requires_grad_(True)
-        candidate_state["mem_batch"] = candidate_memory
+        candidate_memory = self._energy_memory_tensor(backend, memory_state).detach().requires_grad_(True)
+        candidate_state = self._energy_candidate_state(backend, memory_state, candidate_memory)
         write_batch = backend.build_write_inputs(candidate_state, batch_ctx)
         with backend.activation_context(candidate_state):
             if self.write_objective == "reconstruction":
@@ -2499,8 +2502,29 @@ class GradMemGPT(PreTrainedModel):
     def _outer_supervision_loss(self, supervision, read_out, read_batch, input_ids, labels, target_loss):
         return target_loss.new_zeros(()), {}
 
+    def _prepare_write_supervision(self, input_ids, labels):
+        """Optional extra WRITE supervision; never expose it to held-out READ."""
+        return None
+
+    def _write_supervision_stats(self, supervision):
+        return {}
+
+    def _run_write_objective(self, backend, memory_state, batch_ctx, supervision, *, final=False):
+        """Shared WRITE dispatch, extensible without duplicating the meta-loop."""
+        write_batch = backend.build_write_inputs(memory_state, batch_ctx)
+        with backend.activation_context(memory_state):
+            if self.write_objective in ('energy', 'energy_with_reconstruction'):
+                outs, reconstruction, energy = self._run_energy_reconstruction_write_forward(write_batch)
+                loss = energy if self.write_objective == 'energy' else (
+                    self.write_reconstruction_weight * reconstruction + self.write_energy_weight * energy)
+            else:
+                outs, reconstruction = self._run_reconstruction_write_forward(write_batch)
+                energy, loss = None, reconstruction
+        return outs, reconstruction, energy, loss
+
     def forward(self, input_ids, labels=None, return_mem=False):
         supervision = self._prepare_outer_supervision(input_ids, labels)
+        write_supervision = self._prepare_write_supervision(input_ids, labels)
         context_input_ids = input_ids['context_input_ids']
         query_input_ids = input_ids['query_input_ids']
 
@@ -2579,29 +2603,9 @@ class GradMemGPT(PreTrainedModel):
                             self.memory_noise_sigma * initial_rms
                         )
                         gradient_memory_state["mem_batch"] = memory_state["mem_batch"] + noise
-                    write_batch = backend.build_write_inputs(gradient_memory_state, batch_ctx)
-                    rec_loss = None
-                    energy_loss = None
-                    if self.write_objective == "energy":
-                        with backend.activation_context(gradient_memory_state):
-                            outs, rec_loss, energy_loss = self._run_energy_reconstruction_write_forward(
-                                write_batch
-                            )
-                        inner_loss_per_sample = energy_loss
-                        del outs
-                    elif self.write_objective == "energy_with_reconstruction":
-                        with backend.activation_context(gradient_memory_state):
-                            outs, rec_loss, energy_loss = self._run_energy_reconstruction_write_forward(write_batch)
-                        inner_loss_per_sample = (
-                            self.write_reconstruction_weight * rec_loss
-                            + self.write_energy_weight * energy_loss
-                        )
-                        del outs
-                    else:
-                        with backend.activation_context(gradient_memory_state):
-                            outs, rec_loss = self._run_reconstruction_write_forward(write_batch)
-                        inner_loss_per_sample = rec_loss
-                        del outs
+                    outs, rec_loss, energy_loss, inner_loss_per_sample = self._run_write_objective(
+                        backend, gradient_memory_state, batch_ctx, write_supervision)
+                    del outs
 
                     inner_loss_history.append(inner_loss_per_sample)
                     if energy_loss is not None:
@@ -2675,26 +2679,8 @@ class GradMemGPT(PreTrainedModel):
         reconstruction_loss_after_write = None
         energy_loss_after_write = None
         with torch.enable_grad():
-            final_write_batch = backend.build_write_inputs(memory_state, batch_ctx)
-            with backend.activation_context(memory_state):
-                if self.write_objective in ("energy", "energy_with_reconstruction"):
-                    final_outs, reconstruction_loss_after_write, energy_loss_after_write = (
-                        self._run_energy_reconstruction_write_forward(final_write_batch)
-                    )
-                else:
-                    final_outs, reconstruction_loss_after_write = self._run_reconstruction_write_forward(
-                        final_write_batch
-                    )
-
-        if self.write_objective == "energy":
-            inner_loss_after_write = energy_loss_after_write
-        elif self.write_objective == "energy_with_reconstruction":
-            inner_loss_after_write = (
-                self.write_reconstruction_weight * reconstruction_loss_after_write
-                + self.write_energy_weight * energy_loss_after_write
-            )
-        else:
-            inner_loss_after_write = reconstruction_loss_after_write
+            final_outs, reconstruction_loss_after_write, energy_loss_after_write, inner_loss_after_write = (
+                self._run_write_objective(backend, memory_state, batch_ctx, write_supervision, final=True))
 
         inner_loop_stats['inner_reconstruction_loss_after_write'] = (
             reconstruction_loss_after_write.detach().mean()
@@ -2704,6 +2690,7 @@ class GradMemGPT(PreTrainedModel):
         del final_outs
         if inner_loss_after_write is not None:
             inner_loop_stats['inner_loss_after_write'] = inner_loss_after_write.detach().mean()
+        inner_loop_stats.update(self._write_supervision_stats(write_supervision))
         if inner_loss_after_write is not None and len(inner_loss_history) > 0:
             inner_loss_initial = inner_loss_history[0]
             inner_loss_write_delta = inner_loss_after_write - inner_loss_initial
@@ -2947,7 +2934,7 @@ class GradMemGPT(PreTrainedModel):
         landscape_stats = {}
         energy_objective_active = self.write_objective in ("energy", "energy_with_reconstruction")
         lipschitz_active = self.lipschitz_weight > 0.0
-        lipschitz_diagnostic_active = self.memory_backend == "prefix"
+        lipschitz_diagnostic_active = self.memory_backend == "prefix" or lipschitz_active
         rank_active = energy_objective_active and self.energy_rank_weight > 0.0
         anchor_active = energy_objective_active and self.energy_anchor_weight > 0.0
         trajectory_active = (

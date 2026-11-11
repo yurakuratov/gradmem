@@ -36,8 +36,8 @@ TOKENIZER_PATH=${TOKENIZER_PATH:-gpt2}
 MAX_CONTEXT_LENGTH=${MAX_CONTEXT_LENGTH:-256}
 
 MEMORY_BACKEND=prefix
-# Support KL replaces the standard WRITE loss; energy is not supported here.
-WRITE_OBJECTIVE=${WRITE_OBJECTIVE:-reconstruction}
+# Support KL augments energy WRITE; reconstruction-only mode remains available.
+WRITE_OBJECTIVE=${WRITE_OBJECTIVE:-energy}
 N_MEM_TOKENS=8
 N_CTRL_TOKENS=0
 K=1
