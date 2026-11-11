@@ -1,0 +1,107 @@
+# Resume of the interference curve's `interface_softmax` chains ONLY
+# (tasks/SOFTMAX_RESUME_TASK.md; user directive 2026-11-10 after the
+# 2026-11-03 double infrastructure failure: an external interrupt killed the
+# interface N64 phases and the adaptive job, then the shared filesystem hit
+# 100% and the softmax chains' N32 phases died at 18:15 with
+# OSError(28, 'No space left on device') at <=2.5k of 50k steps).
+#
+# RESUME SEMANTICS: scripts/run_interference_chain.py is idempotent — phases
+# recorded `done` in runs/interference_curve/<arm>_<seed>.chain.json are
+# skipped on rerun; a killed phase is rerun from step 0, weights-only
+# warm-started from the previous phase's best checkpoint (re-globbed fresh
+# via resolve_prev_run_dir, so stale absolute paths inside `done` records
+# are harmless). With N8 and N16 `done`, this job executes exactly:
+# skip N8, skip N16, run N32 -> N64 -> N96 per seed (threshold stops at
+# EM >= 0.99; max_steps 50000 per phase).
+#
+# STATE-FILE DEPENDENCY: load_state silently falls back to {'phases': {}}
+# on a corrupt/unreadable state file — the chain would then RETRAIN FROM
+# SCRATCH (N8 onward) while looking like a resume. All three softmax state
+# files were json-parsed and verified BEFORE submission (N8/N16 status=done,
+# best_em recorded; N32=running = the killed phase). Verification 2026-11-10
+# against the dead curve job's run copy
+# /home/jovyan/dzhivelikian/.cryri/run_2026_10_29_1748_358129 (job
+# ccde14ed, killed 2026-11-03):
+#   interface_softmax_4378.chain.json:  N8 done em=0.9916; N16 done em=0.9912; N32 running
+#   interface_softmax_43894.chain.json: N8 done em=0.9930; N16 done em=0.9922; N32 running
+#   interface_softmax_2343.chain.json:  N8 done em=0.9908; N16 done em=0.9924; N32 running
+# The N16 warm-start dirs (run_4378_da39e4db / run_43894_938765d9 /
+# run_2343_4120f87e, 14 MB each, each with checkpoint-*/model.safetensors)
+# were staged WITH these state files into the remote project dir's runs/
+# tree before submission (the tar sync excludes runs/, the job copy
+# carries it). The dead copy's whole runs/ tree was archived OUTSIDE the
+# project dir at ~/archives/interference_curve_runs_20261103.tar.gz on the
+# login node (future interface-N64 / adaptive resumes need its N32 best
+# checkpoints). Disk remediation before submission: deleted the leftover
+# .venv dirs of the two certainly-dead jobs' run copies
+# (.cryri/run_2026_10_29_1748_358129/.venv 5.3G + .cryri/run_2026_11_02_
+# 1458_a107ba/.venv 98M; `rm -r .venv` never runs on a killed job) — the
+# shared 12T filesystem was at 100% on 2026-11-03 and stood at 96%
+# (559G free) at submission.
+#
+# SCOPE: the `interface` and `adaptive` chains are NOT resumed (user
+# decision — partial results already analysed; interface N96 would cost
+# 10+ days at ~19 s/step extrapolated and its N64 plateau already answers
+# the question). NOTE for the later collection cycle: the Comet project
+# then contains TWO generations of interf_interface_softmax_N32 runs
+# (killed + rerun) — disambiguate by newest end_ms per (run_name, seed).
+#
+# NOTE on base_config: run_scheduler.load_manifest REQUIRES a base_config
+# field on every experiment; the wrapper owns the per-arm base configs, so
+# base_config below points at this manifest itself — a placeholder token
+# the wrapper receives and ignores (it consumes only key=val tokens).
+#
+# PRE-REGISTERED PREDICTIONS (pasted VERBATIM from
+# tasks/SOFTMAX_RESUME_TASK.md, BEFORE submission):
+#
+# - **P-S1 (N32 completes):** warm-started from the N16 checkpoints (best EM
+#   0.991–0.992), the rerun N32 phases reach EM ≥ 0.99 within the 50k budget
+#   and stop on the threshold. Evidence: the killed N32 runs were at
+#   0.975–0.982 after ≤2.5k steps and rising; N16 crossed 0.99 at 5.5–9.5k
+#   steps from a comparable level. If N32 instead plateaus below 0.99, the
+#   truncated-Δ(32) reading must be revisited against the converged control.
+# - **P-S2 (N64 control holds — the write path is not the N=64 bottleneck):**
+#   warm-started from N32 ≥ 0.99, softmax N64 reaches EM ≥ 0.99 under the
+#   budget. Basis: per-segment write load is constant by design; the exact
+#   read's step-0 transfer was 0.93 at both N16 and N32. If softmax N64 also
+#   plateaus ≪ 0.99 (the interface arm plateaued at 0.41), the N=64 failure
+#   is protocol/write-bound, not superposition — Δ(64) becomes
+#   uninterpretable and the curve report must be revised.
+# - **P-S3 (N96, open):** if N64 holds, N96 runs; no directional bet — the
+#   control has no superposition mechanism; a failure there would indict
+#   write capacity or the 48-segment curriculum.
+# - **Δ(64) expectation given P-S2:** interface N64 plateaued at best-EM mean
+#   0.409 (EM and eval loss flat from ~10k to 23k steps); if softmax N64
+#   reaches ≥ 0.99, Δ(64) ≥ 0.58 — at N = 2·d_h the superposition cost is
+#   total, not gradual.
+# - **Fairness note:** identical protocol/curriculum/seeds as the original
+#   curve; each rerun N32 phase restarts from step 0 (weights-only warm start
+#   from the N16 best) — the killed partials are discarded, so all three
+#   seeds get a clean, identical N32 phase. The interface arm's N32/N64
+#   numbers it is compared against are unchanged.
+# - **Cost estimate:** N32 measured 2–3.7 s/step on the killed runs (threshold
+#   stop hoped ≤ ~10–15k steps → ≤ ~0.5 day); N64 at B=32 ≈ 9–10 s/step
+#   (interface measured 9.3), ≤ ~2.5 days if it stops by ~20k; N96 at B=16 is
+#   unmeasured — extrapolated ~1.5–2.5× N64 per step, up to ~5 days if it
+#   needs many steps. The 3 chains share one A100 (as the original job did);
+#   wall = slowest chain. Expected total ~3–8 days if N96 runs, ~2–4 days if
+#   it ends at N64. Known risk: the 2026-11-03 interrupt cause was never
+#   identified — if the cluster kills ~5-day jobs, N96 may be cut.
+#
+# Dry run:
+#   uv run python run_scheduler.py manifests/kv_interference_softmax_resume.yaml --dry-run
+
+max_parallel: 3        # the three seeds of the ONE softmax arm in parallel
+schedule: sequential   # single experiment; kept for parity with the curve manifest
+
+experiments:
+  # the no-superposition control (exact softmax over the unfolded bank at the
+  # M=2 interface sites, two-pass conditioning) — only arm being resumed.
+  # Same command / overrides / grid as the curve manifest's softmax entry.
+  - name: interf_interface_softmax
+    command: "python scripts/run_interference_chain.py"
+    base_config: "manifests/kv_interference_softmax_resume.yaml"   # scheduler-required placeholder; ignored by the wrapper
+    overrides:
+      chain.arm: interface_softmax
+    grid:
+      chain.seed: [4378, 43894, 2343]

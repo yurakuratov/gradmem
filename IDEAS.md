@@ -9,8 +9,11 @@ on another result).
 ## Candidate scientific contribution (2026-11-09; draft, not authorized runs)
 
 The user-requested staged roadmap is now in
-[`PROGRESS.md`](PROGRESS.md#contribution-roadmap-2026-11-09-research-plan-execution-not-started).
+[`PROGRESS.md`](PROGRESS.md#contribution-roadmap-2026-11-09-implementation-started-2026-11-10).
 The hypotheses below remain unproven; the roadmap specifies decision gates.
+The first linear implementation/pilot milestone is now reviewed in
+[`LINEAR_MEMORY_PILOT.md`](reports/LINEAR_MEMORY_PILOT.md); its limited
+gradient-routing signal does not establish the broader contribution.
 
 - **Optimize locally, store globally: fixed-error memory allocation.** Main
   question: given N facts, an error tolerance, and a query workload, when

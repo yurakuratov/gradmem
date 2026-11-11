@@ -180,7 +180,14 @@ per-segment K; maximum local write dependency is h*K before graph truncation.
 Compare against joint writing of the same group and report real compute.
 Specified in IDEAS; no implementation or experiment performed.
 
-## Contribution roadmap (2026-11-09; research plan, execution not started)
+## Contribution roadmap (2026-11-09; implementation started 2026-11-10)
+
+**Execution update (2026-11-10):** cycle 1 completed the first milestone:
+standalone linear writer, analytical/gradient checks, and a bounded CPU
+snapshot pilot. See the reviewed results below and
+[`LINEAR_MEMORY_PILOT.md`](reports/LINEAR_MEMORY_PILOT.md). The original stage
+descriptions remain the roadmap, not claims of completed work; held-out
+allocation prediction and transformer integration remain pending.
 
 **Working thesis:** local gradient writing, global associative storage, and
 intermediate commits offer distinct ways to spend memory and compute.
@@ -193,7 +200,8 @@ this is a falsifiable supporting mechanism, not an established speedup.
 a controlled gradient-routing study; and a validated allocation rule for
 local size p, global address D, reset horizon h, commit interval tau, and
 inner-step count K. No universal dominance or novel-attention-shortcut claim.
-This roadmap does not launch jobs or supersede the historical results above.
+Execution status is recorded separately; this plan does not supersede the
+historical results above.
 
 ### Stage 0 — freeze the comparison and cost model
 
@@ -221,8 +229,8 @@ before the corresponding experiments.
 
 ### Stage 1 — derive a minimal linear theory
 
-Use W_j=W_(j-1)+eta*(v_j-W_(j-1)x_j)*x_j^T and explicitly specified local
-key/value distributions. Encode whole W snapshots with global keys in D
+Use $W_j=W_{(j-1)}+\eta*(v_j-W_{(j-1)}x_j)*x_j^T$ and explicitly specified local
+key/value distributions. Encode whole $W$ snapshots with global keys in $D$
 dimensions; begin with fixed/oracle keys, then test learned routing.
 
 1. Derive acquisition and forgetting versus p,K,h and local-key geometry;
@@ -338,6 +346,137 @@ and constant-memory unlimited capacity remain outside the claims.
 error/gradient model and a bounded Stage 2 experiment brief. No large sweep
 is needed to decide whether to proceed. Implementation and runs follow the
 PI/research-scientist workflow in AGENTS.md when execution is undertaken.
+
+**Milestone update (2026-11-10):** the initial specification, a restricted
+linear error/crossover theory, and the implemented Stage 2 pilot are complete.
+Next is out-of-sample testing of the allocation prediction; the general
+phase diagram, broader convergence theory, and transformer stages are open.
+
+## Linear milestone specification and derivations (2026-11-10)
+
+**Scope fixed before pilot:** one associative pair per elementary segment;
+local W in R^(v x p); K delta-rule updates per segment; reset every h
+segments; commit every tau segments within each group plus its final state.
+Partial groups receive an endpoint commit. The query is explicitly given
+the address of the first commit at or after its fact within its own group.
+This oracle separates storage/gradient mechanisms from learned routing; it
+is not an end-to-end content-addressed solution. Global keys are independent
+zero-mean isotropic unit vectors, independent of the local episodes/writer,
+local queries, and selected commit indices. The pilot
+must include trainable shared writer parameters to study outer learning.
+
+Primary intervention is full versus branch-detached INTERMEDIATE commits,
+with all group endpoints and the continuing recurrence differentiable.
+Same seeds/data/initial parameters, same forward computation, same query
+loss and normalization. Endpoint-only storage and exact oracle snapshot
+reads are controls. Predeclare normalized-MSE target, step budget, seeds,
+and evaluation episodes in the runnable configuration before training.
+Record nonreaches rather than adjusting the target after seeing results.
+If the learned local encoder also produces the local query x, its query-
+side gradient remains live in both arms: the intervention removes only
+snapshot-storage routes. Global query addresses remain exogenous. State
+Jacobian paths terminate at resets and sum only over later commits in the
+SAME group; shared writer parameters can receive gradients from all groups.
+
+**Conditional error identity (new derivation):** for a query with local key
+x, value y and selected commit r, define z_c=W_c*x, local residual
+e=z_r-y, and LA contamination n=sum_(c!=r)(k_r^T*k_c)*z_c. Then samplewise
+||prediction-y||^2=||e||^2+||n||^2+2*e^T*n. Conditional on all local
+snapshots and x,y,r, random global addresses give E[n]=0 and
+E[||n||^2]=(1/D)*sum_(c!=r)||z_c||^2. Cross terms between different
+commits vanish because their global keys are independent and zero-mean;
+the snapshots themselves need not be independent. Isotropy gives the
+variance 1/D. Thus payload correlation alone does not invalidate this law.
+
+Averaging over facts/episodes with one common, positive target-energy
+normalizer gives E[NMSE]=delta+A/D, where delta is exact selected-snapshot
+NMSE and A is normalized non-target response energy. A counts redundancy
+through its actual response energies, not an assumed unit payload norm.
+Content-dependent/learned global keys, key-dependent commit selection, or
+read normalization require a different calculation with bias/cross terms.
+Frozen learned local weights are allowed if fresh test addresses remain
+independent. This is an expected-error identity, not a tail guarantee.
+
+For A>0 and delta<epsilon, the minimal integer address size under this
+model is D_min=max(1,ceil(A/(epsilon-delta))). If delta>=epsilon and A>0,
+no finite D suffices. If A=0, feasibility is simply delta<=epsilon.
+This rule holds for a fixed local writer and commit policy; optimizing D
+jointly with a retrained writer needs recalibration/predictive modeling.
+
+**An explicit crossover:** take two unit local keys with inner product rho,
+two independent zero-mean unit-variance scalar values, eta=1,K=1,h=2, and
+zero initial W. Query both facts equally. Endpoint-only tau=2 gives
+W2*x1=(1-rho^2)*y1+rho*y2 and W2*x2=y2. Its expected MSE is therefore
+(rho^2+rho^4)/2, with zero global interference because there is one commit.
+With tau=1 and the first-available-commit oracle, local error is zero;
+the two non-target response energies average to (1+rho^4)/2. Hence LA MSE
+is (1+rho^4)/(2D). Intermediate commits improve error exactly when
+D>(1+rho^4)/(rho^2+rho^4), for rho!=0. Orthogonal local keys (rho=0)
+make endpoint-only storage perfect while intermediate LA commits add
+noise at any finite D. This demonstrates both favorable and unfavorable
+regimes without claiming a universal benefit or better storage efficiency.
+The oracle supplies a version address; routing cost/learnability is excluded.
+
+**Cost ledger for this toy model:** P=p*v, C=sum_groups ceil(h_group/tau).
+Dense local update work is Theta(J*K*p*v); global commits Theta(C*D*P);
+full-payload retrieval for Q queries Theta(Q*(D*P+p*v)). These counts
+exclude a learned local encoder, which must be added separately. Folded
+state uses D*P scalars plus local P; a bank implementation also stores C*P
+payloads and C*D addresses, and training keeps additional graph tensors.
+Alternative contraction orders/sparse readers may be cheaper. Count the
+actual pilot implementation separately from this streaming ideal.
+
+**Prior-art boundary checked for the milestone:**
+[Sparse Attentive Backtracking](https://arxiv.org/abs/1809.03702) already
+uses attention shortcuts to past states for temporal credit assignment;
+[Linear Transformers Are Secretly Fast Weight Programmers](https://proceedings.mlr.press/v139/schlag21a.html)
+already connects additive associative writes, capacity limits, and delta
+updates. [ARMT](https://arxiv.org/abs/2407.04841) and
+[GradMem](https://arxiv.org/abs/2603.13875) are required architectural
+comparators. This focused source check is not an exhaustive novelty audit.
+The intended contribution remains predictive allocation and a controlled
+mechanism study, not invention of gradient shortcuts or delta-rule memory.
+
+## Linear milestone results: EXP-LM-001 (2026-11-10; reviewed)
+
+Implementation: [`experiments/linear_memory/`](experiments/linear_memory/).
+Report: [`LINEAR_MEMORY_PILOT.md`](reports/LINEAR_MEMORY_PILOT.md).
+The isolated harness supports local reset h, commit interval tau, repeated
+inner writes, partial groups, exact/oracle and folded-LA reads, and snapshot-
+branch detachment. Fifteen focused tests pass, including actual delta-rule
+Jacobians and zero cross-reset value gradients.
+
+The predeclared pilot used J12,p4,v3,D16,h6,K1, tau6 or tau2, three seeds,
+120 Adam updates, and target NMSE<=0.20 evaluated every20 updates. A learned
+position codebook supplies local keys; global keys and routing are exogenous.
+Fresh values/global keys vary by episode. This is not learned content routing.
+
+| Reader / storage | Final NMSE, mean over 3 seeds | First observed target step, per seed |
+|---|---:|---|
+| Exact / endpoint | 0.38213 | none / none / none |
+| Exact / intermediate detached | 0.000195 | 40 / 40 / 40 |
+| Exact / intermediate full | 0.000532 | 40 / 40 / 40 |
+| LA / endpoint | 0.41550 | none / none / none |
+| LA / intermediate detached | 0.11526 | 60 / 60 / 60 |
+| LA / intermediate full | 0.11497 | 60 / 40 / 40 |
+
+Fixed-parameter detached/full forward differences are exactly zero for all
+seeds/readers, while encoder and step-size gradients differ. The intervention
+works. The small LA early-target signal is not a general speedup result; exact
+reads show no threshold-step benefit at this resolution, and final LA errors
+coincide closely. Snapshot availability is the dominant gain over endpoints.
+The conditional noise law agrees with measurements, and the two-fact Monte
+Carlo crossover check reproduces both success and failure regimes.
+
+At C=2 or6, the raw banks are smaller/cheaper than the D*p*v folded state;
+no folding efficiency benefit is established. CPU times are single short
+measurements, operation counts are estimates, and training retains raw
+banks/autograd graphs. Full cost exclusions are listed in the report.
+
+**Decision:** first executable milestone accepted; cycle1 ends here. Next
+test whether delta+A/D selects feasible D and useful p,h,tau allocations on
+held-out workloads. Retain branch-detach and exact-reader controls, and do
+not infer content-routing or transformer performance from this pilot.
 
 ## Hypotheses ledger
 

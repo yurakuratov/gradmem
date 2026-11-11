@@ -1,0 +1,18 @@
+{
+  "experiment_id": "EXP-LM-001",
+  "started_from_config_sha256": "190b0d0fb46c4d253ba1951af45c0e6ad2a994d25d7549ab9fb6a26a014a8fa9",
+  "config_path": "/home/evgenio/Activity/running/gradmem/test_time_gd/experiments/linear_memory/pilot_config.json",
+  "timestamp_utc": "2026-11-10T11:49:07.267836+00:00",
+  "command": ".venv/bin/python -m experiments.linear_memory.run_pilot --config experiments/linear_memory/pilot_config.json",
+  "python": "3.11.15",
+  "torch": "2.5.1+cu121",
+  "platform": "Linux-6.6.156-2-MANJARO-x86_64-with-glibc2.44",
+  "torch_num_threads": 1,
+  "torch_num_interop_threads": 1,
+  "git_head": "b3367fbdade80d5f793e91254b834d233b6f2dc6",
+  "git_status_short": "M PROGRESS.md\n M notebooks/collect_results.ipynb\n M notebooks/dump_babi_dataset.ipynb\n M notebooks/dump_dataset.ipynb\n?? experiments/\n?? reports/results/\n?? tasks/SOFTMAX_RESUME_TASK.md\n?? tests/",
+  "file_sha256": {
+    "/home/evgenio/Activity/running/gradmem/test_time_gd/experiments/linear_memory/run_pilot.py": "e34c33979aad5436d869118da50cfd776a9598c0334d077c7765f992d835fa50",
+    "/home/evgenio/Activity/running/gradmem/test_time_gd/experiments/linear_memory/model.py": "03cd61523d5add87528eda2cc6693bd1cc8db1f7b7164a8b5a377e7f9404e114"
+  }
+}

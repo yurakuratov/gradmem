@@ -7,6 +7,53 @@ rationale), verification status. Current state and hypotheses live in
 **Maintenance rule:** every merged change updates this journal and, when it
 changes the evidence picture, `PROGRESS.md` in the same commit.
 
+## 2026-11-10 (a) — cycle 1 complete: linear model and snapshot pilot
+
+Implemented the first executable roadmap milestone through the research-
+scientist workflow; independently audited the derivations and completed one
+remedial review. New standalone code/protocol/config lives in
+`experiments/linear_memory/`, with tests in `tests/test_linear_memory.py` and
+the evidence report in `reports/LINEAR_MEMORY_PILOT.md`. Existing transformer
+code, training jobs, and user notebook edits were not changed.
+
+**Theory:** conditional expected error is delta+A/D under fresh independent,
+zero-mean isotropic unit GLOBAL keys and oracle target addresses, even when
+snapshots are mutually correlated. A is actual non-target response energy.
+Derived a two-fact local-key-overlap crossover including the orthogonal
+failure regime. D_min is expectation-only, with the zero-noise edge case
+handled explicitly. Local codebook queries may remain differentiable in
+both intervention arms; the removed routes are snapshot-storage routes.
+
+**Execution:** EXP-LM-001, 6 arms x 3 seeds x 120 CPU updates; J12,p4,v3,D16,
+h6,K1; endpoint tau6 versus intermediate tau2. The local encoder is a learned
+position codebook, and global snapshot routing is oracle-controlled. Frozen
+config hash, raw curves, summaries, and code/environment provenance are in
+`reports/results/linear_memory/EXP-LM-001/`. Scoped ignore exceptions preserve
+the JSON configuration/provenance artifacts for normal version control.
+
+**Evidence:** detached/full probes have zero forward difference and nonzero
+writer-gradient differences. Exact-reader arms both reach NMSE 0.20 at
+step40 in all seeds. LA full reaches at 60/40/40 versus detached 60/60/60,
+observed only every20 updates; final means are 0.11497 and 0.11526. Endpoint
+arms fail the target in all seeds. This is a limited LA-specific early-target
+signal, not a general convergence or systems speedup. Correlated-payload
+noise agrees with the conditional energy law; two-fact Monte Carlo relative
+errors are <=3.33% for LA and <=0.96% for nonzero endpoint errors.
+
+**Verification:** `.venv/bin/python -m pytest -q tests/test_linear_memory.py`
+reports 15 passed in 2.37s, including actual-writer reset independence and
+K=2 transition Jacobian, orthogonal retention, overwrite, commit tails,
+folded/direct reads, live endpoint gradients, and error decomposition.
+The CPU run completed all18 arms. Source implementation was reviewed; memory
+and operation tables explicitly exclude/identify codebook, oracle metadata,
+raw banks, and training tensors. At this small C the raw bank is cheaper and
+smaller than folding; no LA storage/compute advantage is established.
+
+**Decision:** milestone reached; stop cycle1 here per AGENTS.md. Next
+milestone is held-out validation of the fixed-error allocation rule, keeping
+oracle/position-codebook limitations explicit, before transformer integration.
+The rest of the roadmap remains pending. No new large sweep was launched.
+
 ## 2026-11-09 (f) — contribution roadmap formulated
 
 Added the requested staged roadmap to PROGRESS: freeze the cost/comparison

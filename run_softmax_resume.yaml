@@ -1,0 +1,54 @@
+container:
+  image: "cr.ai.cloud.ru/aicloud-base-images/cuda12.3-torch2-py310:0.0.37"
+
+  # CMD to run. The flock guard makes duplicate spawns harmless: when the API
+  # gateway is slow, `cr submit`'s internal retry loop creates one job per
+  # attempt, ALL pinned to this same run copy, and the racing `uv sync`s
+  # corrupt the shared .venv. First job to start holds .job_lock; duplicates
+  # exit 0 immediately (see DUPLICATE_SPAWN in the job log).
+  # NOTE: this is the 2026-11-10 RESUME job for the interference curve's
+  # interface_softmax chains only (N32 -> N64 -> N96; N8/N16 skipped via the
+  # chain state files) — run.yaml keeps targeting the original curve job's
+  # manifest and run_adaptive.yaml the carried-memory job's manifest; neither
+  # is modified. The .job_lock is per-run-copy, so jobs cannot collide.
+  command: 'exec 9>.job_lock && { flock -n 9 || { echo DUPLICATE_SPAWN_LOCK_HELD_EXITING; exit 0; }; } && python -m pip install --user uv && $HOME/.local/bin/uv cache dir && $HOME/.local/bin/uv sync && $HOME/.local/bin/uv run python run_scheduler.py manifests/kv_interference_softmax_resume.yaml && rm -r .venv'
+
+  # ENV vars
+  environment:
+    "HF_HOME": "$HF_HOME"
+    "HF_TOKEN": "$HF_TOKEN"
+    "TRITON_CACHE_DIR": "$TRITON_CACHE_DIR"
+    "COMET_API_KEY": "$COMET_API_KEY"
+    "COMET_PROJECT_NAME": "gradmem-linear-read-interference"
+    "COMET_WORKSPACE": "$COMET_WORKSPACE"
+    "COMET_MODE": "online"
+    # Added to job description
+    "TEAM_NAME": "gradmem/$ME"
+    "MY_HOME": "$MY_HOME"
+    "UV_CACHE_DIR": "$UV_CACHE_DIR"
+  
+  # Local working directory, recommend leaving as default
+  work_dir: '.'
+
+  # Whether to run from a copy of the working directory
+  run_from_copy: True
+
+  # Local path for creating working directory copies
+  cry_copy_dir: "$MY_HOME/.cryri"
+  exclude_from_copy:
+    - ".venv"
+    - ".git"
+    - "notebooks"
+    - "data"
+
+cloud:
+  region: "SR006"
+  
+  # Type of cloud instance (check the command to list available instances in cryri readme)
+  instance_type: "a100plus.1gpu.80vG.12C.96G"
+
+  # Number of worker instances, 1 is the only option
+  n_workers: 1
+  
+  # Job description
+  description: "interference-curve softmax chains resume (N32-N96)"

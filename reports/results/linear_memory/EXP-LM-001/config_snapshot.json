@@ -1,0 +1,93 @@
+{
+  "experiment_id": "EXP-LM-001",
+  "output_dir": "reports/results/linear_memory/EXP-LM-001",
+  "seeds": [
+    101,
+    202,
+    303
+  ],
+  "model": {
+    "num_segments": 12,
+    "local_dim": 4,
+    "value_dim": 3,
+    "global_dim": 16,
+    "h": 6,
+    "intermediate_tau": 2,
+    "inner_steps": 1,
+    "eta_init": 0.4,
+    "eta_max": 1.25
+  },
+  "training": {
+    "steps": 120,
+    "batch_size": 32,
+    "eval_episodes": 128,
+    "probe_episodes": 32,
+    "eval_every": 20,
+    "learning_rate": 0.03,
+    "target_nmse": 0.2
+  },
+  "data": {
+    "description": "Position-indexed one-hot fact identities shared across episodes; fresh iid unit-norm Gaussian value vectors per episode; deterministic random unit global keys indexed by segment endpoint.",
+    "train_seed_offset": 10000,
+    "eval_seed_offset": 20000
+  },
+  "arms": [
+    {
+      "name": "endpoint_exact",
+      "reader": "exact",
+      "tau": 6,
+      "detach_intermediate": false
+    },
+    {
+      "name": "intermediate_detached_exact",
+      "reader": "exact",
+      "tau": 2,
+      "detach_intermediate": true
+    },
+    {
+      "name": "intermediate_full_exact",
+      "reader": "exact",
+      "tau": 2,
+      "detach_intermediate": false
+    },
+    {
+      "name": "endpoint_la",
+      "reader": "la",
+      "tau": 6,
+      "detach_intermediate": false
+    },
+    {
+      "name": "intermediate_detached_la",
+      "reader": "la",
+      "tau": 2,
+      "detach_intermediate": true
+    },
+    {
+      "name": "intermediate_full_la",
+      "reader": "la",
+      "tau": 2,
+      "detach_intermediate": false
+    }
+  ],
+  "theory_mc": {
+    "seed": 424242,
+    "samples": 30000,
+    "rho_values": [
+      0.0,
+      0.3,
+      0.7,
+      1.0
+    ],
+    "global_dims": [
+      2,
+      8,
+      32
+    ]
+  },
+  "runtime": {
+    "device": "cpu",
+    "torch_num_threads": 1,
+    "torch_num_interop_threads": 1,
+    "deterministic_algorithms": true
+  }
+}
