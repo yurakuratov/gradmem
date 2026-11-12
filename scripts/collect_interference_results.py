@@ -108,7 +108,11 @@ def main():
                       and str(r["params"].get("seed")) == str(s)]
                 if not rs:
                     continue
-                r = rs[0]
+                # duplicate generations exist for rerun phases (e.g. softmax
+                # N32: the 11-03 disk-full kills + the 11-10 resume); the
+                # LATEST end time is the authoritative generation
+                rs.sort(key=lambda r: r.get("end_ms") or 0)
+                r = rs[-1]
                 em = curve(r, "eval/exact_match")
                 ct = curve(r, "eval/read_state_cross_talk")
                 if not em:

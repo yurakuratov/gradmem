@@ -1,0 +1,24 @@
+{
+  "analytic_frontiers_sha256": "ce61099ea810e71b458b5d6e37dd99f80cd16eb3f0b8b360205b306555794ff0",
+  "command": "/home/evgenio/Activity/running/gradmem/test_time_gd/experiments/linear_memory/run_local_only_comparison.py --config experiments/linear_memory/local_only_comparison_config.json --stage evaluate",
+  "completed_at_utc": "2026-11-11T15:33:33.495794+00:00",
+  "config_snapshot_sha256": "45d3ffbc968d67c3f69b2e6f78d4e2cfe28e04aad04a415a017ae22c86336d75",
+  "git_head": "710c110f111fc447a5e2ffb29e051643ed5cdfa6",
+  "git_status": "M .gitignore\n M PROGRESS.md\n M STATUS.md\n M experiments/linear_memory/.gitignore\n M notebooks/collect_results.ipynb\n M notebooks/dump_babi_dataset.ipynb\n M notebooks/dump_dataset.ipynb\n?? docs/HIERARCHICAL_MEMORY_INTRODUCTION.md\n?? experiments/linear_memory/allocation.py\n?? experiments/linear_memory/allocation_audit_config.json\n?? experiments/linear_memory/allocation_audit_protocol.md\n?? experiments/linear_memory/allocation_config.json\n?? experiments/linear_memory/allocation_protocol.md\n?? experiments/linear_memory/local_only_comparison.py\n?? experiments/linear_memory/local_only_comparison_config.json\n?? experiments/linear_memory/local_only_comparison_protocol.md\n?? experiments/linear_memory/refined_allocation.py\n?? experiments/linear_memory/refined_allocation_config.json\n?? experiments/linear_memory/refined_allocation_protocol.md\n?? experiments/linear_memory/run_allocation.py\n?? experiments/linear_memory/run_local_only_comparison.py\n?? experiments/linear_memory/run_refined_allocation.py\n?? reports/ALLOCATION_TRANSFER_RESULTS.md\n?? reports/REFINED_ALLOCATION_RESULTS.md\n?? reports/results/linear_memory/EXP-LM-002-AUDIT/\n?? reports/results/linear_memory/EXP-LM-002/\n?? reports/results/linear_memory/EXP-LM-003/\n?? reports/results/linear_memory/EXP-LM-004/\n?? research/\n?? tasks/LOCAL_ONLY_COMPARISON_TASK.md\n?? tasks/REFINED_ALLOCATION_TASK.md\n?? tests/test_linear_memory_allocation.py\n?? tests/test_linear_memory_local_only.py\n?? tests/test_linear_memory_refined_allocation.py",
+  "heldout_evaluation_sha256": "365b2cfcc4c5d8edeb2ce17ced4593d526fc3d0def24ec2bd16ef38123dc2407",
+  "input_hashes": {
+    "allocation_code": "2a2ce0d7067650808d75dadf431eb5d59bcf5081724a7462c9b14fb8f8d527eb",
+    "config": "45d3ffbc968d67c3f69b2e6f78d4e2cfe28e04aad04a415a017ae22c86336d75",
+    "model_code": "03cd61523d5add87528eda2cc6693bd1cc8db1f7b7164a8b5a377e7f9404e114",
+    "protocol": "8340d7f8302bf83bdd5c2703e0cad82fac3653a027d9d106a1281ac061400dab",
+    "runner_code": "4533c40310073cc98ada69c83109ed67e32b8cfc86951d32573777b7e2bd664a",
+    "theory_code": "d83dba5d3c86010f8e7baa217f1dc9f38653ee553efd1401a044f04ecb69d825"
+  },
+  "platform": "Linux-6.6.156-2-MANJARO-x86_64-with-glibc2.44",
+  "python": "3.11.15 (main, May 10 2026, 19:28:18) [Clang 22.1.3 ]",
+  "rng_scheme": "SHA-256-derived p-specific flat IID key streams, J-specific values shared across p/method/h, and separate configuration-specific global-key streams",
+  "selection_evaluation_sha256": "76a5334e7e0c516bbc0722c0ff7b231d97b8b75fe00fbd83e8e8632cb86f295c",
+  "selections_preregistered_sha256": "d69b256e487807cffe3f9326262bc025ed5e40fef0b0e8212bee211b7d6029f3",
+  "summary_sha256": "2db3c3668f5b684a13b4a8e26fd2540795dd522c5c2a02db2318a5df75fd4264",
+  "torch": "2.5.1+cu121"
+}

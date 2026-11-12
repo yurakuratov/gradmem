@@ -1,0 +1,24 @@
+{
+  "calibration_sha256": "2b5d114c9ca98923fd060a0560eb7f809e2a5b03e43f7a72813ef61763e202f4",
+  "candidate_metrics_sha256": "c580fd9587dffdc603526249e0d5bed589fdc871de81befd0663f10253f0baf7",
+  "candidate_predictions_sha256": "68fe1e93f3020e3295bfa491946d6ebfbb19c129148d32337dc8a8ac89587d1e",
+  "command": "/home/evgenio/Activity/running/gradmem/test_time_gd/experiments/linear_memory/run_allocation.py --config experiments/linear_memory/allocation_config.json --stage evaluate",
+  "completed_at_utc": "2026-11-11T12:15:07.316458+00:00",
+  "config_snapshot_sha256": "787fbe0014f5ec97d872107baad4ff5b9e1fc093fa276f297ebd5fefc3a94b21",
+  "experiment_id": "EXP-LM-002",
+  "git_head": "710c110f111fc447a5e2ffb29e051643ed5cdfa6",
+  "git_status": "M PROGRESS.md\n M STATUS.md\n M experiments/linear_memory/.gitignore\n M notebooks/collect_results.ipynb\n M notebooks/dump_babi_dataset.ipynb\n M notebooks/dump_dataset.ipynb\n?? docs/HIERARCHICAL_MEMORY_INTRODUCTION.md\n?? experiments/linear_memory/allocation.py\n?? experiments/linear_memory/allocation_config.json\n?? experiments/linear_memory/allocation_protocol.md\n?? experiments/linear_memory/run_allocation.py\n?? reports/results/linear_memory/EXP-LM-002/\n?? tests/test_linear_memory_allocation.py",
+  "input_hashes": {
+    "allocation_code": "2a2ce0d7067650808d75dadf431eb5d59bcf5081724a7462c9b14fb8f8d527eb",
+    "config": "787fbe0014f5ec97d872107baad4ff5b9e1fc093fa276f297ebd5fefc3a94b21",
+    "protocol": "4e77b5b8216452839ad53a9c983385f1a078b413acee9e8143273b8399789bc7",
+    "runner_code": "73218986319135b68f8dc0b0f7213bc869baa31aafc1090b99300c30fccd34fa"
+  },
+  "platform": "Linux-6.6.156-2-MANJARO-x86_64-with-glibc2.44",
+  "python": "3.11.15 (main, May 10 2026, 19:28:18) [Clang 22.1.3 ]",
+  "rng_scheme": "SHA-256-derived seeds over registered seed/split/geometry/candidate coordinates; held-out values shared over p,h,tau,geometry for each seed/J; addresses shared over tau; raw global Gaussian prefixes shared over D.",
+  "selection_evaluation_sha256": "a796559ee68e1ce13faf4d69099d44ff9ccfb7f76d23d8c467dfda7df33ebf76",
+  "selections_preregistered_sha256": "98bbe4e64d6eff40545028655569096cd2793e5c0b70242ac34ca54ecb40be1d",
+  "summary_sha256": "68d8d536a68c564ece7e93b209dc3970036723666c3a6cffaee568d5bec0f74b",
+  "torch": "2.5.1+cu121"
+}

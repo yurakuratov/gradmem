@@ -15,16 +15,18 @@ all-positions 0.997, interface two-pass 0.999) while the one-shot control
 fail — and the conditioning ablation shows **pass-1 query conditioning is
 load-bearing** (prediction held, Δ > 0.98 per seed). The deployable read is
 (d′): interface-only reads + two-pass conditioning. **The interference curve
-vs N has partial results** (2026-11-09,
+vs N is decided** (2026-11-12,
 [`reports/INTERFERENCE_CURVE_RESULTS.md`](reports/INTERFERENCE_CURVE_RESULTS.md)).
-Both jobs died on 2026-11-03 (an interrupt, then a full disk), so no arm
-reached N=96 and the control is truncated from N=32 on. On single-key with
-the deployable read, **superposition binds at N=32**: Δ against exact
-softmax at the same interface sites is 0.0005 / 0.0025 / 0.052 at
-N=8/16/32, and the interface read plateaus at EM 0.41 at N=64. This matches
-the random-key estimate √((N−1)/d_h) with key width d_h = 32 (a hypothesis;
-d_h sweep pending). The carried-memory baseline (same curriculum, every
-segment writing the SAME M=2 tokens;
+After the 2026-11-03 double infrastructure failure, the exact-softmax control
+was resumed and completed the full curriculum — EM ≥ 0.99 at every phase
+through N=96 (all threshold stops; N96 within 0.5–2.5k steps). On single-key
+with the deployable read, **superposition binds at N=32**: Δ against exact
+softmax at the same interface sites is 0.0005 / 0.0025 / **0.065** /
+**0.58** at N=8/16/32/64, and the interface read plateaus at EM 0.41 at N=64
+(vs control 0.99 at the identical protocol). This matches the random-key
+estimate √((N−1)/d_h) with key width d_h = 32 (a hypothesis; d_h sweep
+pending). The carried-memory baseline (same curriculum, every segment
+writing the SAME M=2 tokens;
 [`manifests/kv_interference_adaptive.yaml`](manifests/kv_interference_adaptive.yaml))
 fails at every N (0.82 / 0.48 / 0.15 at N=8/16/32). Per-segment slots are
 the first-order effect; read superposition is second-order and appears only
@@ -182,12 +184,26 @@ Specified in IDEAS; no implementation or experiment performed.
 
 ## Contribution roadmap (2026-11-09; implementation started 2026-11-10)
 
-**Execution update (2026-11-10):** cycle 1 completed the first milestone:
-standalone linear writer, analytical/gradient checks, and a bounded CPU
-snapshot pilot. See the reviewed results below and
-[`LINEAR_MEMORY_PILOT.md`](reports/LINEAR_MEMORY_PILOT.md). The original stage
-descriptions remain the roadmap, not claims of completed work; held-out
-allocation prediction and transformer integration remain pending.
+**Reading entry point:** [Introduction to local gradient memory and global
+associative storage](docs/HIERARCHICAL_MEMORY_INTRODUCTION.md) defines the
+notation, derives the basic results, and explains the proposed mechanisms
+without requiring code inspection.
+
+**Execution update (2026-11-11):** the standalone linear writer, analytical/
+gradient checks, bounded snapshot pilot, and first held-out allocation study
+are implemented. See the reviewed results below,
+[`LINEAR_MEMORY_PILOT.md`](reports/LINEAR_MEMORY_PILOT.md), and
+[`ALLOCATION_TRANSFER_RESULTS.md`](reports/ALLOCATION_TRANSFER_RESULTS.md).
+EXP-LM-002 selected independent local writes throughout its limited grid.
+The subsequent EXP-LM-003 refinement found shared-writing savings for IID
+addresses at low query count under the same operation proxy; see
+[`REFINED_ALLOCATION_RESULTS.md`](reports/REFINED_ALLOCATION_RESULTS.md).
+EXP-LM-004 now compares against enlarged local delta and direct additive
+memories over every affordable integer width. Hierarchy wins two of eight
+registered population scenarios; strong local-only methods win the other six.
+See [`LOCAL_ONLY_COMPARISON_RESULTS.md`](reports/LOCAL_ONLY_COMPARISON_RESULTS.md).
+The general phase diagram, measured systems costs, deep-prefix/LoRA comparisons,
+and transformer integration remain pending.
 
 **Working thesis:** local gradient writing, global associative storage, and
 intermediate commits offer distinct ways to spend memory and compute.
@@ -342,15 +358,14 @@ The evidence chooses whether the paper leads with resource allocation,
 optimization, or retention. Faster inner fitting, universal superiority,
 and constant-memory unlimited capacity remain outside the claims.
 
-**Immediate next milestone:** Stage 0's specification plus Stage 1's linear
-error/gradient model and a bounded Stage 2 experiment brief. No large sweep
-is needed to decide whether to proceed. Implementation and runs follow the
-PI/research-scientist workflow in AGENTS.md when execution is undertaken.
-
-**Milestone update (2026-11-10):** the initial specification, a restricted
-linear error/crossover theory, and the implemented Stage 2 pilot are complete.
-Next is out-of-sample testing of the allocation prediction; the general
-phase diagram, broader convergence theory, and transformer stages are open.
+**Immediate next milestone (after EXP-LM-004):** connect the separate local
+write, global commit, and read costs to an actual implementation. Freeze the
+payload/address mapping and a measured-cost protocol before running a matched
+transformer comparison. Include enlarged/deep local storage and fast LoRA
+without treating their capacity as additional sequence length. The linear
+comparison establishes a restricted compute/storage tradeoff with oracle
+routing; it does not establish a transformer or wall-clock advantage. Broader
+convergence theory remains open.
 
 ## Linear milestone specification and derivations (2026-11-10)
 
@@ -478,33 +493,492 @@ test whether delta+A/D selects feasible D and useful p,h,tau allocations on
 held-out workloads. Retain branch-detach and exact-reader controls, and do
 not infer content-routing or transformer performance from this pilot.
 
+## Held-out allocation milestone specification (2026-11-11)
+
+**Cycle 1 question:** can statistics measured on short isolated reset groups
+select useful (p,h,tau,D) allocations for unseen longer contexts at a fixed
+expected retrieval error and a fixed folded-state budget? Implementation is
+authorized for a bounded local CPU study, EXP-LM-002. A negative predictive
+or comparative result completes the milestone if the protocol and evidence
+are reproducible; thresholds must not be adjusted after evaluation.
+
+**Transfer law:** calibrate delta (selected-snapshot local error), A0 (sum of
+same-group non-target response energies), and B (all responses from one
+independent other group) on J=h only. With unit-value normalization,
+B=(1/p)*E sum_c ||W_c||_F^2, because a local query from another group is
+independent and marginally isotropic. For G=J/h independent equal-size groups,
+the predictor is E_hat=delta+[A0+(G-1)*B]/D. The within-group coefficient A0
+can include correlated snapshots. The covariance between different global
+keys still vanishes under the prior milestone's random-address assumptions.
+This law assumes the local writer and group distribution are unchanged;
+it does not assert transfer to new geometries or a retrained writer.
+
+**Frozen design:** p={2,4,8}, h={1,2,4,8}, valid unique tau from {1,2,h},
+D={4,8,16,32,64,128}, v2,eta1,K1. Local addresses and unit random values are
+fresh for each episode. Regimes: independent unit Gaussian directions, or
+normalized sqrt(a)*u_group+sqrt(1-a)*e_fact with independent isotropic Gaussian
+u,e and a=.7. This a is a mixing coefficient, not the realized dot product.
+Both regimes have isotropic marginals and independent reset groups; each is
+calibrated separately. This frozen writer replaces the first pilot's learned
+position codebook and makes no new gradient-routing or training-speed claim.
+
+Calibration uses 512 isolated groups per candidate and seed. Held-out sets
+contain 256 complete episodes at J16/J32; costs are evaluated for Q1/Q32
+queries and error targets .10/.25. Seeds 1101/2202/3303. The candidate grid
+contains the h=tau=1 independent-write baseline and endpoint/intermediate
+commit policies. The primary selector jointly chooses p,h,tau,D. Fixed-policy
+comparators constrain p4,h=tau1 or p4,tau=h and select remaining dimensions
+from the SAME calibration, without seeing test outcomes.
+
+The selection proxy is J*(3pv+v)+C*D*pv+Q*(Dpv+pv), with folded-state budget
+pv+Dpv<=2048 scalars. This is a declared primitive-operation/MAC proxy, not
+measured FLOPs. Address generation and oracle discovery costs are excluded;
+bank and address metadata are reported separately. All regret comparisons
+use the same grid, reader, budget, and cost definition.
+
+**Leakage barrier:** freeze protocol/config, calibrate short groups, then
+write and hash all selections/predictions BEFORE generating/evaluating long
+test episodes. Test-derived delta/A remain diagnostics, never selector inputs.
+Evaluate explicit folded LA with fresh global keys and an additional
+conditional-expected-error reference integrating global keys analytically.
+The latter has lower variance but uses the same proven identity and is not
+an independent test of that identity. Confidence intervals use independent
+episodes, not individual correlated queries within an episode.
+
+**Predeclared decision criteria:** at least90% point-feasible unrestricted
+selections, median feasible cost regret at most10% against the cheapest
+feasible grid reference under the same budget. Report uncertain intervals,
+false feasibility decisions, no-selection cases, and infeasible-selection
+regret as undefined. These are study criteria, not high-probability guarantees
+from the theory, and scenario counts sharing datasets are not independent
+replications.
+
+**Potential limitation identified before evaluation:** independent writes
+have delta=A0=0 and B=1/p exactly with unit keys/values and eta1. Their error
+is (J-1)/(pD). They may dominate this frozen-writer cost grid. If so, successful
+selection alone will not demonstrate a benefit from nontrivial h/tau
+allocation; retain this baseline and report the collapse instead of changing
+the grid. Prediction of full-grid errors remains a separate useful test.
+
+Protocol/config: `experiments/linear_memory/allocation_protocol.md` and
+`allocation_config.json`. This specification precedes evaluation; outcomes
+and post-result qualifications follow separately.
+
+## Held-out allocation results: EXP-LM-002 (2026-11-11)
+
+The sealed calibration stage produced 7,776 predictions and 144 selections
+before evaluation of 1,944 candidate cases. The unrestricted selector met
+the target in all 48 scenario rows, with zero cost regret against the cheapest
+point-feasible configuration in the registered grid. All 48 also met the
+target by the full episode-level 95% conditional-reference interval and by
+the sampled-LA point estimate. Selected median/max absolute prediction
+errors were .000169/.00165. The rows reuse data across Q and error targets;
+they are not 48 independent replications.
+
+Every selected allocation had h=tau=1. The four (J,epsilon)->(p,D) choices
+were (16,.10)->(2,128), (16,.25)->(2,32), (32,.10)->(4,128), and
+(32,.25)->(2,64). Both p4 restricted policies also chose h1 and became the
+same baseline; their median/max cost regret was .0261/.0815. These are
+finite-grid comparisons, not global optimality or evidence that hierarchy
+dominates a strong one-level memory.
+
+The selected predictions reduce to the exact special case (J-1)/(pD), so
+this success provides limited evidence about nontrivial h/tau allocation.
+Across the complete grid, median/max absolute prediction error was
+.00512/.1095. Explicit sampled LA was consistent with the conditional
+reference (1,904/1,944 candidate intervals contained it), but that reference
+uses the same global-key identity as the predictor. Transfer of local
+moments is assessed on disjoint held-out local episodes; the identity is
+not independently validated by comparing it to itself.
+
+**Post-result audit, kept separate from preregistration:** the initial hash
+manifest omitted imported `model.py`; the repaired guard includes it. The
+original acceptance criterion conditioned on making a selection, which can
+reward abstention. The additional audit criterion counts feasible selections
+over all scenarios with a feasible grid oracle and rejects empty coverage;
+the 90% threshold is unchanged. An interval-certified oracle sensitivity
+analysis complements the original point oracle. Original artifacts and the
+executed source archive are preserved; the instrumentation rerun uses a
+separate `EXP-LM-002-AUDIT` directory and unchanged scientific settings.
+These reporting corrections are post-result, not retrospectively registered.
+
+**Audit outcome and verification:** all 30 focused/prior linear-memory tests
+passed. Calibration, candidate predictions, and candidate metrics were
+byte-identical in the isolated reproduction; selections and all 40 common
+evaluation fields were unchanged. Oracle-scenario coverage was 48/48.
+All 48 selected configurations were interval-feasible, certified-oracle
+median/max regret remained zero, and no cheaper interval-uncertain candidate
+was found. These are pointwise approximate intervals, not a simultaneous
+high-probability optimality guarantee. See the reproduction comparison in
+`reports/results/linear_memory/EXP-LM-002-AUDIT/`.
+
+**Decision:** cycle 1 of this task is complete and the declared held-out
+allocation milestone is reached. Stop here under AGENTS.md. Accept the
+restricted allocation result and its limitations; the refined-grid study
+below is the next proposed milestone, not part of this completed run.
+
+### Post-result analytic prediction and grid limitation
+
+For IID spherical local addresses, independent zero-mean unit values, eta1,
+K1, and h=tau=2, write rho=x1^T x2. The first fact's endpoint residual is
+-rho^2*y1+rho*y2, while the second fact is exact. Consequently,
+
+    delta = (1/p + 3/[p(p+2)])/2,
+    A0 = 0,
+    B = (2-1/p)/p,
+    E = delta + (J/2-1)*B/D.
+
+This independently audited derivation predicts E=.08943685 for
+J16,p16,h=tau2,D16, below the .10 target. Memory is 544 scalars and cost is
+1568+4096+544Q: 6208 at Q1 and 23072 at Q32. It beats the original selected
+p2,h=tau1,D128 configuration (8932/24928) under the unchanged proxy. Thus
+the p<=8 cap can hide candidates that beat the reported grid optimum.
+
+However, the D grid is also restrictive: independent p2,D75 gives exact
+expected E=.10, memory 304, and cost 5328 at J16,Q1, cheaper than that grouped
+candidate. This is an expectation calculation at the boundary, not a
+finite-sample certified result. Neither new candidate was run or included
+in EXP-LM-002's oracle/regret. These calculations motivate refining BOTH
+p and D before claiming a robust sharing advantage; they do not justify
+adding an arbitrary commit penalty to obtain a preferred outcome.
+
+## Refined allocation milestone specification: EXP-LM-003 (2026-11-11)
+
+**Cycle 1 question:** does a shared local writer offer a cost advantage once
+both local width and global address resolution are improved? The authorized
+bounded CPU study follows `tasks/REFINED_ALLOCATION_TASK.md`. A reproducible
+positive or negative answer completes this milestone; transformer integration
+and measured acceleration remain outside it.
+
+Keep the unit-key/unit-value eta1,K1,v2 writer, oracle routing, operation proxy,
+and 2048-scalar folded-state cap unchanged. Expand p to {2,4,8,16,32,64}; retain
+h={1,2,4,8} and unique valid tau from {1,2,h}. Allow EVERY positive integer D
+under the memory cap. The independent baseline now optimizes p and D over the
+same domain. Compare unrestricted, independent-only, and shared-only h>1
+selectors, with deterministic ties and identical resources.
+
+Fresh seeds are 4404,5505,6606. Calibrate each known iid/correlated geometry on
+4096 isolated groups; evaluate 1024 held-out episodes per local configuration
+at J16/J32, Q1/Q32, epsilon .10/.25. h1 candidates use their exact theoretical
+moments; estimated h1 moments remain diagnostics. h>1 predictions use the
+short-group empirical moments. Every selector targets .95*epsilon, a fixed
+5% reserve chosen before data to reduce boundary sensitivity. Evaluation and
+regret use epsilon. The reserve is not a confidence guarantee.
+
+Freeze protocol, config, imported execution dependencies, calibration,
+predictions, and selections before held-out evaluation. Conditional-reference
+errors for all integer D follow from per-episode delta,A moments. Enumerate
+the interval oracle without assuming normal-CI endpoints are monotone.
+Explicit sampled LA is limited to unique selected configurations and fixed
+witness/sentinel cases, and remains a consistency check. Scenario rows reuse
+episodes and do not multiply the number of independent replications.
+
+Prediction acceptance is >=90% feasible-selection coverage among scenarios
+with a feasible point oracle, and <=10% median feasible cost regret. No
+selection or an empty oracle denominator cannot produce a vacuous pass.
+Report interval sensitivity and cheaper uncertain alternatives. Report both
+calibrated policies and restricted held-out oracles when comparing sharing
+to independence; neither infeasible solutions nor noisy boundary cases
+establish a cost advantage. The earlier J16,p16,h2,D16 and independent
+J16,p2,D75 analytic examples are fixed checks, separate from selection.
+
+**Pre-execution analytic witness (independently audited):** with IID local
+addresses, J32,p32,h=tau2,D12 gives delta=.01700367647, A=.9228515625,
+E=.09390797335<.095, and memory832. Its proxy cost is18496+832Q. For ANY
+independent h1 memory with p>=2 meeting true epsilon=.1, the identity
+(J-1)/(pD)<=epsilon implies pD>=310. Consequently,
+
+    cost = Jv + pv(3J+Q) + (J+Q)Dpv
+         >= 20288 + 624Q.
+
+This bound even relaxes integer D and upper limits on p/memory. At Q1 the
+shared witness costs19328 versus independent lowerbound20912: at least7.57%
+less under the proxy. It beats that bound for Q<1792/208=8.615, including
+integer Q<=8. This sufficient condition establishes a restricted theoretical
+sharing advantage without relying on a coarse D grid. It does not prove the
+shared candidate is optimal or that sharing loses above that Q. The candidate
+is a fixed held-out/sampled-LA check in EXP003, selected before new data.
+
+Pre-execution audit also adds slack-matched oracle/coverage diagnostics to
+separate the reserve's cost from prediction error. Primary criteria still
+use the original epsilon. Tiny negative A from roundoff must be guarded;
+integer boundary choices must be checked explicitly.
+
+**Pre-execution release:** 40 focused and prior linear-memory tests passed.
+Independent theory and implementation audits found no scientific blocker;
+the PI released the frozen calibration/selection and held-out stages. This
+specification and the fixed witness precede EXP-LM-003 outcomes. The runner
+guards dependency drift and refuses to overwrite completed evaluations.
+
+## Refined allocation results: EXP-LM-003 (2026-11-11)
+
+The predeclared primary criteria passed: all 48 unrestricted scenario rows
+were feasible at epsilon, with median cost regret .04808 and maximum .10385
+against the point-feasible held-out oracle. The criterion concerned median,
+not maximum regret. Independent-only and shared-only policies also had 48/48
+feasible selections. The original frozen selection artifact has SHA-256
+`d97868b12e8ed1a6082f905c76bc373d5933e092b124c6ae143671a3aefec500`.
+Calibration took about 5.4s and evaluation 82.8s on CPU; these are experiment
+execution times, not benchmarks of deployed memory architectures.
+
+Sharing won in 9 of 48 dependent reporting views, identically categorized
+by the calibrated-policy and restricted-oracle comparisons. The substantive
+gains occur for IID addresses, J32,Q1, in all three seeds:
+
+| Target error | Independent (p,h,tau,D) | Shared (p,h,tau,D) | Independent/shared cost | Independent/shared memory scalars |
+|---|---|---|---|---|
+| .10 | (2,1,1,164) | (32,4,4,20 or21) | 22100 / 17792 or18368 | 660 / 1344 or1408 |
+| .25 | (2,1,1,66) | (16,4,4,13) | 9164 / 6912 | 268 / 448 |
+
+The reductions are 16.9–19.5% and 24.6%, respectively. These are proxy-compute
+gains under a common memory CAP, with more actual memory used by the shared
+writer; they are not Pareto improvements in both compute and storage. The
+remaining three nominal wins are J16,Q1,epsilon.25 with cost 2400 versus 2404,
+only .17% and unsuitable as a practical headline. Independent writing wins
+every Q32 comparison and all comparisons in the correlated family.
+
+The fixed, analytically audited two-fact witness at J32,p32,h=tau2,D12 was
+confirmed on fresh samples. Its three conditional-reference errors were
+.0936774,.0936513,.0941990, versus prediction .0939080. All three pointwise
+95% intervals contain the prediction and lie below .10. Sampled-LA means
+were .0933891,.0933201,.0947618. The witness's proof of cost19328 below the
+continuous independent lowerbound20912 is separate from the empirically
+selected h4 configurations, and does not rely on a discrete-D oracle.
+
+**Uncertainty and scope:** finer D puts many feasible-oracle choices near
+the boundary: 41/48 unrestricted views have a cheaper interval-uncertain
+alternative to the interval-feasible oracle. Thus exact rankings are not
+statistically certified. At the stricter .95*epsilon diagnostic target,
+unrestricted coverage is 40/48; at the actual epsilon it is 48/48. This
+diagnostic boundary sensitivity must not be hidden by the primary pass.
+Full-grid moment-transfer error grows with h, and sampled LA remains a
+consistency check using the same conditional-reference identity.
+
+The correlated generator's latent blocks coincide with reset groups, so
+changing h also changes the joint address distribution. Those results
+describe a reset-conditioned family, not an intervention on one fixed
+correlated fact stream. IID comparisons share the same population and
+support the principal gain. Exogenous fixed correlation blocks would require
+a revised transfer analysis when dependence crosses reset boundaries.
+
+This study does not compare against enlarged local-only memory, layerwise
+tokens, LoRA, or learned content routing, and establishes no convergence or
+wall-clock advantage. Those remain necessary for the broader contribution.
+
+**Verification and decision:** all 40 focused/prior linear tests passed.
+The run produced 324 calibration rows, 2592 predicted frontiers, 648 held-out
+local moment rows, 144 policy views, and 72 unique sampled-LA checks. All
+selected conditional-reference intervals and sampled-LA point means were
+feasible at the original target. The final dependency hashes match those
+sealed before evaluation. Independent audits covered theory, implementation,
+and interpretation. Cycle 1 is complete and this milestone is reached; stop
+here under AGENTS.md. Accept the restricted IID compute/storage crossover
+and retain the enlarged local-only comparison as the next proposed milestone.
+
+## Local-only comparison specification: EXP-LM-004 (2026-11-11)
+
+**Cycle 1 question:** when does hierarchy reduce the operation proxy relative
+to an enlarged local-only associative memory under the same expected-error
+requirement and persistent-state cap? The scientist brief is
+`tasks/LOCAL_ONLY_COMPARISON_TASK.md`. Compare both carried delta-rule memory
+and direct additive memory; the second control separates a hierarchy benefit
+from the cost of a particular local update rule. A negative or mixed outcome
+is a valid completed milestone.
+
+### Exact IID theory, independently audited before execution
+
+For a v-by-p delta memory with eta=K=1, unit spherical IID keys and independent
+zero-mean unit values, let a_n=E||W_n||_F^2 and let R_n be the sum, over the n
+stored facts, of E||W_n*x_j||^2. Define lambda=1-1/p and
+beta=1-2/p+2/[p(p+2)]. Then
+
+    a_0=R_0=0,
+    a_n=lambda*a_(n-1)+1,
+    R_n=beta*R_(n-1)+(n-1)*(a_(n-1)/[p(p+2)]+1/p)+1,
+    delta_n(p)=(R_n-2*a_n+n)/n.
+
+The first recurrence follows because the retained and newly written matrix
+components have orthogonal right factors. The second follows from the
+spherical fourth moment; the new fact is read exactly. Summed target-response
+alignment obeys the same recurrence as a_n, giving the final error formula.
+At p1, delta_n=2(n-1)/n (complete replacement); at n2 it reduces to the
+previous .5*(1/p+3/[p(p+2)]) result.
+
+For a snapshot at time c and a fact j, response energy e_cj is a_c/p before
+the fact arrives, equals1 at c=j, and subsequently obeys
+
+    e_cj=beta*e_(c-1,j)+a_(c-1)/[p(p+2)]+1/p.
+
+Its target alignment after arrival is lambda^(c-j). Consequently, delta,
+same-group distractor energy A0, and cross-group energy B for every h,tau
+schedule can all be computed exactly using the existing routing rule. This
+extends delta+[A0+(J/h-1)B]/D beyond the earlier h1/h2 special cases. No
+empirical calibration is required in this IID study.
+
+An additional independently audited fixed-J, large-p expansion is
+
+    delta_J(p)=(J-1)/(2p)+(J-1)(2J+5)/(6p^2)+O(p^-3).
+
+Consequently, as epsilon tends to zero with continuous widths and no active
+cap, p_delta=(J-1)/(2epsilon)+(2J+5)/3+O(epsilon), versus
+p_additive=(J-1)/epsilon. Delta writing corrects the current fact exactly;
+to leading order only subsequent writes interfere with that fact, whereas
+additive writing leaves interference from both earlier and later facts.
+This explains the leading factor-of-two capacity advantage of local delta
+memory. Its more expensive writes counterbalance that smaller state: under
+the proxy the leading local-delta/additive cost crossover is Q=J. Finite-error
+width corrections shift the continuous crossover upward; integer allocation
+and a binding cap need the exact calculation. This asymptotic is explanatory
+theory, not an extra evaluated workload or a universal memory-capacity claim.
+
+### Frozen comparison and validation design
+
+All methods use v2, J={16,32}, Q={1,32}, epsilon={.10,.25}, and persistent
+state cap2048 scalars. The primary frontier is the exact population optimum
+at epsilon. An additional .95*epsilon selection for every method is a shared
+robustness sensitivity, not protection against calibration error.
+
+| Method | Eligible dimensions | Persistent state | Operation proxy |
+|---|---|---|---|
+| Carried local delta | every integer p1..1024 | pv | J(3pv+v)+Qpv |
+| Local additive W+=yx^T | every integer p1..1024 | pv | (J+Q)pv |
+| Delta plus global LA | every integer p,D>=1 with pv(1+D)<=2048; all divisor h of J and divisor tau of h | pv(1+D) | J(3pv+v)+(J/tau)Dpv+Q(Dpv+pv) |
+
+The additive error is exactly (J-1)/p. All comparisons use the same existing
+mixed-operation/MAC convention, report its components, and assign no fictitious
+LA overhead to local-only methods. No result is claimed at equal actual state
+use merely because the cap is shared. The hierarchy receives an oracle global
+route in addition to its local address; address construction and routing
+metadata costs remain excluded. Varying p changes the random representation,
+so the comparison is for an IID address family, not arbitrary fixed inputs.
+
+Seal exact candidates, optima and reserve selections, config, protocol, and
+imported code before held-out generation. Fresh seeds7707,8808,9909 use1024
+episodes. Evaluate unique selected allocations at both targets, immediate
+local-width or hierarchical-D boundary neighbors, and fixed known/p1 checks.
+For the same p,J, pair the flat IID key/value stream across all methods and
+reset horizons before grouping. Different widths may use separate recorded
+random streams. Omit the reset-conditioned correlated family.
+
+Acceptance for empirical deployment feasibility is >=90% coverage at epsilon
+for each method's reserve selections when its population oracle is feasible;
+empty denominators cannot pass. Primary epsilon choices may lie on a true
+population boundary, so sample means above that boundary are not automatically
+model failures. Report theory/measurement residuals, pointwise intervals,
+reserve sensitivity, and direct sampled-LA consistency without using held-out
+data to replace the analytic oracle or retune choices. Only the evaluated
+subset receives empirical validation; no full-grid simulation is claimed.
+
+**Status:** completed after independent theory/core/runner audits and PI
+release. The frozen design above was not changed after held-out generation.
+
+## Local-only comparison results: EXP-LM-004 (2026-11-11)
+
+The exact bounded integer comparison has a mixed result. Costs below are the
+registered operation proxy, optimized separately at the same population-error
+target and 2048-scalar cap. The winner is the overall minimum;
+actual storage and achieved errors differ across methods.
+
+| J | Q | epsilon | Local delta cost | Local additive cost | Hierarchical cost | Winner |
+|---|---|---|---|---|---|---|
+| 16 | 1 | .10 | 8362 | 5100 | 5230 | Additive |
+| 16 | 1 | .25 | 3658 | 2040 | 2170 | Additive |
+| 16 | 32 | .10 | 13632 | 14400 | 14592 | Delta |
+| 16 | 32 | .25 | 5952 | 5760 | 5952 | Additive |
+| 32 | 1 | .10 | 33432 | 20460 | 16054 | Hierarchy |
+| 32 | 1 | .25 | 14420 | 8184 | 6624 | Hierarchy |
+| 32 | 32 | .10 | 44096 | 39680 | 40000 | Additive |
+| 32 | 32 | .25 | 19008 | 15872 | 16192 | Additive |
+
+At J32,Q1, hierarchy uses h=tau=4,D=12, with p39 at epsilon .10
+and p16 at epsilon .25. Its population errors are .09990219 and .24653972.
+Against the stronger local-only comparator (additive), proxy costs fall by
+21.53% and 19.06%, while state grows from 620 to 1014 scalars and from 248
+to 416. Local delta uses even less state (344 and 148) but costs more. This
+is a compute/storage tradeoff within a common cap, not Pareto dominance.
+
+All other hierarchical optima use p1,h=tau=1 and are more expensive than
+direct additive memory. Local delta wins J16,Q32,epsilon .10: its p85
+state uses 170 scalars and costs 13632, versus additive p150,300 scalars,
+cost14400. The asymptotic capacity advantage of delta writing therefore
+does not by itself imply a compute advantage: query count, finite-error
+corrections, and integer widths matter. No selected hierarchy uses an
+intermediate commit tau<h; this comparison adds no evidence of an
+optimization benefit from intermediate anchors.
+
+**Verification:** 180224 analytic frontier rows yield 64 selection rows;
+59 unique allocations (including frozen neighbors/fixed checks) were evaluated
+on three fresh seeds with 1024 episodes each. The 177 seed/configuration rows
+have median absolute prediction residual .00033276 and maximum .00772436.
+All three methods achieve 24/24 deployment-epsilon feasible reserve views;
+hierarchy also achieves 24/24 using direct sampled LA. All 24 reference
+reserve intervals per method lie below deployment epsilon. These are dependent
+views, not 24 independent replications. The 5% reserve costs a median
+5.29%/5.56%/5.35% extra for delta/additive/hierarchy, respectively.
+
+Primary choices at the exact epsilon boundary are only point-feasible in
+14/24 delta, 12/24 additive, and 13/24 hierarchical views. This is compatible
+with finite-sample fluctuation around a population boundary, and is reported
+separately from reserve acceptance. No outcomes were used to revise selections.
+The hierarchy reference averages over global keys conditionally; direct
+sampled LA is an additional check, with median/max absolute differences
+.00084533/.00468345 over 72 rows. Pointwise intervals are not simultaneous
+guarantees. Only the registered subset, not the full analytic frontier, was
+simulated.
+
+The final independent evidence audit confirmed all table and coverage
+aggregates. Raw theory-in-interval coverage is 137/177; 36 exclusions are
+deterministic p1,h1 reference roundoff at about 1e-17. With an explicitly
+reported 1e-15 comparison tolerance, coverage is 173/177. The four material
+pointwise misses and the numerical diagnostic are retained in the report;
+none changes the frozen population selections or acceptance rule.
+
+**Reproducibility:** 76 focused/prior tests pass. Prediction/selection took
+18.15s internally and evaluation 26.42s on CPU. These are study execution
+times, not method performance benchmarks. The selection artifact hash is
+`d69b256e487807cffe3f9326262bc025ed5e40fef0b0e8212bee211b7d6029f3`.
+Source/config/protocol/imported dependencies were sealed before evaluation;
+previous experiment sources and artifacts were preserved. Report:
+`reports/LOCAL_ONLY_COMPARISON_RESULTS.md`; artifacts:
+`reports/results/linear_memory/EXP-LM-004/`.
+
+**Scope and decision:** accept the restricted IID low-query hierarchy win
+against both enlarged one-level comparators, along with its larger state and
+the six local-only wins. Changing p changes the supplied random address
+representation; hierarchy additionally receives oracle global routing.
+Address construction, metadata, temporary buffers, and learned encoders are
+outside the cost/state proxy. The result therefore makes no universal,
+transformer, LoRA, or wall-clock claim. Cycle 1/5 reaches the declared
+milestone; stop here. Measured costs and competitive transformer baselines
+are the next proposed work, not runs launched by this study.
+
 ## Hypotheses ledger
 
 | hypothesis | status | strongest support | strongest doubt / missing |
 |---|---|---|---|
 | **H1** independently written per-segment memories + attention retrieval beat carried memory on forgetting | **supported** (KV single-key) | fact 2: all pairs stored with 2 tokens / 8 pairs / 4 segments; clean forgetting matrices | not yet shown at large segment counts (N ≥ 64 is confounded by read superposition); carried-memory control now tabulated on the identical curriculum (2026-11-09): 0.82/0.48/0.15 vs interface 0.99/0.99/0.93 at N=8/16/32 (budget unmatched by design: 2 carried tokens vs N stored); its forgetting matrices are still on the remote only |
 | **H2** the concat failure is a **read-interface** bottleneck, not a write-quality one | **supported** (ladder, 2026-10-22) | facts 5–7; the ran control: bank-prefix fails at 0.024 WHILE (c)/(d)/(d′) reach 1.00/0.997/0.999 on the SAME stored tokens — the prefix interface, not write quality, is indicted (fact 8) | prefix-interface failure is established only at this training scale (4L/128d from scratch); a pretrained/larger frozen reader might yet make the prefix work |
-| **H3** per-token, per-level linear-attention reads from a shared state (`S = Σkᵢvᵢᵀ`), added as a bias to softmax attention over the query context, fix routing + payload + iteration at O(1) read cost | **supported for routing+payload** (ladder 2026-10-22: 0.995–1.00 vs 0.25/0.02 controls; single-key 0.997+); implementation STATUS.md 2026-10-18 (b)/(c) | facts 8–9; interface variant (d′) matches all-position reads at M·L sites — cheaper architecture suffices given pass-1 conditioning | the **iteration** claim (pointer chasing, depth-bounded multi-hop) is untested; **O(1)-read capacity is bounded**: at d_h=32, superposition binds at N=32 on single-key (Δ(32)=0.052; EM 0.41 at N=64; [report](reports/INTERFERENCE_CURVE_RESULTS.md)). O(1) reads hold only while N ≲ d_h per head (capacity hypothesis, d_h sweep pending) |
+| **H3** per-token, per-level linear-attention reads from a shared state (`S = Σkᵢvᵢᵀ`), added as a bias to softmax attention over the query context, fix routing + payload + iteration at O(1) read cost | **supported for routing+payload** (ladder 2026-10-22: 0.995–1.00 vs 0.25/0.02 controls; single-key 0.997+); implementation STATUS.md 2026-10-18 (b)/(c) | facts 8–9; interface variant (d′) matches all-position reads at M·L sites — cheaper architecture suffices given pass-1 conditioning | the **iteration** claim (pointer chasing, depth-bounded multi-hop) is untested; **O(1)-read capacity is bounded**: at d_h=32, superposition binds at N=32 on single-key (Δ(32)=0.065 converged; Δ(64)=0.58 — EM 0.41 vs control 0.99 at identical protocol; control ≥ 0.99 through N=96; [report](reports/INTERFERENCE_CURVE_RESULTS.md)). O(1) reads hold only while N ≲ d_h per head (capacity hypothesis, d_h sweep pending) |
 
 ## Missing experiments (decision-critical, in priority order)
 
-1. **Interference curve vs N** — **PARTIAL RESULTS (2026-11-09,
+1. **Interference curve vs N** — **DECIDED (2026-11-12,
    [`reports/INTERFERENCE_CURVE_RESULTS.md`](reports/INTERFERENCE_CURVE_RESULTS.md)):
-   superposition binds at N=32.** Both jobs (`ccde14ed`, `7c2ed873`) died on
-   2026-11-03 (an interrupt, then a full disk). Still missing: the softmax
-   control at N ≥ 32 (P1, Δ(64)), N96 for all arms, and the adaptive arm's
-   forgetting matrices (remote only). Manifest:
-   [`kv_interference_curve.yaml`](manifests/kv_interference_curve.yaml).
-   Protocol per user: single-key KV, checkpoint-chained curriculum
-   N ∈ {8,16,32,64,96}, 50k steps/phase, 0.99-EM early stop; arms
-   `interface` + `interface_softmax` (user-selected: hopfield dropped,
-   linear-all deferred — definitions kept in the chain script for a later
-   manifest). Revision-2 predictions P1–P3 in the manifest header.
-   `read_state_cross_talk` rose 0.127 → 0.143 and saturated at the
-   random-key |cos| for d_h=32. Superposition binds, so the planned
-   mitigation applies: coarse top-k segment routing (reuse the
-   compressed-query scores) before building the state. The direct capacity
-   test is d_h = 64 (#2 arm2) on this curriculum.
+   superposition binds at N=32; total collapse at N=64.** After the
+   2026-11-03 double infrastructure failure, the softmax control was resumed
+   (job `960c43c4`, manifest
+   [`kv_interference_softmax_resume.yaml`](manifests/kv_interference_softmax_resume.yaml))
+   and completed the full curriculum: EM ≥ 0.99 at every phase through N=96.
+   Δ(N) = 0.0005 / 0.0025 / 0.065 / 0.58 at N=8/16/32/64. Still missing and
+   judged low-information: interface N96 (~10+ days, Δ(96) stays undefined),
+   adaptive N64/N96. The adaptive arm's forgetting matrices are in the remote
+   archive only. Protocol per user: single-key KV, checkpoint-chained
+   curriculum N ∈ {8,16,32,64,96}, 50k steps/phase, 0.99-EM early stop; arms
+   `interface` + `interface_softmax` (user-selected). `read_state_cross_talk`
+   rose 0.127 → 0.143 and saturated at the random-key |cos| for d_h=32.
+   Superposition binds, so the planned mitigation applies: coarse top-k
+   segment routing (reuse the compressed-query scores) before building the
+   state. The direct capacity test is d_h = 64 (#2 arm2) on this curriculum.
 2. **Interface read: kernel × key-geometry cells** —
    [`manifests/kv_interface_softmax.yaml`](manifests/kv_interface_softmax.yaml):
    arm1 softmax kernel (config-only), arm2 key width 64 = the old hopfield

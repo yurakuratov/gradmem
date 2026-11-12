@@ -1,0 +1,51 @@
+{
+  "experiment_id": "EXP-LM-004",
+  "output_dir": "reports/results/linear_memory/EXP-LM-004",
+  "seeds": [7707, 8808, 9909],
+  "task": {
+    "geometry": "iid_unit_sphere",
+    "num_facts": [16, 32],
+    "num_queries": [1, 32],
+    "target_errors": [0.1, 0.25],
+    "value_dim": 2,
+    "eta": 1.0,
+    "inner_steps": 1
+  },
+  "allocation": {
+    "mutable_state_cap_scalars": 2048,
+    "local_width_rule": "every integer p from 1 through floor(memory_cap/value_dim)",
+    "hierarchy_rule": "every h dividing J, every tau dividing h, every affordable integer p,D>=1",
+    "threshold_multipliers": [1.0, 0.95],
+    "method_order": ["local_delta", "local_additive", "hierarchical"],
+    "tie_break": ["operation_proxy", "mutable_state_scalars", "method_order", "p", "h", "tau", "D"],
+    "cost_description": "local delta J*(3*p*v+v)+Q*p*v; local additive (J+Q)*p*v; hierarchy J*(3*p*v+v)+(J/tau)*D*p*v+Q*(D*p*v+p*v)",
+    "memory_description": "local methods p*v; hierarchy p*v*(1+D); supplied addresses, oracle routing, metadata, and temporary arithmetic excluded"
+  },
+  "heldout": {
+    "episodes_per_configuration": 1024,
+    "local_seed_offset": 510000,
+    "value_seed_offset": 520000,
+    "global_key_seed_offset": 530000,
+    "confidence_z": 1.96,
+    "evaluate": "deduplicated selection union at epsilon and 0.95*epsilon, registered primary neighbors, and fixed checks"
+  },
+  "fixed_checks": [
+    {"name": "hierarchy_iid_witness", "method": "hierarchical", "J": 32, "p": 32, "h": 2, "tau": 2, "D": 12, "theory_error": 0.09390797334558823},
+    {"name": "local_delta_J16_p16", "method": "local_delta", "J": 16, "p": 16},
+    {"name": "local_delta_J32_p32", "method": "local_delta", "J": 32, "p": 32},
+    {"name": "local_additive_boundary", "method": "local_additive", "J": 32, "p": 310, "theory_error": 0.1},
+    {"name": "local_delta_p1", "method": "local_delta", "J": 16, "p": 1, "theory_error": 1.875}
+  ],
+  "acceptance": {
+    "reserve_selection_deployment_epsilon_coverage_min": 0.9,
+    "empty_denominator_passes": false
+  },
+  "runtime": {
+    "device": "cpu",
+    "dtype": "float64",
+    "torch_num_threads": 1,
+    "torch_num_interop_threads": 1,
+    "deterministic_algorithms": true,
+    "scientific_stage_time_limit_seconds": 600
+  }
+}

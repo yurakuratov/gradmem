@@ -1,0 +1,18 @@
+{
+  "analytic_frontiers_sha256": "ce61099ea810e71b458b5d6e37dd99f80cd16eb3f0b8b360205b306555794ff0",
+  "command": "/home/evgenio/Activity/running/gradmem/test_time_gd/experiments/linear_memory/run_local_only_comparison.py --config experiments/linear_memory/local_only_comparison_config.json --stage predict-select",
+  "completed_at_utc": "2026-11-11T15:32:43.756892+00:00",
+  "elapsed_seconds": 18.14883562400064,
+  "evaluation_configurations": 59,
+  "frontier_rows": 180224,
+  "input_hashes": {
+    "allocation_code": "2a2ce0d7067650808d75dadf431eb5d59bcf5081724a7462c9b14fb8f8d527eb",
+    "config": "45d3ffbc968d67c3f69b2e6f78d4e2cfe28e04aad04a415a017ae22c86336d75",
+    "model_code": "03cd61523d5add87528eda2cc6693bd1cc8db1f7b7164a8b5a377e7f9404e114",
+    "protocol": "8340d7f8302bf83bdd5c2703e0cad82fac3653a027d9d106a1281ac061400dab",
+    "runner_code": "4533c40310073cc98ada69c83109ed67e32b8cfc86951d32573777b7e2bd664a",
+    "theory_code": "d83dba5d3c86010f8e7baa217f1dc9f38653ee553efd1401a044f04ecb69d825"
+  },
+  "selection_rows": 64,
+  "selections_preregistered_sha256": "d69b256e487807cffe3f9326262bc025ed5e40fef0b0e8212bee211b7d6029f3"
+}

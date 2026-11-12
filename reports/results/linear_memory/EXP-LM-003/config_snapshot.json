@@ -1,0 +1,66 @@
+{
+  "experiment_id": "EXP-LM-003",
+  "output_dir": "reports/results/linear_memory/EXP-LM-003",
+  "seeds": [4404, 5505, 6606],
+  "geometry": {
+    "regimes": ["iid", "correlated"],
+    "correlated_mixing_coefficient": 0.7,
+    "description": "Fresh marginally isotropic unit local addresses per episode and reset group. Correlated addresses normalize sqrt(a)*u_group + sqrt(1-a)*e_fact; a=0.7 is a mixing coefficient, not the realized cosine."
+  },
+  "grid": {
+    "local_dims": [2, 4, 8, 16, 32, 64],
+    "reset_horizons": [1, 2, 4, 8],
+    "tau_rule": "unique values from [1,2,h] satisfying tau<=h",
+    "global_dim_rule": "every positive integer D satisfying p*v*(1+D)<=2048",
+    "value_dim": 2,
+    "eta": 1.0,
+    "inner_steps": 1
+  },
+  "calibration": {
+    "groups_per_local_configuration": 4096,
+    "seed_offset": 410000,
+    "h1_selector_moments": {"delta": 0.0, "A0": 0.0, "B_formula": "1/p"},
+    "empirical_h1_is_diagnostic_only": true
+  },
+  "heldout": {
+    "num_segments": [16, 32],
+    "episodes_per_local_configuration": 1024,
+    "num_queries": [1, 32],
+    "target_errors": [0.1, 0.25],
+    "seed_offset": 420000,
+    "global_key_seed_offset": 430000
+  },
+  "selection": {
+    "folded_inference_memory_cap_scalars": 2048,
+    "predicted_error_slack_multiplier": 0.95,
+    "policies": ["unrestricted", "independent", "shared"],
+    "tie_break": ["operation_proxy", "folded_inference_memory_scalars", "p", "h", "tau", "D"],
+    "cost_description": "J*(3*p*v+v) local write operations + C*D*p*v state-build MAC + Q*(D*p*v+p*v) read MAC",
+    "memory_description": "p*v + D*p*v folded inference scalars; address generation, oracle routing, and route metadata excluded"
+  },
+  "fixed_checks": [
+    {"name": "iid_shared_witness", "geometry": "iid", "J": 16, "p": 16, "h": 2, "tau": 2, "D": 16, "theory_error": 0.08943684895833333, "theory_cost_Q1": 6208},
+    {"name": "iid_independent_boundary", "geometry": "iid", "J": 16, "p": 2, "h": 1, "tau": 1, "D": 75, "theory_error": 0.1, "theory_cost_Q1": 5328},
+    {"name": "iid_shared_lowQ_witness", "geometry": "iid", "J": 32, "p": 32, "h": 2, "tau": 2, "D": 12, "theory_error": 0.09390797334558823, "theory_cost_Q1": 19328, "independent_true_epsilon_cost_lower_bound_Q1": 20912},
+    {"name": "sentinel_iid", "geometry": "iid", "J": 16, "p": 4, "h": 4, "tau": 1, "D": 32},
+    {"name": "sentinel_correlated", "geometry": "correlated", "J": 16, "p": 4, "h": 4, "tau": 1, "D": 32}
+  ],
+  "acceptance": {
+    "oracle_scenario_coverage_min": 0.9,
+    "median_feasible_cost_regret_max": 0.1,
+    "confidence_z": 1.96,
+    "empty_oracle_denominator_passes": false
+  },
+  "diagnostics": {
+    "slack_matched_oracle_target_multiplier": 0.95,
+    "description": "Post-selection diagnostic registered before data: repeat point-oracle coverage/regret at the selector threshold to separate prediction error from the cost of the 5% slack. Primary acceptance remains against the actual epsilon oracle."
+  },
+  "runtime": {
+    "device": "cpu",
+    "dtype": "float64",
+    "torch_num_threads": 1,
+    "torch_num_interop_threads": 1,
+    "deterministic_algorithms": true,
+    "scientific_run_time_limit_seconds": 600
+  }
+}

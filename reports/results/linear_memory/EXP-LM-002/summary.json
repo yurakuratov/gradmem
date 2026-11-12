@@ -1,0 +1,71 @@
+{
+  "acceptance": {
+    "feasible_rate_threshold": 0.9,
+    "median_regret_threshold": 0.1,
+    "passed": true
+  },
+  "candidate_metric_rows": 1944,
+  "completed_at_utc": "2026-11-11T12:15:07.315507+00:00",
+  "elapsed_seconds": 14.968194839999342,
+  "experiment_id": "EXP-LM-002",
+  "policy_summaries": {
+    "endpoint_p4": {
+      "false_feasible": 0,
+      "false_infeasible": 0,
+      "max_feasible_cost_regret": 0.08153078202995001,
+      "max_prediction_abs_error": 0.0016613322982080292,
+      "median_feasible_cost_regret": 0.026066126456497307,
+      "median_prediction_abs_error": 0.00033234073955162174,
+      "no_selection": 0,
+      "point_reference_feasible": 48,
+      "point_reference_feasible_rate_among_selected": 1.0,
+      "reference_interval_feasible": 48,
+      "reference_interval_infeasible": 0,
+      "reference_interval_uncertain": 0,
+      "sampled_point_feasible": 48,
+      "scenarios": 48,
+      "selected": 48
+    },
+    "independent_p4": {
+      "false_feasible": 0,
+      "false_infeasible": 0,
+      "max_feasible_cost_regret": 0.08153078202995001,
+      "max_prediction_abs_error": 0.0016613322982080292,
+      "median_feasible_cost_regret": 0.026066126456497307,
+      "median_prediction_abs_error": 0.00033234073955162174,
+      "no_selection": 0,
+      "point_reference_feasible": 48,
+      "point_reference_feasible_rate_among_selected": 1.0,
+      "reference_interval_feasible": 48,
+      "reference_interval_infeasible": 0,
+      "reference_interval_uncertain": 0,
+      "sampled_point_feasible": 48,
+      "scenarios": 48,
+      "selected": 48
+    },
+    "theory": {
+      "false_feasible": 0,
+      "false_infeasible": 0,
+      "max_feasible_cost_regret": 0.0,
+      "max_prediction_abs_error": 0.0016458338004368411,
+      "median_feasible_cost_regret": 0.0,
+      "median_prediction_abs_error": 0.00016871836019957676,
+      "no_selection": 0,
+      "point_reference_feasible": 48,
+      "point_reference_feasible_rate_among_selected": 1.0,
+      "reference_interval_feasible": 48,
+      "reference_interval_infeasible": 0,
+      "reference_interval_uncertain": 0,
+      "sampled_point_feasible": 48,
+      "scenarios": 48,
+      "selected": 48
+    }
+  },
+  "sampled_la_validation": {
+    "max_abs_sampled_minus_reference": 0.21483579410397358,
+    "mean_sampled_minus_reference": -0.0006040737114822262,
+    "median_abs_sampled_minus_reference": 0.004744975863304524
+  },
+  "scope": "Three seeds and two known geometry regimes; no writer fitting or optimization claim.",
+  "selection_evaluation_rows": 144
+}

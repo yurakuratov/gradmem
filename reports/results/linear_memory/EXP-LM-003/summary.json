@@ -1,0 +1,122 @@
+{
+  "acceptance_passed": true,
+  "completed_at_utc": "2026-11-11T14:02:59.575803+00:00",
+  "elapsed_seconds": 82.81335996900089,
+  "experiment_id": "EXP-LM-003",
+  "full_grid_transfer_by_h": {
+    "1": {
+      "local_configuration_views": 72,
+      "max_local_max_abs_error_over_D": 0.026963372894603488,
+      "median_local_mean_abs_error_over_D": 0.0001315622112871978
+    },
+    "2": {
+      "local_configuration_views": 144,
+      "max_local_max_abs_error_over_D": 0.11779668393199927,
+      "median_local_mean_abs_error_over_D": 0.0006370908167365654
+    },
+    "4": {
+      "local_configuration_views": 216,
+      "max_local_max_abs_error_over_D": 0.18855951247821778,
+      "median_local_mean_abs_error_over_D": 0.001219103226856273
+    },
+    "8": {
+      "local_configuration_views": 216,
+      "max_local_max_abs_error_over_D": 0.3299853631101719,
+      "median_local_mean_abs_error_over_D": 0.0020149655587968773
+    }
+  },
+  "policy_summaries": {
+    "independent": {
+      "certified_oracle_scenarios": 48,
+      "cheaper_interval_uncertain": 48,
+      "false_feasible": 0,
+      "false_infeasible": 0,
+      "max_feasible_cost_regret": 0.06282722513089012,
+      "median_certified_cost_regret": 0.041854065396458195,
+      "median_feasible_cost_regret": 0.048078792764803646,
+      "primary_point_oracle": {
+        "coverage": 1.0,
+        "coverage_passed": true,
+        "coverage_threshold": 0.9,
+        "oracle_existing_scenarios": 48,
+        "oracle_existing_with_feasible_selection": 48
+      },
+      "scenarios": 48,
+      "selected": 48,
+      "slack_matched_diagnostic": {
+        "coverage": 0.8333333333333334,
+        "coverage_passed": false,
+        "coverage_threshold": 0.9,
+        "max_cost_regret": 0.0,
+        "median_cost_regret": 0.0,
+        "oracle_existing_scenarios": 48,
+        "oracle_existing_with_feasible_selection": 40
+      }
+    },
+    "shared": {
+      "certified_oracle_scenarios": 48,
+      "cheaper_interval_uncertain": 24,
+      "false_feasible": 0,
+      "false_infeasible": 0,
+      "max_feasible_cost_regret": 0.10384615384615392,
+      "median_certified_cost_regret": 0.04806408544726293,
+      "median_feasible_cost_regret": 0.05266122625839531,
+      "primary_point_oracle": {
+        "coverage": 1.0,
+        "coverage_passed": true,
+        "coverage_threshold": 0.9,
+        "oracle_existing_scenarios": 48,
+        "oracle_existing_with_feasible_selection": 48
+      },
+      "scenarios": 48,
+      "selected": 48,
+      "slack_matched_diagnostic": {
+        "coverage": 0.9791666666666666,
+        "coverage_passed": true,
+        "coverage_threshold": 0.9,
+        "max_cost_regret": 0.08540925266903909,
+        "median_cost_regret": 0.0,
+        "oracle_existing_scenarios": 48,
+        "oracle_existing_with_feasible_selection": 47
+      }
+    },
+    "unrestricted": {
+      "certified_oracle_scenarios": 48,
+      "cheaper_interval_uncertain": 41,
+      "false_feasible": 0,
+      "false_infeasible": 0,
+      "max_feasible_cost_regret": 0.10384615384615392,
+      "median_certified_cost_regret": 0.04347826086956519,
+      "median_feasible_cost_regret": 0.048078792764803646,
+      "primary_point_oracle": {
+        "coverage": 1.0,
+        "coverage_passed": true,
+        "coverage_threshold": 0.9,
+        "oracle_existing_scenarios": 48,
+        "oracle_existing_with_feasible_selection": 48
+      },
+      "scenarios": 48,
+      "selected": 48,
+      "slack_matched_diagnostic": {
+        "coverage": 0.8333333333333334,
+        "coverage_passed": false,
+        "coverage_threshold": 0.9,
+        "max_cost_regret": 0.03237410071942448,
+        "median_cost_regret": 0.0,
+        "oracle_existing_scenarios": 48,
+        "oracle_existing_with_feasible_selection": 40
+      }
+    }
+  },
+  "sampled_la_consistency": {
+    "max_abs_sampled_minus_reference": 0.0050649169457624155,
+    "median_abs_sampled_minus_reference": 0.0007974070355635174,
+    "unique_rows": 72
+  },
+  "sharing_comparison": {
+    "dependent_views_note": "rows reuse episode sets across Q and epsilon",
+    "reporting_rows": 48,
+    "restricted_oracle_shared_wins": 9,
+    "selected_shared_wins": 9
+  }
+}

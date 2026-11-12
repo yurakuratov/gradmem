@@ -1,0 +1,25 @@
+{
+  "calibration_sha256": "98beefb110c68012676a8a4c30f19cff6db49642ec2c985aabeb7bb55bf0784c",
+  "command": "/home/evgenio/Activity/running/gradmem/test_time_gd/experiments/linear_memory/run_refined_allocation.py --config experiments/linear_memory/refined_allocation_config.json --stage evaluate",
+  "completed_at_utc": "2026-11-11T14:02:59.576138+00:00",
+  "config_snapshot_sha256": "431c8cf74efdd7ff4f022914ff7fb845102ba1003e21cb0aa4faa0b59ca808a7",
+  "git_head": "710c110f111fc447a5e2ffb29e051643ed5cdfa6",
+  "git_status": "M PROGRESS.md\n M STATUS.md\n M experiments/linear_memory/.gitignore\n M notebooks/collect_results.ipynb\n M notebooks/dump_babi_dataset.ipynb\n M notebooks/dump_dataset.ipynb\n?? docs/HIERARCHICAL_MEMORY_INTRODUCTION.md\n?? experiments/linear_memory/allocation.py\n?? experiments/linear_memory/allocation_audit_config.json\n?? experiments/linear_memory/allocation_audit_protocol.md\n?? experiments/linear_memory/allocation_config.json\n?? experiments/linear_memory/allocation_protocol.md\n?? experiments/linear_memory/refined_allocation.py\n?? experiments/linear_memory/refined_allocation_config.json\n?? experiments/linear_memory/refined_allocation_protocol.md\n?? experiments/linear_memory/run_allocation.py\n?? experiments/linear_memory/run_refined_allocation.py\n?? reports/ALLOCATION_TRANSFER_RESULTS.md\n?? reports/results/linear_memory/EXP-LM-002-AUDIT/\n?? reports/results/linear_memory/EXP-LM-002/\n?? reports/results/linear_memory/EXP-LM-003/\n?? research/\n?? tasks/REFINED_ALLOCATION_TASK.md\n?? tests/test_linear_memory_allocation.py\n?? tests/test_linear_memory_refined_allocation.py",
+  "heldout_moments_sha256": "669422c4a15ae1f82a2e5379a1b3b2ef2585159d0dc1ad48d50391b52f192b61",
+  "input_hashes": {
+    "allocation_code": "2a2ce0d7067650808d75dadf431eb5d59bcf5081724a7462c9b14fb8f8d527eb",
+    "config": "431c8cf74efdd7ff4f022914ff7fb845102ba1003e21cb0aa4faa0b59ca808a7",
+    "model_code": "03cd61523d5add87528eda2cc6693bd1cc8db1f7b7164a8b5a377e7f9404e114",
+    "protocol": "5af3d9da92ce46679c3245a20574e8ac684665582b543b6682d4656903e5f845",
+    "refined_code": "b02a8050bc056c05fc56bd0d15e4f8279f79bb0a91385f60085938cc1ceb0245",
+    "runner_code": "f436c78d64c64e81c6b8c9ff30a974ae1f49cc919cdcab366cac62ff68c839b2"
+  },
+  "platform": "Linux-6.6.156-2-MANJARO-x86_64-with-glibc2.44",
+  "policy_evaluation_sha256": "4b58b3de3451e451620620f0fe16bf2ff425b8db0d34fa286386c4a44234f5c7",
+  "prediction_frontiers_sha256": "a2c23c57a1ede0a83c3307a3bf27b55eddd5af91a7a98087c5ed27a8fbc67ede",
+  "python": "3.11.15 (main, May 10 2026, 19:28:18) [Clang 22.1.3 ]",
+  "rng_scheme": "SHA-256-derived disjoint calibration/local-test/global-key streams; held-out values shared over p,h,tau,geometry for seed/J; addresses shared over tau; global raw Gaussian prefixes shared over requested D.",
+  "selections_preregistered_sha256": "d97868b12e8ed1a6082f905c76bc373d5933e092b124c6ae143671a3aefec500",
+  "summary_sha256": "7d922ded40e65ce23a6339fb1584b2c69d143e02202b354d35b1a628895bc58c",
+  "torch": "2.5.1+cu121"
+}

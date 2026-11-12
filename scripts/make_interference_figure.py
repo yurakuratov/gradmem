@@ -76,12 +76,12 @@ def main():
     ax = axes[1]
     for arm in ["interface", "interface_softmax", "adaptive"]:
         label, color, _ = STYLE[arm]
-        xs = [n for n in [16, 32, 64] if phase(S, arm, n)]
+        xs = [n for n in [16, 32, 64, 96] if phase(S, arm, n)]
         ys = [phase(S, arm, n)["mean_step0_em"] for n in xs]
         ax.plot(xs, ys, color=color, lw=2.0, marker="o", ms=5, label=label)
     ax.set_xscale("log", base=2)
-    ax.set_xticks([16, 32, 64])
-    ax.set_xticklabels([16, 32, 64])
+    ax.set_xticks([16, 32, 64, 96])
+    ax.set_xticklabels([16, 32, 64, 96])
     ax.set_ylim(0, 1.04)
     ax.set_xlabel("new bank size N (warm-started from N/2)")
     ax.set_ylabel("step-0 EM (first eval after checkpoint load)")
@@ -93,7 +93,7 @@ def main():
     for arm in ["interface", "interface_softmax"]:
         label, color, _ = STYLE[arm]
         xs, ys = [], []
-        for n in [8, 16, 32, 64]:
+        for n in [8, 16, 32, 64, 96]:
             p = phase(S, arm, n)
             vals = [s["cross_talk_tail"] for s in p["seeds"]
                     if s.get("cross_talk_tail") is not None] if p else []
@@ -101,8 +101,8 @@ def main():
                 xs.append(n); ys.append(sum(vals) / len(vals))
         ax.plot(xs, ys, color=color, lw=2.0, marker="o", ms=5, label=label)
     ax.set_xscale("log", base=2)
-    ax.set_xticks([8, 16, 32, 64])
-    ax.set_xticklabels([8, 16, 32, 64])
+    ax.set_xticks([8, 16, 32, 64, 96])
+    ax.set_xticklabels([8, 16, 32, 64, 96])
     ax.set_xlabel("bank size N")
     ax.set_ylabel("read_state_cross_talk (tail mean)")
     ax.set_title("Interference floor: mean |q·k| over\nnon-target bank items (interface arms)")

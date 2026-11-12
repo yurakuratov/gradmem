@@ -191,3 +191,4 @@ notebooks/tasks_1-20_v1-2
 *.cometml-runs
 .idea
 *.json
+!experiments/linear_memory/local_only_comparison_config.json

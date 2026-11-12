@@ -1,0 +1,55 @@
+{
+  "experiment_id": "EXP-LM-002-AUDIT",
+  "output_dir": "reports/results/linear_memory/EXP-LM-002-AUDIT",
+  "audit_protocol": "experiments/linear_memory/allocation_audit_protocol.md",
+  "seeds": [1101, 2202, 3303],
+  "geometry": {
+    "regimes": ["iid", "correlated"],
+    "correlated_mixing_coefficient": 0.7,
+    "description": "Fresh marginally isotropic unit local addresses per episode and reset group. Correlated addresses normalize sqrt(a)*u_group + sqrt(1-a)*e_fact; a is a mixing coefficient, not the realized dot product."
+  },
+  "grid": {
+    "local_dims": [2, 4, 8],
+    "reset_horizons": [1, 2, 4, 8],
+    "tau_rule": "unique values from [1, 2, h] satisfying tau <= h",
+    "global_dims": [4, 8, 16, 32, 64, 128],
+    "value_dim": 2,
+    "eta": 1.0,
+    "inner_steps": 1
+  },
+  "calibration": {
+    "groups_per_candidate": 512,
+    "context_groups": 1,
+    "seed_offset": 100000
+  },
+  "heldout": {
+    "num_segments": [16, 32],
+    "episodes": 256,
+    "num_queries": [1, 32],
+    "target_errors": [0.1, 0.25],
+    "seed_offset": 200000,
+    "global_key_seed_offset": 300000
+  },
+  "selection": {
+    "folded_inference_memory_cap_scalars": 2048,
+    "policies": ["theory", "independent_p4", "endpoint_p4"],
+    "cost_description": "mixed primitive-operation proxy: J*(3*p*v+v) local write operations + C*D*p*v state-build MAC + Q*(D*p*v+p*v) read MAC",
+    "memory_description": "p*v + D*p*v folded-inference scalars; supplied address generation, oracle routes, and metadata are excluded"
+  },
+  "acceptance": {
+    "selected_reference_feasible_rate_min": 0.9,
+    "median_feasible_cost_regret_max": 0.1,
+    "confidence_z": 1.96
+  },
+  "post_result_audit": {
+    "oracle_scenario_coverage_min": 0.9,
+    "description": "Added after review of EXP-LM-002 to close the abstention loophole. Future experiments must preregister this criterion. It does not alter the scientific grid, RNG, sample counts, selector, or original acceptance fields."
+  },
+  "runtime": {
+    "device": "cpu",
+    "dtype": "float64",
+    "torch_num_threads": 1,
+    "torch_num_interop_threads": 1,
+    "deterministic_algorithms": true
+  }
+}

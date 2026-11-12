@@ -1,0 +1,85 @@
+{
+  "acceptance_passed": true,
+  "completed_at_utc": "2026-11-11T15:33:33.495251+00:00",
+  "dependence_note": "Q, epsilon, method, and neighbor views reuse episode streams and are not independent replications",
+  "elapsed_seconds": 26.415695417999814,
+  "experiment_id": "EXP-LM-004",
+  "heldout_rows": 177,
+  "maximum_absolute_prediction_residual": 0.007724357219454414,
+  "median_absolute_prediction_residual": 0.0003327606843862435,
+  "method_summaries": {
+    "hierarchical": {
+      "primary_deployment_point_feasible": 13,
+      "primary_views": 24,
+      "reserve_cost_overhead_vs_primary": {
+        "maximum": 0.06451612903225801,
+        "median": 0.05351578947368418
+      },
+      "reserve_deployment_epsilon_coverage": {
+        "coverage": 1.0,
+        "eligible_views": 24,
+        "empirically_feasible_views": 24,
+        "passed": true
+      },
+      "reserve_direct_sampled_deployment_epsilon_coverage": {
+        "coverage": 1.0,
+        "eligible_views": 24,
+        "empirically_feasible_views": 24,
+        "passed": true
+      },
+      "reserve_interval_feasible": 24,
+      "reserve_target_empirically_feasible": 23
+    },
+    "local_additive": {
+      "primary_deployment_point_feasible": 12,
+      "primary_views": 24,
+      "reserve_cost_overhead_vs_primary": {
+        "maximum": 0.06666666666666665,
+        "median": 0.0556451612903226
+      },
+      "reserve_deployment_epsilon_coverage": {
+        "coverage": 1.0,
+        "eligible_views": 24,
+        "empirically_feasible_views": 24,
+        "passed": true
+      },
+      "reserve_direct_sampled_deployment_epsilon_coverage": {
+        "coverage": 1.0,
+        "eligible_views": 24,
+        "empirically_feasible_views": 24,
+        "passed": true
+      },
+      "reserve_interval_feasible": 24,
+      "reserve_target_empirically_feasible": 16
+    },
+    "local_delta": {
+      "primary_deployment_point_feasible": 14,
+      "primary_views": 24,
+      "reserve_cost_overhead_vs_primary": {
+        "maximum": 0.05387205387205385,
+        "median": 0.052915414531722105
+      },
+      "reserve_deployment_epsilon_coverage": {
+        "coverage": 1.0,
+        "eligible_views": 24,
+        "empirically_feasible_views": 24,
+        "passed": true
+      },
+      "reserve_direct_sampled_deployment_epsilon_coverage": {
+        "coverage": 1.0,
+        "eligible_views": 24,
+        "empirically_feasible_views": 24,
+        "passed": true
+      },
+      "reserve_interval_feasible": 24,
+      "reserve_target_empirically_feasible": 24
+    }
+  },
+  "pairwise_rows": 48,
+  "sampled_la_consistency": {
+    "maximum_absolute_difference": 0.004683449717159949,
+    "median_absolute_difference": 0.0008453283369185549,
+    "rows": 72
+  },
+  "unique_evaluated_configurations": 59
+}

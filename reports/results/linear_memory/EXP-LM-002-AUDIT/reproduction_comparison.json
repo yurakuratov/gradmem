@@ -1,0 +1,35 @@
+{
+  "audit_input_hashes": {
+    "allocation_code": "2a2ce0d7067650808d75dadf431eb5d59bcf5081724a7462c9b14fb8f8d527eb",
+    "audit_protocol": "e6c021752f6431ee95b06a547d9ac5093277f1fa8bc02ad0e271b0f3a025b617",
+    "config": "8cc131b928ac8a6d1b91efb7c071bd7a5a3652ce89bf293f3879e73c3ec4eb67",
+    "model_code": "03cd61523d5add87528eda2cc6693bd1cc8db1f7b7164a8b5a377e7f9404e114",
+    "protocol": "4e77b5b8216452839ad53a9c983385f1a078b413acee9e8143273b8399789bc7",
+    "runner_code": "88f47fe94209beac9ae97c0fa23d842452c3a02ac5e97c9f60f156a6297fa8d9"
+  },
+  "audit_selection_sha256": "9cd0defd968af5996d5400961008985847f2be6e704a32cf8c8d7a403589c6a6",
+  "common_selection_evaluation_field_count": 40,
+  "common_selection_evaluation_fields_equal": true,
+  "note": "Config/output identifiers, timestamps, source hashes, audit fields, and selection artifact hashes intentionally differ. Grid, RNG, selections, calibration, predictions, and held-out candidate metrics are unchanged.",
+  "original_executed_sources_archive_sha256": "733614f757d533488e0dcd30ed4860a437f187e9d2e84ddca55e2bba4fc00104",
+  "original_selection_sha256": "98bbe4e64d6eff40545028655569096cd2793e5c0b70242ac34ca54ecb40be1d",
+  "scientific_raw_files": {
+    "calibration.csv": {
+      "audit_sha256": "2b5d114c9ca98923fd060a0560eb7f809e2a5b03e43f7a72813ef61763e202f4",
+      "byte_identical": true,
+      "original_sha256": "2b5d114c9ca98923fd060a0560eb7f809e2a5b03e43f7a72813ef61763e202f4"
+    },
+    "candidate_metrics.csv": {
+      "audit_sha256": "c580fd9587dffdc603526249e0d5bed589fdc871de81befd0663f10253f0baf7",
+      "byte_identical": true,
+      "original_sha256": "c580fd9587dffdc603526249e0d5bed589fdc871de81befd0663f10253f0baf7"
+    },
+    "candidate_predictions.csv": {
+      "audit_sha256": "68fe1e93f3020e3295bfa491946d6ebfbb19c129148d32337dc8a8ac89587d1e",
+      "byte_identical": true,
+      "original_sha256": "68fe1e93f3020e3295bfa491946d6ebfbb19c129148d32337dc8a8ac89587d1e"
+    }
+  },
+  "selections_equal": true,
+  "status": "post-result instrumentation-only reproduction comparison"
+}

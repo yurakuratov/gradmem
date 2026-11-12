@@ -1,0 +1,21 @@
+{
+  "calibration_sha256": "2b5d114c9ca98923fd060a0560eb7f809e2a5b03e43f7a72813ef61763e202f4",
+  "candidate_predictions_sha256": "68fe1e93f3020e3295bfa491946d6ebfbb19c129148d32337dc8a8ac89587d1e",
+  "completed_at_utc": "2026-11-11T12:44:10.731016+00:00",
+  "elapsed_seconds": 0.3352751869970234,
+  "git_head": "710c110f111fc447a5e2ffb29e051643ed5cdfa6",
+  "git_status_before_heldout": "M PROGRESS.md\n M STATUS.md\n M experiments/linear_memory/.gitignore\n M notebooks/collect_results.ipynb\n M notebooks/dump_babi_dataset.ipynb\n M notebooks/dump_dataset.ipynb\n?? docs/HIERARCHICAL_MEMORY_INTRODUCTION.md\n?? experiments/linear_memory/allocation.py\n?? experiments/linear_memory/allocation_audit_config.json\n?? experiments/linear_memory/allocation_audit_protocol.md\n?? experiments/linear_memory/allocation_config.json\n?? experiments/linear_memory/allocation_protocol.md\n?? experiments/linear_memory/run_allocation.py\n?? reports/ALLOCATION_TRANSFER_RESULTS.md\n?? reports/results/linear_memory/EXP-LM-002-AUDIT/\n?? reports/results/linear_memory/EXP-LM-002/\n?? research/\n?? tests/test_linear_memory_allocation.py",
+  "input_hashes": {
+    "allocation_code": "2a2ce0d7067650808d75dadf431eb5d59bcf5081724a7462c9b14fb8f8d527eb",
+    "audit_protocol": "e6c021752f6431ee95b06a547d9ac5093277f1fa8bc02ad0e271b0f3a025b617",
+    "config": "8cc131b928ac8a6d1b91efb7c071bd7a5a3652ce89bf293f3879e73c3ec4eb67",
+    "model_code": "03cd61523d5add87528eda2cc6693bd1cc8db1f7b7164a8b5a377e7f9404e114",
+    "protocol": "4e77b5b8216452839ad53a9c983385f1a078b413acee9e8143273b8399789bc7",
+    "runner_code": "88f47fe94209beac9ae97c0fa23d842452c3a02ac5e97c9f60f156a6297fa8d9"
+  },
+  "platform": "Linux-6.6.156-2-MANJARO-x86_64-with-glibc2.44",
+  "python": "3.11.15 (main, May 10 2026, 19:28:18) [Clang 22.1.3 ]",
+  "selections_preregistered_sha256": "9cd0defd968af5996d5400961008985847f2be6e704a32cf8c8d7a403589c6a6",
+  "stage": "calibrate-select",
+  "torch": "2.5.1+cu121"
+}
